@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\web\DocumentType.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Text;
+using System.Xml;
+using System.Linq;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using umbraco.BusinessLogic;
+using Umbraco.Core.Services;
+using umbraco.DataLayer;
+using System.Collections.Generic;
+using Umbraco.Core;
+
+namespace umbraco.cms.businesslogic.web
+{
+    /// &lt;summary&gt;
+    /// Summary description for DocumentType.
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;Obsolete, Use Umbraco.Core.Models.ContentType&quot;, false)]
+    public class DocumentType : ContentType
+    {
+        #region Constructors
+
+        public DocumentType(int id) : base(id) { }
+
+        public DocumentType(Guid id) : base(id) { }
+
+        public DocumentType(int id, bool noSetup) : base(id, noSetup) { }
+
+        internal DocumentType(IContentType contentType)
+            : base(contentType)
+        {
+            SetupNode(contentType);
+        }
+
+        #endregion
+
+        #region Constants and Static members
+
+        public static Guid _objectType = new Guid(Constants.ObjectTypes.DocumentType);
+
+        new internal const string m_SQLOptimizedGetAll = @&quot;
+            SELECT id, createDate, trashed, parentId, nodeObjectType, nodeUser, level, path, sortOrder, uniqueID, text,
+                allowAtRoot, isContainer, Alias,icon,thumbnail,description,
+                templateNodeId, IsDefault
+            FROM umbracoNode 
+            INNER JOIN cmsContentType ON umbracoNode.id = cmsContentType.nodeId
+            LEFT OUTER JOIN cmsDocumentType ON cmsContentType.nodeId = cmsDocumentType.contentTypeNodeId
+            WHERE nodeObjectType = @nodeObjectType&quot;;
+
+        #endregion
+
+        #region Private Members
+
+        private ArrayList _templateIds = new ArrayList();
+        private int _defaultTemplate;
+        private bool _hasChildrenInitialized = false;
+        private bool _hasChildren;
+
+        private IContentType ContentType
+        {
+            get { return base.ContentTypeItem as IContentType; }
+            set { base.ContentTypeItem = value; }
+        }
+
+        #endregion
+
+        #region Static Methods
+
+        /// &lt;summary&gt;
+        /// Generates the complete (simplified) XML DTD 
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;The DTD as a string&lt;/returns&gt;
+        [Obsolete(&quot;Obsolete, Use Umbraco.Core.Services.ContentTypeService.GetDtd()&quot;, false)]
+        public static string GenerateDtd()
+        {
+            StringBuilder dtd = new StringBuilder();
+            // Renamed &#39;umbraco&#39; to &#39;root&#39; since the top level of the DOCTYPE should specify the name of the root node for it to be valid;
+            // there&#39;s no mention of &#39;umbraco&#39; anywhere in the schema that this DOCTYPE governs
+            // (Alex N 20100212)
+            dtd.AppendLine(&quot;&lt;!DOCTYPE root [ &quot;);
+
+            dtd.AppendLine(GenerateXmlDocumentType());
+            dtd.AppendLine(&quot;]&gt;&quot;);
+
+            return dtd.ToString();
+        }
+
+        [Obsolete(&quot;Obsolete, Use Umbraco.Core.Services.ContentTypeService.GetContentTypesDtd()&quot;, false)]
+        public static string GenerateXmlDocumentType()
+        {
+            StringBuilder dtd = new StringBuilder();
+            if (UmbracoConfig.For.UmbracoSettings().Content.UseLegacyXmlSchema)
+            {
+                dtd.AppendLine(&quot;&lt;!ELEMENT node ANY&gt; &lt;!ATTLIST node id ID #REQUIRED&gt;  &lt;!ELEMENT data ANY&gt;&quot;);
+            }
+            else
+            {
+                // TEMPORARY: Added Try-Catch to this call since trying to generate a DTD against a corrupt db
+                // or a broken connection string is not handled yet
+                // (Alex N 20100212)
+                try
+                {
+                    StringBuilder strictSchemaBuilder = new StringBuilder();
+
+                    List&lt;DocumentType&gt; dts = GetAllAsList();
+                    foreach (DocumentType dt in dts)
+                    {
+                        string safeAlias = helpers.Casing.SafeAlias(dt.Alias);
+                        if (safeAlias != null)
+                        {
+                            strictSchemaBuilder.AppendLine(String.Format(&quot;&lt;!ELEMENT {0} ANY&gt;&quot;, safeAlias));
+                            strictSchemaBuilder.AppendLine(String.Format(&quot;&lt;!ATTLIST {0} id ID #REQUIRED&gt;&quot;, safeAlias));
+                        }
+                    }
+
+                    // Only commit the strong schema to the container if we didn&#39;t generate an error building it
+                    dtd.Append(strictSchemaBuilder);
+                }
+                catch (Exception exception)
+                {
+                    LogHelper.Error&lt;DocumentType&gt;(&quot;Exception while trying to build DTD for Xml schema; is Umbraco installed correctly and the connection string configured?&quot;, exception);
+                }
+
+            }
+            return dtd.ToString();
+
+        }
+
+        [Obsolete(&quot;Obsolete, Use Umbraco.Core.Services.ContentTypeService.GetContentType()&quot;, false)]
+        public new static DocumentType GetByAlias(string Alias)
+        {
+            try
+            {
+                var contentType = ApplicationContext.Current.Services.ContentTypeService.GetContentType(Alias);
+                return new DocumentType(contentType.Id);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        [Obsolete(&quot;Obsolete, Use Umbraco.Core.Models.ContentType and Umbraco.Core.Services.ContentTypeService.Save()&quot;, false)]
+        public static DocumentType MakeNew(User u, string Text)
+        {
+            var contentType = new Umbraco.Core.Models.ContentType(-1) { Name = Text, Alias = Text, CreatorId = u.Id, Thumbnail = &quot;icon-folder&quot;, Icon = &quot;icon-folder&quot; };
+            ApplicationContext.Current.Services.ContentTypeService.Save(contentType, u.Id);
+            var newDt = new DocumentType(contentType);
+
+            //event
+            NewEventArgs e = new NewEventArgs();
+            newDt.OnNew(e);
+
+            return newDt;
+        }
+
+        [Obsolete(&quot;Use GetAllAsList() method call instead&quot;, true)]
+        public new static DocumentType[] GetAll
+        {
+            get
+            {
+                return GetAllAsList().ToArray();
+            }
+        }
+
+        [Obsolete(&quot;Obsolete, Use Umbraco.Core.Services.ContentTypeService.GetAllContentTypes()&quot;, false)]
+        public static List&lt;DocumentType&gt; GetAllAsList()
+        {
+            var contentTypes = ApplicationContext.Current.Services.ContentTypeService.GetAllContentTypes();
+            var documentTypes = contentTypes.Select(x =&gt; new DocumentType(x));
+
+            return documentTypes.OrderBy(x =&gt; x.Text).ToList();
+        }
+
+        #endregion
+
+        #region Public Properties
+        [Obsolete(&quot;Obsolete, Use Umbraco.Core.Services.ContentTypeService.HasChildren()&quot;, false)]
+        public override bool HasChildren
+        {
+            get
+            {
+                if (_hasChildrenInitialized == false)
+                {
+                    HasChildren = ApplicationContext.Current.Services.ContentTypeService.HasChildren(Id);
+                }
+                return _hasChildren;
+            }
+            set
+            {
+                _hasChildrenInitialized = true;
+                _hasChildren = value;
+            }
+        }
+
+        [Obsolete(&quot;Obsolete, Use SetDefaultTemplate() on Umbraco.Core.Models.ContentType&quot;, false)]
+        public int DefaultTemplate
+        {
+            get { return _defaultTemplate; }
+            set
+            {
+                RemoveDefaultTemplate();
+                _defaultTemplate = value;
+
+                if (_defaultTemplate != 0)
+                {
+                    var template = ApplicationContext.Current.Services.FileService.GetTemplate(_defaultTemplate);
+                    ContentType.SetDefaultTemplate(template);
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets/sets the allowed templates for this document type.
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Obsolete, Use AllowedTemplates property on Umbraco.Core.Models.ContentType&quot;, false)]
+        public template.Template[] allowedTemplates
+        {
+            get
+            {
+                if (HasTemplate())
+                {
+                    template.Template[] retval = new template.Template[_templateIds.Count];
+                    for (int i = 0; i &lt; _templateIds.Count; i++)
+                    {
+                        retval[i] = template.Template.GetTemplate((int)_templateIds[i]);
+                    }
+                    return retval;
+                }
+                return new template.Template[0];
+            }
+            set
+            {
+                clearTemplates();
+                var templates = new List&lt;ITemplate&gt;();
+                foreach (template.Template t in value)
+                {
+                    var template = ApplicationContext.Current.Services.FileService.GetTemplate(t.Id);
+                    templates.Add(template);
+
+                    _templateIds.Add(t.Id);
+                }
+                ContentType.AllowedTemplates = templates;
+            }
+        }
+
+        public new string Path
+        {
+            get
+            {
+                List&lt;int&gt; path = new List&lt;int&gt;();
+                DocumentType working = this;
+                while (working != null)
+                {
+                    path.Add(working.Id);
+                    try
+                    {
+                        if (working.MasterContentType != 0)
+                        {
+                            working = new DocumentType(working.MasterContentType);
+                        }
+                        else
+                        {
+                            working = null;
+                        }
+                    }
+                    catch (ArgumentException)
+                    {
+                        working = null;
+                    }
+                }
+                path.Add(-1);
+                path.Reverse();
+                string sPath = string.Join(&quot;,&quot;, path.ConvertAll(item =&gt; item.ToString()).ToArray());
+                return sPath;
+            }
+            set
+            {
+                base.Path = value;
+            }
+        }
+        #endregion
+
+        #region Public Methods
+
+        #region Regenerate Xml Structures
+
+        /// &lt;summary&gt;
+        /// This will return all PUBLISHED content Ids that are of this content type or any descendant types as well.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This will also work if we have multiple child content types (if one day we support that)
+        /// &lt;/remarks&gt;
+        internal override IEnumerable&lt;int&gt; GetContentIdsForContentType()
+        {
+            var ids = new List&lt;int&gt;();
+
+            var currentContentTypeIds = new[] { this.Id };
+            while (currentContentTypeIds.Any())
+            {
+                var childContentTypeIds = new List&lt;int&gt;();
+
+                //loop through each content type id
+                foreach (var currentContentTypeId in currentContentTypeIds)
+                {
+                    //get all the content item ids of the current content type
+                    using (var sqlHelper = Application.SqlHelper)
+                    using (var dr = sqlHelper.ExecuteReader(@&quot;SELECT DISTINCT cmsDocument.nodeId FROM cmsDocument
+                                                        INNER JOIN cmsContent ON cmsContent.nodeId = cmsDocument.nodeId
+                                                        INNER JOIN cmsContentType ON cmsContent.contentType = cmsContentType.nodeId
+                                                        WHERE cmsContentType.nodeId = @contentTypeId AND cmsDocument.published = 1&quot;,
+                                                            sqlHelper.CreateParameter(&quot;@contentTypeId&quot;, currentContentTypeId)))
+                    {
+                        while (dr.Read())
+                        {
+                            ids.Add(dr.GetInt(&quot;nodeId&quot;));
+                        }
+                        dr.Close();
+                    }
+
+                    //lookup the child content types if there are any and add the ids to the content type ids array
+                    using (var sqlHelper = Application.SqlHelper)
+                    using (var reader = sqlHelper.ExecuteReader(&quot;SELECT childContentTypeId FROM cmsContentType2ContentType WHERE parentContentTypeId=@contentTypeId&quot;,
+                                                                sqlHelper.CreateParameter(&quot;@contentTypeId&quot;, currentContentTypeId)))
+                    {
+                        while (reader.Read())
+                        {
+                            childContentTypeIds.Add(reader.GetInt(&quot;childContentTypeId&quot;));
+                        }
+                    }
+      
+                }
+
+                currentContentTypeIds = childContentTypeIds.ToArray();       
+                
+            }
+            return ids;
+        } 
+
+        /// &lt;summary&gt;
+        /// Rebuilds the xml structure for the content item by id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentId&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// This is not thread safe
+        /// &lt;/remarks&gt;
+        internal override void RebuildXmlStructureForContentItem(int contentId)
+        {
+            var xd = new XmlDocument();
+            try
+            {
+                //create the document in optimized mode! 
+                // (not sure why we wouldn&#39;t always do that ?!)
+
+                new Document(true, contentId).XmlGenerate(xd);
+
+                //The benchmark results that I found based contructing the Document object with &#39;true&#39; for optimized
+                //mode, vs using the normal ctor. Clearly optimized mode is better!
+                /*
+                 * The average page rendering time (after 10 iterations) for submitting /umbraco/dialogs/republish?xml=true when using 
+                 * optimized mode is
+                 * 
+                 * 0.060400555555556
+                 * 
+                 * The average page rendering time (after 10 iterations) for submitting /umbraco/dialogs/republish?xml=true when not
+                 * using optimized mode is
+                 * 
+                 * 0.107037777777778
+                 *                      
+                 * This means that by simply changing this to use optimized mode, it is a 45% improvement!
+                 * 
+                 */
+            }
+            catch (Exception ee)
+            {
+                LogHelper.Error&lt;DocumentType&gt;(&quot;Error generating xml&quot;, ee);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Clears all xml structures in the cmsContentXml table for the current content type and any of it&#39;s descendant types
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This is not thread safe.
+        /// This will also work if we have multiple child content types (if one day we support that)
+        /// &lt;/remarks&gt;
+        internal override void ClearXmlStructuresForContent()
+        {
+            var currentContentTypeIds = new[] {this.Id};
+            while (currentContentTypeIds.Any())
+            {
+                var childContentTypeIds = new List&lt;int&gt;();
+
+                //loop through each content type id
+                foreach (var currentContentTypeId in currentContentTypeIds)
+                {
+                    //Remove all items from the cmsContentXml table that are of this current content type
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlHelper.ExecuteNonQuery(@&quot;DELETE FROM cmsContentXml WHERE nodeId IN
+                                        (SELECT DISTINCT cmsContent.nodeId FROM cmsContent 
+                                            INNER JOIN cmsContentType ON cmsContent.contentType = cmsContentType.nodeId 
+                                            WHERE cmsContentType.nodeId = @contentTypeId)&quot;,
+                                              sqlHelper.CreateParameter(&quot;@contentTypeId&quot;, currentContentTypeId));
+
+                    //lookup the child content types if there are any and add the ids to the content type ids array
+                    using (var sqlHelper = Application.SqlHelper)
+                    using (var reader = sqlHelper.ExecuteReader(&quot;SELECT childContentTypeId FROM cmsContentType2ContentType WHERE parentContentTypeId=@contentTypeId&quot;,
+                                                                sqlHelper.CreateParameter(&quot;@contentTypeId&quot;, currentContentTypeId)))
+                    {                        
+                        while (reader.Read())
+                        {
+                            childContentTypeIds.Add(reader.GetInt(&quot;childContentTypeId&quot;));
+                        }                        
+                    }      
+
+                }
+
+                currentContentTypeIds = childContentTypeIds.ToArray();                          
+            }
+        } 
+
+        #endregion
+
+        [Obsolete(&quot;Obsolete, Use RemoveTemplate() on Umbraco.Core.Models.ContentType&quot;, false)]
+        public void RemoveTemplate(int templateId)
+        {
+            // remove if default template
+            if (this.DefaultTemplate == templateId)
+            {
+                RemoveDefaultTemplate();
+            }
+
+            // remove from list of document type templates
+            if (_templateIds.Contains(templateId))
+            {
+                var template = ContentType.AllowedTemplates.FirstOrDefault(x =&gt; x.Id == templateId);
+                if (template != null)
+                    ContentType.RemoveTemplate(template);
+
+                _templateIds.Remove(templateId);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// 
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;ArgumentException&quot;&gt;Throws an exception if trying to delete a document type that is assigned as a master document type&lt;/exception&gt;
+        [Obsolete(&quot;Obsolete, Use Umbraco.Core.Services.ContentTypeService.Delete()&quot;, false)]
+        public override void delete()
+        {
+            DeleteEventArgs e = new DeleteEventArgs();
+            FireBeforeDelete(e);
+
+            if (e.Cancel == false)
+            {
+                // check that no document types uses me as a master
+                if (GetAllAsList().Any(dt =&gt; dt.MasterContentTypes.Contains(this.Id)))
+                {
+                    throw new ArgumentException(&quot;Can&#39;t delete a Document Type used as a Master Content Type. Please remove all references first!&quot;);
+                }
+                
+                ApplicationContext.Current.Services.ContentTypeService.Delete(ContentType);
+
+                clearTemplates();
+
+                FireAfterDelete(e);
+            }
+        }
+
+        public void clearTemplates()
+        {
+            ContentType.AllowedTemplates = new List&lt;ITemplate&gt;();
+            _templateIds.Clear();
+        }
+
+        public XmlElement ToXml(XmlDocument xd)
+        {
+            var exporter = new EntityXmlSerializer();
+            var xml = exporter.Serialize(
+                ApplicationContext.Current.Services.DataTypeService,
+                ApplicationContext.Current.Services.ContentTypeService,
+                ContentType);
+
+            //convert the Linq to Xml structure to the old .net xml structure
+            var xNode = xml.GetXmlNode();
+            var doc = (XmlElement)xd.ImportNode(xNode, true);
+            return doc;
+        }
+
+        [Obsolete(&quot;Obsolete, Use SetDefaultTemplate(null) on Umbraco.Core.Models.ContentType&quot;, false)]
+        public void RemoveDefaultTemplate()
+        {
+            _defaultTemplate = 0;
+            ContentType.SetDefaultTemplate(null);
+        }
+
+        public bool HasTemplate()
+        {
+            return (_templateIds.Count &gt; 0);
+        }
+
+        /// &lt;summary&gt;
+        /// Used to persist object changes to the database. In Version3.0 it&#39;s just a stub for future compatibility
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Obsolete, Use Umbraco.Core.Services.ContentTypeService.Save()&quot;, false)]
+        public override void Save()
+        {
+            var e = new SaveEventArgs();
+            FireBeforeSave(e);
+
+            if (!e.Cancel)
+            {
+                var current = User.GetCurrent();
+                int userId = current == null ? 0 : current.Id;
+                ApplicationContext.Current.Services.ContentTypeService.Save(ContentType, userId);
+
+                base.Save();
+                FireAfterSave(e);
+            }
+        }
+
+        #endregion
+
+        #region Protected Methods
+
+        [Obsolete(&quot;Depreated, No longer needed nor used&quot;)]
+        protected void PopulateDocumentTypeNodeFromReader(IRecordsReader dr)
+        {
+            if (!dr.IsNull(&quot;templateNodeId&quot;))
+            {
+                _templateIds.Add(dr.GetInt(&quot;templateNodeId&quot;));
+                if (!dr.IsNull(&quot;IsDefault&quot;))
+                {
+                    if (dr.GetBoolean(&quot;IsDefault&quot;))
+                    {
+                        _defaultTemplate = dr.GetInt(&quot;templateNodeId&quot;);
+                    }
+                }
+            }
+        }
+
+        protected override void setupNode()
+        {
+            var contentType = ApplicationContext.Current.Services.ContentTypeService.GetContentType(Id);
+            
+            // If it&#39;s null, it&#39;s probably a folder
+            if (contentType != null)
+                SetupNode(contentType);
+        }
+
+        #endregion
+
+        #region Private Methods
+        private void SetupNode(IContentType contentType)
+        {
+            ContentType = contentType;
+            foreach (var template in ContentType.AllowedTemplates.Where(t =&gt; t != null))
+            {
+                _templateIds.Add(template.Id);
+            }
+
+            if (ContentType.DefaultTemplate != null)
+                _defaultTemplate = ContentType.DefaultTemplate.Id;
+
+            base.PopulateContentTypeFromContentTypeBase(ContentType);
+            base.PopulateCMSNodeFromUmbracoEntity(ContentType, _objectType);
+        }
+        #endregion
+
+        #region Events
+        /// &lt;summary&gt;
+        /// The save event handler
+        /// &lt;/summary&gt;
+        public delegate void SaveEventHandler(DocumentType sender, SaveEventArgs e);
+        /// &lt;summary&gt;
+        /// The New event handler
+        /// &lt;/summary&gt;
+        public delegate void NewEventHandler(DocumentType sender, NewEventArgs e);
+        /// &lt;summary&gt;
+        /// The delete event handler
+        /// &lt;/summary&gt;
+        public delegate void DeleteEventHandler(DocumentType sender, DeleteEventArgs e);
+
+        /// &lt;summary&gt;
+        /// Occurs when [before save].
+        /// &lt;/summary&gt;
+        public static event SaveEventHandler BeforeSave;
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:BeforeSave&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireBeforeSave(SaveEventArgs e)
+        {
+            if (BeforeSave != null)
+                BeforeSave(this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs when [after save].
+        /// &lt;/summary&gt;
+        public static event SaveEventHandler AfterSave;
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:AfterSave&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireAfterSave(SaveEventArgs e)
+        {
+            if (AfterSave != null)
+            {
+                var updated = this.ContentType == null
+                                  ? new DocumentType(this.Id)
+                                  : new DocumentType(this.ContentType);
+                AfterSave(updated, e);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs when [new].
+        /// &lt;/summary&gt;
+        public static event NewEventHandler New;
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:New&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void OnNew(NewEventArgs e)
+        {
+            if (New != null)
+                New(this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs when [before delete].
+        /// &lt;/summary&gt;
+        public static event DeleteEventHandler BeforeDelete;
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:BeforeDelete&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireBeforeDelete(DeleteEventArgs e)
+        {
+            if (BeforeDelete != null)
+                BeforeDelete(this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs when [after delete].
+        /// &lt;/summary&gt;
+        public static event DeleteEventHandler AfterDelete;
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:AfterDelete&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireAfterDelete(DeleteEventArgs e)
+        {
+            if (AfterDelete != null)
+                AfterDelete(this, e);
+        }
+        #endregion
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,39,25,47,0],[25,48,25,49,0],[25,50,25,51,0],[27,40,27,48,0],[27,49,27,50,0],[27,51,27,52,0],[29,53,29,70,0],[29,71,29,72,0],[29,73,29,74,0],[32,15,32,32,0],[33,9,33,10,0],[34,13,34,36,0],[35,9,35,10,0],[41,9,41,87,0],[56,9,56,58,0],[56,9,56,58,0],[56,9,56,58,0],[56,9,56,58,0],[58,9,58,54,0],[58,9,58,54,0],[58,9,58,54,0],[58,9,58,54,0],[63,17,63,18,0],[63,19,63,63,0],[63,64,63,65,0],[64,17,64,18,0],[64,19,64,48,0],[64,49,64,50,0],[77,9,77,10,0],[78,13,78,53,0],[82,13,82,49,0],[84,13,84,55,0],[85,13,85,34,0],[87,13,87,35,0],[88,9,88,10,0],[92,9,92,10,0],[93,13,93,53,0],[94,13,94,80,0],[95,13,95,14,0],[96,17,96,108,0],[97,13,97,14,0],[99,13,99,14,0],[104,17,104,18,0],[105,21,105,77,0],[107,21,107,61,0],[108,21,108,28,0],[108,30,108,45,0],[108,46,108,48,0],[108,49,108,52,0],[109,21,109,22,0],[110,25,110,79,0],[111,25,111,47,0],[112,25,112,26,0],[113,29,113,108,0],[114,29,114,120,0],[115,25,115,26,0],[116,21,116,22,0],[119,21,119,53,0],[120,17,120,18,0],[121,17,121,44,0],[122,17,122,18,0],[123,21,123,186,0],[124,17,124,18,0],[126,13,126,14,0],[127,13,127,35,0],[129,9,129,10,0],[133,9,133,10,0],[135,13,135,14,0],[136,17,136,112,0],[137,17,137,57,0],[139,13,139,18,0],[140,13,140,14,0],[141,17,141,29,0],[143,9,143,10,0],[147,9,147,10,0],[148,13,148,168,0],[149,13,149,92,0],[150,13,150,55,0],[153,13,153,49,0],[154,13,154,28,0],[156,13,156,26,0],[157,9,157,10,0],[163,13,163,14,0],[164,17,164,49,0],[165,13,165,14,0],[170,9,170,10,0],[171,13,171,108,0],[172,13,172,58,0],[172,58,172,77,0],[172,77,172,79,0],[172,13,172,79,0],[174,13,174,47,0],[174,47,174,53,0],[174,53,174,64,0],[174,13,174,64,0],[175,9,175,10,0],[184,13,184,14,0],[185,17,185,54,0],[186,17,186,18,0],[187,21,187,106,0],[188,17,188,18,0],[189,17,189,37,0],[190,13,190,14,0],[192,13,192,14,0],[193,17,193,48,0],[194,17,194,38,0],[195,13,195,14,0],[201,17,201,18,0],[201,19,201,43,0],[201,44,201,45,0],[203,13,203,14,0],[204,17,204,41,0],[205,17,205,42,0],[207,17,207,43,0],[208,17,208,18,0],[209,21,209,114,0],[210,21,210,62,0],[211,17,211,18,0],[212,13,212,14,0],[222,13,222,14,0],[223,17,223,35,0],[224,17,224,18,0],[225,21,225,92,0],[226,26,226,35,0],[226,37,226,59,0],[226,61,226,64,0],[227,21,227,22,0],[228,25,228,89,0],[229,21,229,22,0],[230,21,230,35,0],[232,17,232,49,0],[233,13,233,14,0],[235,13,235,14,0],[236,17,236,34,0],[237,17,237,55,0],[238,17,238,24,0],[238,26,238,45,0],[238,46,238,48,0],[238,49,238,54,0],[239,17,239,18,0],[240,21,240,102,0],[241,21,241,45,0],[243,21,243,44,0],[244,17,244,18,0],[245,17,245,58,0],[246,13,246,14,0],[252,13,252,14,0],[253,17,253,50,0],[254,17,254,45,0],[255,17,255,40,0],[256,17,256,18,0],[257,21,257,42,0],[259,21,259,22,0],[260,25,260,60,0],[261,25,261,26,0],[262,29,262,83,0],[263,25,263,26,0],[265,25,265,26,0],[266,29,266,44,0],[267,25,267,26,0],[268,21,268,22,0],[269,21,269,46,0],[270,21,270,22,0],[271,25,271,40,0],[272,21,272,22,0],[273,17,273,18,0],[274,17,274,30,0],[275,17,275,32,0],[276,17,276,73,0],[276,73,276,88,0],[276,88,276,101,0],[276,17,276,101,0],[277,17,277,30,0],[278,13,278,14,0],[280,13,280,14,0],[281,17,281,35,0],[282,13,282,14,0],[298,9,298,10,0],[299,13,299,39,0],[301,13,301,59,0],[302,13,302,48,0],[303,13,303,14,0],[304,17,304,59,0],[307,17,307,24,0],[307,26,307,50,0],[307,51,307,53,0],[307,54,307,75,0],[308,17,308,18,0],[310,28,310,65,0],[311,28,315,127,0],[316,21,316,22,0],[317,25,317,42,0],[318,25,318,26,0],[319,29,319,58,0],[320,25,320,26,0],[321,25,321,36,0],[322,21,322,22,0],[325,28,325,65,0],[326,28,327,131,0],[328,21,328,22,0],[329,25,329,46,0],[330,25,330,26,0],[331,29,331,90,0],[332,25,332,26,0],[333,21,333,22,0],[335,17,335,18,0],[337,17,337,71,0],[339,13,339,14,0],[340,13,340,24,0],[341,9,341,10,0],[351,9,351,10,0],[352,13,352,40,0],[354,13,354,14,0],[358,17,358,63,0],[376,13,376,14,0],[377,13,377,33,0],[378,13,378,14,0],[379,17,379,75,0],[380,13,380,14,0],[381,9,381,10,0],[391,9,391,10,0],[392,13,392,57,0],[393,13,393,48,0],[394,13,394,14,0],[395,17,395,59,0],[398,17,398,24,0],[398,26,398,50,0],[398,51,398,53,0],[398,54,398,75,0],[399,17,399,18,0],[401,28,401,65,0],[402,25,406,114,0],[409,28,409,65,0],[410,28,411,131,0],[412,21,412,22,0],[413,25,413,46,0],[414,25,414,26,0],[415,29,415,90,0],[416,25,416,26,0],[417,21,417,22,0],[419,17,419,18,0],[421,17,421,71,0],[422,13,422,14,0],[423,9,423,10,0],[429,9,429,10,0],[431,13,431,52,0],[432,13,432,14,0],[433,17,433,41,0],[434,13,434,14,0],[437,13,437,51,0],[438,13,438,14,0],[439,17,439,81,0],[439,81,439,99,0],[439,99,439,101,0],[439,17,439,101,0],[440,17,440,38,0],[441,21,441,58,0],[443,17,443,49,0],[444,13,444,14,0],[445,9,445,10,0],[453,9,453,10,0],[454,13,454,55,0],[455,13,455,33,0],[457,13,457,35,0],[458,13,458,14,0],[460,17,460,46,0],[460,46,460,85,0],[460,85,460,87,0],[460,17,460,87,0],[461,17,461,18,0],[462,21,462,148,0],[465,17,465,92,0],[467,17,467,34,0],[469,17,469,36,0],[470,13,470,14,0],[471,9,471,10,0],[474,9,474,10,0],[475,13,475,66,0],[476,13,476,34,0],[477,9,477,10,0],[480,9,480,10,0],[481,13,481,54,0],[482,13,485,30,0],[488,13,488,42,0],[489,13,489,62,0],[490,13,490,24,0],[491,9,491,10,0],[495,9,495,10,0],[496,13,496,34,0],[497,13,497,50,0],[498,9,498,10,0],[501,9,501,10,0],[502,13,502,45,0],[503,9,503,10,0],[510,9,510,10,0],[511,13,511,41,0],[512,13,512,31,0],[514,13,514,27,0],[515,13,515,14,0],[516,17,516,49,0],[517,17,517,63,0],[518,17,518,98,0],[520,17,520,29,0],[521,17,521,34,0],[522,13,522,14,0],[523,9,523,10,0],[531,9,531,10,0],[532,13,532,46,0],[533,13,533,14,0],[534,17,534,63,0],[535,17,535,45,0],[536,17,536,18,0],[537,21,537,52,0],[538,21,538,22,0],[539,25,539,72,0],[540,21,540,22,0],[541,17,541,18,0],[542,13,542,14,0],[543,9,543,10,0],[546,9,546,10,0],[547,13,547,105,0],[550,13,550,37,0],[551,17,551,40,0],[552,9,552,10,0],[558,9,558,10,0],[559,13,559,39,0],[560,13,560,20,0],[560,22,560,34,0],[560,35,560,37,0],[560,38,560,78,0],[560,78,560,87,0],[560,87,560,88,0],[560,38,560,88,0],[561,13,561,14,0],[562,17,562,47,0],[563,13,563,14,0],[565,13,565,53,0],[566,17,566,67,0],[568,13,568,70,0],[569,13,569,77,0],[570,9,570,10,0],[596,9,596,10,0],[597,13,597,36,0],[598,17,598,37,0],[599,9,599,10,0],[610,9,610,10,0],[611,13,611,35,0],[612,13,612,14,0],[613,17,615,72,0],[616,17,616,39,0],[617,13,617,14,0],[618,9,618,10,0],[629,9,629,10,0],[630,13,630,29,0],[631,17,631,30,0],[632,9,632,10,0],[643,9,643,10,0],[644,13,644,38,0],[645,17,645,39,0],[646,9,646,10,0],[657,9,657,10,0],[658,13,658,37,0],[659,17,659,38,0],[660,9,660,10,0]]);
+    </script>
+  </body>
+</html>

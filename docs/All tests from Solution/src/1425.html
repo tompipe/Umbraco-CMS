@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\TypeHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+
+namespace Umbraco.Core
+{
+    /// &lt;summary&gt;
+	/// A utility class for type checking, this provides internal caching so that calls to these methods will be faster
+	/// than doing a manual type check in c#
+	/// &lt;/summary&gt;
+	internal static class TypeHelper
+	{
+		
+		private static readonly ConcurrentDictionary&lt;Type, FieldInfo[]&gt; GetFieldsCache = new ConcurrentDictionary&lt;Type, FieldInfo[]&gt;();
+		private static readonly ConcurrentDictionary&lt;Tuple&lt;Type, bool, bool, bool&gt;, PropertyInfo[]&gt; GetPropertiesCache = new ConcurrentDictionary&lt;Tuple&lt;Type, bool, bool, bool&gt;, PropertyInfo[]&gt;();
+        
+        /// &lt;summary&gt;
+        /// Checks if the method is actually overriding a base method
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;m&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static bool IsOverride(MethodInfo m)
+        {
+            return m.GetBaseDefinition().DeclaringType != m.DeclaringType;
+        }
+
+        /// &lt;summary&gt;
+        /// Find all assembly references that are referencing the assignTypeFrom Type&#39;s assembly found in the assemblyList
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;assignTypeFrom&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;assemblies&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// If the assembly of the assignTypeFrom Type is in the App_Code assembly, then we return nothing since things cannot
+        /// reference that assembly, same with the global.asax assembly.
+        /// &lt;/remarks&gt;
+        public static Assembly[] GetReferencedAssemblies(Type assignTypeFrom, IEnumerable&lt;Assembly&gt; assemblies)
+        {
+            //check if it is the app_code assembly.
+            //check if it is App_global.asax assembly
+            if (assignTypeFrom.Assembly.IsAppCodeAssembly() || assignTypeFrom.Assembly.IsGlobalAsaxAssembly())
+            {
+                return Enumerable.Empty&lt;Assembly&gt;().ToArray();
+            }
+            
+            //find all assembly references that are referencing the current type&#39;s assembly since we 
+            //should only be scanning those assemblies because any other assembly will definitely not
+            //contain sub type&#39;s of the one we&#39;re currently looking for
+            return assemblies
+                .Where(assembly =&gt;
+                       assembly == assignTypeFrom.Assembly 
+                        || HasReferenceToAssemblyWithName(assembly, assignTypeFrom.Assembly.GetName().Name))
+                .ToArray();
+        }
+
+	    /// &lt;summary&gt;
+	    /// checks if the assembly has a reference with the same name as the expected assembly name.
+	    /// &lt;/summary&gt;
+	    /// &lt;param name=&quot;assembly&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;expectedAssemblyName&quot;&gt;&lt;/param&gt;
+	    /// &lt;returns&gt;&lt;/returns&gt;
+        private static bool HasReferenceToAssemblyWithName(Assembly assembly, string expectedAssemblyName)
+        {           
+            return assembly
+                .GetReferencedAssemblies()                
+                .Select(a =&gt; a.Name)
+                .Contains(expectedAssemblyName, StringComparer.Ordinal);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns true if the type is a class and is not static
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;t&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+	    public static bool IsNonStaticClass(Type t)
+        {
+            return t.IsClass &amp;&amp; IsStaticClass(t) == false;
+        }
+
+	    /// &lt;summary&gt;
+        /// Returns true if the type is a static class
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// In IL a static class is abstract and sealed
+        /// see: http://stackoverflow.com/questions/1175888/determine-if-a-type-is-static
+        /// &lt;/remarks&gt;
+        public static bool IsStaticClass(Type type)
+        {
+            return type.IsAbstract &amp;&amp; type.IsSealed;
+        }
+
+	    /// &lt;summary&gt;
+        /// Finds a lowest base class amongst a collection of types
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;types&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// The term &#39;lowest&#39; refers to the most base class of the type collection.
+        /// If a base type is not found amongst the type collection then an invalid attempt is returned.
+        /// &lt;/remarks&gt;
+        public static Attempt&lt;Type&gt; GetLowestBaseType(params Type[] types)
+	    {
+	        if (types.Length == 0)
+	        {
+	            return Attempt&lt;Type&gt;.Fail();
+	        }
+	        if (types.Length == 1)
+	        {
+                return Attempt.Succeed(types[0]);
+	        }
+
+	        foreach (var curr in types)
+	        {
+	            var others = types.Except(new[] {curr});
+
+	            //is the curr type a common denominator for all others ?
+	            var isBase = others.All(curr.IsAssignableFrom);
+
+	            //if this type is the base for all others
+	            if (isBase)
+	            {
+	                return Attempt.Succeed(curr);
+	            }
+	        }
+
+	        return Attempt&lt;Type&gt;.Fail();
+	    }
+
+        /// &lt;summary&gt;
+		/// Determines whether the type &lt;paramref name=&quot;implementation&quot;/&gt; is assignable from the specified implementation,
+		/// and caches the result across the application using a &lt;see cref=&quot;ConcurrentDictionary{TKey,TValue}&quot;/&gt;.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;contract&quot;&gt;The type of the contract.&lt;/param&gt;
+		/// &lt;param name=&quot;implementation&quot;&gt;The implementation.&lt;/param&gt;
+		/// &lt;returns&gt;
+		/// 	&lt;c&gt;true&lt;/c&gt; if [is type assignable from] [the specified contract]; otherwise, &lt;c&gt;false&lt;/c&gt;.
+		/// &lt;/returns&gt;
+		public static bool IsTypeAssignableFrom(Type contract, Type implementation)
+		{
+		    return contract.IsAssignableFrom(implementation);
+		}
+
+		/// &lt;summary&gt;
+		/// Determines whether the type &lt;paramref name=&quot;implementation&quot;/&gt; is assignable from the specified implementation &lt;typeparamref name=&quot;TContract&quot;/&gt;,
+		/// and caches the result across the application using a &lt;see cref=&quot;ConcurrentDictionary{TKey,TValue}&quot;/&gt;.
+		/// &lt;/summary&gt;
+		/// &lt;typeparam name=&quot;TContract&quot;&gt;The type of the contract.&lt;/typeparam&gt;
+		/// &lt;param name=&quot;implementation&quot;&gt;The implementation.&lt;/param&gt;
+		public static bool IsTypeAssignableFrom&lt;TContract&gt;(Type implementation)
+		{
+			return IsTypeAssignableFrom(typeof(TContract), implementation);
+		}
+
+        /// &lt;summary&gt;
+        /// Determines whether the object instance &lt;paramref name=&quot;implementation&quot;/&gt; is assignable from the specified implementation &lt;typeparamref name=&quot;TContract&quot;/&gt;,
+        /// and caches the result across the application using a &lt;see cref=&quot;ConcurrentDictionary{TKey,TValue}&quot;/&gt;.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TContract&quot;&gt;The type of the contract.&lt;/typeparam&gt;
+        /// &lt;param name=&quot;implementation&quot;&gt;The implementation.&lt;/param&gt;
+        public static bool IsTypeAssignableFrom&lt;TContract&gt;(object implementation)
+        {
+            if (implementation == null) throw new ArgumentNullException(&quot;implementation&quot;);
+            return IsTypeAssignableFrom&lt;TContract&gt;(implementation.GetType());
+        }
+
+		/// &lt;summary&gt;
+		/// A method to determine whether &lt;paramref name=&quot;implementation&quot;/&gt; represents a value type.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;implementation&quot;&gt;The implementation.&lt;/param&gt;
+		public static bool IsValueType(Type implementation)
+		{
+		    return implementation.IsValueType || implementation.IsPrimitive;
+		}
+
+		/// &lt;summary&gt;
+		/// A method to determine whether &lt;paramref name=&quot;implementation&quot;/&gt; is an implied value type (&lt;see cref=&quot;Type.IsValueType&quot;/&gt;, &lt;see cref=&quot;Type.IsEnum&quot;/&gt; or a string).
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;implementation&quot;&gt;The implementation.&lt;/param&gt;
+		public static bool IsImplicitValueType(Type implementation)
+		{
+		    return IsValueType(implementation) || implementation.IsEnum || implementation == typeof (string);
+		}
+
+		/// &lt;summary&gt;
+		/// Returns (and caches) a PropertyInfo from a type
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;name&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;mustRead&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;mustWrite&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;includeIndexed&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;caseSensitive&quot;&gt; &lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		public static PropertyInfo GetProperty(Type type, string name, 
+			bool mustRead = true, 
+			bool mustWrite = true, 
+			bool includeIndexed = false,
+			bool caseSensitive = true)
+		{
+			return CachedDiscoverableProperties(type, mustRead, mustWrite, includeIndexed)
+				.FirstOrDefault(x =&gt;
+					{
+						if (caseSensitive)
+							return x.Name == name;
+						return x.Name.InvariantEquals(name);
+					});
+		}        
+
+		/// &lt;summary&gt;
+		/// Gets (and caches) &lt;see cref=&quot;FieldInfo&quot;/&gt; discoverable in the current &lt;see cref=&quot;AppDomain&quot;/&gt; for a given &lt;paramref name=&quot;type&quot;/&gt;.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;type&quot;&gt;The source.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		public static FieldInfo[] CachedDiscoverableFields(Type type)
+		{
+			return GetFieldsCache.GetOrAdd(
+				type,
+				x =&gt; type
+				     	.GetFields(BindingFlags.Public | BindingFlags.Instance)
+				     	.Where(y =&gt; !y.IsInitOnly)
+				     	.ToArray());
+		}
+
+		/// &lt;summary&gt;
+		/// Gets (and caches) &lt;see cref=&quot;PropertyInfo&quot;/&gt; discoverable in the current &lt;see cref=&quot;AppDomain&quot;/&gt; for a given &lt;paramref name=&quot;type&quot;/&gt;.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;type&quot;&gt;The source.&lt;/param&gt;
+		/// &lt;param name=&quot;mustRead&quot;&gt;true if the properties discovered are readable&lt;/param&gt;
+		/// &lt;param name=&quot;mustWrite&quot;&gt;true if the properties discovered are writable&lt;/param&gt;
+		/// &lt;param name=&quot;includeIndexed&quot;&gt;true if the properties discovered are indexable&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		public static PropertyInfo[] CachedDiscoverableProperties(Type type, bool mustRead = true, bool mustWrite = true, bool includeIndexed = false)
+		{
+			return GetPropertiesCache.GetOrAdd(
+				new Tuple&lt;Type, bool, bool, bool&gt;(type, mustRead, mustWrite, includeIndexed),
+				x =&gt; type
+				     	.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+				     	.Where(y =&gt; (!mustRead || y.CanRead)
+				     	            &amp;&amp; (!mustWrite || y.CanWrite)
+				     	            &amp;&amp; (includeIndexed || !y.GetIndexParameters().Any()))
+				     	.ToArray());
+		}
+
+
+        #region Match Type
+
+        //TODO: Need to determine if these methods should replace/combine/merge etc with IsTypeAssignableFrom, IsAssignableFromGeneric
+
+        // readings:
+        // http://stackoverflow.com/questions/2033912/c-sharp-variance-problem-assigning-listderived-as-listbase
+        // http://stackoverflow.com/questions/2208043/generic-variance-in-c-sharp-4-0
+        // http://stackoverflow.com/questions/8401738/c-sharp-casting-generics-covariance-and-contravariance
+        // http://stackoverflow.com/questions/1827425/how-to-check-programatically-if-a-type-is-a-struct-or-a-class
+        // http://stackoverflow.com/questions/74616/how-to-detect-if-type-is-another-generic-type/1075059#1075059
+
+        private static bool MatchGeneric(Type implementation, Type contract, IDictionary&lt;string, Type&gt; bindings)
+        {
+            // trying to match eg List&lt;int&gt; with List&lt;T&gt;
+            // or List&lt;List&lt;List&lt;int&gt;&gt;&gt; with List&lt;ListList&lt;T&gt;&gt;&gt;
+            // classes are NOT invariant so List&lt;string&gt; does not match List&lt;object&gt;
+
+            if (implementation.IsGenericType == false) return false;
+
+            // must have the same generic type definition
+            var implDef = implementation.GetGenericTypeDefinition();
+            var contDef = contract.GetGenericTypeDefinition();
+            if (implDef != contDef) return false;
+
+            // must have the same number of generic arguments
+            var implArgs = implementation.GetGenericArguments();
+            var contArgs = contract.GetGenericArguments();
+            if (implArgs.Length != contArgs.Length) return false;
+
+            // generic arguments must match
+            // in insta we should have actual types (eg int, string...)
+            // in typea we can have generic parameters (eg &lt;T&gt;)
+            for (var i = 0; i &lt; implArgs.Length; i++)
+            {
+                const bool variance = false; // classes are NOT invariant
+                if (MatchType(implArgs[i], contArgs[i], bindings, variance) == false)
+                    return false;
+            }
+
+            return true;
+        }
+
+        public static bool MatchType(Type implementation, Type contract)
+        {
+            return MatchType(implementation, contract, new Dictionary&lt;string, Type&gt;());
+        }
+
+        internal static bool MatchType(Type implementation, Type contract, IDictionary&lt;string, Type&gt; bindings, bool variance = true)
+        {
+            if (contract.IsGenericType)
+            {
+                // eg type is List&lt;int&gt; or List&lt;T&gt;
+                // if we have variance then List&lt;int&gt; can match IList&lt;T&gt;
+                // if we don&#39;t have variance it can&#39;t - must have exact type
+
+                // try to match implementation against contract
+                if (MatchGeneric(implementation, contract, bindings)) return true;
+
+                // if no variance, fail
+                if (variance == false) return false;
+
+                // try to match an ancestor of implementation against contract
+                var t = implementation.BaseType;
+                while (t != null)
+                {
+                    if (MatchGeneric(t, contract, bindings)) return true;
+                    t = t.BaseType;
+                }
+
+                // try to match an interface of implementation against contract
+                return implementation.GetInterfaces().Any(i =&gt; MatchGeneric(i, contract, bindings));
+            }
+
+            if (contract.IsGenericParameter)
+            {
+                // eg &lt;T&gt;
+
+                if (bindings.ContainsKey(contract.Name))
+                {
+                    // already bound: ensure it&#39;s compatible
+                    return bindings[contract.Name] == implementation;
+                }
+
+                // not already bound: bind
+                bindings[contract.Name] = implementation;
+                return true;
+            }
+
+            // not a generic type, not a generic parameter
+            // so normal class or interface
+            // fixme structs? enums? array types?
+            // about primitive types, value types, etc:
+            // http://stackoverflow.com/questions/1827425/how-to-check-programatically-if-a-type-is-a-struct-or-a-class
+
+            if (implementation == contract) return true;
+            if (contract.IsClass &amp;&amp; implementation.IsClass &amp;&amp; implementation.IsSubclassOf(contract)) return true;
+            if (contract.IsInterface &amp;&amp; implementation.GetInterfaces().Contains(contract)) return true;
+
+            return false;
+        }
+
+        #endregion
+	}
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[17,3,17,130,1],[18,3,18,190,1],[26,9,26,10,1],[27,13,27,75,1],[28,9,28,10,1],[41,9,41,10,1],[44,13,44,111,1],[45,13,45,14,0],[46,17,46,63,0],[52,13,54,24,1],[54,24,55,108,1],[55,108,56,28,1],[52,13,56,28,1],[57,9,57,10,1],[66,9,66,10,1],[67,13,69,30,1],[69,30,69,36,1],[69,36,70,73,1],[67,13,70,73,1],[71,9,71,10,1],[79,9,79,10,1],[80,13,80,59,1],[81,9,81,10,1],[93,9,93,10,1],[94,13,94,53,1],[95,9,95,10,1],[107,6,107,7,1],[108,10,108,32,1],[109,10,109,11,1],[110,14,110,42,1],[112,10,112,32,1],[113,10,113,11,1],[114,17,114,50,1],[117,10,117,17,1],[117,19,117,27,1],[117,28,117,30,1],[117,31,117,36,1],[118,10,118,11,1],[119,14,119,54,1],[122,14,122,61,1],[125,14,125,25,1],[126,14,126,15,1],[127,18,127,47,1],[129,10,129,11,1],[131,10,131,38,1],[132,6,132,7,1],[144,3,144,4,1],[145,7,145,56,1],[146,3,146,4,1],[155,3,155,4,1],[156,4,156,67,1],[157,3,157,4,1],[166,9,166,10,1],[167,13,167,40,1],[167,41,167,91,0],[168,13,168,78,1],[169,9,169,10,1],[176,3,176,4,0],[177,7,177,71,0],[178,3,178,4,0],[185,3,185,4,0],[186,7,186,104,0],[187,3,187,4,0],[204,3,204,4,0],[205,4,207,6,0],[207,6,207,7,0],[207,7,208,7,0],[208,7,208,25,0],[208,25,209,8,0],[209,8,209,30,0],[209,30,210,7,0],[210,7,210,43,0],[210,43,211,6,0],[211,6,211,7,0],[211,7,211,9,0],[205,4,211,9,0],[212,3,212,4,0],[220,3,220,4,0],[221,4,223,10,0],[223,10,225,23,0],[225,23,225,36,0],[225,36,226,21,0],[223,10,226,21,0],[226,21,226,23,0],[221,4,226,23,0],[227,3,227,4,0],[238,3,238,4,1],[239,4,241,10,1],[241,10,243,23,1],[243,23,245,75,1],[245,75,246,21,1],[241,10,246,21,1],[246,21,246,23,1],[239,4,246,23,1],[247,3,247,4,1],[262,9,262,10,1],[267,13,267,55,1],[267,56,267,69,1],[270,13,270,69,1],[271,13,271,63,1],[272,13,272,36,1],[272,37,272,50,1],[275,13,275,65,1],[276,13,276,59,1],[277,13,277,52,1],[277,53,277,66,0],[282,18,282,27,1],[282,29,282,48,1],[282,50,282,53,1],[283,13,283,14,1],[285,17,285,86,1],[286,21,286,34,1],[287,13,287,14,1],[289,13,289,25,1],[290,9,290,10,1],[293,9,293,10,1],[294,13,294,88,1],[295,9,295,10,1],[298,9,298,10,1],[299,13,299,40,1],[300,13,300,14,1],[306,17,306,70,1],[306,71,306,83,1],[309,17,309,39,1],[309,40,309,53,0],[312,17,312,49,1],[313,17,313,34,1],[314,17,314,18,1],[315,21,315,61,1],[315,62,315,74,1],[316,21,316,36,1],[317,17,317,18,1],[320,17,320,64,1],[320,64,320,99,1],[320,99,320,101,1],[320,17,320,101,1],[323,13,323,45,1],[324,13,324,14,1],[327,17,327,57,1],[328,17,328,18,1],[330,21,330,70,1],[334,17,334,58,1],[335,17,335,29,1],[344,13,344,44,1],[344,45,344,57,1],[345,13,345,101,1],[345,102,345,114,1],[346,13,346,91,1],[346,92,346,104,1],[348,13,348,26,1],[349,9,349,10,1]]);
+    </script>
+  </body>
+</html>

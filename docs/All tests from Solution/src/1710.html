@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\DictionaryRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.Relators;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents a repository for doing CRUD operations for &lt;see cref=&quot;DictionaryItem&quot;/&gt;
+    /// &lt;/summary&gt;
+    internal class DictionaryRepository : PetaPocoRepositoryBase&lt;int, IDictionaryItem&gt;, IDictionaryRepository
+    {
+        public DictionaryRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider syntax)
+            : base(work, cache, logger, syntax)
+        {
+        }
+
+        private IRepositoryCachePolicyFactory&lt;IDictionaryItem, int&gt; _cachePolicyFactory;
+        protected override IRepositoryCachePolicyFactory&lt;IDictionaryItem, int&gt; CachePolicyFactory
+        {
+            get
+            {
+                //custom cache policy which will not cache any results for GetAll
+                return _cachePolicyFactory ?? (_cachePolicyFactory = new OnlySingleItemsRepositoryCachePolicyFactory&lt;IDictionaryItem, int&gt;(
+                    RuntimeCache,
+                    new RepositoryCachePolicyOptions
+                    {
+                            //allow zero to be cached
+                            GetAllCacheAllowZeroCount = true
+                    }));
+            }
+        }
+
+        #region Overrides of RepositoryBase&lt;int,DictionaryItem&gt;
+
+        protected override IDictionaryItem PerformGet(int id)
+        {
+            var sql = GetBaseQuery(false)
+                .Where(GetBaseWhereClause(), new { Id = id })
+                .OrderBy&lt;DictionaryDto&gt;(x =&gt; x.UniqueId, SqlSyntax);
+
+            var dto = Database.Fetch&lt;DictionaryDto, LanguageTextDto, DictionaryDto&gt;(new DictionaryLanguageTextRelator().Map, sql).FirstOrDefault();
+            if (dto == null)
+                return null;
+            
+            var entity = ConvertFromDto(dto);
+
+            //on initial construction we don&#39;t want to have dirty properties tracked
+            // http://issues.umbraco.org/issue/U4-1946
+            ((Entity)entity).ResetDirtyProperties(false);
+
+            return entity;
+        }
+
+        protected override IEnumerable&lt;IDictionaryItem&gt; PerformGetAll(params int[] ids)
+        {
+            var sql = GetBaseQuery(false).Where(&quot;cmsDictionary.pk &gt; 0&quot;);
+            if (ids.Any())
+            {
+                sql.Where(&quot;cmsDictionary.pk in (@ids)&quot;, new { ids = ids });
+            }
+
+            return Database.Fetch&lt;DictionaryDto, LanguageTextDto, DictionaryDto&gt;(new DictionaryLanguageTextRelator().Map, sql)
+                    .Select(dto =&gt; ConvertFromDto(dto));
+        }
+
+        protected override IEnumerable&lt;IDictionaryItem&gt; PerformGetByQuery(IQuery&lt;IDictionaryItem&gt; query)
+        {
+            var sqlClause = GetBaseQuery(false);
+            var translator = new SqlTranslator&lt;IDictionaryItem&gt;(sqlClause, query);
+            var sql = translator.Translate();
+            sql.OrderBy&lt;DictionaryDto&gt;(x =&gt; x.UniqueId, SqlSyntax);
+            
+            return Database.Fetch&lt;DictionaryDto, LanguageTextDto, DictionaryDto&gt;(new DictionaryLanguageTextRelator().Map, sql)
+                .Select(x =&gt; ConvertFromDto(x));
+        }
+
+        #endregion
+
+        #region Overrides of PetaPocoRepositoryBase&lt;int,DictionaryItem&gt;
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+            if (isCount)
+            {
+                sql.Select(&quot;COUNT(*)&quot;)
+                    .From&lt;DictionaryDto&gt;(SqlSyntax);
+            }
+            else
+            {
+                sql.Select(&quot;*&quot;)
+                   .From&lt;DictionaryDto&gt;(SqlSyntax)
+                   .LeftJoin&lt;LanguageTextDto&gt;(SqlSyntax)
+                   .On&lt;DictionaryDto, LanguageTextDto&gt;(SqlSyntax, left =&gt; left.UniqueId, right =&gt; right.UniqueId);
+            }
+            return sql;
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;cmsDictionary.pk = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            return new List&lt;string&gt;();
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { throw new NotImplementedException(); }
+        }
+
+        #endregion
+
+        #region Unit of Work Implementation
+
+        protected override void PersistNewItem(IDictionaryItem entity)
+        {
+            var dictionaryItem = ((DictionaryItem) entity);
+
+            dictionaryItem.AddingEntity();
+
+            foreach (var translation in dictionaryItem.Translations)
+                translation.Value = translation.Value.ToValidXmlString();
+
+            var factory = new DictionaryItemFactory();
+            var dto = factory.BuildDto(dictionaryItem);
+
+            var id = Convert.ToInt32(Database.Insert(dto));
+            dictionaryItem.Id = id;
+
+            var translationFactory = new DictionaryTranslationFactory(dictionaryItem.Key);
+            foreach (var translation in dictionaryItem.Translations)
+            {
+                var textDto = translationFactory.BuildDto(translation);
+                translation.Id = Convert.ToInt32(Database.Insert(textDto));
+                translation.Key = dictionaryItem.Key;
+            }
+
+            dictionaryItem.ResetDirtyProperties();            
+        }
+
+        protected override void PersistUpdatedItem(IDictionaryItem entity)
+        {
+            ((Entity)entity).UpdatingEntity();
+
+            foreach (var translation in entity.Translations)
+                translation.Value = translation.Value.ToValidXmlString();
+
+            var factory = new DictionaryItemFactory();
+            var dto = factory.BuildDto(entity);
+
+            Database.Update(dto);
+
+            var translationFactory = new DictionaryTranslationFactory(entity.Key);
+            foreach (var translation in entity.Translations)
+            {
+                var textDto = translationFactory.BuildDto(translation);
+                if (translation.HasIdentity)
+                {
+                    Database.Update(textDto);
+                }
+                else
+                {
+                    translation.Id = Convert.ToInt32(Database.Insert(textDto));
+                    translation.Key = entity.Key;
+                }
+            }
+
+            entity.ResetDirtyProperties();
+
+            //Clear the cache entries that exist by uniqueid/item key
+            RuntimeCache.ClearCacheItem(GetCacheIdKey&lt;IDictionaryItem&gt;(entity.ItemKey));
+            RuntimeCache.ClearCacheItem(GetCacheIdKey&lt;IDictionaryItem&gt;(entity.Key));
+        }
+
+        protected override void PersistDeletedItem(IDictionaryItem entity)
+        {
+            RecursiveDelete(entity.Key);
+
+            Database.Delete&lt;LanguageTextDto&gt;(&quot;WHERE UniqueId = @Id&quot;, new { Id = entity.Key });
+            Database.Delete&lt;DictionaryDto&gt;(&quot;WHERE id = @Id&quot;, new { Id = entity.Key });
+
+            //Clear the cache entries that exist by uniqueid/item key
+            RuntimeCache.ClearCacheItem(GetCacheIdKey&lt;IDictionaryItem&gt;(entity.ItemKey));
+            RuntimeCache.ClearCacheItem(GetCacheIdKey&lt;IDictionaryItem&gt;(entity.Key));
+        }
+
+        private void RecursiveDelete(Guid parentId)
+        {
+            var list = Database.Fetch&lt;DictionaryDto&gt;(&quot;WHERE parent = @ParentId&quot;, new { ParentId = parentId });
+            foreach (var dto in list)
+            {
+                RecursiveDelete(dto.UniqueId);
+
+                Database.Delete&lt;LanguageTextDto&gt;(&quot;WHERE UniqueId = @Id&quot;, new { Id = dto.UniqueId });
+                Database.Delete&lt;DictionaryDto&gt;(&quot;WHERE id = @Id&quot;, new { Id = dto.UniqueId });
+
+                //Clear the cache entries that exist by uniqueid/item key
+                RuntimeCache.ClearCacheItem(GetCacheIdKey&lt;IDictionaryItem&gt;(dto.Key));
+                RuntimeCache.ClearCacheItem(GetCacheIdKey&lt;IDictionaryItem&gt;(dto.UniqueId));
+            }
+        }
+
+        #endregion
+
+        protected IDictionaryItem ConvertFromDto(DictionaryDto dto)
+        {
+            var factory = new DictionaryItemFactory();
+            var entity = factory.BuildEntity(dto);
+
+            var list = new List&lt;IDictionaryTranslation&gt;();
+            foreach (var textDto in dto.LanguageTextDtos)
+            {                
+                if (textDto.LanguageId &lt;= 0)
+                    continue;
+
+                var translationFactory = new DictionaryTranslationFactory(dto.UniqueId);
+                list.Add(translationFactory.BuildEntity(textDto));
+            }
+            entity.Translations = list;
+
+            return entity;
+        }
+
+        public IDictionaryItem Get(Guid uniqueId)
+        {
+            using (var uniqueIdRepo = new DictionaryByUniqueIdRepository(this, UnitOfWork, RepositoryCache, Logger, SqlSyntax))
+            {
+                return uniqueIdRepo.Get(uniqueId);
+            }
+        }
+
+        public IDictionaryItem Get(string key)
+        {
+            using (var keyRepo = new DictionaryByKeyRepository(this, UnitOfWork, RepositoryCache, Logger, SqlSyntax))
+            {
+                return keyRepo.Get(key);
+            }
+        }
+        
+        private IEnumerable&lt;IDictionaryItem&gt; GetRootDictionaryItems()
+        {
+            var query = Query&lt;IDictionaryItem&gt;.Builder.Where(x =&gt; x.ParentId == null);
+            return GetByQuery(query);
+        }
+
+        public IEnumerable&lt;IDictionaryItem&gt; GetDictionaryItemDescendants(Guid? parentId)
+        {
+            //This methods will look up children at each level, since we do not store a path for dictionary (ATM), we need to do a recursive
+            // lookup to get descendants. Currently this is the most efficient way to do it
+
+            Func&lt;Guid[], IEnumerable&lt;IEnumerable&lt;IDictionaryItem&gt;&gt;&gt; getItemsFromParents = guids =&gt;
+            {
+                //needs to be in groups of 2000 because we are doing an IN clause and there&#39;s a max parameter count that can be used.
+                return guids.InGroupsOf(2000)
+                    .Select(@group =&gt;
+                    {
+                        var sqlClause = GetBaseQuery(false)
+                            .Where&lt;DictionaryDto&gt;(x =&gt; x.Parent != null)
+                            .Where(string.Format(&quot;{0} IN (@parentIds)&quot;, SqlSyntax.GetQuotedColumnName(&quot;parent&quot;)), new { parentIds = @group });
+
+                        var translator = new SqlTranslator&lt;IDictionaryItem&gt;(sqlClause, Query&lt;IDictionaryItem&gt;.Builder);
+                        var sql = translator.Translate();
+                        sql.OrderBy&lt;DictionaryDto&gt;(x =&gt; x.UniqueId, SqlSyntax);
+
+                        return Database.Fetch&lt;DictionaryDto, LanguageTextDto, DictionaryDto&gt;(new DictionaryLanguageTextRelator().Map, sql)
+                            .Select(x =&gt; ConvertFromDto(x));
+                    });
+            };
+
+            var childItems = parentId.HasValue == false
+                ? new[] { GetRootDictionaryItems() }
+                : getItemsFromParents(new[] { parentId.Value });
+
+            return childItems.SelectRecursive(items =&gt; getItemsFromParents(items.Select(x =&gt; x.Key).ToArray())).SelectMany(items =&gt; items);
+
+        }
+
+        private class DictionaryByUniqueIdRepository : SimpleGetRepository&lt;Guid, IDictionaryItem, DictionaryDto&gt;
+        {
+            private readonly DictionaryRepository _dictionaryRepository;
+
+            public DictionaryByUniqueIdRepository(DictionaryRepository dictionaryRepository, IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax)
+                : base(work, cache, logger, sqlSyntax)
+            {
+                _dictionaryRepository = dictionaryRepository;
+            }
+
+            protected override IEnumerable&lt;DictionaryDto&gt; PerformFetch(Sql sql)
+            {
+                return Database.Fetch&lt;DictionaryDto, LanguageTextDto, DictionaryDto&gt;(new DictionaryLanguageTextRelator().Map, sql);
+            }
+
+            protected override Sql GetBaseQuery(bool isCount)
+            {
+                return _dictionaryRepository.GetBaseQuery(isCount);
+            }
+
+            protected override string GetBaseWhereClause()
+            {
+                return &quot;cmsDictionary.&quot; + SqlSyntax.GetQuotedColumnName(&quot;id&quot;) + &quot; = @Id&quot;;
+            }
+
+            protected override IDictionaryItem ConvertToEntity(DictionaryDto dto)
+            {
+                return _dictionaryRepository.ConvertFromDto(dto);
+            }
+
+            protected override object GetBaseWhereClauseArguments(Guid id)
+            {
+                return new { Id = id };
+            }
+
+            protected override string GetWhereInClauseForGetAll()
+            {
+                return &quot;cmsDictionary.&quot; + SqlSyntax.GetQuotedColumnName(&quot;id&quot;) + &quot; in (@ids)&quot;;
+            }
+
+            private IRepositoryCachePolicyFactory&lt;IDictionaryItem, Guid&gt; _cachePolicyFactory;
+            protected override IRepositoryCachePolicyFactory&lt;IDictionaryItem, Guid&gt; CachePolicyFactory
+            {
+                get
+                {
+                    //custom cache policy which will not cache any results for GetAll
+                    return _cachePolicyFactory ?? (_cachePolicyFactory = new OnlySingleItemsRepositoryCachePolicyFactory&lt;IDictionaryItem, Guid&gt;(
+                        RuntimeCache,
+                        new RepositoryCachePolicyOptions
+                        {
+                            //allow zero to be cached
+                            GetAllCacheAllowZeroCount = true
+                        }));
+                }
+            }
+        }
+
+        private class DictionaryByKeyRepository : SimpleGetRepository&lt;string, IDictionaryItem, DictionaryDto&gt;
+        {
+            private readonly DictionaryRepository _dictionaryRepository;
+
+            public DictionaryByKeyRepository(DictionaryRepository dictionaryRepository, IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax)
+                : base(work, cache, logger, sqlSyntax)
+            {
+                _dictionaryRepository = dictionaryRepository;
+            }
+
+            protected override IEnumerable&lt;DictionaryDto&gt; PerformFetch(Sql sql)
+            {
+                return Database.Fetch&lt;DictionaryDto, LanguageTextDto, DictionaryDto&gt;(new DictionaryLanguageTextRelator().Map, sql);
+            }
+
+            protected override Sql GetBaseQuery(bool isCount)
+            {
+                return _dictionaryRepository.GetBaseQuery(isCount);
+            }
+
+            protected override string GetBaseWhereClause()
+            {
+                return &quot;cmsDictionary.&quot; + SqlSyntax.GetQuotedColumnName(&quot;key&quot;) + &quot; = @Id&quot;;
+            }
+
+            protected override IDictionaryItem ConvertToEntity(DictionaryDto dto)
+            {
+                return _dictionaryRepository.ConvertFromDto(dto);
+            }
+
+            protected override object GetBaseWhereClauseArguments(string id)
+            {
+                return new { Id = id };
+            }
+
+            protected override string GetWhereInClauseForGetAll()
+            {
+                return &quot;cmsDictionary.&quot; + SqlSyntax.GetQuotedColumnName(&quot;key&quot;) + &quot; in (@ids)&quot;;
+            }
+
+            private IRepositoryCachePolicyFactory&lt;IDictionaryItem, string&gt; _cachePolicyFactory;
+            protected override IRepositoryCachePolicyFactory&lt;IDictionaryItem, string&gt; CachePolicyFactory
+            {
+                get
+                {
+                    //custom cache policy which will not cache any results for GetAll
+                    return _cachePolicyFactory ?? (_cachePolicyFactory = new OnlySingleItemsRepositoryCachePolicyFactory&lt;IDictionaryItem, string&gt;(
+                        RuntimeCache,
+                        new RepositoryCachePolicyOptions
+                        {
+                            //allow zero to be cached
+                            GetAllCacheAllowZeroCount = true
+                        }));
+                }
+            }
+        }
+
+       
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,15,24,48,1],[25,9,25,10,1],[26,9,26,10,1],[32,13,32,14,1],[34,17,40,25,1],[41,13,41,14,1],[47,9,47,10,1],[48,13,50,69,1],[52,13,52,148,1],[53,13,53,29,1],[54,17,54,29,0],[56,13,56,46,1],[60,13,60,58,1],[62,13,62,27,1],[63,9,63,10,1],[66,9,66,10,1],[67,13,67,73,1],[68,13,68,27,1],[69,13,69,14,1],[70,17,70,76,1],[71,13,71,14,1],[73,13,74,36,1],[74,36,74,55,1],[74,55,74,57,1],[73,13,74,57,1],[75,9,75,10,1],[78,9,78,10,1],[79,13,79,49,1],[80,13,80,83,1],[81,13,81,46,1],[82,13,82,68,1],[84,13,85,30,1],[85,30,85,47,1],[85,47,85,49,1],[84,13,85,49,1],[86,9,86,10,1],[93,9,93,10,1],[94,13,94,33,1],[95,13,95,25,1],[96,13,96,14,1],[97,17,98,53,1],[99,13,99,14,1],[101,13,101,14,1],[102,17,105,115,1],[106,13,106,14,1],[107,13,107,24,1],[108,9,108,10,1],[111,9,111,10,1],[112,13,112,45,1],[113,9,113,10,1],[116,9,116,10,0],[117,13,117,39,0],[118,9,118,10,0],[122,17,122,18,0],[122,19,122,55,0],[130,9,130,10,1],[131,13,131,60,1],[133,13,133,43,1],[135,13,135,20,1],[135,22,135,37,1],[135,38,135,40,1],[135,41,135,68,1],[136,17,136,74,1],[138,13,138,55,1],[139,13,139,56,1],[141,13,141,60,1],[142,13,142,36,1],[144,13,144,91,1],[145,13,145,20,1],[145,22,145,37,1],[145,38,145,40,1],[145,41,145,68,1],[146,13,146,14,1],[147,17,147,72,1],[148,17,148,76,1],[149,17,149,54,1],[150,13,150,14,1],[152,13,152,51,1],[153,9,153,10,1],[156,9,156,10,1],[157,13,157,47,1],[159,13,159,20,1],[159,22,159,37,1],[159,38,159,40,1],[159,41,159,60,1],[160,17,160,74,1],[162,13,162,55,1],[163,13,163,48,1],[165,13,165,34,1],[167,13,167,83,1],[168,13,168,20,1],[168,22,168,37,1],[168,38,168,40,1],[168,41,168,60,1],[169,13,169,14,1],[170,17,170,72,1],[171,17,171,45,1],[172,17,172,18,1],[173,21,173,46,1],[174,17,174,18,1],[176,17,176,18,1],[177,21,177,80,1],[178,21,178,50,1],[179,17,179,18,1],[180,13,180,14,1],[182,13,182,43,1],[185,13,185,89,1],[186,13,186,85,1],[187,9,187,10,1],[190,9,190,10,1],[191,13,191,41,1],[193,13,193,95,1],[194,13,194,87,1],[197,13,197,89,1],[198,13,198,85,1],[199,9,199,10,1],[202,9,202,10,1],[203,13,203,111,1],[204,13,204,20,1],[204,22,204,29,0],[204,30,204,32,1],[204,33,204,37,1],[205,13,205,14,0],[206,17,206,47,0],[208,17,208,101,0],[209,17,209,93,0],[212,17,212,86,0],[213,17,213,91,0],[214,13,214,14,0],[215,9,215,10,1],[220,9,220,10,1],[221,13,221,55,1],[222,13,222,51,1],[224,13,224,59,1],[225,13,225,20,1],[225,22,225,33,1],[225,34,225,36,1],[225,37,225,57,1],[226,13,226,14,1],[227,17,227,45,1],[228,21,228,30,1],[230,17,230,89,1],[231,17,231,67,1],[232,13,232,14,1],[233,13,233,40,1],[235,13,235,27,1],[236,9,236,10,1],[239,9,239,10,1],[240,20,240,127,1],[241,13,241,14,1],[242,17,242,51,1],[244,9,244,10,1],[247,9,247,10,1],[248,20,248,117,1],[249,13,249,14,1],[250,17,250,41,1],[252,9,252,10,1],[255,9,255,10,0],[256,13,256,87,0],[257,13,257,38,0],[258,9,258,10,0],[261,9,261,10,1],[265,13,266,13,1],[266,13,266,14,1],[266,14,268,17,1],[268,17,270,21,1],[270,21,270,22,1],[270,22,271,25,1],[271,25,273,143,1],[273,143,275,25,1],[275,25,275,120,1],[275,120,276,25,1],[276,25,276,58,1],[276,58,277,25,1],[277,25,277,80,1],[277,80,279,25,1],[279,25,280,42,1],[280,42,280,59,1],[280,59,280,61,1],[279,25,280,61,1],[280,61,281,21,1],[281,21,281,22,1],[281,22,281,24,1],[268,17,281,24,1],[281,24,282,13,1],[282,13,282,14,1],[282,14,282,15,1],[265,13,282,15,1],[284,13,286,65,1],[288,13,288,56,1],[288,56,288,94,1],[288,94,288,99,1],[288,99,288,111,1],[288,56,288,111,1],[288,111,288,133,1],[288,133,288,138,1],[288,138,288,140,1],[288,13,288,140,1],[290,9,290,10,1],[297,19,297,55,1],[298,13,298,14,1],[299,17,299,62,1],[300,13,300,14,1],[303,13,303,14,1],[304,17,304,132,1],[305,13,305,14,1],[308,13,308,14,1],[309,17,309,68,1],[310,13,310,14,1],[313,13,313,14,1],[314,17,314,90,1],[315,13,315,14,1],[318,13,318,14,1],[319,17,319,66,1],[320,13,320,14,1],[323,13,323,14,1],[324,17,324,40,1],[325,13,325,14,1],[328,13,328,14,0],[329,17,329,94,0],[330,13,330,14,0],[336,17,336,18,1],[338,21,344,29,1],[345,17,345,18,1],[354,19,354,55,1],[355,13,355,14,1],[356,17,356,62,1],[357,13,357,14,1],[360,13,360,14,1],[361,17,361,132,1],[362,13,362,14,1],[365,13,365,14,1],[366,17,366,68,1],[367,13,367,14,1],[370,13,370,14,1],[371,17,371,91,1],[372,13,372,14,1],[375,13,375,14,1],[376,17,376,66,1],[377,13,377,14,1],[380,13,380,14,1],[381,17,381,40,1],[382,13,382,14,1],[385,13,385,14,0],[386,17,386,95,0],[387,13,387,14,0],[393,17,393,18,1],[395,21,401,29,1],[402,17,402,18,1]]);
+    </script>
+  </body>
+</html>

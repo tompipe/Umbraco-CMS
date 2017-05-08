@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\TemplateRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Services;
+using Umbraco.Core.Strings;
+using Umbraco.Core.Sync;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents the Template Repository
+    /// &lt;/summary&gt;
+    internal class TemplateRepository : PetaPocoRepositoryBase&lt;int, ITemplate&gt;, ITemplateRepository
+    {
+        private readonly IFileSystem _masterpagesFileSystem;
+        private readonly IFileSystem _viewsFileSystem;
+        private readonly ITemplatesSection _templateConfig;
+        private readonly ViewHelper _viewHelper;
+        private readonly MasterPageHelper _masterPageHelper;
+
+        internal TemplateRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax, IFileSystem masterpageFileSystem, IFileSystem viewFileSystem, ITemplatesSection templateConfig)
+            : base(work, cache, logger, sqlSyntax)
+        {
+            _masterpagesFileSystem = masterpageFileSystem;
+            _viewsFileSystem = viewFileSystem;
+            _templateConfig = templateConfig;
+            _viewHelper = new ViewHelper(_viewsFileSystem);
+            _masterPageHelper = new MasterPageHelper(_masterpagesFileSystem);            
+        }
+
+
+        private FullDataSetRepositoryCachePolicyFactory&lt;ITemplate, int&gt; _cachePolicyFactory;
+        protected override IRepositoryCachePolicyFactory&lt;ITemplate, int&gt; CachePolicyFactory
+        {
+            get
+            {
+                //Use a FullDataSet cache policy - this will cache the entire GetAll result in a single collection
+                return _cachePolicyFactory ?? (_cachePolicyFactory = new FullDataSetRepositoryCachePolicyFactory&lt;ITemplate, int&gt;(
+                    RuntimeCache, GetEntityId, () =&gt; PerformGetAll(), false));
+            }
+        }
+
+        #region Overrides of RepositoryBase&lt;int,ITemplate&gt;
+
+        protected override ITemplate PerformGet(int id)
+        {
+            //use the underlying GetAll which will force cache all templates
+            return base.GetAll().FirstOrDefault(x =&gt; x.Id == id);
+        }
+
+        protected override IEnumerable&lt;ITemplate&gt; PerformGetAll(params int[] ids)
+        {
+            var sql = GetBaseQuery(false);
+
+            if (ids.Any())
+            {
+                sql.Where(&quot;umbracoNode.id in (@ids)&quot;, new { ids = ids });
+            }
+            else
+            {
+                sql.Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId);
+            }
+
+            var dtos = Database.Fetch&lt;TemplateDto, NodeDto&gt;(sql);
+
+            if (dtos.Count == 0) return Enumerable.Empty&lt;ITemplate&gt;();
+
+            //look up the simple template definitions that have a master template assigned, this is used 
+            // later to populate the template item&#39;s properties
+            var childIds = (ids.Any()
+                ? GetAxisDefinitions(dtos.ToArray())
+                : dtos.Select(x =&gt; new UmbracoEntity
+                {
+                    Id = x.NodeId,
+                    ParentId = x.NodeDto.ParentId,
+                    Name = x.Alias
+                })).ToArray();
+            
+            return dtos.Select(d =&gt; MapFromDto(d, childIds));
+        }
+
+        protected override IEnumerable&lt;ITemplate&gt; PerformGetByQuery(IQuery&lt;ITemplate&gt; query)
+        {
+            var sqlClause = GetBaseQuery(false);
+            var translator = new SqlTranslator&lt;ITemplate&gt;(sqlClause, query);
+            var sql = translator.Translate();
+
+            var dtos = Database.Fetch&lt;TemplateDto, NodeDto&gt;(sql);
+
+            if (dtos.Count == 0) return Enumerable.Empty&lt;ITemplate&gt;();
+
+            //look up the simple template definitions that have a master template assigned, this is used 
+            // later to populate the template item&#39;s properties
+            var childIds = GetAxisDefinitions(dtos.ToArray()).ToArray();
+
+            return dtos.Select(d =&gt; MapFromDto(d, childIds));
+        }
+
+        #endregion
+
+        #region Overrides of PetaPocoRepositoryBase&lt;int,ITemplate&gt;
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+            sql.Select(isCount ? &quot;COUNT(*)&quot; : &quot;*&quot;)
+                .From&lt;TemplateDto&gt;(SqlSyntax)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;TemplateDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId);
+            return sql;
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoNode.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            var list = new List&lt;string&gt;
+                           {
+                               &quot;DELETE FROM umbracoUser2NodeNotify WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodePermission WHERE nodeId = @Id&quot;,
+                               &quot;UPDATE cmsDocument SET templateId = NULL WHERE templateId = @Id&quot;,
+                               &quot;DELETE FROM cmsDocumentType WHERE templateNodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsTemplate WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoNode WHERE id = @Id&quot;
+                           };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { return new Guid(Constants.ObjectTypes.Template); }
+        }
+
+        protected override void PersistNewItem(ITemplate entity)
+        {
+            EnsureValidAlias(entity);
+
+            //Save to db
+            var template = (Template)entity;
+            template.AddingEntity();
+
+            var factory = new TemplateFactory(NodeObjectTypeId);
+            var dto = factory.BuildDto(template);
+
+            //Create the (base) node data - umbracoNode
+            var nodeDto = dto.NodeDto;
+            nodeDto.Path = &quot;-1,&quot; + dto.NodeDto.NodeId;
+            var o = Database.IsNew(nodeDto) ? Convert.ToInt32(Database.Insert(nodeDto)) : Database.Update(nodeDto);
+
+            //Update with new correct path
+            var parent = Get(template.MasterTemplateId.Value);
+            if (parent != null)
+            {
+                nodeDto.Path = string.Concat(parent.Path, &quot;,&quot;, nodeDto.NodeId);
+            }
+            else
+            {
+                nodeDto.Path = &quot;-1,&quot; + dto.NodeDto.NodeId;
+            }
+            Database.Update(nodeDto);
+
+            //Insert template dto
+            dto.NodeId = nodeDto.NodeId;
+            Database.Insert(dto);
+
+            //Update entity with correct values
+            template.Id = nodeDto.NodeId; //Set Id on entity to ensure an Id is set
+            template.Path = nodeDto.Path;
+
+            //now do the file work
+
+            if (DetermineTemplateRenderingEngine(entity) == RenderingEngine.Mvc)
+            {
+                var result = _viewHelper.CreateView(template, true);
+                if (result != entity.Content)
+                {
+                    entity.Content = result;
+                    //re-persist it... though we don&#39;t really care about the templates in the db do we??!!
+                    dto.Design = result;
+                    Database.Update(dto);
+                }
+            }
+            else
+            {
+                var result = _masterPageHelper.CreateMasterPage(template, this, true);
+                if (result != entity.Content)
+                {
+                    entity.Content = result;
+                    //re-persist it... though we don&#39;t really care about the templates in the db do we??!!
+                    dto.Design = result;
+                    Database.Update(dto);
+                }
+            }
+
+            template.ResetDirtyProperties();
+
+            // ensure that from now on, content is lazy-loaded
+            if (template.GetFileContent == null)
+                template.GetFileContent = file =&gt; GetFileContent((Template) file, false);
+        }
+
+        protected override void PersistUpdatedItem(ITemplate entity)
+        {
+            EnsureValidAlias(entity);
+
+            //store the changed alias if there is one for use with updating files later
+            var originalAlias = entity.Alias;
+            if (entity.IsPropertyDirty(&quot;Alias&quot;))
+            {
+                //we need to check what it currently is before saving and remove that file
+                var current = Get(entity.Id);
+                originalAlias = current.Alias;
+            }
+
+            var template = (Template)entity;
+
+            if (entity.IsPropertyDirty(&quot;MasterTemplateId&quot;))
+            {
+                var parent = Get(template.MasterTemplateId.Value);
+                if (parent != null)
+                {
+                    entity.Path = string.Concat(parent.Path, &quot;,&quot;, entity.Id);
+                }
+                else
+                {
+                    //this means that the master template has been removed, so we need to reset the template&#39;s
+                    //path to be at the root
+                    entity.Path = string.Concat(&quot;-1,&quot;, entity.Id);
+                }
+            }
+
+            //Get TemplateDto from db to get the Primary key of the entity
+            var templateDto = Database.SingleOrDefault&lt;TemplateDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = entity.Id });
+            //Save updated entity to db
+
+            template.UpdateDate = DateTime.Now;
+            var factory = new TemplateFactory(templateDto.PrimaryKey, NodeObjectTypeId);
+            var dto = factory.BuildDto(template);
+
+            Database.Update(dto.NodeDto);
+            Database.Update(dto);
+
+            //re-update if this is a master template, since it could have changed!
+            var axisDefs = GetAxisDefinitions(dto);
+            template.IsMasterTemplate = axisDefs.Any(x =&gt; x.ParentId == dto.NodeId);
+
+            //now do the file work
+
+            if (DetermineTemplateRenderingEngine(entity) == RenderingEngine.Mvc)
+            {
+                var result = _viewHelper.UpdateViewFile(entity, originalAlias);
+                if (result != entity.Content)
+                {
+                    entity.Content = result;
+                    //re-persist it... though we don&#39;t really care about the templates in the db do we??!!
+                    dto.Design = result;
+                    Database.Update(dto);
+                }
+            }
+            else
+            {
+                var result = _masterPageHelper.UpdateMasterPageFile(entity, originalAlias, this);
+                if (result != entity.Content)
+                {
+                    entity.Content = result;
+                    //re-persist it... though we don&#39;t really care about the templates in the db do we??!!
+                    dto.Design = result;
+                    Database.Update(dto);
+                }
+            }
+
+            entity.ResetDirtyProperties();
+
+            // ensure that from now on, content is lazy-loaded
+            if (template.GetFileContent == null)
+                template.GetFileContent = file =&gt; GetFileContent((Template) file, false);
+        }
+
+        protected override void PersistDeletedItem(ITemplate entity)
+        {
+            var deletes = GetDeleteClauses().ToArray();
+
+            var descendants = GetDescendants(entity.Id).ToList();
+
+            //change the order so it goes bottom up! (deepest level first)
+            descendants.Reverse();
+
+            //delete the hierarchy
+            foreach (var descendant in descendants)
+            {
+                foreach (var delete in deletes)
+                {
+                    Database.Execute(delete, new { Id = GetEntityId(descendant) });
+                }
+            }
+
+            //now we can delete this one
+            foreach (var delete in deletes)
+            {
+                Database.Execute(delete, new { Id = GetEntityId(entity) });
+            }
+
+            if (DetermineTemplateRenderingEngine(entity) == RenderingEngine.Mvc)
+            {
+                var viewName = string.Concat(entity.Alias, &quot;.cshtml&quot;);
+                _viewsFileSystem.DeleteFile(viewName);
+            }
+            else
+            {
+                var masterpageName = string.Concat(entity.Alias, &quot;.master&quot;);
+                _masterpagesFileSystem.DeleteFile(masterpageName);
+            }         
+        }
+
+        #endregion
+
+        private IEnumerable&lt;IUmbracoEntity&gt; GetAxisDefinitions(params TemplateDto[] templates)
+        {
+            //look up the simple template definitions that have a master template assigned, this is used 
+            // later to populate the template item&#39;s properties
+            var childIdsSql = new Sql()
+                .Select(&quot;nodeId,alias,parentID&quot;)
+                .From&lt;TemplateDto&gt;(SqlSyntax)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;TemplateDto, NodeDto&gt;(SqlSyntax, dto =&gt; dto.NodeId, dto =&gt; dto.NodeId)
+                //lookup axis&#39;s
+                .Where(&quot;umbracoNode.&quot; + SqlSyntax.GetQuotedColumnName(&quot;id&quot;) + &quot; IN (@parentIds) OR umbracoNode.parentID IN (@childIds)&quot;,
+                    new {parentIds = templates.Select(x =&gt; x.NodeDto.ParentId), childIds = templates.Select(x =&gt; x.NodeId)});            
+
+            var childIds = Database.Fetch&lt;dynamic&gt;(childIdsSql)
+                .Select(x =&gt; new UmbracoEntity
+                {
+                    Id = x.nodeId,
+                    ParentId = x.parentID,
+                    Name = x.alias
+                });
+            return childIds;
+        }
+
+        /// &lt;summary&gt;
+        /// Maps from a dto to an ITemplate
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dto&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;axisDefinitions&quot;&gt;
+        /// This is a collection of template definitions ... either all templates, or the collection of child templates and it&#39;s parent template
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private ITemplate MapFromDto(TemplateDto dto, IUmbracoEntity[] axisDefinitions)
+        {
+            var factory = new TemplateFactory();
+            var template = factory.BuildEntity(dto, axisDefinitions, file =&gt; GetFileContent((Template) file, false));
+
+            if (dto.NodeDto.ParentId &gt; 0)
+            {
+                var masterTemplate = axisDefinitions.FirstOrDefault(x =&gt; x.Id == dto.NodeDto.ParentId);
+                if (masterTemplate != null)
+                {
+                    template.MasterTemplateAlias = masterTemplate.Name;
+                    template.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; dto.NodeDto.ParentId);
+                }
+            }
+
+            // get the infos (update date and virtual path) that will change only if
+            // path changes - but do not get content, will get loaded only when required
+            GetFileContent(template, true);
+
+            //on initial construction we don&#39;t want to have dirty properties tracked
+            // http://issues.umbraco.org/issue/U4-1946
+            template.ResetDirtyProperties(false);
+
+            return template;
+        }
+
+        private string GetFileContent(ITemplate template, bool init)
+        {
+            var path = template.OriginalPath;
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                // we need to discover the path
+                path = string.Concat(template.Alias, &quot;.cshtml&quot;);
+                if (_viewsFileSystem.FileExists(path))
+                    return GetFileContent(template, _viewsFileSystem, path, init);
+                path = string.Concat(template.Alias, &quot;.vbhtml&quot;);
+                if (_viewsFileSystem.FileExists(path))
+                    return GetFileContent(template, _viewsFileSystem, path, init);
+                path = string.Concat(template.Alias, &quot;.master&quot;);
+                if (_masterpagesFileSystem.FileExists(path))
+                    return GetFileContent(template, _masterpagesFileSystem, path, init);
+            }
+            else
+            {
+                // we know the path already
+                var ext = Path.GetExtension(path);
+                switch (ext)
+                {
+                    case &quot;.cshtml&quot;:
+                    case &quot;.vbhtml&quot;:
+                        return GetFileContent(template, _viewsFileSystem, path, init);
+                    case &quot;.master&quot;:
+                        return GetFileContent(template, _masterpagesFileSystem, path, init);
+                    default:
+                        return string.Empty;
+                }
+            }
+
+            var fsname = string.Concat(template.Alias, &quot;.cshtml&quot;);
+            if (_viewsFileSystem.FileExists(fsname))
+                return GetFileContent(template, _viewsFileSystem, fsname, init);
+            fsname = string.Concat(template.Alias, &quot;.vbhtml&quot;);
+            if (_viewsFileSystem.FileExists(fsname))
+                return GetFileContent(template, _viewsFileSystem, fsname, init);
+            fsname = string.Concat(template.Alias, &quot;.master&quot;);
+            if (_masterpagesFileSystem.FileExists(fsname))
+                return GetFileContent(template, _masterpagesFileSystem, fsname, init);
+            return string.Empty;
+        }
+
+        private string GetFileContent(ITemplate template, IFileSystem fs, string filename, bool init)
+        {
+            // do not update .UpdateDate as that would make it dirty (side-effect)
+            // unless initializing, because we have to do it once
+            if (init)
+            {
+                template.UpdateDate = fs.GetLastModified(filename).UtcDateTime;
+            }
+
+            // TODO
+            //  see if this could enable us to update UpdateDate without messing with change tracking
+            //  and then we&#39;d want to do it for scripts, stylesheets and partial views too (ie files)
+            //var xtemplate = template as Template;
+            //xtemplate.DisableChangeTracking();
+            //template.UpdateDate = fs.GetLastModified(filename).UtcDateTime;
+            //xtemplate.EnableChangeTracking();
+
+            template.VirtualPath = fs.GetUrl(filename);
+
+            return init ? null : GetFileContent(fs, filename);
+        }
+
+        private string GetFileContent(IFileSystem fs, string filename)
+        {
+            using (var stream = fs.OpenFile(filename))
+            using (var reader = new StreamReader(stream, Encoding.UTF8, true))
+            {
+                return reader.ReadToEnd();
+            }
+        }
+
+        #region Implementation of ITemplateRepository
+
+        public ITemplate Get(string alias)
+        {
+            return GetAll(alias).FirstOrDefault();
+        }
+
+        public IEnumerable&lt;ITemplate&gt; GetAll(params string[] aliases)
+        {
+            //We must call the base (normal) GetAll method
+            // which is cached. This is a specialized method and unfortunatley with the params[] it
+            // overlaps with the normal GetAll method.
+            if (aliases.Any() == false) return base.GetAll();
+
+            //return from base.GetAll, this is all cached
+            return base.GetAll().Where(x =&gt; aliases.InvariantContains(x.Alias));
+        }
+
+        public IEnumerable&lt;ITemplate&gt; GetChildren(int masterTemplateId)
+        {
+            //return from base.GetAll, this is all cached
+            var all = base.GetAll().ToArray();
+
+            if (masterTemplateId &lt;= 0) return all.Where(x =&gt; x.MasterTemplateAlias.IsNullOrWhiteSpace());
+
+            var parent = all.FirstOrDefault(x =&gt; x.Id == masterTemplateId);
+            if (parent == null) return Enumerable.Empty&lt;ITemplate&gt;();
+
+            var children = all.Where(x =&gt; x.MasterTemplateAlias.InvariantEquals(parent.Alias));
+            return children;
+        }
+
+        public IEnumerable&lt;ITemplate&gt; GetChildren(string alias)
+        {
+            //return from base.GetAll, this is all cached
+            return base.GetAll().Where(x =&gt; alias.IsNullOrWhiteSpace()
+                ? x.MasterTemplateAlias.IsNullOrWhiteSpace()
+                : x.MasterTemplateAlias.InvariantEquals(alias));
+        }
+
+        public IEnumerable&lt;ITemplate&gt; GetDescendants(int masterTemplateId)
+        {
+            //return from base.GetAll, this is all cached
+            var all = base.GetAll().ToArray();
+            var descendants = new List&lt;ITemplate&gt;();
+            if (masterTemplateId &gt; 0)
+            {
+                var parent = all.FirstOrDefault(x =&gt; x.Id == masterTemplateId);
+                if (parent == null) return Enumerable.Empty&lt;ITemplate&gt;();
+                //recursively add all children with a level
+                AddChildren(all, descendants, parent.Alias);
+            }
+            else
+            {
+                descendants.AddRange(all.Where(x =&gt; x.MasterTemplateAlias.IsNullOrWhiteSpace()));
+                foreach (var parent in descendants)
+                {
+                    //recursively add all children with a level
+                    AddChildren(all, descendants, parent.Alias);
+                }
+            }
+
+            //return the list - it will be naturally ordered by level
+            return descendants;
+        }
+        
+        public IEnumerable&lt;ITemplate&gt; GetDescendants(string alias)
+        {
+            var all = base.GetAll().ToArray();
+            var descendants = new List&lt;ITemplate&gt;();
+            if (alias.IsNullOrWhiteSpace() == false)
+            {
+                var parent = all.FirstOrDefault(x =&gt; x.Alias.InvariantEquals(alias));
+                if (parent == null) return Enumerable.Empty&lt;ITemplate&gt;();
+                //recursively add all children
+                AddChildren(all, descendants, parent.Alias);
+            }
+            else
+            {
+                descendants.AddRange(all.Where(x =&gt; x.MasterTemplateAlias.IsNullOrWhiteSpace()));
+                foreach (var parent in descendants)
+                {
+                    //recursively add all children with a level
+                    AddChildren(all, descendants, parent.Alias);
+                }
+            }
+            //return the list - it will be naturally ordered by level
+            return descendants;
+        }
+
+        private void AddChildren(ITemplate[] all, List&lt;ITemplate&gt; descendants, string masterAlias)
+        {
+            var c = all.Where(x =&gt; x.MasterTemplateAlias.InvariantEquals(masterAlias)).ToArray();
+            descendants.AddRange(c);
+            if (c.Any() == false) return;
+            //recurse through all children
+            foreach (var child in c)
+            {
+                AddChildren(all, descendants, child.Alias);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a template as a template node which can be traversed (parent, children)
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;Use GetDescendants instead&quot;)]
+        public TemplateNode GetTemplateNode(string alias)
+        {            
+            //first get all template objects
+            var allTemplates = base.GetAll().ToArray();
+
+            var selfTemplate = allTemplates.SingleOrDefault(x =&gt; x.Alias.InvariantEquals(alias));
+            if (selfTemplate == null)
+            {
+                return null;
+            }
+            
+            var top = selfTemplate;
+            while (top.MasterTemplateAlias.IsNullOrWhiteSpace() == false)
+            {
+                top = allTemplates.Single(x =&gt; x.Alias.InvariantEquals(top.MasterTemplateAlias));
+            }
+
+            var topNode = new TemplateNode(allTemplates.Single(x =&gt; x.Id == top.Id));
+            var childTemplates = allTemplates.Where(x =&gt; x.MasterTemplateAlias.InvariantEquals(top.Alias));
+            //This now creates the hierarchy recursively
+            topNode.Children = CreateChildren(topNode, childTemplates, allTemplates);
+
+            //now we&#39;ll return the TemplateNode requested
+            return FindTemplateInTree(topNode, alias);
+        }
+
+        [Obsolete(&quot;Only used by obsolete code&quot;)]
+        private static TemplateNode WalkTree(TemplateNode current, string alias)
+        {
+            //now walk the tree to find the node
+            if (current.Template.Alias.InvariantEquals(alias))
+            {
+                return current;
+            }
+            foreach (var c in current.Children)
+            {
+                var found = WalkTree(c, alias);
+                if (found != null) return found;
+            }
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// Given a template node in a tree, this will find the template node with the given alias if it is found in the hierarchy, otherwise null
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;anyNode&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;Use GetDescendants instead&quot;)]
+        public TemplateNode FindTemplateInTree(TemplateNode anyNode, string alias)
+        {
+            //first get the root
+            var top = anyNode;
+            while (top.Parent != null)
+            {
+                top = top.Parent;
+            }
+            return WalkTree(top, alias);
+        }
+
+        /// &lt;summary&gt;
+        /// This checks what the default rendering engine is set in config but then also ensures that there isn&#39;t already 
+        /// a template that exists in the opposite rendering engine&#39;s template folder, then returns the appropriate 
+        /// rendering engine to use.
+        /// &lt;/summary&gt; 
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// The reason this is required is because for example, if you have a master page file already existing under ~/masterpages/Blah.aspx
+        /// and then you go to create a template in the tree called Blah and the default rendering engine is MVC, it will create a Blah.cshtml 
+        /// empty template in ~/Views. This means every page that is using Blah will go to MVC and render an empty page. 
+        /// This is mostly related to installing packages since packages install file templates to the file system and then create the 
+        /// templates in business logic. Without this, it could cause the wrong rendering engine to be used for a package.
+        /// &lt;/remarks&gt;
+        public RenderingEngine DetermineTemplateRenderingEngine(ITemplate template)
+        {
+            var engine = _templateConfig.DefaultRenderingEngine;
+            var viewHelper = new ViewHelper(_viewsFileSystem);
+            if (viewHelper.ViewExists(template) == false)
+            {
+                if (template.Content.IsNullOrWhiteSpace() == false &amp;&amp; MasterPageHelper.IsMasterPageSyntax(template.Content))
+                {
+                    //there is a design but its definitely a webforms design and we haven&#39;t got a MVC view already for it
+                    return RenderingEngine.WebForms;
+                }
+            }
+
+            var masterPageHelper = new MasterPageHelper(_masterpagesFileSystem);
+
+            switch (engine)
+            {
+                case RenderingEngine.Mvc:
+                    //check if there&#39;s a view in ~/masterpages
+                    if (masterPageHelper.MasterPageExists(template) &amp;&amp; viewHelper.ViewExists(template) == false)
+                    {
+                        //change this to webforms since there&#39;s already a file there for this template alias
+                        engine = RenderingEngine.WebForms;
+                    }
+                    break;
+                case RenderingEngine.WebForms:
+                    //check if there&#39;s a view in ~/views
+                    if (viewHelper.ViewExists(template) &amp;&amp; masterPageHelper.MasterPageExists(template) == false)
+                    {
+                        //change this to mvc since there&#39;s already a file there for this template alias
+                        engine = RenderingEngine.Mvc;
+                    }
+                    break;
+            }
+            return engine;
+        }
+
+        /// &lt;summary&gt;
+        /// Validates a &lt;see cref=&quot;ITemplate&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;template&quot;&gt;&lt;see cref=&quot;ITemplate&quot;/&gt; to validate&lt;/param&gt;
+        /// &lt;returns&gt;True if Script is valid, otherwise false&lt;/returns&gt;
+        public bool ValidateTemplate(ITemplate template)
+        {
+            // get path
+            // TODO
+            //  templates should have a real Path somehow - but anyways
+            //  are we using Path for something else?!
+            var path = template.VirtualPath;
+
+            // get valid paths
+            var validDirs = _templateConfig.DefaultRenderingEngine == RenderingEngine.Mvc
+                ? new[] { SystemDirectories.Masterpages, SystemDirectories.MvcViews }
+                : new[] { SystemDirectories.Masterpages };
+
+            // get valid extensions
+            var validExts = new List&lt;string&gt;();
+            if (_templateConfig.DefaultRenderingEngine == RenderingEngine.Mvc)
+            {
+                validExts.Add(&quot;cshtml&quot;);
+                validExts.Add(&quot;vbhtml&quot;);
+            }
+            else
+            {
+                validExts.Add(_templateConfig.UseAspNetMasterPages ? &quot;master&quot; : &quot;aspx&quot;);
+            }
+
+            // validate path and extension
+            var validFile = IOHelper.VerifyEditPath(path, validDirs);
+            var validExtension = IOHelper.VerifyFileExtension(path, validExts);
+            return validFile &amp;&amp; validExtension;
+        }
+
+        private static IEnumerable&lt;TemplateNode&gt; CreateChildren(TemplateNode parent, IEnumerable&lt;ITemplate&gt; childTemplates, ITemplate[] allTemplates)
+        {
+            var children = new List&lt;TemplateNode&gt;();
+            foreach (var childTemplate in childTemplates)
+            {
+                var template = allTemplates.Single(x =&gt; x.Id == childTemplate.Id);
+                var child = new TemplateNode(template)
+                    {
+                        Parent = parent
+                    };
+
+                //add to our list
+                children.Add(child);
+
+                //get this node&#39;s children
+                var local = childTemplate;
+                var kids = allTemplates.Where(x =&gt; x.MasterTemplateAlias.InvariantEquals(local.Alias));
+
+                //recurse
+                child.Children = CreateChildren(child, kids, allTemplates);
+            }
+            return children;
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Ensures that there are not duplicate aliases and if so, changes it to be a numbered version and also verifies the length
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;template&quot;&gt;&lt;/param&gt;
+        private void EnsureValidAlias(ITemplate template)
+        {
+            //ensure unique alias 
+            template.Alias = template.Alias.ToCleanString(CleanStringType.UnderscoreAlias);
+
+            if (template.Alias.Length &gt; 100)
+                template.Alias = template.Alias.Substring(0, 95);
+
+            if (AliasAlreadExists(template))
+            {
+                template.Alias = EnsureUniqueAlias(template, 1);
+            }
+        }
+
+        private bool AliasAlreadExists(ITemplate template)
+        {
+            var sql = GetBaseQuery(true).Where&lt;TemplateDto&gt;(x =&gt; x.Alias.InvariantEquals(template.Alias) &amp;&amp; x.NodeId != template.Id);
+            var count = Database.ExecuteScalar&lt;int&gt;(sql);
+            return count &gt; 0;
+        }
+
+        private string EnsureUniqueAlias(ITemplate template, int attempts)
+        {
+            //TODO: This is ported from the old data layer... pretty crap way of doing this but it works for now.
+            if (AliasAlreadExists(template))
+                return template.Alias + attempts;
+            attempts++;
+            return EnsureUniqueAlias(template, attempts);
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[38,15,38,51,1],[39,9,39,10,1],[40,13,40,59,1],[41,13,41,47,1],[42,13,42,46,1],[43,13,43,60,1],[44,13,44,78,1],[45,9,45,10,1],[52,13,52,14,1],[54,17,55,54,1],[55,54,55,69,1],[55,69,55,79,1],[54,17,55,79,1],[56,13,56,14,1],[62,9,62,10,0],[64,13,64,54,0],[64,54,64,64,0],[64,64,64,66,0],[64,13,64,66,0],[65,9,65,10,0],[68,9,68,10,1],[69,13,69,43,1],[71,13,71,27,1],[72,13,72,14,0],[73,17,73,74,0],[74,13,74,14,0],[76,13,76,14,1],[77,17,77,79,1],[78,13,78,14,1],[80,13,80,66,1],[82,13,82,33,1],[82,34,82,71,1],[86,13,88,36,1],[88,36,93,18,1],[93,18,93,31,1],[86,13,93,31,1],[95,13,95,37,1],[95,37,95,60,1],[95,60,95,62,1],[95,13,95,62,1],[96,9,96,10,1],[99,9,99,10,0],[100,13,100,49,0],[101,13,101,77,0],[102,13,102,46,0],[104,13,104,66,0],[106,13,106,33,0],[106,34,106,71,0],[110,13,110,73,0],[112,13,112,37,0],[112,37,112,60,0],[112,60,112,62,0],[112,13,112,62,0],[113,9,113,10,0],[120,9,120,10,1],[121,13,121,33,1],[122,13,126,76,1],[127,13,127,24,1],[128,9,128,10,1],[131,9,131,10,0],[132,13,132,43,0],[133,9,133,10,0],[136,9,136,10,1],[137,13,145,30,1],[146,13,146,25,1],[147,9,147,10,1],[151,17,151,18,1],[151,19,151,67,1],[151,68,151,69,1],[155,9,155,10,1],[156,13,156,38,1],[159,13,159,45,1],[160,13,160,37,1],[162,13,162,65,1],[163,13,163,50,1],[166,13,166,39,1],[167,13,167,55,1],[168,13,168,116,1],[171,13,171,63,1],[172,13,172,32,1],[173,13,173,14,1],[174,17,174,80,1],[175,13,175,14,1],[177,13,177,14,1],[178,17,178,59,1],[179,13,179,14,1],[180,13,180,38,1],[183,13,183,41,1],[184,13,184,34,1],[187,13,187,42,1],[188,13,188,42,1],[192,13,192,81,1],[193,13,193,14,1],[194,17,194,69,1],[195,17,195,46,1],[196,17,196,18,1],[197,21,197,45,1],[199,21,199,41,1],[200,21,200,42,1],[201,17,201,18,1],[202,13,202,14,1],[204,13,204,14,1],[205,17,205,87,1],[206,17,206,46,1],[207,17,207,18,1],[208,21,208,45,1],[210,21,210,41,1],[211,21,211,42,1],[212,17,212,18,1],[213,13,213,14,1],[215,13,215,45,1],[218,13,218,49,1],[219,17,219,51,1],[219,51,219,89,0],[219,89,219,90,1],[219,17,219,90,1],[220,9,220,10,1],[223,9,223,10,1],[224,13,224,38,1],[227,13,227,46,1],[228,13,228,49,1],[229,13,229,14,1],[231,17,231,46,1],[232,17,232,47,1],[233,13,233,14,1],[235,13,235,45,1],[237,13,237,60,1],[238,13,238,14,1],[239,17,239,67,1],[240,17,240,36,1],[241,17,241,18,1],[242,21,242,78,1],[243,17,243,18,1],[245,17,245,18,1],[248,21,248,67,1],[249,17,249,18,1],[250,13,250,14,1],[253,13,253,115,1],[256,13,256,48,1],[257,13,257,89,1],[258,13,258,50,1],[260,13,260,42,1],[261,13,261,34,1],[264,13,264,52,1],[265,13,265,59,1],[265,59,265,83,1],[265,83,265,85,1],[265,13,265,85,1],[269,13,269,81,1],[270,13,270,14,1],[271,17,271,80,1],[272,17,272,46,1],[273,17,273,18,0],[274,21,274,45,0],[276,21,276,41,0],[277,21,277,42,0],[278,17,278,18,0],[279,13,279,14,1],[281,13,281,14,1],[282,17,282,98,1],[283,17,283,46,1],[284,17,284,18,0],[285,21,285,45,0],[287,21,287,41,0],[288,21,288,42,0],[289,17,289,18,0],[290,13,290,14,1],[292,13,292,43,1],[295,13,295,49,1],[296,17,296,51,0],[296,51,296,89,0],[296,89,296,90,0],[296,17,296,90,0],[297,9,297,10,1],[300,9,300,10,1],[301,13,301,56,1],[303,13,303,66,1],[306,13,306,35,1],[309,13,309,20,1],[309,22,309,36,1],[309,37,309,39,1],[309,40,309,51,1],[310,13,310,14,1],[311,17,311,24,1],[311,26,311,36,1],[311,37,311,39,1],[311,40,311,47,1],[312,17,312,18,1],[313,21,313,84,1],[314,17,314,18,1],[315,13,315,14,1],[318,13,318,20,1],[318,22,318,32,1],[318,33,318,35,1],[318,36,318,43,1],[319,13,319,14,1],[320,17,320,76,1],[321,13,321,14,1],[323,13,323,81,1],[324,13,324,14,1],[325,17,325,71,1],[326,17,326,55,1],[327,13,327,14,1],[329,13,329,14,1],[330,17,330,77,1],[331,17,331,67,1],[332,13,332,14,1],[333,9,333,10,1],[338,9,338,10,1],[341,13,348,60,1],[348,60,348,78,1],[348,78,348,114,1],[348,114,348,122,1],[348,122,348,126,1],[341,13,348,126,1],[350,13,351,30,1],[351,30,356,18,1],[356,18,356,20,1],[350,13,356,20,1],[357,13,357,29,1],[358,9,358,10,1],[369,9,369,10,1],[370,13,370,49,1],[371,13,371,78,1],[371,78,371,116,1],[371,116,371,118,1],[371,13,371,118,1],[373,13,373,42,1],[374,13,374,14,1],[375,17,375,74,1],[375,74,375,102,1],[375,102,375,104,1],[375,17,375,104,1],[376,17,376,44,1],[377,17,377,18,1],[378,21,378,72,1],[379,21,379,69,1],[379,69,379,89,0],[379,89,379,91,1],[379,21,379,91,1],[380,17,380,18,1],[381,13,381,14,1],[385,13,385,44,1],[389,13,389,50,1],[391,13,391,29,1],[392,9,392,10,1],[395,9,395,10,1],[396,13,396,46,1],[397,13,397,49,1],[398,13,398,14,1],[400,17,400,65,1],[401,17,401,55,1],[402,21,402,83,1],[403,17,403,65,1],[404,17,404,55,1],[405,21,405,83,0],[406,17,406,65,1],[407,17,407,61,1],[408,21,408,89,1],[409,13,409,14,1],[411,13,411,14,0],[413,17,413,51,0],[414,17,414,29,0],[418,25,418,87,0],[420,25,420,93,0],[422,25,422,45,0],[426,13,426,67,1],[427,13,427,53,1],[428,17,428,81,0],[429,13,429,63,1],[430,13,430,53,1],[431,17,431,81,0],[432,13,432,63,1],[433,13,433,59,1],[434,17,434,87,0],[435,13,435,33,1],[436,9,436,10,1],[439,9,439,10,1],[442,13,442,22,1],[443,13,443,14,1],[444,17,444,80,1],[445,13,445,14,1],[455,13,455,56,1],[457,13,457,63,1],[458,9,458,10,1],[461,9,461,10,1],[462,20,462,54,1],[463,20,463,78,1],[464,13,464,14,1],[465,17,465,43,1],[467,9,467,10,1],[472,9,472,10,1],[473,13,473,51,1],[474,9,474,10,1],[477,9,477,10,1],[481,13,481,40,1],[481,41,481,62,1],[484,13,484,45,1],[484,45,484,79,1],[484,79,484,81,1],[484,13,484,81,1],[485,9,485,10,1],[488,9,488,10,1],[490,13,490,47,1],[492,13,492,39,1],[492,40,492,62,1],[492,62,492,104,1],[492,104,492,106,1],[492,40,492,106,1],[494,13,494,50,1],[494,50,494,74,1],[494,74,494,76,1],[494,13,494,76,1],[495,13,495,32,1],[495,33,495,70,0],[497,13,497,43,1],[497,43,497,94,1],[497,94,497,96,1],[497,13,497,96,1],[498,13,498,29,1],[499,9,499,10,1],[502,9,502,10,1],[504,13,504,45,1],[504,45,506,63,1],[506,63,506,65,1],[504,13,506,65,1],[507,9,507,10,1],[510,9,510,10,1],[512,13,512,47,1],[513,13,513,53,1],[514,13,514,38,1],[515,13,515,14,1],[516,17,516,54,1],[516,54,516,78,1],[516,78,516,80,1],[516,17,516,80,1],[517,17,517,36,1],[517,37,517,74,0],[519,17,519,61,1],[520,13,520,14,1],[522,13,522,14,0],[523,17,523,53,0],[523,53,523,95,0],[523,95,523,98,0],[523,17,523,98,0],[524,17,524,24,0],[524,26,524,36,0],[524,37,524,39,0],[524,40,524,51,0],[525,17,525,18,0],[527,21,527,65,0],[528,17,528,18,0],[529,13,529,14,0],[532,13,532,32,1],[533,9,533,10,1],[536,9,536,10,1],[537,13,537,47,1],[538,13,538,53,1],[539,13,539,53,1],[540,13,540,14,1],[541,17,541,54,1],[541,54,541,84,1],[541,84,541,86,1],[541,17,541,86,1],[542,17,542,36,1],[542,37,542,74,0],[544,17,544,61,1],[545,13,545,14,1],[547,13,547,14,0],[548,17,548,53,0],[548,53,548,95,0],[548,95,548,98,0],[548,17,548,98,0],[549,17,549,24,0],[549,26,549,36,0],[549,37,549,39,0],[549,40,549,51,0],[550,17,550,18,0],[552,21,552,65,0],[553,17,553,18,0],[554,13,554,14,0],[556,13,556,32,1],[557,9,557,10,1],[560,9,560,10,1],[561,13,561,36,1],[561,36,561,86,1],[561,86,561,98,1],[561,13,561,98,1],[562,13,562,37,1],[563,13,563,34,1],[563,35,563,42,1],[565,13,565,20,1],[565,22,565,31,1],[565,32,565,34,1],[565,35,565,36,1],[566,13,566,14,1],[567,17,567,60,1],[568,13,568,14,1],[569,9,569,10,1],[578,9,578,10,1],[580,13,580,56,1],[582,13,582,66,1],[582,66,582,96,1],[582,96,582,98,1],[582,13,582,98,1],[583,13,583,38,1],[584,13,584,14,0],[585,17,585,29,0],[588,13,588,36,1],[589,13,589,74,1],[590,13,590,14,0],[591,17,591,48,0],[591,48,591,96,0],[591,96,591,98,0],[591,17,591,98,0],[592,13,592,14,0],[594,13,594,69,1],[594,69,594,83,1],[594,83,594,86,1],[594,13,594,86,1],[595,13,595,58,1],[595,58,595,106,1],[595,106,595,108,1],[595,13,595,108,1],[597,13,597,86,1],[600,13,600,55,1],[601,9,601,10,1],[605,9,605,10,1],[607,13,607,63,1],[608,13,608,14,1],[609,17,609,32,1],[611,13,611,20,1],[611,22,611,27,1],[611,28,611,30,1],[611,31,611,47,1],[612,13,612,14,1],[613,17,613,48,1],[614,17,614,35,1],[614,36,614,49,1],[615,13,615,14,1],[616,13,616,25,1],[617,9,617,10,1],[627,9,627,10,1],[629,13,629,31,1],[630,13,630,39,1],[631,13,631,14,0],[632,17,632,34,0],[633,13,633,14,0],[634,13,634,41,1],[635,9,635,10,1],[651,9,651,10,1],[652,13,652,65,1],[653,13,653,63,1],[654,13,654,58,1],[655,13,655,14,1],[656,17,656,125,1],[657,17,657,18,1],[659,21,659,53,1],[661,13,661,14,1],[663,13,663,81,1],[665,13,665,28,1],[669,21,669,113,1],[670,21,670,22,1],[672,25,672,59,1],[673,21,673,22,1],[674,21,674,27,1],[677,21,677,113,1],[678,21,678,22,1],[680,25,680,54,1],[681,21,681,22,1],[682,21,682,27,1],[684,13,684,27,1],[685,9,685,10,1],[693,9,693,10,0],[698,13,698,45,0],[701,13,703,59,0],[706,13,706,48,0],[707,13,707,79,0],[708,13,708,14,0],[709,17,709,41,0],[710,17,710,41,0],[711,13,711,14,0],[713,13,713,14,0],[714,17,714,89,0],[715,13,715,14,0],[718,13,718,70,0],[719,13,719,80,0],[720,13,720,48,0],[721,9,721,10,0],[724,9,724,10,1],[725,13,725,53,1],[726,13,726,20,1],[726,22,726,39,1],[726,40,726,42,1],[726,43,726,57,1],[727,13,727,14,1],[728,17,728,57,1],[728,57,728,81,1],[728,81,728,83,1],[728,17,728,83,1],[729,17,732,23,1],[735,17,735,37,1],[738,17,738,43,1],[739,17,739,52,1],[739,52,739,102,1],[739,102,739,104,1],[739,17,739,104,1],[742,17,742,76,1],[743,13,743,14,1],[744,13,744,29,1],[745,9,745,10,1],[754,9,754,10,1],[756,13,756,92,1],[758,13,758,45,1],[759,17,759,66,0],[761,13,761,45,1],[762,13,762,14,1],[763,17,763,65,1],[764,13,764,14,1],[765,9,765,10,1],[768,9,768,10,1],[769,13,769,134,1],[770,13,770,58,1],[771,13,771,30,1],[772,9,772,10,1],[775,9,775,10,1],[777,13,777,45,1],[778,17,778,50,1],[779,13,779,24,0],[780,13,780,58,0],[781,9,781,10,1]]);
+    </script>
+  </body>
+</html>

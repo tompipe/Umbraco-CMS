@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Manifest\ManifestParser.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using Umbraco.Core.Cache;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.PropertyEditors;
+
+namespace Umbraco.Core.Manifest
+{
+    /// &lt;summary&gt;
+    /// Parses the Main.js file and replaces all tokens accordingly.
+    /// &lt;/summary&gt;
+    internal class ManifestParser
+    {
+        private readonly DirectoryInfo _pluginsDir;
+        private readonly IRuntimeCacheProvider _cache;
+
+        //used to strip comments
+        private static readonly Regex CommentsSurround = new Regex(@&quot;/\*([^*]|[\r\n]|(\*+([^*/]|[\r\n])))*\*+/&quot;, RegexOptions.Compiled);
+        private static readonly Regex CommentsLine = new Regex(@&quot;^\s*//.*?$&quot;, RegexOptions.Compiled | RegexOptions.Multiline);
+
+        public ManifestParser(DirectoryInfo pluginsDir, IRuntimeCacheProvider cache)
+        {
+            if (pluginsDir == null) throw new ArgumentNullException(&quot;pluginsDir&quot;);
+            _pluginsDir = pluginsDir;
+            _cache = cache;
+        }
+
+        /// &lt;summary&gt;
+        /// Parse the grid editors from the json array
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;jsonEditors&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static IEnumerable&lt;GridEditor&gt; GetGridEditors(JArray jsonEditors)
+        {
+            return JsonConvert.DeserializeObject&lt;IEnumerable&lt;GridEditor&gt;&gt;(
+                jsonEditors.ToString(),
+                new GridEditorConverter());
+        }
+
+        /// &lt;summary&gt;
+        /// Parse the property editors from the json array
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;jsonEditors&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static IEnumerable&lt;PropertyEditor&gt; GetPropertyEditors(JArray jsonEditors)
+        {
+            return JsonConvert.DeserializeObject&lt;IEnumerable&lt;PropertyEditor&gt;&gt;(
+                jsonEditors.ToString(), 
+                new PropertyEditorConverter(),
+                new PreValueFieldConverter());
+        }
+
+        /// &lt;summary&gt;
+        /// Parse the property editors from the json array
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;jsonEditors&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static IEnumerable&lt;ParameterEditor&gt; GetParameterEditors(JArray jsonEditors)
+        {
+            return JsonConvert.DeserializeObject&lt;IEnumerable&lt;ParameterEditor&gt;&gt;(
+                jsonEditors.ToString(),
+                new ParameterEditorConverter());
+        }
+        
+        /// &lt;summary&gt;
+        /// Get all registered manifests
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This ensures that we only build and look for all manifests once per Web app (based on the IRuntimeCache)
+        /// &lt;/remarks&gt;
+        public IEnumerable&lt;PackageManifest&gt; GetManifests()
+        {
+            return _cache.GetCacheItem&lt;IEnumerable&lt;PackageManifest&gt;&gt;(typeof (ManifestParser) + &quot;GetManifests&quot;, () =&gt;
+            {
+                //get all Manifest.js files in the appropriate folders
+                var manifestFileContents = GetAllManifestFileContents(_pluginsDir);
+                return CreateManifests(manifestFileContents.ToArray());
+            }, new TimeSpan(0, 10, 0));
+        }
+
+        /// &lt;summary&gt;
+        /// Get the file contents from all declared manifest files
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;currDir&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IEnumerable&lt;string&gt; GetAllManifestFileContents(DirectoryInfo currDir)
+        {
+            var depth = FolderDepth(_pluginsDir, currDir);
+            
+            if (depth &lt; 1)
+            {
+                var result = new List&lt;string&gt;();
+                if (currDir.Exists)
+                {
+                    var dirs = currDir.GetDirectories();
+
+                    foreach (var d in dirs)
+                    {
+                        result.AddRange(GetAllManifestFileContents(d));
+                    }    
+                }
+                return result;
+            }
+
+            //look for files here
+            return currDir.GetFiles(&quot;Package.manifest&quot;)
+                          .Select(f =&gt; File.ReadAllText(f.FullName))
+                          .ToList();
+        }
+
+        /// &lt;summary&gt;
+        /// Get the folder depth compared to the base folder
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;baseDir&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;currDir&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static int FolderDepth(DirectoryInfo baseDir, DirectoryInfo currDir)
+        {
+            var removed = currDir.FullName.Remove(0, baseDir.FullName.Length).TrimStart(&#39;\\&#39;).TrimEnd(&#39;\\&#39;);
+            return removed.Split(new char[] {&#39;\\&#39;}, StringSplitOptions.RemoveEmptyEntries).Length;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a list of PropertyEditorManifest from the file contents of each manifest file
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;manifestFileContents&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This ensures that comments are removed (but they have to be /* */ style comments
+        /// and ensures that virtual paths are replaced with real ones
+        /// &lt;/remarks&gt;
+        internal static IEnumerable&lt;PackageManifest&gt; CreateManifests(params string[] manifestFileContents)
+        {
+            var result = new List&lt;PackageManifest&gt;();
+            foreach (var m in manifestFileContents)
+            { 
+                var manifestContent = m;
+
+                if (manifestContent.IsNullOrWhiteSpace()) continue;
+
+                // Strip byte object marker, JSON.NET does not like it
+                var preamble = Encoding.UTF8.GetString(Encoding.UTF8.GetPreamble());
+
+                // Strangely StartsWith(preamble) would always return true
+                if (manifestContent.Substring(0, 1) == preamble)
+                    manifestContent = manifestContent.Remove(0, preamble.Length);
+
+                if (manifestContent.IsNullOrWhiteSpace()) continue;
+
+                //remove any comments first
+                var replaced = CommentsSurround.Replace(manifestContent, match =&gt; &quot; &quot;);
+                replaced = CommentsLine.Replace(replaced, match =&gt; &quot;&quot;);
+
+                JObject deserialized;
+                try
+                {
+                    deserialized = JsonConvert.DeserializeObject&lt;JObject&gt;(replaced);
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.Error&lt;ManifestParser&gt;(&quot;An error occurred parsing manifest with contents: &quot; + manifestContent, ex);
+                    continue;
+                }
+
+                //validate the javascript
+                var init = deserialized.Properties().Where(x =&gt; x.Name == &quot;javascript&quot;).ToArray();
+                if (init.Length &gt; 1)
+                {
+                    throw new FormatException(&quot;The manifest is not formatted correctly contains more than one &#39;javascript&#39; element&quot;);
+                }
+
+                //validate the css
+                var cssinit = deserialized.Properties().Where(x =&gt; x.Name == &quot;css&quot;).ToArray();
+                if (cssinit.Length &gt; 1)
+                {
+                    throw new FormatException(&quot;The manifest is not formatted correctly contains more than one &#39;css&#39; element&quot;);
+                }
+
+                //validate the property editors section
+                var propEditors = deserialized.Properties().Where(x =&gt; x.Name == &quot;propertyEditors&quot;).ToArray();
+                if (propEditors.Length &gt; 1)
+                {
+                    throw new FormatException(&quot;The manifest is not formatted correctly contains more than one &#39;propertyEditors&#39; element&quot;);
+                }
+
+                //validate the parameterEditors section
+                var paramEditors = deserialized.Properties().Where(x =&gt; x.Name == &quot;parameterEditors&quot;).ToArray();
+                if (paramEditors.Length &gt; 1)
+                {
+                    throw new FormatException(&quot;The manifest is not formatted correctly contains more than one &#39;parameterEditors&#39; element&quot;);
+                }
+
+                //validate the gridEditors section
+                var gridEditors = deserialized.Properties().Where(x =&gt; x.Name == &quot;gridEditors&quot;).ToArray();
+                if (gridEditors.Length &gt; 1)
+                {
+                    throw new FormatException(&quot;The manifest is not formatted correctly contains more than one &#39;gridEditors&#39; element&quot;);
+                }
+
+                var jConfig = init.Any() ? (JArray)deserialized[&quot;javascript&quot;] : new JArray();
+                ReplaceVirtualPaths(jConfig);
+
+                var cssConfig = cssinit.Any() ? (JArray)deserialized[&quot;css&quot;] : new JArray();
+                ReplaceVirtualPaths(cssConfig);
+
+                //replace virtual paths for each property editor
+                if (deserialized[&quot;propertyEditors&quot;] != null)
+                {
+                    foreach (JObject p in deserialized[&quot;propertyEditors&quot;])
+                    {
+                        if (p[&quot;editor&quot;] != null)
+                        {
+                            ReplaceVirtualPaths((JObject) p[&quot;editor&quot;]);
+                        }
+                        if (p[&quot;preValues&quot;] != null)
+                        {
+                            ReplaceVirtualPaths((JObject)p[&quot;preValues&quot;]);
+                        }
+                    }
+                }
+
+                //replace virtual paths for each property editor
+                if (deserialized[&quot;gridEditors&quot;] != null)
+                {
+                    foreach (JObject p in deserialized[&quot;gridEditors&quot;])
+                    {
+                        if (p[&quot;view&quot;] != null)
+                        {
+                            ReplaceVirtualPaths(p[&quot;view&quot;]);
+                        }
+                        if (p[&quot;render&quot;] != null)
+                        {
+                            ReplaceVirtualPaths(p[&quot;render&quot;]);
+                        }
+                    }
+                }
+                
+                var manifest = new PackageManifest()
+                    {
+                        JavaScriptInitialize = jConfig,
+                        StylesheetInitialize = cssConfig,
+                        PropertyEditors = propEditors.Any() ? (JArray)deserialized[&quot;propertyEditors&quot;] : new JArray(),
+                        ParameterEditors = paramEditors.Any() ? (JArray)deserialized[&quot;parameterEditors&quot;] : new JArray(),
+                        GridEditors = gridEditors.Any() ? (JArray)deserialized[&quot;gridEditors&quot;] : new JArray()
+                    };
+                result.Add(manifest);
+            }
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Replaces any virtual paths found in properties
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;jarr&quot;&gt;&lt;/param&gt;
+        private static void ReplaceVirtualPaths(JArray jarr)
+        {
+            foreach (var i in jarr)
+            {
+                ReplaceVirtualPaths(i);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Replaces any virtual paths found in properties
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;jToken&quot;&gt;&lt;/param&gt;
+        private static void ReplaceVirtualPaths(JToken jToken)
+        {
+            if (jToken.Type == JTokenType.Object)
+            {
+                //recurse
+                ReplaceVirtualPaths((JObject)jToken);
+            }
+            else
+            {
+                var value = jToken as JValue;
+                if (value != null)
+                {
+                    if (value.Type == JTokenType.String)
+                    {
+                        if (value.Value&lt;string&gt;().StartsWith(&quot;~/&quot;))
+                        {
+                            //replace the virtual path
+                            value.Value = IOHelper.ResolveUrl(value.Value&lt;string&gt;());
+                        }
+                    }
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Replaces any virtual paths found in properties
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;jObj&quot;&gt;&lt;/param&gt;
+        private static void ReplaceVirtualPaths(JObject jObj)
+        {
+            foreach (var p in jObj.Properties().Select(x =&gt; x.Value))
+            {
+                ReplaceVirtualPaths(p);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Merges two json objects together
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;receiver&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;donor&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;keepOriginal&quot;&gt;set to true if we will keep the receiver value if the proeprty already exists&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// taken from 
+        /// http://stackoverflow.com/questions/4002508/does-c-sharp-have-a-library-for-parsing-multi-level-cascading-json/4002550#4002550
+        /// &lt;/remarks&gt;
+        internal static void MergeJObjects(JObject receiver, JObject donor, bool keepOriginal = false)
+        {
+            foreach (var property in donor)
+            {
+                var receiverValue = receiver[property.Key] as JObject;
+                var donorValue = property.Value as JObject;
+                if (receiverValue != null &amp;&amp; donorValue != null)
+                {
+                    MergeJObjects(receiverValue, donorValue);
+                }
+                else if (receiver[property.Key] == null || !keepOriginal)
+                {
+                    receiver[property.Key] = property.Value;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Merges the donor array values into the receiver array
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;receiver&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;donor&quot;&gt;&lt;/param&gt;
+        internal static void MergeJArrays(JArray receiver, JArray donor)
+        {
+            foreach (var item in donor)
+            {
+                if (!receiver.Any(x =&gt; x.Equals(item)))
+                {
+                    receiver.Add(item);   
+                }
+            }
+        }
+
+        
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,9,25,137,1],[26,9,26,127,1],[28,9,28,85,1],[29,9,29,10,1],[30,13,30,36,1],[30,37,30,83,0],[31,13,31,38,1],[32,13,32,28,1],[33,9,33,10,1],[41,9,41,10,1],[42,13,44,44,1],[45,9,45,10,1],[53,9,53,10,1],[54,13,57,47,1],[58,9,58,10,1],[66,9,66,10,1],[67,13,69,49,1],[70,9,70,10,1],[80,9,80,10,1],[81,13,82,13,1],[82,13,82,14,1],[82,14,84,17,1],[84,17,84,84,1],[84,84,85,17,1],[85,17,85,72,1],[85,72,86,13,1],[86,13,86,14,1],[86,14,86,40,1],[81,13,86,40,1],[87,9,87,10,1],[95,9,95,10,1],[96,13,96,59,1],[98,13,98,27,1],[99,13,99,14,1],[100,17,100,49,1],[101,17,101,36,1],[102,17,102,18,1],[103,21,103,57,1],[105,21,105,28,1],[105,30,105,35,0],[105,36,105,38,1],[105,39,105,43,1],[106,21,106,22,0],[107,25,107,72,0],[108,21,108,22,0],[109,17,109,18,1],[110,17,110,31,1],[114,13,115,40,0],[115,40,115,68,0],[115,68,116,37,0],[114,13,116,37,0],[117,9,117,10,1],[126,9,126,10,1],[127,13,127,109,1],[128,13,128,99,1],[129,9,129,10,1],[141,9,141,10,1],[142,13,142,54,1],[143,13,143,20,1],[143,22,143,27,1],[143,28,143,30,1],[143,31,143,51,1],[144,13,144,14,1],[145,17,145,41,1],[147,17,147,58,1],[147,59,147,68,1],[150,17,150,85,1],[153,17,153,65,1],[154,21,154,82,1],[156,17,156,58,1],[156,59,156,68,0],[159,17,159,83,1],[159,83,159,86,1],[159,86,159,88,1],[159,17,159,88,1],[160,17,160,68,1],[160,68,160,70,1],[160,70,160,72,1],[160,17,160,72,1],[164,17,164,18,1],[165,21,165,85,1],[166,17,166,18,1],[167,17,167,37,1],[168,17,168,18,1],[169,21,169,129,1],[170,21,170,30,1],[174,17,174,65,1],[174,65,174,87,1],[174,87,174,99,1],[174,17,174,99,1],[175,17,175,37,1],[176,17,176,18,0],[177,21,177,134,0],[181,17,181,68,1],[181,68,181,83,1],[181,83,181,95,1],[181,17,181,95,1],[182,17,182,40,1],[183,17,183,18,0],[184,21,184,127,0],[188,17,188,72,1],[188,72,188,99,1],[188,99,188,111,1],[188,17,188,111,1],[189,17,189,44,1],[190,17,190,18,0],[191,21,191,139,0],[195,17,195,73,1],[195,73,195,101,1],[195,101,195,113,1],[195,17,195,113,1],[196,17,196,45,1],[197,17,197,18,0],[198,21,198,140,0],[202,17,202,72,1],[202,72,202,95,1],[202,95,202,107,1],[202,17,202,107,1],[203,17,203,44,1],[204,17,204,18,0],[205,21,205,135,0],[208,17,208,94,1],[209,17,209,46,1],[211,17,211,92,1],[212,17,212,48,1],[215,17,215,61,1],[216,17,216,18,1],[217,21,217,28,1],[217,30,217,39,1],[217,40,217,42,1],[217,43,217,74,1],[218,21,218,22,1],[219,25,219,49,1],[220,25,220,26,1],[221,29,221,72,1],[222,25,222,26,1],[223,25,223,52,1],[224,25,224,26,0],[225,29,225,74,0],[226,25,226,26,0],[227,21,227,22,1],[228,17,228,18,1],[231,17,231,57,1],[232,17,232,18,1],[233,21,233,28,1],[233,30,233,39,1],[233,40,233,42,1],[233,43,233,70,1],[234,21,234,22,1],[235,25,235,47,1],[236,25,236,26,1],[237,29,237,60,1],[238,25,238,26,1],[239,25,239,49,1],[240,25,240,26,1],[241,29,241,62,1],[242,25,242,26,1],[243,21,243,22,1],[244,17,244,18,1],[246,17,253,23,1],[254,17,254,38,1],[255,13,255,14,1],[256,13,256,27,1],[257,9,257,10,1],[264,9,264,10,1],[265,13,265,20,1],[265,22,265,27,1],[265,28,265,30,1],[265,31,265,35,1],[266,13,266,14,1],[267,17,267,40,1],[268,13,268,14,1],[269,9,269,10,1],[276,9,276,10,1],[277,13,277,50,1],[278,13,278,14,1],[280,17,280,54,1],[281,13,281,14,1],[283,13,283,14,1],[284,17,284,46,1],[285,17,285,35,1],[286,17,286,18,1],[287,21,287,57,1],[288,21,288,22,1],[289,25,289,68,1],[290,25,290,26,1],[292,29,292,86,1],[293,25,293,26,1],[294,21,294,22,1],[295,17,295,18,1],[296,13,296,14,1],[297,9,297,10,1],[304,9,304,10,1],[305,13,305,20,1],[305,22,305,27,1],[305,28,305,30,1],[305,31,305,61,1],[305,61,305,68,1],[305,68,305,69,1],[305,31,305,69,1],[306,13,306,14,1],[307,17,307,40,1],[308,13,308,14,1],[309,9,309,10,1],[322,9,322,10,1],[323,13,323,20,1],[323,22,323,34,1],[323,35,323,37,1],[323,38,323,43,1],[324,13,324,14,1],[325,17,325,71,1],[326,17,326,60,1],[327,17,327,65,1],[328,17,328,18,0],[329,21,329,62,0],[330,17,330,18,0],[331,22,331,74,1],[332,17,332,18,1],[333,21,333,61,1],[334,17,334,18,1],[335,13,335,14,1],[336,9,336,10,1],[344,9,344,10,1],[345,13,345,20,1],[345,22,345,30,1],[345,31,345,33,1],[345,34,345,39,1],[346,13,346,14,1],[347,17,347,40,1],[347,40,347,54,1],[347,54,347,56,1],[347,17,347,56,1],[348,17,348,18,1],[349,21,349,40,1],[350,17,350,18,1],[351,13,351,14,1],[352,9,352,10,1]]);
+    </script>
+  </body>
+</html>

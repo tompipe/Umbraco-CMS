@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.datalayer\SqlHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+/************************************************************************************
+ * 
+ *  Umbraco Data Layer
+ *  MIT Licensed work
+ *  �2008 Ruben Verborgh
+ * 
+ ***********************************************************************************/
+
+using System;
+using System.Data;
+using System.Diagnostics;
+using System.IO;
+using System.Xml;
+using umbraco.DataLayer.Utility;
+using Umbraco.Core.Logging;
+
+namespace umbraco.DataLayer
+{
+    /// &lt;summary&gt;
+    /// Abstract base class for SQL helpers that use parameters implementing IDataParameter.
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name=&quot;P&quot;&gt;SQL parameter data type.&lt;/typeparam&gt;
+    public abstract class SqlHelper&lt;P&gt; : ISqlHelper where P : IDataParameter
+    {
+        #region Private Fields
+
+        /// &lt;summary&gt;The connection string that provides access to the SQL database.&lt;/summary&gt;
+        private readonly string m_ConnectionString;
+
+        #endregion
+
+        #region Protected Fields
+
+        /// &lt;summary&gt;Utility that provides access to complex database actions.&lt;/summary&gt;
+        protected IUtilitySet m_Utility;
+
+        #endregion
+
+        #region Public Properties
+
+        /// &lt;summary&gt;
+        /// Gets the connection string that provides access to the SQL database.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The connection string that provides access to the SQL database.&lt;/value&gt;
+        public string ConnectionString
+        {
+            get { return m_ConnectionString; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the Umbraco utility associated with this SQL helper.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The utilities.&lt;/value&gt;
+        public IUtilitySet Utility
+        {
+            get { return m_Utility; }
+        }
+
+        #endregion
+
+        #region Public Constructors
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;SqlHelper&amp;lt;P&amp;gt;&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;connectionString&quot;&gt;The connection string.&lt;/param&gt;
+        public SqlHelper(string connectionString) : this(connectionString, null)
+        { }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;SqlHelper&amp;lt;P&amp;gt;&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;connectionString&quot;&gt;The connection string, cannot be &lt;c&gt;null&lt;/c&gt;.&lt;/param&gt;
+        /// &lt;param name=&quot;utility&quot;&gt;The utility, a default utility will be used if &lt;c&gt;null&lt;/c&gt;.&lt;/param&gt;
+        public SqlHelper(string connectionString, IUtilitySet utility)
+        {
+            // Check arguments
+            if (connectionString == null)
+                throw new ArgumentNullException(&quot;connectionString&quot;);
+            if (utility == null)
+                utility = new DefaultUtility&lt;SqlHelper&lt;P&gt;&gt;(this);
+
+            // Initialize member fields
+            m_ConnectionString = connectionString;
+            m_Utility = utility;
+
+            #if DEBUG &amp;&amp; DebugDataLayer
+                // Log creation
+                Trace.TraceInformation(GetType().Name + &quot; created.&quot;);
+            #endif
+        }
+
+        /// &lt;summary&gt;
+        /// Releases unmanaged resources and performs other cleanup operations before the
+        /// &lt;see cref=&quot;SqlHelper&amp;lt;P&amp;gt;&quot;/&gt; is reclaimed by garbage collection.
+        /// &lt;/summary&gt;
+        ~SqlHelper()
+        {
+            Dispose();
+        }
+        #endregion
+
+        #region Protected Methods
+        /// &lt;summary&gt;
+        /// Performs necessary conversion on the SQL command prior to its execution.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;returns&gt;The original command text. Inheriting classes can change this behavior.&lt;/returns&gt;
+        protected virtual string ConvertCommand(string commandText)
+        {
+            if (commandText == null)
+                throw new ArgumentNullException(&quot;commandText&quot;);
+            return commandText;
+        }
+
+        /// &lt;summary&gt;
+        /// Performs necessary conversion on the parameters prior to its execution.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters. Expected to be of type IParameterContainer.&lt;/param&gt;
+        /// &lt;returns&gt;The parameters, converted to the raw types of their containers.&lt;/returns&gt;
+        protected virtual P[] ConvertParameters(IParameter[] parameters)
+        {
+            // Check arguments
+            if (parameters == null)
+                throw new ArgumentNullException(&quot;parameters&quot;);
+
+            // Add raw types of parameters to an array
+            var newParams = new P[parameters.Length];
+            for (var index = 0; index &lt; parameters.Length; index++)
+            {
+                // Get raw type out of container
+                var parameter = parameters[index] as IParameterContainer&lt;P&gt;;
+                if (parameter == null)
+                    throw new ArgumentException(String.Format(&quot;Element {0} of parameters has the wrong type. Expected: IParameterContainer&lt;{1}&gt;. Received: null.&quot;, index, typeof(P).Name), &quot;parameters&quot;);
+                newParams[index] = parameter.RawParameter;
+            }
+            return newParams;
+        }
+
+        /// &lt;summary&gt;Converts the scalar value to the given type.&lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;Desired type of the value.&lt;/typeparam&gt;
+        /// &lt;param name=&quot;scalar&quot;&gt;A scalar returned by ExecuteScalar.&lt;/param&gt;
+        /// &lt;returns&gt;The scalar, converted to type T.&lt;/returns&gt;
+        protected virtual T ConvertScalar&lt;T&gt;(object scalar)
+        {
+            if (scalar == null || (scalar == DBNull.Value &amp;&amp; !typeof(T).IsAssignableFrom(typeof(DBNull))))
+                return default(T);
+
+            switch(typeof(T).FullName)
+            {
+                case &quot;System.Int32&quot;: return (T)(object)int.Parse(scalar.ToString());
+                case &quot;System.Int64&quot;: return (T)(object)long.Parse(scalar.ToString());
+                default: return (T)scalar;
+            }
+        }
+        #endregion
+
+        #region ISqlHelper Members
+
+		/// &lt;summary&gt;
+		/// Creates a concatenation fragment for use in an SQL query.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;values&quot;&gt;The values that need to be concatenated&lt;/param&gt;
+		/// &lt;returns&gt;The SQL query fragment.&lt;/returns&gt;
+		/// &lt;remarks&gt;SQL Server uses a+b, MySql uses concat(a,b), Oracle uses a||b...&lt;/remarks&gt;
+		public virtual string Concat(params string[] values)
+		{
+			// default is SQL Server syntax
+			return &quot;(&quot; + string.Join(&quot;+&quot;, values) + &quot;)&quot;;
+		}
+
+        /// &lt;summary&gt;
+        /// Escapes a string for use in an SQL query.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The value.&lt;/param&gt;
+        /// &lt;returns&gt;The escaped value.&lt;/returns&gt;
+        /// &lt;remarks&gt;You should use SQL parameters instead.&lt;/remarks&gt;
+        public virtual string EscapeString(string value)
+        {
+            return string.IsNullOrEmpty(value) ? string.Empty : value.Replace(&quot;&#39;&quot;, &quot;&#39;&#39;&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new parameter for use with this specific implementation of ISqlHelper.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parameterName&quot;&gt;Name of the parameter.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;Value of the parameter.&lt;/param&gt;
+        /// &lt;returns&gt;A new parameter of the correct type.&lt;/returns&gt;
+        /// &lt;remarks&gt;Abstract factory pattern&lt;/remarks&gt;
+        public abstract IParameter CreateParameter(string parameterName, object value);
+
+        /// &lt;summary&gt;
+        /// Executes a command that returns a single value.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;The type of the value.&lt;/typeparam&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;The return value of the command.&lt;/returns&gt;
+        /// &lt;exception cref=&quot;umbraco.DataLayer.SqlHelperException&quot;&gt;If a data source error occurs.&lt;/exception&gt;
+        public T ExecuteScalar&lt;T&gt;(string commandText, params IParameter[] parameters)
+        {
+            string commandConverted = ConvertCommand(commandText);
+            P[] parametersConverted = ConvertParameters(parameters);
+            try
+            {
+                return ConvertScalar&lt;T&gt;(ExecuteScalar(commandConverted.TrimToOneLine(), parametersConverted));
+            }
+            catch (Exception e)
+            {
+                LogHelper.Error&lt;SqlHelper&lt;P&gt;&gt;(string.Format(&quot;Error executing query {0}&quot;, commandText), e);
+                throw new SqlHelperException(&quot;ExecuteScalar&quot;, commandText, parameters, e);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Executes a command and returns the number of rows affected.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The number of rows affected by the command.
+        /// &lt;/returns&gt;
+        /// &lt;exception cref=&quot;umbraco.DataLayer.SqlHelperException&quot;&gt;If a data source error occurs.&lt;/exception&gt;
+        public int ExecuteNonQuery(string commandText, params IParameter[] parameters)
+        {
+			string commandConverted = ConvertCommand(commandText);
+            P[] parametersConverted = ConvertParameters(parameters);
+            try
+            {
+                return ExecuteNonQuery(commandConverted.TrimToOneLine(), parametersConverted);
+            }
+            catch (Exception e)
+            {
+                LogHelper.Error&lt;SqlHelper&lt;P&gt;&gt;(string.Format(&quot;Error executing query {0}&quot;, commandText), e);
+                throw new SqlHelperException(&quot;ExecuteNonQuery&quot;, commandText, parameters, e);
+            }
+        }
+        
+        /// &lt;summary&gt;
+        /// Executes a command and returns a records reader containing the results.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A data reader containing the results of the command.
+        /// &lt;/returns&gt;
+        /// &lt;exception cref=&quot;umbraco.DataLayer.SqlHelperException&quot;&gt;If a data source error occurs.&lt;/exception&gt;
+        public IRecordsReader ExecuteReader(string commandText, params IParameter[] parameters)
+        {
+			string commandConverted = ConvertCommand(commandText);
+            P[] parametersConverted = ConvertParameters(parameters);
+            try
+            {
+                return ExecuteReader(commandConverted.TrimToOneLine(), parametersConverted);
+            }
+            catch (Exception e)
+            {
+                LogHelper.Error&lt;SqlHelper&lt;P&gt;&gt;(string.Format(&quot;Error executing query {0}&quot;, commandText), e);
+                throw new SqlHelperException(&quot;ExecuteReader&quot;, commandText, parameters, e);
+            }
+        }
+        
+        /// &lt;summary&gt;
+        /// Executes a command that returns an XML value.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// An XML reader containing the return value.
+        /// &lt;/returns&gt;
+        /// &lt;exception cref=&quot;umbraco.DataLayer.SqlHelperException&quot;&gt;If a data source error occurs.&lt;/exception&gt;
+        public XmlReader ExecuteXmlReader(string commandText, params IParameter[] parameters)
+        {
+			string commandConverted = ConvertCommand(commandText);
+            P[] parametersConverted = ConvertParameters(parameters);
+            try
+            {
+                return ExecuteXmlReader(commandConverted.TrimToOneLine(), parametersConverted);
+            }
+            catch (Exception e)
+            {
+                LogHelper.Error&lt;SqlHelper&lt;P&gt;&gt;(string.Format(&quot;Error executing query {0}&quot;, commandText), e);
+                throw new SqlHelperException(&quot;ExecuteXmlReader&quot;, commandText, parameters, e);
+            }
+        }
+        
+        #endregion
+
+        #region Abstract Query Methods
+
+        /// &lt;summary&gt;
+        /// Executes a command that returns a single value.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;The return value of the command.&lt;/returns&gt;
+        protected abstract object ExecuteScalar(string commandText, P[] parameters);
+
+        /// &lt;summary&gt;
+        /// Executes a command and returns the number of rows affected.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The number of rows affected by the command.
+        /// &lt;/returns&gt;
+        protected abstract int ExecuteNonQuery(string commandText, params P[] parameters);
+
+        /// &lt;summary&gt;
+        /// Executes a command and returns a records reader containing the results.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A data reader containing the results of the command.
+        /// &lt;/returns&gt;
+        protected abstract IRecordsReader ExecuteReader(string commandText, params P[] parameters);
+
+        /// &lt;summary&gt;
+        /// Executes a command that returns an XML value.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// An XML reader containing the return value.
+        /// &lt;/returns&gt;
+        protected virtual XmlReader ExecuteXmlReader(string commandText, params P[] parameters)
+        {
+            var xmlString = (string)ExecuteScalar(commandText, parameters);
+            if (xmlString == null)
+                throw new ArgumentException(&quot;The query didn&#39;t return a value.&quot;);
+
+            return XmlReader.Create(new StringReader(xmlString));
+        }
+
+        #endregion
+
+        #region IDisposable Members
+
+        /// &lt;summary&gt;
+        /// Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
+        /// &lt;/summary&gt;
+        public virtual void Dispose()
+        { }
+
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[47,17,47,18,1],[47,19,47,45,1],[47,46,47,47,1],[56,17,56,18,0],[56,19,56,36,0],[56,37,56,38,0],[66,53,66,81,1],[67,9,67,10,1],[67,11,67,12,1],[74,9,74,71,1],[75,9,75,10,1],[77,13,77,42,1],[78,17,78,69,0],[79,13,79,33,1],[80,17,80,66,1],[83,13,83,51,1],[84,13,84,33,1],[88,17,88,70,1],[90,9,90,10,1],[97,9,97,10,1],[97,9,97,10,1],[98,13,98,23,1],[99,9,99,10,1],[99,9,99,10,1],[109,9,109,10,1],[110,13,110,37,1],[111,17,111,64,0],[112,13,112,32,1],[113,9,113,10,1],[121,9,121,10,1],[123,13,123,36,1],[124,17,124,63,0],[127,13,127,54,1],[128,18,128,31,1],[128,33,128,58,1],[128,60,128,67,1],[129,13,129,14,1],[131,17,131,77,1],[132,17,132,39,1],[133,21,133,202,0],[134,17,134,59,1],[135,13,135,14,1],[136,13,136,30,1],[137,9,137,10,1],[144,9,144,10,1],[145,13,145,107,1],[146,17,146,35,0],[148,13,148,39,1],[150,38,150,85,0],[151,38,151,86,0],[152,26,152,43,1],[154,9,154,10,1],[166,3,166,4,0],[168,4,168,48,0],[169,3,169,4,0],[178,9,178,10,0],[179,13,179,90,0],[180,9,180,10,0],[200,9,200,10,1],[201,13,201,67,1],[202,13,202,69,1],[204,13,204,14,1],[205,17,205,111,1],[207,13,207,32,0],[208,13,208,14,0],[209,17,209,107,0],[210,17,210,91,0],[212,9,212,10,1],[224,9,224,10,0],[225,4,225,58,0],[226,13,226,69,0],[228,13,228,14,0],[229,17,229,95,0],[231,13,231,32,0],[232,13,232,14,0],[233,17,233,107,0],[234,17,234,93,0],[236,9,236,10,0],[248,9,248,10,1],[249,4,249,58,1],[250,13,250,69,1],[252,13,252,14,1],[253,17,253,93,1],[255,13,255,32,0],[256,13,256,14,0],[257,17,257,107,0],[258,17,258,91,0],[260,9,260,10,1],[272,9,272,10,0],[273,4,273,58,0],[274,13,274,69,0],[276,13,276,14,0],[277,17,277,96,0],[279,13,279,32,0],[280,13,280,14,0],[281,17,281,107,0],[282,17,282,94,0],[284,9,284,10,0],[327,9,327,10,0],[328,13,328,76,0],[329,13,329,35,0],[330,17,330,81,0],[332,13,332,66,0],[333,9,333,10,0],[343,9,343,10,1],[343,11,343,12,1]]);
+    </script>
+  </body>
+</html>

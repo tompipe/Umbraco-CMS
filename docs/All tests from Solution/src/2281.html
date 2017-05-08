@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Cache\DictionaryCacheProviderBase.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+
+namespace Umbraco.Core.Cache
+{
+    internal abstract class DictionaryCacheProviderBase : ICacheProvider
+    {
+        // prefix cache keys so we know which one are ours
+        protected const string CacheItemPrefix = &quot;umbrtmche&quot;;
+
+        // an object that represent a value that has not been created yet
+        protected internal static readonly object ValueNotCreated = new object();
+
+        // manupulate the underlying cache entries
+        // these *must* be called from within the appropriate locks
+        // and use the full prefixed cache keys
+        protected abstract IEnumerable&lt;DictionaryEntry&gt; GetDictionaryEntries();
+        protected abstract void RemoveEntry(string key);
+        protected abstract object GetEntry(string key);
+
+        // read-write lock the underlying cache
+        protected abstract IDisposable ReadLock { get; }
+        protected abstract IDisposable WriteLock { get; }
+
+        protected string GetCacheKey(string key)
+        {
+            return string.Format(&quot;{0}-{1}&quot;, CacheItemPrefix, key);
+        }
+
+        protected internal static Lazy&lt;object&gt; GetSafeLazy(Func&lt;object&gt; getCacheItem)
+        {
+            // try to generate the value and if it fails,
+            // wrap in an ExceptionHolder - would be much simpler
+            // to just use lazy.IsValueFaulted alas that field is
+            // internal
+            return new Lazy&lt;object&gt;(() =&gt;
+            {
+                try
+                {
+                    return getCacheItem();
+                }
+                catch (Exception e)
+                {
+                    return new ExceptionHolder(e);
+                }
+            });
+        }
+
+        protected internal static object GetSafeLazyValue(Lazy&lt;object&gt; lazy, bool onlyIfValueIsCreated = false)
+        {
+            // if onlyIfValueIsCreated, do not trigger value creation
+            // must return something, though, to differenciate from null values
+            if (onlyIfValueIsCreated &amp;&amp; lazy.IsValueCreated == false) return ValueNotCreated;
+
+            // if execution has thrown then lazy.IsValueCreated is false
+            // and lazy.IsValueFaulted is true (but internal) so we use our
+            // own exception holder (see Lazy&lt;T&gt; source code) to return null
+            if (lazy.Value is ExceptionHolder) return null;
+
+            // we have a value and execution has not thrown so returning
+            // here does not throw - unless we&#39;re re-entering, take care of it
+            try
+            {
+                return lazy.Value;
+            }
+            catch (InvalidOperationException e)
+            {
+                throw new InvalidOperationException(&quot;The method that computes a value for the cache has tried to read that value from the cache.&quot;, e);
+            }
+        }
+
+        internal class ExceptionHolder
+        {
+            public ExceptionHolder(Exception e)
+            {
+                Exception = e;
+            }
+
+            public Exception Exception { get; private set; }
+        }
+
+        #region Clear
+
+        public virtual void ClearAllCache()
+        {
+            using (WriteLock)
+            {
+                foreach (var entry in GetDictionaryEntries()
+                    .ToArray())
+                    RemoveEntry((string) entry.Key);
+            }
+        }
+
+        public virtual void ClearCacheItem(string key)
+        {
+            var cacheKey = GetCacheKey(key);
+            using (WriteLock)
+            {
+                RemoveEntry(cacheKey);
+            }
+        }
+
+        public virtual void ClearCacheObjectTypes(string typeName)
+        {
+            var type = TypeFinder.GetTypeByName(typeName);
+            if (type == null) return;
+            var isInterface = type.IsInterface;
+            using (WriteLock)
+            {
+                foreach (var entry in GetDictionaryEntries()
+                    .Where(x =&gt;
+                    {
+                        // entry.Value is Lazy&lt;object&gt; and not null, its value may be null
+                        // remove null values as well, does not hurt
+                        // get non-created as NonCreatedValue &amp; exceptions as null
+                        var value = GetSafeLazyValue((Lazy&lt;object&gt;)x.Value, true);
+
+                        // if T is an interface remove anything that implements that interface
+                        // otherwise remove exact types (not inherited types)
+                        return value == null || (isInterface ? (type.IsInstanceOfType(value)) : (value.GetType() == type));
+                    })
+                    .ToArray())
+                    RemoveEntry((string) entry.Key);
+            }
+        }
+
+        public virtual void ClearCacheObjectTypes&lt;T&gt;()
+        {
+            var typeOfT = typeof(T);
+            var isInterface = typeOfT.IsInterface;
+            using (WriteLock)
+            {
+                foreach (var entry in GetDictionaryEntries()
+                    .Where(x =&gt;
+                    {
+                        // entry.Value is Lazy&lt;object&gt; and not null, its value may be null
+                        // remove null values as well, does not hurt
+                        // compare on exact type, don&#39;t use &quot;is&quot;
+                        // get non-created as NonCreatedValue &amp; exceptions as null
+                        var value = GetSafeLazyValue((Lazy&lt;object&gt;)x.Value, true);
+
+                        // if T is an interface remove anything that implements that interface
+                        // otherwise remove exact types (not inherited types)
+                        return value == null || (isInterface ? (value is T) : (value.GetType() == typeOfT));
+                    })
+                    .ToArray())
+                    RemoveEntry((string) entry.Key);
+            }
+        }
+
+        public virtual void ClearCacheObjectTypes&lt;T&gt;(Func&lt;string, T, bool&gt; predicate)
+        {
+            var typeOfT = typeof(T);
+            var isInterface = typeOfT.IsInterface;
+            var plen = CacheItemPrefix.Length + 1;
+            using (WriteLock)
+            {
+                foreach (var entry in GetDictionaryEntries()
+                    .Where(x =&gt;
+                    {
+                        // entry.Value is Lazy&lt;object&gt; and not null, its value may be null
+                        // remove null values as well, does not hurt
+                        // compare on exact type, don&#39;t use &quot;is&quot;
+                        // get non-created as NonCreatedValue &amp; exceptions as null
+                        var value = GetSafeLazyValue((Lazy&lt;object&gt;)x.Value, true);
+                        if (value == null) return true;
+
+                        // if T is an interface remove anything that implements that interface
+                        // otherwise remove exact types (not inherited types)
+                        return (isInterface ? (value is T) : (value.GetType() == typeOfT))
+                               // run predicate on the &#39;public key&#39; part only, ie without prefix
+                               &amp;&amp; predicate(((string) x.Key).Substring(plen), (T) value);
+                    }))
+                    RemoveEntry((string) entry.Key);
+            }
+        }
+
+        public virtual void ClearCacheByKeySearch(string keyStartsWith)
+        {
+            var plen = CacheItemPrefix.Length + 1;
+            using (WriteLock)
+            {
+                foreach (var entry in GetDictionaryEntries()
+                    .Where(x =&gt; ((string)x.Key).Substring(plen).InvariantStartsWith(keyStartsWith))
+                    .ToArray())
+                    RemoveEntry((string) entry.Key);
+            }
+        }
+
+        public virtual void ClearCacheByKeyExpression(string regexString)
+        {
+            var plen = CacheItemPrefix.Length + 1;
+            using (WriteLock)
+            {
+                foreach (var entry in GetDictionaryEntries()
+                    .Where(x =&gt; Regex.IsMatch(((string)x.Key).Substring(plen), regexString))
+                    .ToArray())
+                    RemoveEntry((string) entry.Key);
+            }
+        }
+
+        #endregion
+
+        #region Get
+
+        public virtual IEnumerable&lt;object&gt; GetCacheItemsByKeySearch(string keyStartsWith)
+        {
+            var plen = CacheItemPrefix.Length + 1;
+            IEnumerable&lt;DictionaryEntry&gt; entries;
+            using (ReadLock)
+            {
+                entries = GetDictionaryEntries()
+                    .Where(x =&gt; ((string)x.Key).Substring(plen).InvariantStartsWith(keyStartsWith))
+                    .ToArray(); // evaluate while locked
+            }
+            return entries
+                    .Select(x =&gt; GetSafeLazyValue((Lazy&lt;object&gt;)x.Value)) // return exceptions as null
+                    .Where(x =&gt; x != null); // backward compat, don&#39;t store null values in the cache
+        }
+
+        public virtual IEnumerable&lt;object&gt; GetCacheItemsByKeyExpression(string regexString)
+        {
+            const string prefix = CacheItemPrefix + &quot;-&quot;;
+            var plen = prefix.Length;
+            IEnumerable&lt;DictionaryEntry&gt; entries;
+            using (ReadLock)
+            {
+                entries = GetDictionaryEntries()
+                    .Where(x =&gt; Regex.IsMatch(((string)x.Key).Substring(plen), regexString))
+                    .ToArray(); // evaluate while locked
+            }
+            return entries
+                    .Select(x =&gt; GetSafeLazyValue((Lazy&lt;object&gt;)x.Value)) // return exceptions as null
+                    .Where(x =&gt; x != null); // backward compat, don&#39;t store null values in the cache
+        }
+
+        public virtual object GetCacheItem(string cacheKey)
+        {
+            cacheKey = GetCacheKey(cacheKey);
+            Lazy&lt;object&gt; result;
+            using (ReadLock)
+            {
+                result = GetEntry(cacheKey) as Lazy&lt;object&gt;; // null if key not found
+            }
+            return result == null ? null : GetSafeLazyValue(result); // return exceptions as null
+        }
+
+        public abstract object GetCacheItem(string cacheKey, Func&lt;object&gt; getCacheItem);
+
+        #endregion
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[15,9,15,82,1],[29,9,29,10,1],[30,13,30,67,1],[31,9,31,10,1],[34,9,34,10,1],[39,13,40,13,1],[40,13,40,14,1],[40,14,42,17,1],[42,17,42,18,1],[42,18,43,21,1],[43,21,43,43,1],[43,43,45,17,1],[45,17,45,36,1],[45,36,46,17,1],[46,17,46,18,1],[46,18,47,21,1],[47,21,47,51,1],[47,51,49,13,1],[49,13,49,14,1],[49,14,49,16,1],[39,13,49,16,1],[50,9,50,10,1],[53,9,53,10,1],[56,13,56,70,1],[56,71,56,94,0],[61,13,61,47,1],[61,48,61,60,1],[66,13,66,14,1],[67,17,67,35,1],[69,13,69,48,0],[70,13,70,14,0],[71,17,71,151,0],[73,9,73,10,1],[77,13,77,48,1],[78,13,78,14,1],[79,17,79,31,1],[80,13,80,14,1],[82,42,82,46,1],[82,47,82,59,1],[88,9,88,10,1],[89,13,89,30,1],[90,13,90,14,1],[91,17,91,24,1],[91,26,91,35,1],[91,36,91,38,1],[91,39,92,31,1],[93,21,93,53,1],[94,13,94,14,1],[95,9,95,10,1],[98,9,98,10,1],[99,13,99,45,1],[100,13,100,30,1],[101,13,101,14,1],[102,17,102,39,1],[103,13,103,14,1],[104,9,104,10,1],[107,9,107,10,1],[108,13,108,59,1],[109,13,109,30,1],[109,31,109,38,0],[110,13,110,48,1],[111,13,111,30,1],[112,13,112,14,1],[113,17,113,24,1],[113,26,113,35,1],[113,36,113,38,1],[113,39,115,21,1],[115,21,115,22,1],[115,22,119,25,1],[119,25,119,83,1],[119,83,123,25,1],[123,25,123,124,1],[123,124,124,21,1],[124,21,124,22,1],[124,22,125,31,1],[113,39,125,31,1],[126,21,126,53,1],[127,13,127,14,1],[128,9,128,10,1],[131,9,131,10,1],[132,13,132,37,1],[133,13,133,51,1],[134,13,134,30,1],[135,13,135,14,1],[136,17,136,24,1],[136,26,136,35,1],[136,36,136,38,1],[136,39,138,21,1],[138,21,138,22,1],[138,22,143,25,1],[143,25,143,83,1],[143,83,147,25,1],[147,25,147,109,1],[147,109,148,21,1],[148,21,148,22,1],[148,22,149,31,1],[136,39,149,31,1],[150,21,150,53,1],[151,13,151,14,1],[152,9,152,10,1],[155,9,155,10,0],[156,13,156,37,0],[157,13,157,51,0],[158,13,158,51,0],[159,13,159,30,0],[160,13,160,14,0],[161,17,161,24,0],[161,26,161,35,0],[161,36,161,38,0],[161,39,163,21,0],[163,21,163,22,0],[163,22,168,25,0],[168,25,168,83,0],[168,83,169,25,0],[169,25,169,43,0],[169,43,169,44,0],[169,44,169,56,0],[169,56,173,25,0],[173,25,175,90,0],[175,90,176,21,0],[176,21,176,22,0],[176,22,176,23,0],[161,39,176,23,0],[177,21,177,53,0],[178,13,178,14,0],[179,9,179,10,0],[182,9,182,10,1],[183,13,183,51,1],[184,13,184,30,1],[185,13,185,14,1],[186,17,186,24,1],[186,26,186,35,1],[186,36,186,38,1],[186,39,187,33,1],[187,33,187,99,1],[187,99,188,31,1],[186,39,188,31,1],[189,21,189,53,1],[190,13,190,14,1],[191,9,191,10,1],[194,9,194,10,1],[195,13,195,51,1],[196,13,196,30,1],[197,13,197,14,1],[198,17,198,24,1],[198,26,198,35,1],[198,36,198,38,1],[198,39,199,33,1],[199,33,199,92,1],[199,92,200,31,1],[198,39,200,31,1],[201,21,201,53,1],[202,13,202,14,1],[203,9,203,10,1],[210,9,210,10,1],[211,13,211,51,1],[213,13,213,29,1],[214,13,214,14,1],[215,17,216,33,1],[216,33,216,99,1],[216,99,217,32,1],[215,17,217,32,1],[218,13,218,14,1],[219,13,220,34,1],[220,34,220,73,1],[220,73,221,33,1],[221,33,221,42,1],[221,42,221,44,1],[219,13,221,44,1],[222,9,222,10,1],[225,9,225,10,0],[227,13,227,38,0],[229,13,229,29,0],[230,13,230,14,0],[231,17,232,33,0],[232,33,232,92,0],[232,92,233,32,0],[231,17,233,32,0],[234,13,234,14,0],[235,13,236,34,0],[236,34,236,73,0],[236,73,237,33,0],[237,33,237,42,0],[237,42,237,44,0],[235,13,237,44,0],[238,9,238,10,0],[241,9,241,10,1],[242,13,242,46,1],[244,13,244,29,1],[245,13,245,14,1],[246,17,246,61,1],[247,13,247,14,1],[248,13,248,69,1],[249,9,249,10,1]]);
+    </script>
+  </body>
+</html>

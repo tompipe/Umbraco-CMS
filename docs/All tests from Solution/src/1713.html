@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\LanguageRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents a repository for doing CRUD operations for &lt;see cref=&quot;Language&quot;/&gt;
+    /// &lt;/summary&gt;
+    internal class LanguageRepository : PetaPocoRepositoryBase&lt;int, ILanguage&gt;, ILanguageRepository
+    {
+        public LanguageRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax)
+            : base(work, cache, logger, sqlSyntax)
+        {           
+        }
+
+        private FullDataSetRepositoryCachePolicyFactory&lt;ILanguage, int&gt; _cachePolicyFactory;
+        protected override IRepositoryCachePolicyFactory&lt;ILanguage, int&gt; CachePolicyFactory
+        {
+            get
+            {
+                //Use a FullDataSet cache policy - this will cache the entire GetAll result in a single collection
+                return _cachePolicyFactory ?? (_cachePolicyFactory = new FullDataSetRepositoryCachePolicyFactory&lt;ILanguage, int&gt;(
+                    RuntimeCache, GetEntityId, () =&gt; PerformGetAll(), false));
+            }
+        }
+
+        #region Overrides of RepositoryBase&lt;int,Language&gt;
+
+        protected override ILanguage PerformGet(int id)
+        {
+            //use the underlying GetAll which will force cache all domains
+            return GetAll().FirstOrDefault(x =&gt; x.Id == id);
+        }
+
+        protected override IEnumerable&lt;ILanguage&gt; PerformGetAll(params int[] ids)
+        {
+            var sql = GetBaseQuery(false).Where(&quot;umbracoLanguage.id &gt; 0&quot;);
+            if (ids.Any())
+            {
+                sql.Where(&quot;umbracoLanguage.id in (@ids)&quot;, new { ids = ids });
+            }
+
+            //this needs to be sorted since that is the way legacy worked - default language is the first one!!
+            //even though legacy didn&#39;t sort, it should be by id
+            sql.OrderBy&lt;LanguageDto&gt;(dto =&gt; dto.Id, SqlSyntax);
+
+            
+            return Database.Fetch&lt;LanguageDto&gt;(sql).Select(ConvertFromDto);
+        }
+
+        protected override IEnumerable&lt;ILanguage&gt; PerformGetByQuery(IQuery&lt;ILanguage&gt; query)
+        {
+            var sqlClause = GetBaseQuery(false);
+            var translator = new SqlTranslator&lt;ILanguage&gt;(sqlClause, query);
+            var sql = translator.Translate();
+            return Database.Fetch&lt;LanguageDto&gt;(sql).Select(ConvertFromDto);
+        }
+
+        #endregion
+
+        #region Overrides of PetaPocoRepositoryBase&lt;int,Language&gt;
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+            sql.Select(isCount ? &quot;COUNT(*)&quot; : &quot;*&quot;)
+               .From&lt;LanguageDto&gt;(SqlSyntax);
+            return sql;
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoLanguage.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+
+            var list = new List&lt;string&gt;
+                           {
+                               //NOTE: There is no constraint between the Language and cmsDictionary/cmsLanguageText tables (?)
+                               // but we still need to remove them
+                               &quot;DELETE FROM cmsLanguageText WHERE languageId = @Id&quot;,
+                               &quot;DELETE FROM umbracoLanguage WHERE id = @Id&quot;
+                           };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { throw new NotImplementedException(); }
+        }
+
+        #endregion
+
+        #region Unit of Work Implementation
+
+        protected override void PersistNewItem(ILanguage entity)
+        {
+            ((Entity)entity).AddingEntity();
+
+            var factory = new LanguageFactory();
+            var dto = factory.BuildDto(entity);
+
+            var id = Convert.ToInt32(Database.Insert(dto));
+            entity.Id = id;
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(ILanguage entity)
+        {
+            ((Entity)entity).UpdatingEntity();
+
+            var factory = new LanguageFactory();
+            var dto = factory.BuildDto(entity);
+
+            Database.Update(dto);
+
+            entity.ResetDirtyProperties();
+
+            //Clear the cache entries that exist by key/iso
+            RuntimeCache.ClearCacheItem(GetCacheIdKey&lt;ILanguage&gt;(entity.IsoCode));
+            RuntimeCache.ClearCacheItem(GetCacheIdKey&lt;ILanguage&gt;(entity.CultureName));
+        }
+
+        protected override void PersistDeletedItem(ILanguage entity)
+        {
+            base.PersistDeletedItem(entity);
+
+            //Clear the cache entries that exist by key/iso
+            RuntimeCache.ClearCacheItem(GetCacheIdKey&lt;ILanguage&gt;(entity.IsoCode));
+            RuntimeCache.ClearCacheItem(GetCacheIdKey&lt;ILanguage&gt;(entity.CultureName));
+        }
+
+        #endregion
+
+        protected ILanguage ConvertFromDto(LanguageDto dto)
+        {
+            var factory = new LanguageFactory();
+            var entity = factory.BuildEntity(dto);
+            return entity;
+        }
+
+        public ILanguage GetByCultureName(string cultureName)
+        {
+            //use the underlying GetAll which will force cache all languages
+            return GetAll().FirstOrDefault(x =&gt; x.CultureName.InvariantEquals(cultureName));
+        }
+
+        public ILanguage GetByIsoCode(string isoCode)
+        {
+            //use the underlying GetAll which will force cache all languages
+            return GetAll().FirstOrDefault(x =&gt; x.IsoCode.InvariantEquals(isoCode));
+        }
+
+   
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[23,15,23,51,1],[24,9,24,10,1],[25,9,25,10,1],[31,13,31,14,1],[33,17,34,54,1],[34,54,34,69,1],[34,69,34,79,1],[33,17,34,79,1],[35,13,35,14,1],[41,9,41,10,0],[43,13,43,49,0],[43,49,43,59,0],[43,59,43,61,0],[43,13,43,61,0],[44,9,44,10,0],[47,9,47,10,1],[48,13,48,75,1],[49,13,49,27,1],[50,13,50,14,0],[51,17,51,78,0],[52,13,52,14,0],[56,13,56,64,1],[59,13,59,76,1],[60,9,60,10,1],[63,9,63,10,1],[64,13,64,49,1],[65,13,65,77,1],[66,13,66,46,1],[67,13,67,76,1],[68,9,68,10,1],[75,9,75,10,1],[76,13,76,33,1],[77,13,78,46,1],[79,13,79,24,1],[80,9,80,10,1],[83,9,83,10,0],[84,13,84,47,0],[85,9,85,10,0],[88,9,88,10,1],[90,13,96,30,1],[97,13,97,25,1],[98,9,98,10,1],[102,17,102,18,0],[102,19,102,55,0],[110,9,110,10,1],[111,13,111,45,1],[113,13,113,49,1],[114,13,114,48,1],[116,13,116,60,1],[117,13,117,28,1],[119,13,119,43,1],[120,9,120,10,1],[123,9,123,10,1],[124,13,124,47,1],[126,13,126,49,1],[127,13,127,48,1],[129,13,129,34,1],[131,13,131,43,1],[134,13,134,83,1],[135,13,135,87,1],[136,9,136,10,1],[139,9,139,10,1],[140,13,140,45,1],[143,13,143,83,1],[144,13,144,87,1],[145,9,145,10,1],[150,9,150,10,1],[151,13,151,49,1],[152,13,152,51,1],[153,13,153,27,1],[154,9,154,10,1],[157,9,157,10,1],[159,13,159,49,1],[159,49,159,91,1],[159,91,159,93,1],[159,13,159,93,1],[160,9,160,10,1],[163,9,163,10,1],[165,13,165,49,1],[165,49,165,83,1],[165,83,165,85,1],[165,13,165,85,1],[166,9,166,10,1]]);
+    </script>
+  </body>
+</html>

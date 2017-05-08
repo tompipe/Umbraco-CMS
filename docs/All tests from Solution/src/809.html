@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\WebApi\Filters\ContentItemValidationHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Web.Http.Controllers;
+using System.Web.Http.ModelBinding;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Web.Models.ContentEditing;
+
+namespace Umbraco.Web.WebApi.Filters
+{
+    /// &lt;summary&gt;
+    /// A validation helper class used with ContentItemValidationFilterAttribute to be shared between content, media, etc...
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name=&quot;TPersisted&quot;&gt;&lt;/typeparam&gt;
+    /// &lt;typeparam name=&quot;TModelSave&quot;&gt;&lt;/typeparam&gt;
+    /// &lt;remarks&gt;
+    /// If any severe errors occur then the response gets set to an error and execution will not continue. Property validation
+    /// errors will just be added to the ModelState.
+    /// &lt;/remarks&gt;
+    internal class ContentItemValidationHelper&lt;TPersisted, TModelSave&gt;
+        where TPersisted : class, IContentBase
+        where TModelSave : ContentBaseItemSave&lt;TPersisted&gt;
+    {
+     
+        public void ValidateItem(HttpActionContext actionContext, string argumentName)
+        {
+            var contentItem = actionContext.ActionArguments[argumentName] as TModelSave;
+            if (contentItem == null)
+            {
+                actionContext.Response = actionContext.Request.CreateErrorResponse(HttpStatusCode.BadRequest, &quot;No &quot; + typeof(TModelSave) + &quot; found in request&quot;);
+                return;
+            }
+
+            ValidateItem(actionContext, contentItem);
+
+        }
+
+        public void ValidateItem(HttpActionContext actionContext, TModelSave contentItem)
+        {
+            //now do each validation step
+            if (ValidateExistingContent(contentItem, actionContext) == false) return;
+            if (ValidateProperties(contentItem, actionContext) == false) return;
+            if (ValidatePropertyData(contentItem, actionContext) == false) return;
+        }
+
+        /// &lt;summary&gt;
+        /// Ensure the content exists
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;postedItem&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;actionContext&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected virtual bool ValidateExistingContent(ContentItemBasic&lt;ContentPropertyBasic, TPersisted&gt; postedItem, HttpActionContext actionContext)
+        {
+            if (postedItem.PersistedContent == null)
+            {
+                var message = string.Format(&quot;content with id: {0} was not found&quot;, postedItem.Id);
+                actionContext.Response = actionContext.Request.CreateErrorResponse(HttpStatusCode.NotFound, message);
+                return false;
+            }
+
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Ensure all of the ids in the post are valid
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;postedItem&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;actionContext&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected virtual bool ValidateProperties(ContentItemBasic&lt;ContentPropertyBasic, TPersisted&gt; postedItem, HttpActionContext actionContext)
+        {
+            return ValidateProperties(postedItem.Properties.ToArray(), postedItem.PersistedContent.Properties.ToArray(), actionContext);
+        }
+
+        /// &lt;summary&gt;
+        /// This validates that all of the posted properties exist on the persisted entity
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;postedProperties&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;persistedProperties&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;actionContext&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected bool ValidateProperties(ContentPropertyBasic[] postedProperties , Property[] persistedProperties, HttpActionContext actionContext)
+        {
+            foreach (var p in postedProperties)
+            {
+                if (persistedProperties.Any(property =&gt; property.Alias == p.Alias) == false)
+                {
+                    //TODO: Do we return errors here ? If someone deletes a property whilst their editing then should we just
+                    //save the property data that remains? Or inform them they need to reload... not sure. This problem exists currently too i think.
+
+                    var message = string.Format(&quot;property with alias: {0} was not found&quot;, p.Alias);
+                    actionContext.Response = actionContext.Request.CreateErrorResponse(HttpStatusCode.NotFound, new InvalidOperationException(message));
+                    return false;
+                }
+
+            }
+            return true;
+        } 
+
+        /// &lt;summary&gt;
+        /// Validates the data for each property
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;postedItem&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;actionContext&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// All property data validation goes into the modelstate with a prefix of &quot;Properties&quot;
+        /// &lt;/remarks&gt;
+        protected virtual bool ValidatePropertyData(ContentItemBasic&lt;ContentPropertyBasic, TPersisted&gt; postedItem, HttpActionContext actionContext)
+        {
+            foreach (var p in postedItem.ContentDto.Properties)
+            {
+                var editor = p.PropertyEditor;
+                if (editor == null)
+                {
+                    var message = string.Format(&quot;The property editor with alias: {0} was not found for property with id {1}&quot;, p.DataType.PropertyEditorAlias, p.Id);
+                    LogHelper.Warn&lt;ContentItemValidationHelper&lt;TPersisted, TModelSave&gt;&gt;(message);
+                    //actionContext.Response = actionContext.Request.CreateErrorResponse(HttpStatusCode.NotFound, message);
+                    //return false;
+                    continue;
+                }
+
+                //get the posted value for this property
+                var postedValue = postedItem.Properties.Single(x =&gt; x.Alias == p.Alias).Value;
+
+                //get the pre-values for this property
+                var preValues = p.PreValues;
+
+                //TODO: when we figure out how to &#39;override&#39; certain pre-value properties we&#39;ll either need to:
+                // * Combine the preValues with the overridden values stored with the document type property (but how to combine?)
+                // * Or, pass in the overridden values stored with the doc type property separately
+
+                foreach (var result in editor.ValueEditor.Validators.SelectMany(v =&gt; v.Validate(postedValue, preValues, editor)))
+                {
+                    actionContext.ModelState.AddPropertyError(result, p.Alias);
+                }
+
+                //Now we need to validate the property based on the PropertyType validation (i.e. regex and required)
+                // NOTE: These will become legacy once we have pre-value overrides.
+                if (p.IsRequired)
+                {
+                    foreach (var result in p.PropertyEditor.ValueEditor.RequiredValidator.Validate(postedValue, &quot;&quot;, preValues, editor))
+                    {
+                        actionContext.ModelState.AddPropertyError(result, p.Alias);
+                    }
+                }
+
+                if (p.ValidationRegExp.IsNullOrWhiteSpace() == false)
+                {
+
+                    //We only want to execute the regex statement if:
+                    // * the value is null or empty AND it is required OR
+                    // * the value is not null or empty
+                    //See: http://issues.umbraco.org/issue/U4-4669
+
+                    var asString = postedValue as string;
+
+                    if (
+                        //Value is not null or empty
+                        (postedValue != null &amp;&amp; asString.IsNullOrWhiteSpace() == false)
+                        //It&#39;s required
+                        || (p.IsRequired))
+                    {
+                        foreach (var result in p.PropertyEditor.ValueEditor.RegexValidator.Validate(postedValue, p.ValidationRegExp, preValues, editor))
+                        {
+                            actionContext.ModelState.AddPropertyError(result, p.Alias);
+                        }
+                    }
+                    
+                }
+            }
+
+            return actionContext.ModelState.IsValid;
+        }
+
+        
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[31,9,31,10,0],[32,13,32,89,0],[33,13,33,37,0],[34,13,34,14,0],[35,17,35,161,0],[36,17,36,24,0],[39,13,39,54,0],[41,9,41,10,0],[44,9,44,10,0],[46,13,46,78,0],[46,79,46,86,0],[47,13,47,73,0],[47,74,47,81,0],[48,13,48,75,0],[48,76,48,83,0],[49,9,49,10,0],[58,9,58,10,0],[59,13,59,53,0],[60,13,60,14,0],[61,17,61,98,0],[62,17,62,118,0],[63,17,63,30,0],[66,13,66,25,0],[67,9,67,10,0],[76,9,76,10,0],[77,13,77,137,0],[78,9,78,10,0],[88,9,88,10,0],[89,13,89,20,0],[89,22,89,27,0],[89,28,89,30,0],[89,31,89,47,0],[90,13,90,14,0],[91,17,91,57,0],[91,57,91,82,0],[91,82,91,93,0],[91,17,91,93,0],[92,17,92,18,0],[96,21,96,100,0],[97,21,97,153,0],[98,21,98,34,0],[101,13,101,14,0],[102,13,102,25,0],[103,9,103,10,0],[115,9,115,10,0],[116,13,116,20,0],[116,22,116,27,0],[116,28,116,30,0],[116,31,116,63,0],[117,13,117,14,0],[118,17,118,47,0],[119,17,119,36,0],[120,17,120,18,0],[121,21,121,165,0],[122,21,122,98,0],[125,21,125,30,0],[129,17,129,69,0],[129,69,129,87,0],[129,87,129,95,0],[129,17,129,95,0],[132,17,132,45,0],[138,17,138,24,0],[138,26,138,36,0],[138,37,138,39,0],[138,40,138,86,0],[138,86,138,128,0],[138,128,138,129,0],[138,40,138,129,0],[139,17,139,18,0],[140,21,140,80,0],[141,17,141,18,0],[145,17,145,34,0],[146,17,146,18,0],[147,21,147,28,0],[147,30,147,40,0],[147,41,147,43,0],[147,44,147,135,0],[148,21,148,22,0],[149,25,149,84,0],[150,21,150,22,0],[151,17,151,18,0],[153,17,153,70,0],[154,17,154,18,0],[161,21,161,58,0],[163,21,167,43,0],[168,21,168,22,0],[169,25,169,32,0],[169,34,169,44,0],[169,45,169,47,0],[169,48,169,152,0],[170,25,170,26,0],[171,29,171,88,0],[172,25,172,26,0],[173,21,173,22,0],[175,17,175,18,0],[176,13,176,14,0],[178,13,178,53,0],[179,9,179,10,0]]);
+    </script>
+  </body>
+</html>

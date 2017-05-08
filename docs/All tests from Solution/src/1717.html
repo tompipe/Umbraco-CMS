@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\MemberRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Xml.Linq;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents a repository for doing CRUD operations for &lt;see cref=&quot;IMember&quot;/&gt;
+    /// &lt;/summary&gt;
+    internal class MemberRepository : VersionableRepositoryBase&lt;int, IMember&gt;, IMemberRepository
+    {
+        private readonly IMemberTypeRepository _memberTypeRepository;
+        private readonly ITagRepository _tagRepository;
+        private readonly IMemberGroupRepository _memberGroupRepository;
+        private readonly ContentXmlRepository&lt;IMember&gt; _contentXmlRepository;
+        private readonly ContentPreviewRepository&lt;IMember&gt; _contentPreviewRepository;
+
+        public MemberRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax, IMemberTypeRepository memberTypeRepository, IMemberGroupRepository memberGroupRepository, ITagRepository tagRepository, IContentSection contentSection)
+            : base(work, cache, logger, sqlSyntax, contentSection)
+        {
+            if (memberTypeRepository == null) throw new ArgumentNullException(&quot;memberTypeRepository&quot;);
+            if (tagRepository == null) throw new ArgumentNullException(&quot;tagRepository&quot;);
+            _memberTypeRepository = memberTypeRepository;
+            _tagRepository = tagRepository;
+            _memberGroupRepository = memberGroupRepository;
+            _contentXmlRepository = new ContentXmlRepository&lt;IMember&gt;(work, CacheHelper.CreateDisabledCacheHelper(), logger, sqlSyntax);
+            _contentPreviewRepository = new ContentPreviewRepository&lt;IMember&gt;(work, CacheHelper.CreateDisabledCacheHelper(), logger, sqlSyntax);
+        }
+
+        #region Overrides of RepositoryBase&lt;int, IMembershipUser&gt;
+
+        protected override IMember PerformGet(int id)
+        {
+            var sql = GetBaseQuery(false);
+            sql.Where(GetBaseWhereClause(), new { Id = id });
+            sql.OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate, SqlSyntax);
+
+            var dto = Database.Fetch&lt;MemberDto, ContentVersionDto, ContentDto, NodeDto&gt;(SqlSyntax.SelectTop(sql, 1)).FirstOrDefault();
+
+            if (dto == null)
+                return null;
+
+            var content = CreateMemberFromDto(dto, sql);
+
+            return content;
+
+        }
+
+        protected override IEnumerable&lt;IMember&gt; PerformGetAll(params int[] ids)
+        {
+            var sql = GetBaseQuery(false);
+            if (ids.Any())
+            {
+                sql.Where(&quot;umbracoNode.id in (@ids)&quot;, new { ids = ids });
+            }
+
+            return ProcessQuery(sql, new PagingSqlQuery(sql));
+
+        }
+
+        protected override IEnumerable&lt;IMember&gt; PerformGetByQuery(IQuery&lt;IMember&gt; query)
+        {
+            var baseQuery = GetBaseQuery(false);
+
+            //check if the query is based on properties or not
+
+            var wheres = query.GetWhereClauses();
+            //this is a pretty rudimentary check but wil work, we just need to know if this query requires property
+            // level queries
+            if (wheres.Any(x =&gt; x.Item1.Contains(&quot;cmsPropertyType&quot;)))
+            {
+                var sqlWithProps = GetNodeIdQueryWithPropertyData();
+                var translator = new SqlTranslator&lt;IMember&gt;(sqlWithProps, query);
+                var sql = translator.Translate();
+
+                baseQuery.Append(new Sql(&quot;WHERE umbracoNode.id IN (&quot; + sql.SQL + &quot;)&quot;, sql.Arguments))
+                    .OrderBy&lt;NodeDto&gt;(x =&gt; x.SortOrder);
+
+                return ProcessQuery(baseQuery, new PagingSqlQuery(baseQuery));
+            }
+            else
+            {
+                var translator = new SqlTranslator&lt;IMember&gt;(baseQuery, query);
+                var sql = translator.Translate()
+                    .OrderBy&lt;NodeDto&gt;(x =&gt; x.SortOrder);
+
+                return ProcessQuery(sql, new PagingSqlQuery(sql));
+            }
+
+        }
+
+        #endregion
+
+        #region Overrides of PetaPocoRepositoryBase&lt;int,IMembershipUser&gt;
+
+        protected override Sql GetBaseQuery(BaseQueryType queryType)
+        {
+            var sql = new Sql();
+            sql.Select(queryType == BaseQueryType.Count ? &quot;COUNT(*)&quot; : (queryType == BaseQueryType.Ids ? &quot;cmsMember.nodeId&quot; : &quot;*&quot;))
+                .From&lt;MemberDto&gt;(SqlSyntax)
+                .InnerJoin&lt;ContentVersionDto&gt;(SqlSyntax)
+                .On&lt;ContentVersionDto, MemberDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                .On&lt;ContentVersionDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                //We&#39;re joining the type so we can do a query against the member type - not sure if this adds much overhead or not?
+                // the execution plan says it doesn&#39;t so we&#39;ll go with that and in that case, it might be worth joining the content
+                // types by default on the document and media repo&#39;s so we can query by content type there too.
+                .InnerJoin&lt;ContentTypeDto&gt;(SqlSyntax)
+                .On&lt;ContentTypeDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.ContentTypeId)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;ContentDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId, SqlSyntax);
+            return sql;
+        }
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            return GetBaseQuery(isCount ? BaseQueryType.Count : BaseQueryType.FullSingle);
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoNode.id = @Id&quot;;
+        }
+
+        protected Sql GetNodeIdQueryWithPropertyData()
+        {
+            var sql = new Sql();
+            sql.Select(&quot;DISTINCT(umbracoNode.id)&quot;)
+                .From&lt;NodeDto&gt;()
+                .InnerJoin&lt;ContentDto&gt;().On&lt;ContentDto, NodeDto&gt;(left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;ContentTypeDto&gt;().On&lt;ContentTypeDto, ContentDto&gt;(left =&gt; left.NodeId, right =&gt; right.ContentTypeId)
+                .InnerJoin&lt;ContentVersionDto&gt;().On&lt;ContentVersionDto, NodeDto&gt;(left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;MemberDto&gt;().On&lt;MemberDto, ContentDto&gt;(left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .LeftJoin&lt;PropertyTypeDto&gt;().On&lt;PropertyTypeDto, ContentDto&gt;(left =&gt; left.ContentTypeId, right =&gt; right.ContentTypeId)
+                .LeftJoin&lt;DataTypeDto&gt;().On&lt;DataTypeDto, PropertyTypeDto&gt;(left =&gt; left.DataTypeId, right =&gt; right.DataTypeId)
+                .LeftJoin&lt;PropertyDataDto&gt;().On&lt;PropertyDataDto, PropertyTypeDto&gt;(left =&gt; left.PropertyTypeId, right =&gt; right.Id)
+                .Append(&quot;AND cmsPropertyData.versionId = cmsContentVersion.VersionId&quot;)
+                .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId);
+            return sql;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            var list = new List&lt;string&gt;
+                           {
+                               &quot;DELETE FROM cmsTask WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodeNotify WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodePermission WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoRelation WHERE parentId = @Id&quot;,
+                               &quot;DELETE FROM umbracoRelation WHERE childId = @Id&quot;,
+                               &quot;DELETE FROM cmsTagRelationship WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsPropertyData WHERE contentNodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsMember2MemberGroup WHERE Member = @Id&quot;,
+                               &quot;DELETE FROM cmsMember WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentVersion WHERE ContentId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentXml WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContent WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoNode WHERE id = @Id&quot;
+                           };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { return new Guid(Constants.ObjectTypes.Member); }
+        }
+
+        #endregion
+
+        #region Unit of Work Implementation
+
+        protected override void PersistNewItem(IMember entity)
+        {
+            ((Member)entity).AddingEntity();
+
+            //Ensure that strings don&#39;t contain characters that are invalid in XML
+            entity.SanitizeEntityPropertiesForXmlStorage();
+
+            var factory = new MemberFactory(NodeObjectTypeId, entity.Id);
+            var dto = factory.BuildDto(entity);
+
+            //NOTE Should the logic below have some kind of fallback for empty parent ids ?
+            //Logic for setting Path, Level and SortOrder
+            var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = ((IUmbracoEntity)entity).ParentId });
+            int level = parent.Level + 1;
+            int sortOrder =
+                Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM umbracoNode WHERE parentID = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                                                      new { ParentId = ((IUmbracoEntity)entity).ParentId, NodeObjectType = NodeObjectTypeId });
+
+            //Create the (base) node data - umbracoNode
+            var nodeDto = dto.ContentVersionDto.ContentDto.NodeDto;
+            nodeDto.Path = parent.Path;
+            nodeDto.Level = short.Parse(level.ToString(CultureInfo.InvariantCulture));
+            nodeDto.SortOrder = sortOrder;
+            var o = Database.IsNew(nodeDto) ? Convert.ToInt32(Database.Insert(nodeDto)) : Database.Update(nodeDto);
+
+            //Update with new correct path
+            nodeDto.Path = string.Concat(parent.Path, &quot;,&quot;, nodeDto.NodeId);
+            Database.Update(nodeDto);
+
+            //Update entity with correct values
+            entity.Id = nodeDto.NodeId; //Set Id on entity to ensure an Id is set
+            entity.Path = nodeDto.Path;
+            entity.SortOrder = sortOrder;
+            entity.Level = level;
+
+            //Create the Content specific data - cmsContent
+            var contentDto = dto.ContentVersionDto.ContentDto;
+            contentDto.NodeId = nodeDto.NodeId;
+            Database.Insert(contentDto);
+
+            //Create the first version - cmsContentVersion
+            //Assumes a new Version guid and Version date (modified date) has been set
+            dto.ContentVersionDto.NodeId = nodeDto.NodeId;
+            Database.Insert(dto.ContentVersionDto);
+
+            //Create the first entry in cmsMember
+            dto.NodeId = nodeDto.NodeId;
+            Database.Insert(dto);
+
+            //Create the PropertyData for this version - cmsPropertyData
+            var propertyFactory = new PropertyFactory(entity.ContentType.CompositionPropertyTypes.ToArray(), entity.Version, entity.Id);
+            //Add Properties
+            // - don&#39;t try to save the property if it doesn&#39;t exist (or doesn&#39;t have an ID) on the content type
+            // - this can occur if the member type doesn&#39;t contain the built-in properties that the
+            // - member object contains.        
+            var propsToPersist = entity.Properties.Where(x =&gt; x.PropertyType.HasIdentity).ToArray();
+            var propertyDataDtos = propertyFactory.BuildDto(propsToPersist);
+            var keyDictionary = new Dictionary&lt;int, int&gt;();
+
+            //Add Properties
+            foreach (var propertyDataDto in propertyDataDtos)
+            {
+                var primaryKey = Convert.ToInt32(Database.Insert(propertyDataDto));
+                keyDictionary.Add(propertyDataDto.PropertyTypeId, primaryKey);
+            }
+
+            //Update Properties with its newly set Id
+            foreach (var property in propsToPersist)
+            {
+                property.Id = keyDictionary[property.PropertyTypeId];
+            }
+
+            UpdatePropertyTags(entity, _tagRepository);
+
+            ((Member)entity).ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(IMember entity)
+        {
+            //Updates Modified date
+            ((Member)entity).UpdatingEntity();
+
+            //Ensure that strings don&#39;t contain characters that are invalid in XML
+            entity.SanitizeEntityPropertiesForXmlStorage();
+
+            var dirtyEntity = (ICanBeDirty)entity;
+
+            //Look up parent to get and set the correct Path and update SortOrder if ParentId has changed
+            if (dirtyEntity.IsPropertyDirty(&quot;ParentId&quot;))
+            {
+                var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = ((IUmbracoEntity)entity).ParentId });
+                ((IUmbracoEntity)entity).Path = string.Concat(parent.Path, &quot;,&quot;, entity.Id);
+                ((IUmbracoEntity)entity).Level = parent.Level + 1;
+                var maxSortOrder =
+                    Database.ExecuteScalar&lt;int&gt;(
+                        &quot;SELECT coalesce(max(sortOrder),0) FROM umbracoNode WHERE parentid = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                        new { ParentId = ((IUmbracoEntity)entity).ParentId, NodeObjectType = NodeObjectTypeId });
+                ((IUmbracoEntity)entity).SortOrder = maxSortOrder + 1;
+            }
+
+            var factory = new MemberFactory(NodeObjectTypeId, entity.Id);
+            //Look up Content entry to get Primary for updating the DTO
+            var contentDto = Database.SingleOrDefault&lt;ContentDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = entity.Id });
+            factory.SetPrimaryKey(contentDto.PrimaryKey);
+            var dto = factory.BuildDto(entity);
+
+            //Updates the (base) node data - umbracoNode
+            var nodeDto = dto.ContentVersionDto.ContentDto.NodeDto;
+            var o = Database.Update(nodeDto);
+
+            //Only update this DTO if the contentType has actually changed
+            if (contentDto.ContentTypeId != ((Member)entity).ContentTypeId)
+            {
+                //Create the Content specific data - cmsContent
+                var newContentDto = dto.ContentVersionDto.ContentDto;
+                Database.Update(newContentDto);
+            }
+
+            //In order to update the ContentVersion we need to retrieve its primary key id
+            var contentVerDto = Database.SingleOrDefault&lt;ContentVersionDto&gt;(&quot;WHERE VersionId = @Version&quot;, new { Version = entity.Version });
+            dto.ContentVersionDto.Id = contentVerDto.Id;
+            //Updates the current version - cmsContentVersion
+            //Assumes a Version guid exists and Version date (modified date) has been set/updated
+            Database.Update(dto.ContentVersionDto);
+
+            //Updates the cmsMember entry if it has changed
+
+            //NOTE: these cols are the REAL column names in the db
+            var changedCols = new List&lt;string&gt;();
+
+            if (dirtyEntity.IsPropertyDirty(&quot;Email&quot;))
+            {
+                changedCols.Add(&quot;Email&quot;);
+            }
+            if (dirtyEntity.IsPropertyDirty(&quot;Username&quot;))
+            {
+                changedCols.Add(&quot;LoginName&quot;);
+            }
+            // DO NOT update the password if it has not changed or if it is null or empty
+            if (dirtyEntity.IsPropertyDirty(&quot;RawPasswordValue&quot;) &amp;&amp; entity.RawPasswordValue.IsNullOrWhiteSpace() == false)
+            {
+                changedCols.Add(&quot;Password&quot;);
+            }
+            //only update the changed cols
+            if (changedCols.Count &gt; 0)
+            {
+                Database.Update(dto, changedCols);
+            }
+
+            //TODO ContentType for the Member entity
+
+            //Create the PropertyData for this version - cmsPropertyData
+            var propertyFactory = new PropertyFactory(entity.ContentType.CompositionPropertyTypes.ToArray(), entity.Version, entity.Id);
+            var keyDictionary = new Dictionary&lt;int, int&gt;();
+
+            //Add Properties
+            // - don&#39;t try to save the property if it doesn&#39;t exist (or doesn&#39;t have an ID) on the content type
+            // - this can occur if the member type doesn&#39;t contain the built-in properties that the
+            // - member object contains.            
+            var propsToPersist = entity.Properties.Where(x =&gt; x.PropertyType.HasIdentity).ToArray();
+
+            var propertyDataDtos = propertyFactory.BuildDto(propsToPersist);
+
+            foreach (var propertyDataDto in propertyDataDtos)
+            {
+                if (propertyDataDto.Id &gt; 0)
+                {
+                    Database.Update(propertyDataDto);
+                }
+                else
+                {
+                    int primaryKey = Convert.ToInt32(Database.Insert(propertyDataDto));
+                    keyDictionary.Add(propertyDataDto.PropertyTypeId, primaryKey);
+                }
+            }
+
+            //Update Properties with its newly set Id
+            if (keyDictionary.Any())
+            {
+                foreach (var property in ((Member)entity).Properties)
+                {
+                    if (keyDictionary.ContainsKey(property.PropertyTypeId) == false) continue;
+
+                    property.Id = keyDictionary[property.PropertyTypeId];
+                }
+            }
+
+            UpdatePropertyTags(entity, _tagRepository);
+
+            dirtyEntity.ResetDirtyProperties();
+        }
+
+        #endregion
+
+        #region Overrides of VersionableRepositoryBase&lt;IMembershipUser&gt;
+
+        public override IEnumerable&lt;IMember&gt; GetAllVersions(int id)
+        {
+            var sql = GetBaseQuery(false)
+                .Where(GetBaseWhereClause(), new { Id = id })
+                .OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate, SqlSyntax);
+            return ProcessQuery(sql, new PagingSqlQuery(sql), true);
+        }        
+
+        public void RebuildXmlStructures(Func&lt;IMember, XElement&gt; serializer, int groupSize = 200, IEnumerable&lt;int&gt; contentTypeIds = null)
+        {
+            // the previous way of doing this was to run it all in one big transaction,
+            // and to bulk-insert groups of xml rows - which works, until the transaction
+            // times out - and besides, because v7 transactions are ReadCommited, it does
+            // not bring much safety - so this reverts to updating each record individually,
+            // and it may be slower in the end, but should be more resilient.
+
+            var baseId = 0;
+            var contentTypeIdsA = contentTypeIds == null ? new int[0] : contentTypeIds.ToArray();
+            while (true)
+            {
+                // get the next group of nodes
+                var query = GetBaseQuery(false);
+                if (contentTypeIdsA.Length &gt; 0)
+                    query = query
+                        .WhereIn&lt;ContentDto&gt;(x =&gt; x.ContentTypeId, contentTypeIdsA, SqlSyntax);
+                query = query
+                    .Where&lt;NodeDto&gt;(x =&gt; x.NodeId &gt; baseId)
+                    .OrderBy&lt;NodeDto&gt;(x =&gt; x.NodeId, SqlSyntax);
+                var sql = SqlSyntax.SelectTop(query, groupSize);
+                var xmlItems = ProcessQuery(sql, new PagingSqlQuery(sql))
+                    .Select(x =&gt; new ContentXmlDto { NodeId = x.Id, Xml = serializer(x).ToString() })
+                    .ToList();
+
+                // no more nodes, break
+                if (xmlItems.Count == 0) break;
+
+                foreach (var xmlItem in xmlItems)
+                {
+                    try
+                    {
+                        // InsertOrUpdate tries to update first, which is good since it is what
+                        // should happen in most cases, then it tries to insert, and it should work
+                        // unless the node has been deleted, and we just report the exception
+                        Database.InsertOrUpdate(xmlItem);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.Error&lt;MediaRepository&gt;(&quot;Could not rebuild XML for nodeId=&quot; + xmlItem.NodeId, e);
+                    }
+                }
+                baseId = xmlItems.Last().NodeId;
+            }
+        }
+
+        public override IMember GetByVersion(Guid versionId)
+        {
+            var sql = GetBaseQuery(false);
+            sql.Where(&quot;cmsContentVersion.VersionId = @VersionId&quot;, new { VersionId = versionId });
+            sql.OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate);
+
+            var dto = Database.Fetch&lt;MemberDto, ContentVersionDto, ContentDto, NodeDto&gt;(sql).FirstOrDefault();
+
+            if (dto == null)
+                return null;
+
+            var memberType = _memberTypeRepository.Get(dto.ContentVersionDto.ContentDto.ContentTypeId);
+
+            var factory = new MemberFactory(memberType, NodeObjectTypeId, dto.NodeId);
+            var member = factory.BuildEntity(dto);
+
+            var properties = GetPropertyCollection(new PagingSqlQuery(sql), new[] { new DocumentDefinition(dto.ContentVersionDto, memberType) });
+
+            member.Properties = properties[dto.ContentVersionDto.VersionId];
+
+            //on initial construction we don&#39;t want to have dirty properties tracked
+            // http://issues.umbraco.org/issue/U4-1946
+            ((Entity)member).ResetDirtyProperties(false);
+            return member;
+
+        }
+
+        protected override void PerformDeleteVersion(int id, Guid versionId)
+        {
+            Database.Delete&lt;PreviewXmlDto&gt;(&quot;WHERE nodeId = @Id AND versionId = @VersionId&quot;, new { Id = id, VersionId = versionId });
+            Database.Delete&lt;PropertyDataDto&gt;(&quot;WHERE contentNodeId = @Id AND versionId = @VersionId&quot;, new { Id = id, VersionId = versionId });
+            Database.Delete&lt;ContentVersionDto&gt;(&quot;WHERE ContentId = @Id AND VersionId = @VersionId&quot;, new { Id = id, VersionId = versionId });
+        }
+
+        #endregion
+
+        public IEnumerable&lt;IMember&gt; FindMembersInRole(string roleName, string usernameToMatch, StringPropertyMatchType matchType = StringPropertyMatchType.StartsWith)
+        {
+            //get the group id
+            var grpQry = new Query&lt;IMemberGroup&gt;().Where(group =&gt; group.Name.Equals(roleName));
+            var memberGroup = _memberGroupRepository.GetByQuery(grpQry).FirstOrDefault();
+            if (memberGroup == null) return Enumerable.Empty&lt;IMember&gt;();
+
+            // get the members by username
+            var query = new Query&lt;IMember&gt;();
+            switch (matchType)
+            {
+                case StringPropertyMatchType.Exact:
+                    query.Where(member =&gt; member.Username.Equals(usernameToMatch));
+                    break;
+                case StringPropertyMatchType.Contains:
+                    query.Where(member =&gt; member.Username.Contains(usernameToMatch));
+                    break;
+                case StringPropertyMatchType.StartsWith:
+                    query.Where(member =&gt; member.Username.StartsWith(usernameToMatch));
+                    break;
+                case StringPropertyMatchType.EndsWith:
+                    query.Where(member =&gt; member.Username.EndsWith(usernameToMatch));
+                    break;
+                case StringPropertyMatchType.Wildcard:
+                    query.Where(member =&gt; member.Username.SqlWildcard(usernameToMatch, TextColumnType.NVarchar));
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(&quot;matchType&quot;);
+            }
+            var matchedMembers = GetByQuery(query).ToArray();
+
+            var membersInGroup = new List&lt;IMember&gt;();
+            //then we need to filter the matched members that are in the role
+            //since the max sql params are 2100 on sql server, we&#39;ll reduce that to be safe for potentially other servers and run the queries in batches
+            var inGroups = matchedMembers.InGroupsOf(1000);
+            foreach (var batch in inGroups)
+            {
+                var memberIdBatch = batch.Select(x =&gt; x.Id);
+                var sql = new Sql().Select(&quot;*&quot;).From&lt;Member2MemberGroupDto&gt;()
+                    .Where&lt;Member2MemberGroupDto&gt;(dto =&gt; dto.MemberGroup == memberGroup.Id)
+                    .Where(&quot;Member IN (@memberIds)&quot;, new { memberIds = memberIdBatch });
+                var memberIdsInGroup = Database.Fetch&lt;Member2MemberGroupDto&gt;(sql)
+                    .Select(x =&gt; x.Member).ToArray();
+
+                membersInGroup.AddRange(matchedMembers.Where(x =&gt; memberIdsInGroup.Contains(x.Id)));
+            }
+
+            return membersInGroup;
+
+        }
+
+        /// &lt;summary&gt;
+        /// Get all members in a specific group
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;groupName&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; GetByMemberGroup(string groupName)
+        {
+            var grpQry = new Query&lt;IMemberGroup&gt;().Where(group =&gt; group.Name.Equals(groupName));
+            var memberGroup = _memberGroupRepository.GetByQuery(grpQry).FirstOrDefault();
+            if (memberGroup == null) return Enumerable.Empty&lt;IMember&gt;();
+
+            var subQuery = new Sql().Select(&quot;Member&quot;).From&lt;Member2MemberGroupDto&gt;().Where&lt;Member2MemberGroupDto&gt;(dto =&gt; dto.MemberGroup == memberGroup.Id);
+
+            var sql = GetBaseQuery(false)
+                //TODO: An inner join would be better, though I&#39;ve read that the query optimizer will always turn a
+                // subquery with an IN clause into an inner join anyways.
+                .Append(new Sql(&quot;WHERE umbracoNode.id IN (&quot; + subQuery.SQL + &quot;)&quot;, subQuery.Arguments))
+                .OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate)
+                .OrderBy&lt;NodeDto&gt;(x =&gt; x.SortOrder);
+
+            return ProcessQuery(sql, new PagingSqlQuery(sql));
+
+        }
+
+        public bool Exists(string username)
+        {
+            var sql = new Sql();
+
+            sql.Select(&quot;COUNT(*)&quot;)
+                .From&lt;MemberDto&gt;()
+                .Where&lt;MemberDto&gt;(x =&gt; x.LoginName == username);
+
+            return Database.ExecuteScalar&lt;int&gt;(sql) &gt; 0;
+        }
+
+        public int GetCountByQuery(IQuery&lt;IMember&gt; query)
+        {
+            var sqlWithProps = GetNodeIdQueryWithPropertyData();
+            var translator = new SqlTranslator&lt;IMember&gt;(sqlWithProps, query);
+            var sql = translator.Translate();
+
+            //get the COUNT base query
+            var fullSql = GetBaseQuery(true)
+                .Append(new Sql(&quot;WHERE umbracoNode.id IN (&quot; + sql.SQL + &quot;)&quot;, sql.Arguments));
+
+            return Database.ExecuteScalar&lt;int&gt;(fullSql);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets paged member results
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;query&quot;&gt;
+        /// The where clause, if this is null all records are queried
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Index of the page.&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Size of the page.&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;The total records.&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;The order by column&lt;/param&gt;
+        /// &lt;param name=&quot;orderDirection&quot;&gt;The order direction.&lt;/param&gt;
+        /// &lt;param name=&quot;orderBySystemField&quot;&gt;Flag to indicate when ordering by system field&lt;/param&gt;
+        /// &lt;param name=&quot;filter&quot;&gt;Search query&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// The query supplied will ONLY work with data specifically on the cmsMember table because we are using PetaPoco paging (SQL paging)
+        /// &lt;/remarks&gt;
+        public IEnumerable&lt;IMember&gt; GetPagedResultsByQuery(IQuery&lt;IMember&gt; query, long pageIndex, int pageSize, out long totalRecords,
+            string orderBy, Direction orderDirection, bool orderBySystemField, string filter = &quot;&quot;)
+        {
+            var args = new List&lt;object&gt;();
+            var sbWhere = new StringBuilder();
+            Func&lt;Tuple&lt;string, object[]&gt;&gt; filterCallback = null;
+            if (filter.IsNullOrWhiteSpace() == false)
+            {
+                //This will build up the where clause - even though the same &#39;filter&#39; is being
+                //applied to both columns, the parameters values passed to PetaPoco need to be 
+                //duplicated, otherwise it gets confused :/ 
+                var columnFilters = new List&lt;Tuple&lt;string, string&gt;&gt;
+                {
+                    new Tuple&lt;string, string&gt;(&quot;umbracoNode&quot;, &quot;text&quot;),
+                    new Tuple&lt;string, string&gt;(&quot;cmsMember&quot;, &quot;LoginName&quot;)
+                };
+                sbWhere.Append(&quot;AND (&quot;);
+                for (int i = 0; i &lt; columnFilters.Count; i++)
+                {
+                    sbWhere
+                        .Append(&quot;(&quot;)
+                        .Append(SqlSyntax.GetQuotedTableName(columnFilters[i].Item1))
+                        .Append(&quot;.&quot;)
+                        .Append(SqlSyntax.GetQuotedColumnName(columnFilters[i].Item2))
+                        .Append(&quot; LIKE @&quot;)
+                        .Append(args.Count)
+                        .Append(&quot;) &quot;);
+                    args.Add(string.Format(&quot;%{0}%&quot;, filter));
+                    if (i &lt; (columnFilters.Count - 1))
+                    {
+                        sbWhere.Append(&quot;OR &quot;);
+                    }
+                }
+                sbWhere.Append(&quot;)&quot;);
+                filterCallback = () =&gt; new Tuple&lt;string, object[]&gt;(sbWhere.ToString().Trim(), args.ToArray());
+            }
+
+            return GetPagedResultsByQuery&lt;MemberDto&gt;(query, pageIndex, pageSize, out totalRecords,
+                new Tuple&lt;string, string&gt;(&quot;cmsMember&quot;, &quot;nodeId&quot;),
+                (sqlFull, sqlIds) =&gt; ProcessQuery(sqlFull, sqlIds), orderBy, orderDirection, orderBySystemField,
+                filterCallback);
+        }
+
+        public void AddOrUpdateContentXml(IMember content, Func&lt;IMember, XElement&gt; xml)
+        {
+            _contentXmlRepository.AddOrUpdate(new ContentXmlEntity&lt;IMember&gt;(content, xml));
+        }
+
+        public void AddOrUpdatePreviewXml(IMember content, Func&lt;IMember, XElement&gt; xml)
+        {
+            _contentPreviewRepository.AddOrUpdate(new ContentPreviewEntity&lt;IMember&gt;(content, xml));
+        }
+
+        protected override string GetDatabaseFieldNameForOrderBy(string orderBy)
+        {
+            //Some custom ones
+            switch (orderBy.ToUpperInvariant())
+            {
+                case &quot;EMAIL&quot;:
+                    return &quot;cmsMember.Email&quot;;
+                case &quot;LOGINNAME&quot;:
+                    return &quot;cmsMember.LoginName&quot;;
+            }
+
+            return base.GetDatabaseFieldNameForOrderBy(orderBy);
+        }
+
+        protected override string GetEntityPropertyNameForOrderBy(string orderBy)
+        {
+            //Some custom ones
+            switch (orderBy.ToUpperInvariant())
+            {
+                case &quot;LOGINNAME&quot;:
+                    return &quot;Username&quot;;
+            }
+
+            return base.GetEntityPropertyNameForOrderBy(orderBy);
+        }
+
+        /// &lt;summary&gt;
+        /// This is the underlying method that processes most queries for this repository
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sqlFull&quot;&gt;
+        /// The full SQL to select all member data 
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;pagingSqlQuery&quot;&gt;
+        /// The Id SQL to just return all member ids - used to process the properties for the member item
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;withCache&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IEnumerable&lt;IMember&gt; ProcessQuery(Sql sqlFull, PagingSqlQuery pagingSqlQuery, bool withCache = false)
+        {
+            // fetch returns a list so it&#39;s ok to iterate it in this method
+            var dtos = Database.Fetch&lt;MemberDto, ContentVersionDto, ContentDto, NodeDto&gt;(sqlFull);
+
+            //This is a tuple list identifying if the content item came from the cache or not
+            var content = new List&lt;Tuple&lt;IMember, bool&gt;&gt;();
+            var defs = new DocumentDefinitionCollection();
+
+            foreach (var dto in dtos)
+            {
+                // if the cache contains the item, use it
+                if (withCache)
+                {
+                    var cached = RuntimeCache.GetCacheItem&lt;IMember&gt;(GetCacheIdKey&lt;IMember&gt;(dto.NodeId));
+                    //only use this cached version if the dto returned is the same version - this is just a safety check, members dont 
+                    //store different versions, but just in case someone corrupts some data we&#39;ll double check to be sure.
+                    if (cached != null &amp;&amp; cached.Version == dto.ContentVersionDto.VersionId)
+                    {
+                        content.Add(new Tuple&lt;IMember, bool&gt;(cached, true));
+                        continue;
+                    }
+                }
+
+                // else, need to fetch from the database
+                // content type repository is full-cache so OK to get each one independently
+                var contentType = _memberTypeRepository.Get(dto.ContentVersionDto.ContentDto.ContentTypeId);
+
+                // need properties
+                if (defs.AddOrUpdate(new DocumentDefinition(dto.ContentVersionDto, contentType)))
+                {
+                    content.Add(new Tuple&lt;IMember, bool&gt;(MemberFactory.BuildEntity(dto, contentType), false));
+                }
+            }
+
+            // load all properties for all documents from database in 1 query
+            var propertyData = GetPropertyCollection(pagingSqlQuery, defs);
+
+            // assign property data
+            foreach (var contentItem in content)
+            {
+                var cc = contentItem.Item1;
+                var fromCache = contentItem.Item2;
+
+                //if this has come from cache, we do not need to build up it&#39;s structure
+                if (fromCache) continue;
+
+                cc.Properties = propertyData[cc.Version];
+
+                //on initial construction we don&#39;t want to have dirty properties tracked
+                // http://issues.umbraco.org/issue/U4-1946
+                cc.ResetDirtyProperties(false);
+            }
+
+            return content.Select(x =&gt; x.Item1).ToArray();
+        }
+
+        /// &lt;summary&gt;
+        /// Private method to create a member object from a MemberDto
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dto&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;docSql&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IMember CreateMemberFromDto(MemberDto dto, Sql docSql)
+        {
+            var memberType = _memberTypeRepository.Get(dto.ContentVersionDto.ContentDto.ContentTypeId);
+
+            var factory = new MemberFactory(memberType, NodeObjectTypeId, dto.ContentVersionDto.NodeId);
+            var member = factory.BuildEntity(dto);
+
+            var docDef = new DocumentDefinition(dto.ContentVersionDto, memberType);
+
+            var properties = GetPropertyCollection(docSql, new[] { docDef });
+
+            member.Properties = properties[dto.ContentVersionDto.VersionId];
+
+            //on initial construction we don&#39;t want to have dirty properties tracked
+            // http://issues.umbraco.org/issue/U4-1946
+            ((Entity)member).ResetDirtyProperties(false);
+            return member;
+        }
+
+        /// &lt;summary&gt;
+        /// Dispose disposable properties
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Ensure the unit of work is disposed
+        /// &lt;/remarks&gt;
+        protected override void DisposeResources()
+        {
+            _memberTypeRepository.Dispose();
+            _tagRepository.Dispose();
+            _memberGroupRepository.Dispose();
+            _contentXmlRepository.Dispose();
+            _contentPreviewRepository.Dispose();
+        }
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[33,15,33,67,1],[34,9,34,10,1],[35,13,35,46,1],[35,47,35,103,0],[36,13,36,39,1],[36,40,36,89,0],[37,13,37,58,1],[38,13,38,44,1],[39,13,39,60,1],[40,13,40,137,1],[41,13,41,145,1],[42,9,42,10,1],[47,9,47,10,1],[48,13,48,43,1],[49,13,49,62,1],[50,13,50,85,1],[52,13,52,135,1],[54,13,54,29,1],[55,17,55,29,1],[57,13,57,57,1],[59,13,59,28,1],[61,9,61,10,1],[64,9,64,10,1],[65,13,65,43,1],[66,13,66,27,1],[67,13,67,14,1],[68,17,68,74,1],[69,13,69,14,1],[71,13,71,63,1],[73,9,73,10,1],[76,9,76,10,1],[77,13,77,49,1],[81,13,81,50,1],[84,13,84,33,1],[84,33,84,68,1],[84,68,84,70,1],[84,13,84,70,1],[85,13,85,14,1],[86,17,86,69,1],[87,17,87,82,1],[88,17,88,50,1],[90,17,91,57,1],[93,17,93,79,1],[96,13,96,14,1],[97,17,97,79,1],[98,17,99,57,1],[101,17,101,67,1],[104,9,104,10,1],[111,9,111,10,1],[112,13,112,33,1],[113,13,126,87,1],[127,13,127,24,1],[128,9,128,10,1],[131,9,131,10,1],[132,13,132,91,1],[133,9,133,10,1],[136,9,136,10,1],[137,13,137,43,1],[138,9,138,10,1],[141,9,141,10,1],[142,13,142,33,1],[143,13,153,76,1],[154,13,154,24,1],[155,9,155,10,1],[158,9,158,10,1],[159,13,174,30,1],[175,13,175,25,1],[176,9,176,10,1],[180,17,180,18,1],[180,19,180,65,1],[180,66,180,67,1],[188,9,188,10,1],[189,13,189,45,1],[192,13,192,60,1],[194,13,194,74,1],[195,13,195,48,1],[199,13,199,128,1],[200,13,200,42,1],[201,13,203,144,1],[206,13,206,68,1],[207,13,207,40,1],[208,13,208,87,1],[209,13,209,43,1],[210,13,210,116,1],[213,13,213,76,1],[214,13,214,38,1],[217,13,217,40,1],[218,13,218,40,1],[219,13,219,42,1],[220,13,220,34,1],[223,13,223,63,1],[224,13,224,48,1],[225,13,225,41,1],[229,13,229,59,1],[230,13,230,52,1],[233,13,233,41,1],[234,13,234,34,1],[237,13,237,137,1],[242,13,242,63,1],[242,63,242,89,1],[242,89,242,101,1],[242,13,242,101,1],[243,13,243,77,1],[244,13,244,60,1],[247,13,247,20,1],[247,22,247,41,1],[247,42,247,44,1],[247,45,247,61,1],[248,13,248,14,1],[249,17,249,84,1],[250,17,250,79,1],[251,13,251,14,1],[254,13,254,20,1],[254,22,254,34,1],[254,35,254,37,1],[254,38,254,52,1],[255,13,255,14,1],[256,17,256,70,1],[257,13,257,14,1],[259,13,259,56,1],[261,13,261,53,1],[262,9,262,10,1],[265,9,265,10,1],[267,13,267,47,1],[270,13,270,60,1],[272,13,272,51,1],[275,13,275,57,1],[276,13,276,14,0],[277,17,277,132,0],[278,17,278,92,0],[279,17,279,67,0],[280,17,283,114,0],[284,17,284,71,0],[285,13,285,14,0],[287,13,287,74,1],[289,13,289,113,1],[290,13,290,58,1],[291,13,291,48,1],[294,13,294,68,1],[295,13,295,46,1],[298,13,298,76,1],[299,13,299,14,0],[301,17,301,70,0],[302,17,302,48,0],[303,13,303,14,0],[306,13,306,141,1],[307,13,307,57,1],[310,13,310,52,1],[315,13,315,50,1],[317,13,317,54,1],[318,13,318,14,1],[319,17,319,42,1],[320,13,320,14,1],[321,13,321,57,1],[322,13,322,14,1],[323,17,323,46,1],[324,13,324,14,1],[326,13,326,122,1],[327,13,327,14,0],[328,17,328,45,0],[329,13,329,14,0],[331,13,331,39,1],[332,13,332,14,1],[333,17,333,51,1],[334,13,334,14,1],[339,13,339,137,1],[340,13,340,60,1],[346,13,346,63,1],[346,63,346,89,1],[346,89,346,101,1],[346,13,346,101,1],[348,13,348,77,1],[350,13,350,20,1],[350,22,350,41,1],[350,42,350,44,1],[350,45,350,61,1],[351,13,351,14,1],[352,17,352,44,1],[353,17,353,18,1],[354,21,354,54,1],[355,17,355,18,1],[357,17,357,18,0],[358,21,358,88,0],[359,21,359,83,0],[360,17,360,18,0],[361,13,361,14,1],[364,13,364,37,1],[365,13,365,14,0],[366,17,366,24,0],[366,26,366,38,0],[366,39,366,41,0],[366,42,366,69,0],[367,17,367,18,0],[368,21,368,85,0],[368,86,368,95,0],[370,21,370,74,0],[371,17,371,18,0],[372,13,372,14,0],[374,13,374,56,1],[376,13,376,48,1],[377,9,377,10,1],[384,9,384,10,0],[385,13,387,86,0],[388,13,388,69,0],[389,9,389,10,0],[392,9,392,10,1],[399,13,399,28,1],[400,13,400,98,1],[401,13,401,25,1],[402,13,402,14,1],[404,17,404,49,1],[405,17,405,48,1],[406,21,407,96,1],[408,17,410,65,1],[411,17,411,65,1],[412,17,413,34,1],[413,34,413,101,1],[413,101,414,31,1],[412,17,414,31,1],[417,17,417,41,1],[417,42,417,48,1],[419,17,419,24,1],[419,26,419,37,1],[419,38,419,40,1],[419,41,419,49,1],[420,17,420,18,1],[422,21,422,22,1],[426,25,426,58,1],[427,21,427,22,1],[428,21,428,40,0],[429,21,429,22,0],[430,25,430,112,0],[431,21,431,22,0],[432,17,432,18,1],[433,17,433,49,1],[434,13,434,14,1],[435,9,435,10,1],[438,9,438,10,0],[439,13,439,43,0],[440,13,440,98,0],[441,13,441,74,0],[443,13,443,111,0],[445,13,445,29,0],[446,17,446,29,0],[448,13,448,104,0],[450,13,450,87,0],[451,13,451,51,0],[453,13,453,146,0],[455,13,455,77,0],[459,13,459,58,0],[460,13,460,27,0],[462,9,462,10,0],[465,9,465,10,0],[466,13,466,133,0],[467,13,467,142,0],[468,13,468,140,0],[469,9,469,10,0],[474,9,474,10,1],[476,13,476,96,1],[477,13,477,90,1],[478,13,478,37,1],[478,38,478,73,0],[481,13,481,46,1],[482,13,482,31,1],[485,21,485,84,1],[486,21,486,27,1],[488,21,488,86,0],[489,21,489,27,0],[491,21,491,88,1],[492,21,492,27,1],[494,21,494,86,1],[495,21,495,27,1],[497,21,497,114,1],[498,21,498,27,1],[500,21,500,72,0],[502,13,502,62,1],[504,13,504,54,1],[507,13,507,60,1],[508,13,508,20,1],[508,22,508,31,1],[508,32,508,34,1],[508,35,508,43,1],[509,13,509,14,1],[510,17,510,55,1],[510,55,510,59,1],[510,59,510,61,1],[510,17,510,61,1],[511,17,513,89,1],[514,17,515,34,1],[515,34,515,42,1],[515,42,515,54,1],[514,17,515,54,1],[517,17,517,67,1],[517,67,517,98,1],[517,98,517,101,1],[517,17,517,101,1],[518,13,518,14,1],[520,13,520,35,1],[522,9,522,10,1],[530,9,530,10,1],[531,13,531,97,1],[532,13,532,90,1],[533,13,533,37,1],[533,38,533,73,0],[535,13,535,156,1],[537,13,542,53,1],[544,13,544,63,1],[546,9,546,10,1],[549,9,549,10,1],[550,13,550,33,1],[552,13,554,65,1],[556,13,556,57,1],[557,9,557,10,1],[560,9,560,10,1],[561,13,561,65,1],[562,13,562,78,1],[563,13,563,46,1],[566,13,567,94,1],[569,13,569,57,1],[570,9,570,10,1],[591,9,591,10,1],[592,13,592,43,1],[593,13,593,47,1],[594,13,594,65,1],[595,13,595,54,1],[596,13,596,14,0],[600,17,604,19,0],[605,17,605,41,0],[606,22,606,31,0],[606,33,606,56,0],[606,58,606,61,0],[607,17,607,18,0],[608,21,615,39,0],[616,21,616,62,0],[617,21,617,55,0],[618,21,618,22,0],[619,25,619,47,0],[620,21,620,22,0],[621,17,621,18,0],[622,17,622,37,0],[623,17,623,40,0],[623,40,623,110,0],[623,110,623,111,0],[623,17,623,111,0],[624,13,624,14,0],[626,13,628,38,1],[628,38,628,67,1],[628,67,629,33,1],[626,13,629,33,1],[630,9,630,10,1],[633,9,633,10,1],[634,13,634,92,1],[635,9,635,10,1],[638,9,638,10,0],[639,13,639,100,0],[640,9,640,10,0],[643,9,643,10,1],[645,13,645,48,1],[648,21,648,46,1],[650,21,650,50,1],[653,13,653,65,1],[654,9,654,10,1],[657,9,657,10,0],[659,13,659,48,0],[662,21,662,39,0],[665,13,665,66,0],[666,9,666,10,0],[680,9,680,10,1],[682,13,682,99,1],[685,13,685,60,1],[686,13,686,59,1],[688,13,688,20,1],[688,22,688,29,1],[688,30,688,32,1],[688,33,688,37,1],[689,13,689,14,1],[691,17,691,31,1],[692,17,692,18,0],[693,21,693,105,0],[696,21,696,93,0],[697,21,697,22,0],[698,25,698,77,0],[699,25,699,34,0],[701,17,701,18,0],[705,17,705,109,1],[708,17,708,98,1],[709,17,709,18,1],[710,21,710,111,1],[711,17,711,18,1],[712,13,712,14,1],[715,13,715,76,1],[718,13,718,20,1],[718,22,718,37,1],[718,38,718,40,1],[718,41,718,48,1],[719,13,719,14,1],[720,17,720,44,1],[721,17,721,51,1],[724,17,724,31,1],[724,32,724,41,0],[726,17,726,58,1],[730,17,730,48,1],[731,13,731,14,1],[733,13,733,40,1],[733,40,733,47,1],[733,47,733,59,1],[733,13,733,59,1],[734,9,734,10,1],[743,9,743,10,1],[744,13,744,104,1],[746,13,746,105,1],[747,13,747,51,1],[749,13,749,84,1],[751,13,751,78,1],[753,13,753,77,1],[757,13,757,58,1],[758,13,758,27,1],[759,9,759,10,1],[768,9,768,10,1],[769,13,769,45,1],[770,13,770,38,1],[771,13,771,46,1],[772,13,772,45,1],[773,13,773,49,1],[774,9,774,10,1]]);
+    </script>
+  </body>
+</html>

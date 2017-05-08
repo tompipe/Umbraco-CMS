@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Persistence\Repositories\DataTypeDefinitionRepositoryTest.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Data;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Moq;
+using NUnit.Framework;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Tests.TestHelpers.Entities;
+
+namespace Umbraco.Tests.Persistence.Repositories
+{
+    [DatabaseTestBehavior(DatabaseBehavior.NewDbFileAndSchemaPerTest)]
+    [TestFixture]
+    public class DataTypeDefinitionRepositoryTest : BaseDatabaseFactoryTest
+    {
+        [SetUp]
+        public override void Initialize()
+        {
+            base.Initialize();
+        }
+
+        private DataTypeDefinitionRepository CreateRepository(IDatabaseUnitOfWork unitOfWork)
+        {
+            var dataTypeDefinitionRepository = new DataTypeDefinitionRepository(
+                unitOfWork, CacheHelper.CreateDisabledCacheHelper(),
+                Mock.Of&lt;ILogger&gt;(), SqlSyntax,
+                new ContentTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax,
+                    new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;ITemplatesSection&gt;())));
+            return dataTypeDefinitionRepository;
+        }
+
+        private EntityContainerRepository CreateContainerRepository(IDatabaseUnitOfWork unitOfWork)
+        {
+            return new EntityContainerRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, Constants.ObjectTypes.DataTypeContainerGuid);
+        }
+
+        [Test]
+        public void Can_Move()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var containerRepository = CreateContainerRepository(unitOfWork))
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var container1 = new EntityContainer(Constants.ObjectTypes.DataTypeGuid) { Name = &quot;blah1&quot; };
+                containerRepository.AddOrUpdate(container1);
+                unitOfWork.Commit();
+
+                var container2 = new EntityContainer(Constants.ObjectTypes.DataTypeGuid) { Name = &quot;blah2&quot;, ParentId = container1.Id };
+                containerRepository.AddOrUpdate(container2);
+                unitOfWork.Commit();
+
+                var dataType = (IDataTypeDefinition) new DataTypeDefinition(container2.Id, Constants.PropertyEditors.RadioButtonListAlias)
+                {
+                    Name = &quot;dt1&quot;
+                };
+                repository.AddOrUpdate(dataType);
+                unitOfWork.Commit();
+
+                //create a 
+                var dataType2 = (IDataTypeDefinition)new DataTypeDefinition(dataType.Id, Constants.PropertyEditors.RadioButtonListAlias)
+                {
+                    Name = &quot;dt2&quot;
+                };
+                repository.AddOrUpdate(dataType2);
+                unitOfWork.Commit();
+
+                var result = repository.Move(dataType, container1).ToArray();
+                unitOfWork.Commit();
+
+                Assert.AreEqual(2, result.Count());
+
+                //re-get
+                dataType = repository.Get(dataType.Id);
+                dataType2 = repository.Get(dataType2.Id);
+
+                Assert.AreEqual(container1.Id, dataType.ParentId);
+                Assert.AreNotEqual(result.Single(x =&gt; x.Entity.Id == dataType.Id).OriginalPath, dataType.Path);
+                Assert.AreNotEqual(result.Single(x =&gt; x.Entity.Id == dataType2.Id).OriginalPath, dataType2.Path);
+            }
+
+        }
+
+        [Test]
+        public void Can_Create_Container()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            EntityContainer container;
+            using (var containerRepository = CreateContainerRepository(unitOfWork))
+            {
+                container = new EntityContainer(Constants.ObjectTypes.DataTypeGuid) { Name = &quot;blah&quot; };
+                containerRepository.AddOrUpdate(container);
+                unitOfWork.Commit();                
+                Assert.That(container.Id, Is.GreaterThan(0));
+            }
+            using (var containerRepository = CreateContainerRepository(unitOfWork))
+            {
+                var found = containerRepository.Get(container.Id);
+                Assert.IsNotNull(found);
+            }
+        }
+
+        [Test]
+        public void Can_Delete_Container()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            EntityContainer container;
+            using (var containerRepository = CreateContainerRepository(unitOfWork))
+            {
+                container = new EntityContainer(Constants.ObjectTypes.DataTypeGuid) { Name = &quot;blah&quot; };
+                containerRepository.AddOrUpdate(container);
+                unitOfWork.Commit();
+            }
+            using (var containerRepository = CreateContainerRepository(unitOfWork))
+            {
+                // Act
+                containerRepository.Delete(container);
+                unitOfWork.Commit();
+            }
+            using (var containerRepository = CreateContainerRepository(unitOfWork))
+            {
+                var found = containerRepository.Get(container.Id);
+                Assert.IsNull(found);
+            }
+        }
+
+        [Test]
+        public void Can_Create_Container_Containing_Data_Types()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var containerRepository = CreateContainerRepository(unitOfWork))
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var container = new EntityContainer(Constants.ObjectTypes.DataTypeGuid) { Name = &quot;blah&quot; };
+                containerRepository.AddOrUpdate(container);
+                unitOfWork.Commit();
+
+                var dataTypeDefinition = new DataTypeDefinition(container.Id, Constants.PropertyEditors.RadioButtonListAlias) { Name = &quot;test&quot; };
+                repository.AddOrUpdate(dataTypeDefinition);
+                unitOfWork.Commit();
+
+                Assert.AreEqual(container.Id, dataTypeDefinition.ParentId);
+            }
+        }
+
+        [Test]
+        public void Can_Delete_Container_Containing_Data_Types()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            EntityContainer container;
+            IDataTypeDefinition dataType;
+            using (var containerRepository = CreateContainerRepository(unitOfWork))
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                container = new EntityContainer(Constants.ObjectTypes.DataTypeGuid) { Name = &quot;blah&quot; };
+                containerRepository.AddOrUpdate(container);
+                unitOfWork.Commit();
+
+                dataType = new DataTypeDefinition(container.Id, Constants.PropertyEditors.RadioButtonListAlias) { Name = &quot;test&quot; };
+                repository.AddOrUpdate(dataType);
+                unitOfWork.Commit();                
+            }
+            using (var containerRepository = CreateContainerRepository(unitOfWork))
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                containerRepository.Delete(container);
+                unitOfWork.Commit();
+
+                var found = containerRepository.Get(container.Id);
+                Assert.IsNull(found);
+
+                dataType = repository.Get(dataType.Id);
+                Assert.IsNotNull(dataType);
+                Assert.AreEqual(-1, dataType.ParentId);
+            }
+        }
+
+        [Test]
+        public void Can_Create()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            int id;
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var dataTypeDefinition = new DataTypeDefinition(-1, new Guid(Constants.PropertyEditors.RadioButtonList)) {Name = &quot;test&quot;};
+
+                repository.AddOrUpdate(dataTypeDefinition);
+
+                unitOfWork.Commit();
+                id = dataTypeDefinition.Id;
+                Assert.That(id, Is.GreaterThan(0));
+            }
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var dataTypeDefinition = repository.Get(id);
+
+                // Assert
+                Assert.That(dataTypeDefinition, Is.Not.Null);
+                Assert.That(dataTypeDefinition.HasIdentity, Is.True);
+            }
+        }
+
+
+        [Test]
+        public void Can_Perform_Get_On_DataTypeDefinitionRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var dataTypeDefinition = repository.Get(-42);
+
+                // Assert
+                Assert.That(dataTypeDefinition, Is.Not.Null);
+                Assert.That(dataTypeDefinition.HasIdentity, Is.True);
+                Assert.That(dataTypeDefinition.Name, Is.EqualTo(&quot;Dropdown&quot;));    
+            }
+            
+        }
+
+        [Test]
+        public void Can_Perform_GetAll_On_DataTypeDefinitionRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                // Act
+                var dataTypeDefinitions = repository.GetAll();
+
+                // Assert
+                Assert.That(dataTypeDefinitions, Is.Not.Null);
+                Assert.That(dataTypeDefinitions.Any(), Is.True);
+                Assert.That(dataTypeDefinitions.Any(x =&gt; x == null), Is.False);
+                Assert.That(dataTypeDefinitions.Count(), Is.EqualTo(24));
+            }
+        }
+
+        [Test]
+        public void Can_Perform_GetAll_With_Params_On_DataTypeDefinitionRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                // Act
+                var dataTypeDefinitions = repository.GetAll(-40, -41, -42);
+
+                // Assert
+                Assert.That(dataTypeDefinitions, Is.Not.Null);
+                Assert.That(dataTypeDefinitions.Any(), Is.True);
+                Assert.That(dataTypeDefinitions.Any(x =&gt; x == null), Is.False);
+                Assert.That(dataTypeDefinitions.Count(), Is.EqualTo(3));
+            }
+        }
+
+        [Test]
+        public void Can_Perform_GetByQuery_On_DataTypeDefinitionRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                // Act
+            var query = Query&lt;IDataTypeDefinition&gt;.Builder.Where(x =&gt; x.PropertyEditorAlias == Constants.PropertyEditors.RadioButtonListAlias);
+                var result = repository.GetByQuery(query);
+
+                // Assert
+                Assert.That(result, Is.Not.Null);
+                Assert.That(result.Any(), Is.True);
+                Assert.That(result.FirstOrDefault().Name, Is.EqualTo(&quot;Radiobox&quot;));
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Count_On_DataTypeDefinitionRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                // Act
+                var query = Query&lt;IDataTypeDefinition&gt;.Builder.Where(x =&gt; x.Name.StartsWith(&quot;D&quot;));
+                int count = repository.Count(query);
+
+                // Assert
+                Assert.That(count, Is.EqualTo(4));
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Add_On_DataTypeDefinitionRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+            var dataTypeDefinition = new DataTypeDefinition(&quot;Test.TestEditor&quot;)
+                    {
+                        DatabaseType = DataTypeDatabaseType.Integer,
+                        Name = &quot;AgeDataType&quot;,
+                        CreatorId = 0
+                    };
+
+                // Act
+                repository.AddOrUpdate(dataTypeDefinition);
+                unitOfWork.Commit();
+                var exists = repository.Exists(dataTypeDefinition.Id);
+
+                var fetched = repository.Get(dataTypeDefinition.Id);
+
+                // Assert
+                Assert.That(dataTypeDefinition.HasIdentity, Is.True);
+                Assert.That(exists, Is.True);
+
+                TestHelper.AssertAllPropertyValuesAreEquals(dataTypeDefinition, fetched, &quot;yyyy-MM-dd HH:mm:ss&quot;);
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Update_On_DataTypeDefinitionRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+            var dataTypeDefinition = new DataTypeDefinition(&quot;Test.blah&quot;)
+                    {
+                        DatabaseType = DataTypeDatabaseType.Integer,
+                        Name = &quot;AgeDataType&quot;,
+                        CreatorId = 0
+                    };
+                repository.AddOrUpdate(dataTypeDefinition);
+                unitOfWork.Commit();
+
+                // Act
+                var definition = repository.Get(dataTypeDefinition.Id);
+                definition.Name = &quot;AgeDataType Updated&quot;;
+            definition.PropertyEditorAlias = &quot;Test.TestEditor&quot;; //change
+                repository.AddOrUpdate(definition);
+                unitOfWork.Commit();
+
+                var definitionUpdated = repository.Get(dataTypeDefinition.Id);
+
+                // Assert
+                Assert.That(definitionUpdated, Is.Not.Null);
+                Assert.That(definitionUpdated.Name, Is.EqualTo(&quot;AgeDataType Updated&quot;));
+            Assert.That(definitionUpdated.PropertyEditorAlias, Is.EqualTo(&quot;Test.TestEditor&quot;));
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Delete_On_DataTypeDefinitionRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+            var dataTypeDefinition = new DataTypeDefinition(&quot;Test.TestEditor&quot;)
+                    {
+                        DatabaseType = DataTypeDatabaseType.Integer,
+                        Name = &quot;AgeDataType&quot;,
+                        CreatorId = 0
+                    };
+
+                // Act
+                repository.AddOrUpdate(dataTypeDefinition);
+                unitOfWork.Commit();
+                var existsBefore = repository.Exists(dataTypeDefinition.Id);
+
+                repository.Delete(dataTypeDefinition);
+                unitOfWork.Commit();
+
+                var existsAfter = repository.Exists(dataTypeDefinition.Id);
+
+                // Assert
+                Assert.That(existsBefore, Is.True);
+                Assert.That(existsAfter, Is.False);
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Exists_On_DataTypeDefinitionRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                // Act
+                var exists = repository.Exists(1034); //Content picker
+                var doesntExist = repository.Exists(-80);
+
+                // Assert
+                Assert.That(exists, Is.True);
+                Assert.That(doesntExist, Is.False);
+            }
+        }
+
+        [Test]
+        public void Can_Get_Pre_Value_Collection()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+
+            int dtid;
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var dataTypeDefinition = new DataTypeDefinition(-1, new Guid(Constants.PropertyEditors.RadioButtonList)) { Name = &quot;test&quot; };
+                repository.AddOrUpdate(dataTypeDefinition);
+                unitOfWork.Commit();
+                dtid = dataTypeDefinition.Id;
+            }
+
+            DatabaseContext.Database.Insert(new DataTypePreValueDto() { DataTypeNodeId = dtid, SortOrder = 0, Value = &quot;test1&quot;});
+            DatabaseContext.Database.Insert(new DataTypePreValueDto() { DataTypeNodeId = dtid, SortOrder = 1, Value = &quot;test2&quot; });
+
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var collection = repository.GetPreValuesCollectionByDataTypeId(dtid);
+                Assert.AreEqual(2, collection.PreValuesAsArray.Count());
+            }
+        }
+
+        [Test]
+        public void Can_Get_Pre_Value_As_String()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+
+            int dtid;
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var dataTypeDefinition = new DataTypeDefinition(-1, new Guid(Constants.PropertyEditors.RadioButtonList)) { Name = &quot;test&quot; };
+                repository.AddOrUpdate(dataTypeDefinition);
+                unitOfWork.Commit();
+                dtid = dataTypeDefinition.Id;
+            }
+
+            var id = DatabaseContext.Database.Insert(new DataTypePreValueDto() { DataTypeNodeId = dtid, SortOrder = 0, Value = &quot;test1&quot; });
+            DatabaseContext.Database.Insert(new DataTypePreValueDto() { DataTypeNodeId = dtid, SortOrder = 1, Value = &quot;test2&quot; });
+
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var val = repository.GetPreValueAsString(Convert.ToInt32(id));
+                Assert.AreEqual(&quot;test1&quot;, val);
+            }
+        }
+
+        [Test]
+        public void Can_Get_Pre_Value_Collection_With_Cache()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+
+            var cache = new CacheHelper(
+                new ObjectCacheRuntimeCacheProvider(), 
+                new StaticCacheProvider(), 
+                new StaticCacheProvider(),
+                new IsolatedRuntimeCache(type =&gt; new ObjectCacheRuntimeCacheProvider()));
+
+            Func&lt;DataTypeDefinitionRepository&gt; creator = () =&gt; new DataTypeDefinitionRepository(
+                unitOfWork, 
+                cache,
+                Mock.Of&lt;ILogger&gt;(), SqlSyntax,
+                new ContentTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax,
+                    new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;ITemplatesSection&gt;())));
+
+            DataTypeDefinition dtd;
+            using (var repository = creator())
+            {
+                dtd = new DataTypeDefinition(-1, new Guid(Constants.PropertyEditors.RadioButtonList)) { Name = &quot;test&quot; };
+                repository.AddOrUpdate(dtd);
+                unitOfWork.Commit();                
+            }
+
+            DatabaseContext.Database.Insert(new DataTypePreValueDto() { DataTypeNodeId = dtd.Id, SortOrder = 0, Value = &quot;test1&quot; });
+            DatabaseContext.Database.Insert(new DataTypePreValueDto() { DataTypeNodeId = dtd.Id, SortOrder = 1, Value = &quot;test2&quot; });
+
+            //this will cache the result
+            using (var repository = creator())
+            {
+                var collection = repository.GetPreValuesCollectionByDataTypeId(dtd.Id);
+            }
+
+            var cached = cache.IsolatedRuntimeCache.GetCache&lt;IDataTypeDefinition&gt;().Result
+                .GetCacheItemsByKeySearch&lt;PreValueCollection&gt;(CacheKeys.DataTypePreValuesCacheKey + &quot;_&quot; + dtd.Id);
+
+            Assert.IsNotNull(cached);
+            Assert.AreEqual(1, cached.Count());
+            Assert.AreEqual(2, cached.Single().FormatAsDictionary().Count);
+        }
+
+        [Test]
+        public void Can_Get_Pre_Value_As_String_With_Cache()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+
+            var cache = new CacheHelper(
+                new ObjectCacheRuntimeCacheProvider(), 
+                new StaticCacheProvider(), 
+                new StaticCacheProvider(),
+                new IsolatedRuntimeCache(type =&gt; new ObjectCacheRuntimeCacheProvider()));
+
+            Func&lt;DataTypeDefinitionRepository&gt; creator = () =&gt; new DataTypeDefinitionRepository(
+                unitOfWork,
+                cache,
+                Mock.Of&lt;ILogger&gt;(), SqlSyntax,
+                new ContentTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax,
+                    new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;ITemplatesSection&gt;())));
+
+            DataTypeDefinition dtd;
+            using (var repository = creator())
+            {
+                dtd = new DataTypeDefinition(-1, new Guid(Constants.PropertyEditors.RadioButtonList)) { Name = &quot;test&quot; };
+                repository.AddOrUpdate(dtd);
+                unitOfWork.Commit();
+            }
+
+            var id = DatabaseContext.Database.Insert(new DataTypePreValueDto() { DataTypeNodeId = dtd.Id, SortOrder = 0, Value = &quot;test1&quot; });
+            DatabaseContext.Database.Insert(new DataTypePreValueDto() { DataTypeNodeId = dtd.Id, SortOrder = 1, Value = &quot;test2&quot; });
+
+            //this will cache the result
+            using (var repository = creator())
+            {
+                var val = repository.GetPreValueAsString(Convert.ToInt32(id));
+            }
+
+            var cached = cache.IsolatedRuntimeCache.GetCache&lt;IDataTypeDefinition&gt;().Result
+                .GetCacheItemsByKeySearch&lt;PreValueCollection&gt;(CacheKeys.DataTypePreValuesCacheKey + &quot;_&quot; + dtd.Id);
+
+            Assert.IsNotNull(cached);
+            Assert.AreEqual(1, cached.Count());
+            Assert.AreEqual(2, cached.Single().FormatAsDictionary().Count);
+
+            using (var repository = creator())
+            {
+                //ensure it still gets resolved!
+                var val = repository.GetPreValueAsString(Convert.ToInt32(id));
+                Assert.AreEqual(&quot;test1&quot;, val);
+            }
+        }
+
+        [TearDown]
+        public override void TearDown()
+        {
+            base.TearDown();
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[30,9,30,10,1],[31,13,31,31,1],[32,9,32,10,1],[35,9,35,10,1],[36,13,40,208,1],[41,13,41,49,1],[42,9,42,10,1],[45,9,45,10,1],[46,13,46,179,1],[47,9,47,10,1],[51,9,51,10,1],[52,13,52,67,1],[53,13,53,55,1],[54,20,54,83,1],[55,20,55,65,1],[56,13,56,14,1],[57,17,57,109,1],[58,17,58,61,1],[59,17,59,37,1],[61,17,61,135,1],[62,17,62,61,1],[63,17,63,37,1],[65,17,68,19,1],[69,17,69,50,1],[70,17,70,37,1],[73,17,76,19,1],[77,17,77,51,1],[78,17,78,37,1],[80,17,80,78,1],[81,17,81,37,1],[83,17,83,52,1],[86,17,86,56,1],[87,17,87,58,1],[89,17,89,67,1],[90,17,90,55,1],[90,55,90,81,1],[90,81,90,112,1],[90,17,90,112,1],[91,17,91,55,1],[91,55,91,82,1],[91,82,91,114,1],[91,17,91,114,1],[92,13,92,14,1],[94,9,94,10,1],[98,9,98,10,1],[99,13,99,67,1],[100,13,100,55,1],[102,20,102,83,1],[103,13,103,14,1],[104,17,104,103,1],[105,17,105,60,1],[106,17,106,37,1],[107,17,107,62,1],[108,13,108,14,1],[109,20,109,83,1],[110,13,110,14,1],[111,17,111,67,1],[112,17,112,41,1],[113,13,113,14,1],[114,9,114,10,1],[118,9,118,10,1],[119,13,119,67,1],[120,13,120,55,1],[122,20,122,83,1],[123,13,123,14,1],[124,17,124,103,1],[125,17,125,60,1],[126,17,126,37,1],[127,13,127,14,1],[128,20,128,83,1],[129,13,129,14,1],[131,17,131,55,1],[132,17,132,37,1],[133,13,133,14,1],[134,20,134,83,1],[135,13,135,14,1],[136,17,136,67,1],[137,17,137,38,1],[138,13,138,14,1],[139,9,139,10,1],[143,9,143,10,1],[144,13,144,67,1],[145,13,145,55,1],[146,20,146,83,1],[147,20,147,65,1],[148,13,148,14,1],[149,17,149,107,1],[150,17,150,60,1],[151,17,151,37,1],[153,17,153,145,1],[154,17,154,60,1],[155,17,155,37,1],[157,17,157,76,1],[158,13,158,14,1],[159,9,159,10,1],[163,9,163,10,1],[164,13,164,67,1],[165,13,165,55,1],[168,20,168,83,1],[169,20,169,65,1],[170,13,170,14,1],[171,17,171,103,1],[172,17,172,60,1],[173,17,173,37,1],[175,17,175,131,1],[176,17,176,50,1],[177,17,177,37,1],[178,13,178,14,1],[179,20,179,83,1],[180,20,180,65,1],[181,13,181,14,1],[183,17,183,55,1],[184,17,184,37,1],[186,17,186,67,1],[187,17,187,38,1],[189,17,189,56,1],[190,17,190,44,1],[191,17,191,56,1],[192,13,192,14,1],[193,9,193,10,1],[197,9,197,10,1],[198,13,198,67,1],[199,13,199,55,1],[201,20,201,65,1],[202,13,202,14,1],[203,17,203,138,1],[205,17,205,60,1],[207,17,207,37,1],[208,17,208,44,1],[209,17,209,52,1],[210,13,210,14,1],[211,20,211,65,1],[212,13,212,14,1],[214,17,214,61,1],[217,17,217,62,1],[218,17,218,70,1],[219,13,219,14,1],[220,9,220,10,1],[225,9,225,10,1],[227,13,227,67,1],[228,13,228,55,1],[229,20,229,65,1],[230,13,230,14,1],[232,17,232,62,1],[235,17,235,62,1],[236,17,236,70,1],[237,17,237,78,1],[238,13,238,14,1],[240,9,240,10,1],[244,9,244,10,1],[246,13,246,67,1],[247,13,247,55,1],[248,20,248,65,1],[249,13,249,14,1],[252,17,252,63,1],[255,17,255,63,1],[256,17,256,65,1],[257,17,257,58,1],[257,58,257,67,1],[257,67,257,80,1],[257,17,257,80,1],[258,17,258,74,1],[259,13,259,14,1],[260,9,260,10,1],[264,9,264,10,1],[266,13,266,67,1],[267,13,267,55,1],[268,20,268,65,1],[269,13,269,14,1],[272,17,272,76,1],[275,17,275,63,1],[276,17,276,65,1],[277,17,277,58,1],[277,58,277,67,1],[277,67,277,80,1],[277,17,277,80,1],[278,17,278,73,1],[279,13,279,14,1],[280,9,280,10,1],[284,9,284,10,1],[286,13,286,67,1],[287,13,287,55,1],[288,20,288,65,1],[289,13,289,14,1],[292,13,292,144,1],[293,17,293,59,1],[296,17,296,50,1],[297,17,297,52,1],[298,17,298,83,1],[299,13,299,14,1],[300,9,300,10,1],[304,9,304,10,1],[306,13,306,67,1],[307,13,307,55,1],[308,20,308,65,1],[309,13,309,14,1],[312,17,312,99,1],[313,17,313,53,1],[316,17,316,51,1],[317,13,317,14,1],[318,9,318,10,1],[322,9,322,10,1],[324,13,324,67,1],[325,13,325,55,1],[326,20,326,65,1],[327,13,327,14,1],[329,13,334,23,1],[337,17,337,60,1],[338,17,338,37,1],[339,17,339,71,1],[341,17,341,69,1],[344,17,344,70,1],[345,17,345,46,1],[347,17,347,113,1],[348,13,348,14,1],[349,9,349,10,1],[353,9,353,10,1],[355,13,355,67,1],[356,13,356,55,1],[357,20,357,65,1],[358,13,358,14,1],[360,13,365,23,1],[366,17,366,60,1],[367,17,367,37,1],[370,17,370,72,1],[371,17,371,57,1],[372,13,372,64,1],[373,17,373,52,1],[374,17,374,37,1],[376,17,376,79,1],[379,17,379,61,1],[380,17,380,88,1],[381,13,381,95,1],[382,13,382,14,1],[383,9,383,10,1],[387,9,387,10,1],[389,13,389,67,1],[390,13,390,55,1],[391,20,391,65,1],[392,13,392,14,1],[394,13,399,23,1],[402,17,402,60,1],[403,17,403,37,1],[404,17,404,77,1],[406,17,406,55,1],[407,17,407,37,1],[409,17,409,76,1],[412,17,412,52,1],[413,17,413,52,1],[414,13,414,14,1],[415,9,415,10,1],[419,9,419,10,1],[421,13,421,67,1],[422,13,422,55,1],[423,20,423,65,1],[424,13,424,14,1],[427,17,427,54,1],[428,17,428,58,1],[431,17,431,46,1],[432,17,432,52,1],[433,13,433,14,1],[434,9,434,10,1],[438,9,438,10,1],[439,13,439,67,1],[440,13,440,55,1],[443,20,443,65,1],[444,13,444,14,1],[445,17,445,140,1],[446,17,446,60,1],[447,17,447,37,1],[448,17,448,46,1],[449,13,449,14,1],[451,13,451,129,1],[452,13,452,130,1],[454,20,454,65,1],[455,13,455,14,1],[456,17,456,86,1],[457,17,457,73,1],[458,13,458,14,1],[459,9,459,10,1],[463,9,463,10,1],[464,13,464,67,1],[465,13,465,55,1],[468,20,468,65,1],[469,13,469,14,1],[470,17,470,140,1],[471,17,471,60,1],[472,17,472,37,1],[473,17,473,46,1],[474,13,474,14,1],[476,13,476,139,1],[477,13,477,130,1],[479,20,479,65,1],[480,13,480,14,1],[481,17,481,79,1],[482,17,482,47,1],[483,13,483,14,1],[484,9,484,10,1],[488,9,488,10,1],[489,13,489,67,1],[490,13,490,55,1],[492,13,496,50,1],[496,50,496,87,1],[496,87,496,90,1],[492,13,496,90,1],[498,13,498,64,1],[498,64,503,207,1],[503,207,503,208,1],[498,13,503,208,1],[506,20,506,46,1],[507,13,507,14,1],[508,17,508,121,1],[509,17,509,45,1],[510,17,510,37,1],[511,13,511,14,1],[513,13,513,132,1],[514,13,514,132,1],[517,20,517,46,1],[518,13,518,14,1],[519,17,519,88,1],[520,13,520,14,1],[522,13,523,115,1],[525,13,525,38,1],[526,13,526,48,1],[527,13,527,76,1],[528,9,528,10,1],[532,9,532,10,1],[533,13,533,67,1],[534,13,534,55,1],[536,13,540,50,1],[540,50,540,87,1],[540,87,540,90,1],[536,13,540,90,1],[542,13,542,64,1],[542,64,547,207,1],[547,207,547,208,1],[542,13,547,208,1],[550,20,550,46,1],[551,13,551,14,1],[552,17,552,121,1],[553,17,553,45,1],[554,17,554,37,1],[555,13,555,14,1],[557,13,557,141,1],[558,13,558,132,1],[561,20,561,46,1],[562,13,562,14,1],[563,17,563,79,1],[564,13,564,14,1],[566,13,567,115,1],[569,13,569,38,1],[570,13,570,48,1],[571,13,571,76,1],[573,20,573,46,1],[574,13,574,14,1],[576,17,576,79,1],[577,17,577,47,1],[578,13,578,14,1],[579,9,579,10,1],[583,9,583,10,1],[584,13,584,29,1],[585,9,585,10,1]]);
+    </script>
+  </body>
+</html>

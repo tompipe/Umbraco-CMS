@@ -1,0 +1,1901 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\PackagingService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Web;
+using System.Web.UI.WebControls;
+using System.Xml.Linq;
+using System.Xml.XPath;
+using Newtonsoft.Json;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Events;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Packaging;
+using Umbraco.Core.Packaging.Models;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Content = Umbraco.Core.Models.Content;
+
+namespace Umbraco.Core.Services
+{
+    /// &lt;summary&gt;
+    /// Represents the Packaging Service, which provides import/export functionality for the Core models of the API
+    /// using xml representation. This is primarily used by the Package functionality.
+    /// &lt;/summary&gt;
+    public class PackagingService : IPackagingService
+    {
+        private readonly ILogger _logger;
+        private readonly IContentService _contentService;
+        private readonly IContentTypeService _contentTypeService;
+        private readonly IMediaService _mediaService;
+        private readonly IMacroService _macroService;
+        private readonly IDataTypeService _dataTypeService;
+        private readonly IFileService _fileService;
+        private readonly ILocalizationService _localizationService;
+        private readonly IEntityService _entityService;
+        private readonly RepositoryFactory _repositoryFactory;
+        private readonly IDatabaseUnitOfWorkProvider _uowProvider;
+        private Dictionary&lt;string, IContentType&gt; _importedContentTypes;
+        private IPackageInstallation _packageInstallation;
+        private readonly IUserService _userService;
+
+
+        public PackagingService(
+            ILogger logger,
+            IContentService contentService,
+            IContentTypeService contentTypeService,
+            IMediaService mediaService,
+            IMacroService macroService,
+            IDataTypeService dataTypeService,
+            IFileService fileService,
+            ILocalizationService localizationService,
+            IEntityService entityService,
+            IUserService userService,
+            RepositoryFactory repositoryFactory,
+            IDatabaseUnitOfWorkProvider uowProvider)
+        {
+            _logger = logger;
+            _contentService = contentService;
+            _contentTypeService = contentTypeService;
+            _mediaService = mediaService;
+            _macroService = macroService;
+            _dataTypeService = dataTypeService;
+            _fileService = fileService;
+            _localizationService = localizationService;
+            _entityService = entityService;
+            _repositoryFactory = repositoryFactory;
+            _uowProvider = uowProvider;
+            _userService = userService;
+            _importedContentTypes = new Dictionary&lt;string, IContentType&gt;();
+        }
+
+        #region Content
+
+        /// &lt;summary&gt;
+        /// Exports an &lt;see cref=&quot;IContent&quot;/&gt; item to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;Content to export&lt;/param&gt;
+        /// &lt;param name=&quot;deep&quot;&gt;Optional parameter indicating whether to include descendents&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the Content object&lt;/returns&gt;
+        public XElement Export(IContent content, bool deep = false, bool raiseEvents = true)
+        {
+            var nodeName = UmbracoConfig.For.UmbracoSettings().Content.UseLegacyXmlSchema ? &quot;node&quot; : content.ContentType.Alias.ToSafeAliasWithForcingCheck();
+
+            if (raiseEvents)
+            {
+                if (ExportingContent.IsRaisedEventCancelled(new ExportEventArgs&lt;IContent&gt;(content, nodeName), this))
+                    return new XElement(nodeName);
+            }
+
+            var exporter = new EntityXmlSerializer();
+            var xml = exporter.Serialize(_contentService, _dataTypeService, _userService, content, deep);
+
+            if (raiseEvents)
+                ExportedContent.RaiseEvent(new ExportEventArgs&lt;IContent&gt;(content, xml, false), this);
+
+            return xml;
+        }
+
+
+
+        /// &lt;summary&gt;
+        /// Imports and saves package xml as &lt;see cref=&quot;IContent&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;element&quot;&gt;Xml to import&lt;/param&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;Optional parent Id for the content being imported&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the user performing the import&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;An enumrable list of generated content&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; ImportContent(XElement element, int parentId = -1, int userId = 0, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ImportingContent.IsRaisedEventCancelled(new ImportEventArgs&lt;IContent&gt;(element), this))
+                    return Enumerable.Empty&lt;IContent&gt;();
+            }
+
+            var name = element.Name.LocalName;
+            if (name.Equals(&quot;DocumentSet&quot;))
+            {
+                //This is a regular deep-structured import
+                var roots = from doc in element.Elements()
+                            where (string)doc.Attribute(&quot;isDoc&quot;) == &quot;&quot;
+                            select doc;
+
+                var contents = ParseDocumentRootXml(roots, parentId);
+                if (contents.Any())
+                    _contentService.Save(contents, userId);
+
+                if (raiseEvents)
+                    ImportedContent.RaiseEvent(new ImportEventArgs&lt;IContent&gt;(contents, element, false), this);
+                return contents;
+            }
+
+            var attribute = element.Attribute(&quot;isDoc&quot;);
+            if (attribute != null)
+            {
+                //This is a single doc import
+                var elements = new List&lt;XElement&gt; { element };
+                var contents = ParseDocumentRootXml(elements, parentId);
+                if (contents.Any())
+                    _contentService.Save(contents, userId);
+
+                if (raiseEvents)
+                    ImportedContent.RaiseEvent(new ImportEventArgs&lt;IContent&gt;(contents, element, false), this);
+                return contents;
+            }
+
+            throw new ArgumentException(
+                &quot;The passed in XElement is not valid! It does not contain a root element called &quot; +
+                &quot;&#39;DocumentSet&#39; (for structured imports) nor is the first element a Document (for single document import).&quot;);
+        }
+
+        private IEnumerable&lt;IContent&gt; ParseDocumentRootXml(IEnumerable&lt;XElement&gt; roots, int parentId)
+        {
+            var contents = new List&lt;IContent&gt;();
+            foreach (var root in roots)
+            {
+                bool isLegacySchema = root.Name.LocalName.ToLowerInvariant().Equals(&quot;node&quot;);
+                string contentTypeAlias = isLegacySchema
+                                              ? root.Attribute(&quot;nodeTypeAlias&quot;).Value
+                                              : root.Name.LocalName;
+
+                if (_importedContentTypes.ContainsKey(contentTypeAlias) == false)
+                {
+                    var contentType = FindContentTypeByAlias(contentTypeAlias);
+                    _importedContentTypes.Add(contentTypeAlias, contentType);
+                }
+
+                var content = CreateContentFromXml(root, _importedContentTypes[contentTypeAlias], null, parentId, isLegacySchema);
+                contents.Add(content);
+
+                var children = from child in root.Elements()
+                               where (string)child.Attribute(&quot;isDoc&quot;) == &quot;&quot;
+                               select child;
+                if (children.Any())
+                    contents.AddRange(CreateContentFromXml(children, content, isLegacySchema));
+            }
+            return contents;
+        }
+
+        private IEnumerable&lt;IContent&gt; CreateContentFromXml(IEnumerable&lt;XElement&gt; children, IContent parent, bool isLegacySchema)
+        {
+            var list = new List&lt;IContent&gt;();
+            foreach (var child in children)
+            {
+                string contentTypeAlias = isLegacySchema
+                                              ? child.Attribute(&quot;nodeTypeAlias&quot;).Value
+                                              : child.Name.LocalName;
+
+                if (_importedContentTypes.ContainsKey(contentTypeAlias) == false)
+                {
+                    var contentType = FindContentTypeByAlias(contentTypeAlias);
+                    _importedContentTypes.Add(contentTypeAlias, contentType);
+                }
+
+                //Create and add the child to the list
+                var content = CreateContentFromXml(child, _importedContentTypes[contentTypeAlias], parent, default(int), isLegacySchema);
+                list.Add(content);
+
+                //Recursive call
+                XElement child1 = child;
+                var grandChildren = from grand in child1.Elements()
+                                    where (string)grand.Attribute(&quot;isDoc&quot;) == &quot;&quot;
+                                    select grand;
+
+                if (grandChildren.Any())
+                    list.AddRange(CreateContentFromXml(grandChildren, content, isLegacySchema));
+            }
+
+            return list;
+        }
+
+        private IContent CreateContentFromXml(XElement element, IContentType contentType, IContent parent, int parentId, bool isLegacySchema)
+        {
+            var id = element.Attribute(&quot;id&quot;).Value;
+            var level = element.Attribute(&quot;level&quot;).Value;
+            var sortOrder = element.Attribute(&quot;sortOrder&quot;).Value;
+            var nodeName = element.Attribute(&quot;nodeName&quot;).Value;
+            var path = element.Attribute(&quot;path&quot;).Value;
+            var template = element.Attribute(&quot;template&quot;).Value;
+
+            var properties = from property in element.Elements()
+                             where property.Attribute(&quot;isDoc&quot;) == null
+                             select property;
+
+            IContent content = parent == null
+                                   ? new Content(nodeName, parentId, contentType)
+                                   {
+                                       Level = int.Parse(level),
+                                       SortOrder = int.Parse(sortOrder)
+                                   }
+                                   : new Content(nodeName, parent, contentType)
+                                   {
+                                       Level = int.Parse(level),
+                                       SortOrder = int.Parse(sortOrder)
+                                   };
+
+            foreach (var property in properties)
+            {
+                string propertyTypeAlias = isLegacySchema ? property.Attribute(&quot;alias&quot;).Value : property.Name.LocalName;
+                if (content.HasProperty(propertyTypeAlias))
+                {
+                    var propertyValue = property.Value;
+
+                    var propertyType = contentType.PropertyTypes.FirstOrDefault(pt =&gt; pt.Alias == propertyTypeAlias);
+
+                    //TODO: It would be heaps nicer if we didn&#39;t have to hard code references to specific property editors
+                    // we&#39;d have to modify the packaging format to denote how to parse/store the value instead of relying on this
+
+                    if (propertyType != null)
+                    {
+                        if (propertyType.PropertyEditorAlias == Constants.PropertyEditors.CheckBoxListAlias)
+                        {
+
+                            //TODO: We need to refactor this so the packager isn&#39;t making direct db calls for an &#39;edge&#39; case
+                            var database = ApplicationContext.Current.DatabaseContext.Database;
+                            var dtos = database.Fetch&lt;DataTypePreValueDto&gt;(&quot;WHERE datatypeNodeId = @Id&quot;, new { Id = propertyType.DataTypeDefinitionId });
+
+                            var propertyValueList = new List&lt;string&gt;();
+                            foreach (var preValue in propertyValue.Split(&#39;,&#39;))
+                            {
+                                propertyValueList.Add(dtos.Single(x =&gt; x.Value == preValue).Id.ToString(CultureInfo.InvariantCulture));
+                            }
+
+                            propertyValue = string.Join(&quot;,&quot;, propertyValueList.ToArray());
+
+                        }
+                    }
+                    //set property value
+                    content.SetValue(propertyTypeAlias, propertyValue);
+                }
+            }
+
+            return content;
+        }
+
+        #endregion
+
+        #region ContentTypes
+
+        /// &lt;summary&gt;
+        /// Exports an &lt;see cref=&quot;IContentType&quot;/&gt; to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentType&quot;&gt;ContentType to export&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the ContentType item.&lt;/returns&gt;
+        public XElement Export(IContentType contentType, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ExportingContentType.IsRaisedEventCancelled(new ExportEventArgs&lt;IContentType&gt;(contentType, &quot;DocumentType&quot;), this))
+                    return new XElement(&quot;DocumentType&quot;);
+            }
+
+            var exporter = new EntityXmlSerializer();
+            var xml = exporter.Serialize(_dataTypeService, _contentTypeService, contentType);
+
+            if (raiseEvents)
+                ExportedContentType.RaiseEvent(new ExportEventArgs&lt;IContentType&gt;(contentType, xml, false), this);
+
+            return xml;
+        }
+
+        /// &lt;summary&gt;
+        /// Imports and saves package xml as &lt;see cref=&quot;IContentType&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;element&quot;&gt;Xml to import&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the User performing the operation. Default is zero (admin).&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;An enumrable list of generated ContentTypes&lt;/returns&gt;
+        public IEnumerable&lt;IContentType&gt; ImportContentTypes(XElement element, int userId = 0, bool raiseEvents = true)
+        {
+            return ImportContentTypes(element, true, userId);
+        }
+
+        /// &lt;summary&gt;
+        /// Imports and saves package xml as &lt;see cref=&quot;IContentType&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;element&quot;&gt;Xml to import&lt;/param&gt;
+        /// &lt;param name=&quot;importStructure&quot;&gt;Boolean indicating whether or not to import the &lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the User performing the operation. Default is zero (admin).&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;An enumrable list of generated ContentTypes&lt;/returns&gt;
+        public IEnumerable&lt;IContentType&gt; ImportContentTypes(XElement element, bool importStructure, int userId = 0, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ImportingContentType.IsRaisedEventCancelled(new ImportEventArgs&lt;IContentType&gt;(element), this))
+                    return Enumerable.Empty&lt;IContentType&gt;();
+            }
+
+            var name = element.Name.LocalName;
+            if (name.Equals(&quot;DocumentTypes&quot;) == false &amp;&amp; name.Equals(&quot;DocumentType&quot;) == false)
+            {
+                throw new ArgumentException(&quot;The passed in XElement is not valid! It does not contain a root element called &#39;DocumentTypes&#39; for multiple imports or &#39;DocumentType&#39; for a single import.&quot;);
+            }
+
+            _importedContentTypes = new Dictionary&lt;string, IContentType&gt;();
+            var unsortedDocumentTypes = name.Equals(&quot;DocumentTypes&quot;)
+                                    ? (from doc in element.Elements(&quot;DocumentType&quot;) select doc).ToList()
+                                    : new List&lt;XElement&gt; { element };
+
+            //When you are importing a single doc type we have to assume that the depedencies are already there.
+            //Otherwise something like uSync won&#39;t work.
+            var fields = new List&lt;TopologicalSorter.DependencyField&lt;XElement&gt;&gt;();
+            var isSingleDocTypeImport = unsortedDocumentTypes.Count == 1;
+
+            var importedFolders = CreateContentTypeFolderStructure(unsortedDocumentTypes);
+
+            if (isSingleDocTypeImport == false)
+            {
+                //NOTE Here we sort the doctype XElements based on dependencies
+                //before creating the doc types - this should also allow for a better structure/inheritance support.
+                foreach (var documentType in unsortedDocumentTypes)
+                {
+                    var elementCopy = documentType;
+                    var infoElement = elementCopy.Element(&quot;Info&quot;);
+                    var dependencies = new HashSet&lt;string&gt;();
+
+                    //Add the Master as a dependency
+                    if (string.IsNullOrEmpty((string)infoElement.Element(&quot;Master&quot;)) == false)
+                    {
+                        dependencies.Add(infoElement.Element(&quot;Master&quot;).Value);
+                    }
+
+                    //Add compositions as dependencies
+                    var compositionsElement = infoElement.Element(&quot;Compositions&quot;);
+                    if (compositionsElement != null &amp;&amp; compositionsElement.HasElements)
+                    {
+                        var compositions = compositionsElement.Elements(&quot;Composition&quot;);
+                        if (compositions.Any())
+                        {
+                            foreach (var composition in compositions)
+                            {
+                                dependencies.Add(composition.Value);
+                            }
+                        }
+                    }
+
+                    var field = new TopologicalSorter.DependencyField&lt;XElement&gt;
+                    {
+                        Alias = infoElement.Element(&quot;Alias&quot;).Value,
+                        Item = new Lazy&lt;XElement&gt;(() =&gt; elementCopy),
+                        DependsOn = dependencies.ToArray()
+                    };
+
+                    fields.Add(field);
+                }
+            }
+
+            //Sorting the Document Types based on dependencies - if its not a single doc type import ref. #U4-5921
+            var documentTypes = isSingleDocTypeImport
+                ? unsortedDocumentTypes.ToList()
+                : TopologicalSorter.GetSortedItems(fields).ToList();
+
+            //Iterate the sorted document types and create them as IContentType objects
+            foreach (var documentType in documentTypes)
+            {
+                var alias = documentType.Element(&quot;Info&quot;).Element(&quot;Alias&quot;).Value;
+                if (_importedContentTypes.ContainsKey(alias) == false)
+                {
+                    var contentType = _contentTypeService.GetContentType(alias);
+                    _importedContentTypes.Add(alias, contentType == null
+                                                         ? CreateContentTypeFromXml(documentType)
+                                                         : UpdateContentTypeFromXml(documentType, contentType));
+                }
+            }
+
+            foreach (var contentType in _importedContentTypes)
+            {
+                var ct = contentType.Value;
+                if (importedFolders.ContainsKey(ct.Alias))
+                {
+                    ct.ParentId = importedFolders[ct.Alias];
+                }
+            }
+
+            //Save the newly created/updated IContentType objects
+            var list = _importedContentTypes.Select(x =&gt; x.Value).ToList();
+            _contentTypeService.Save(list, userId);
+
+            //Now we can finish the import by updating the &#39;structure&#39;, 
+            //which requires the doc types to be saved/available in the db
+            if (importStructure)
+            {
+                var updatedContentTypes = new List&lt;IContentType&gt;();
+                //Update the structure here - we can&#39;t do it untill all DocTypes have been created
+                foreach (var documentType in documentTypes)
+                {
+                    var alias = documentType.Element(&quot;Info&quot;).Element(&quot;Alias&quot;).Value;
+                    var structureElement = documentType.Element(&quot;Structure&quot;);
+                    //Ensure that we only update ContentTypes which has actual structure-elements
+                    if (structureElement == null || structureElement.Elements(&quot;DocumentType&quot;).Any() == false) continue;
+
+                    var updated = UpdateContentTypesStructure(_importedContentTypes[alias], structureElement);
+                    updatedContentTypes.Add(updated);
+                }
+                //Update ContentTypes with a newly added structure/list of allowed children
+                if (updatedContentTypes.Any())
+                    _contentTypeService.Save(updatedContentTypes, userId);
+            }
+
+            if (raiseEvents)
+                ImportedContentType.RaiseEvent(new ImportEventArgs&lt;IContentType&gt;(list, element, false), this);
+
+            return list;
+        }
+
+        private Dictionary&lt;string, int&gt; CreateContentTypeFolderStructure(IEnumerable&lt;XElement&gt; unsortedDocumentTypes)
+        {
+            var importedFolders = new Dictionary&lt;string, int&gt;();
+            foreach (var documentType in unsortedDocumentTypes)
+            {
+                var foldersAttribute = documentType.Attribute(&quot;Folders&quot;);
+                var infoElement = documentType.Element(&quot;Info&quot;);
+                if (foldersAttribute != null &amp;&amp; infoElement != null 
+                    //don&#39;t import any folder if this is a child doc type - the parent doc type will need to
+                    //exist which contains it&#39;s folders
+                    &amp;&amp; ((string)infoElement.Element(&quot;Master&quot;)).IsNullOrWhiteSpace())
+                {
+                    var alias = documentType.Element(&quot;Info&quot;).Element(&quot;Alias&quot;).Value;
+                    var folders = foldersAttribute.Value.Split(&#39;/&#39;);
+                    var rootFolder = HttpUtility.UrlDecode(folders[0]);
+                    //level 1 = root level folders, there can only be one with the same name
+                    var current = _contentTypeService.GetContentTypeContainers(rootFolder, 1).FirstOrDefault();
+
+                    if (current == null)
+                    {
+                        var tryCreateFolder = _contentTypeService.CreateContentTypeContainer(-1, rootFolder);
+                        if (tryCreateFolder == false)
+                        {
+                            _logger.Error&lt;PackagingService&gt;(&quot;Could not create folder: &quot; + rootFolder, tryCreateFolder.Exception);
+                            throw tryCreateFolder.Exception;
+                        }
+                        var rootFolderId = tryCreateFolder.Result.Entity.Id;
+                        current = _contentTypeService.GetContentTypeContainer(rootFolderId);
+                    }
+
+                    importedFolders.Add(alias, current.Id);
+
+                    for (var i = 1; i &lt; folders.Length; i++)
+                    {
+                        var folderName = HttpUtility.UrlDecode(folders[i]);
+                        current = CreateContentTypeChildFolder(folderName, current);
+                        importedFolders[alias] = current.Id;
+                    }
+                }
+            }
+
+            return importedFolders;
+        }
+
+        private EntityContainer CreateContentTypeChildFolder(string folderName, IUmbracoEntity current)
+        {
+            var children = _entityService.GetChildren(current.Id).ToArray();
+            var found = children.Any(x =&gt; x.Name.InvariantEquals(folderName));
+            if (found)
+            {
+                var containerId = children.Single(x =&gt; x.Name.InvariantEquals(folderName)).Id;
+                return _contentTypeService.GetContentTypeContainer(containerId);
+            }
+
+            var tryCreateFolder = _contentTypeService.CreateContentTypeContainer(current.Id, folderName);
+            if (tryCreateFolder == false)
+            {
+                _logger.Error&lt;PackagingService&gt;(&quot;Could not create folder: &quot; + folderName, tryCreateFolder.Exception);
+                throw tryCreateFolder.Exception;
+            }
+            return _contentTypeService.GetContentTypeContainer(tryCreateFolder.Result.Entity.Id);
+        }
+
+        private IContentType CreateContentTypeFromXml(XElement documentType)
+        {
+            var infoElement = documentType.Element(&quot;Info&quot;);
+
+            //Name of the master corresponds to the parent
+            var masterElement = infoElement.Element(&quot;Master&quot;);
+            IContentType parent = null;
+            if (masterElement != null)
+            {
+                var masterAlias = masterElement.Value;
+                parent = _importedContentTypes.ContainsKey(masterAlias)
+                             ? _importedContentTypes[masterAlias]
+                             : _contentTypeService.GetContentType(masterAlias);
+            }
+
+            var alias = infoElement.Element(&quot;Alias&quot;).Value;
+            var contentType = parent == null
+                                  ? new ContentType(-1) { Alias = alias }
+                                  : new ContentType(parent, alias);
+
+            if (parent != null)
+                contentType.AddContentType(parent);
+
+            return UpdateContentTypeFromXml(documentType, contentType);
+        }
+
+        private IContentType UpdateContentTypeFromXml(XElement documentType, IContentType contentType)
+        {
+            var infoElement = documentType.Element(&quot;Info&quot;);
+            var defaultTemplateElement = infoElement.Element(&quot;DefaultTemplate&quot;);
+
+            contentType.Name = infoElement.Element(&quot;Name&quot;).Value;
+            contentType.Icon = infoElement.Element(&quot;Icon&quot;).Value;
+            contentType.Thumbnail = infoElement.Element(&quot;Thumbnail&quot;).Value;
+            contentType.Description = infoElement.Element(&quot;Description&quot;).Value;
+
+            //NOTE AllowAtRoot is a new property in the package xml so we need to verify it exists before using it.
+            var allowAtRoot = infoElement.Element(&quot;AllowAtRoot&quot;);
+            if (allowAtRoot != null)
+                contentType.AllowedAsRoot = allowAtRoot.Value.InvariantEquals(&quot;true&quot;);
+
+            //NOTE IsListView is a new property in the package xml so we need to verify it exists before using it.
+            var isListView = infoElement.Element(&quot;IsListView&quot;);
+            if (isListView != null)
+                contentType.IsContainer = isListView.Value.InvariantEquals(&quot;true&quot;);
+
+            //Name of the master corresponds to the parent and we need to ensure that the Parent Id is set
+            var masterElement = infoElement.Element(&quot;Master&quot;);
+            if (masterElement != null)
+            {
+                var masterAlias = masterElement.Value;
+                IContentType parent = _importedContentTypes.ContainsKey(masterAlias)
+                    ? _importedContentTypes[masterAlias]
+                    : _contentTypeService.GetContentType(masterAlias);
+
+                contentType.SetLazyParentId(new Lazy&lt;int&gt;(() =&gt; parent.Id));
+            }
+
+            //Update Compositions on the ContentType to ensure that they are as is defined in the package xml
+            var compositionsElement = infoElement.Element(&quot;Compositions&quot;);
+            if (compositionsElement != null &amp;&amp; compositionsElement.HasElements)
+            {
+                var compositions = compositionsElement.Elements(&quot;Composition&quot;);
+                if (compositions.Any())
+                {
+                    foreach (var composition in compositions)
+                    {
+                        var compositionAlias = composition.Value;
+                        var compositionContentType = _importedContentTypes.ContainsKey(compositionAlias)
+                            ? _importedContentTypes[compositionAlias]
+                            : _contentTypeService.GetContentType(compositionAlias);
+                        var added = contentType.AddContentType(compositionContentType);
+                    }
+                }
+            }
+
+            UpdateContentTypesAllowedTemplates(contentType, infoElement.Element(&quot;AllowedTemplates&quot;), defaultTemplateElement);
+            UpdateContentTypesTabs(contentType, documentType.Element(&quot;Tabs&quot;));
+            UpdateContentTypesProperties(contentType, documentType.Element(&quot;GenericProperties&quot;));
+
+            return contentType;
+        }
+
+        private void UpdateContentTypesAllowedTemplates(IContentType contentType,
+                                                        XElement allowedTemplatesElement, XElement defaultTemplateElement)
+        {
+            if (allowedTemplatesElement != null &amp;&amp; allowedTemplatesElement.Elements(&quot;Template&quot;).Any())
+            {
+                var allowedTemplates = contentType.AllowedTemplates.ToList();
+                foreach (var templateElement in allowedTemplatesElement.Elements(&quot;Template&quot;))
+                {
+                    var alias = templateElement.Value;
+                    var template = _fileService.GetTemplate(alias.ToSafeAlias());
+                    if (template != null)
+                    {
+                        if (allowedTemplates.Any(x =&gt; x.Id == template.Id)) continue;
+                        allowedTemplates.Add(template);
+                    }
+                    else
+                    {
+                        _logger.Warn&lt;PackagingService&gt;(
+                            string.Format(
+                                &quot;Packager: Error handling allowed templates. Template with alias &#39;{0}&#39; could not be found.&quot;,
+                                alias));
+                    }
+                }
+
+                contentType.AllowedTemplates = allowedTemplates;
+            }
+
+            if (string.IsNullOrEmpty((string)defaultTemplateElement) == false)
+            {
+                var defaultTemplate = _fileService.GetTemplate(defaultTemplateElement.Value.ToSafeAlias());
+                if (defaultTemplate != null)
+                {
+                    contentType.SetDefaultTemplate(defaultTemplate);
+                }
+                else
+                {
+                    _logger.Warn&lt;PackagingService&gt;(
+                        string.Format(
+                            &quot;Packager: Error handling default template. Default template with alias &#39;{0}&#39; could not be found.&quot;,
+                            defaultTemplateElement.Value));
+                }
+            }
+        }
+
+        private void UpdateContentTypesTabs(IContentType contentType, XElement tabElement)
+        {
+            if (tabElement == null)
+                return;
+
+            var tabs = tabElement.Elements(&quot;Tab&quot;);
+            foreach (var tab in tabs)
+            {
+                var id = tab.Element(&quot;Id&quot;).Value;//Do we need to use this for tracking?
+                var caption = tab.Element(&quot;Caption&quot;).Value;
+
+                if (contentType.PropertyGroups.Contains(caption) == false)
+                {
+                    contentType.AddPropertyGroup(caption);
+
+                }
+
+                int sortOrder;
+                if (tab.Element(&quot;SortOrder&quot;) != null &amp;&amp; int.TryParse(tab.Element(&quot;SortOrder&quot;).Value, out sortOrder))
+                {
+                    // Override the sort order with the imported value
+                    contentType.PropertyGroups[caption].SortOrder = sortOrder;
+                }
+            }
+        }
+
+        private void UpdateContentTypesProperties(IContentType contentType, XElement genericPropertiesElement)
+        {
+            var properties = genericPropertiesElement.Elements(&quot;GenericProperty&quot;);
+            foreach (var property in properties)
+            {
+                var dataTypeDefinitionId = new Guid(property.Element(&quot;Definition&quot;).Value);//Unique Id for a DataTypeDefinition
+
+                var dataTypeDefinition = _dataTypeService.GetDataTypeDefinitionById(dataTypeDefinitionId);
+
+                //If no DataTypeDefinition with the guid from the xml wasn&#39;t found OR the ControlId on the DataTypeDefinition didn&#39;t match the DataType Id
+                //We look up a DataTypeDefinition that matches
+
+                //we&#39;ll check if it is a GUID (legacy id for a property editor)
+                var legacyPropertyEditorId = Guid.Empty;
+                Guid.TryParse(property.Element(&quot;Type&quot;).Value, out legacyPropertyEditorId);
+                //get the alias as a string for use below
+                var propertyEditorAlias = property.Element(&quot;Type&quot;).Value.Trim();
+
+                //If no DataTypeDefinition with the guid from the xml wasn&#39;t found OR the ControlId on the DataTypeDefinition didn&#39;t match the DataType Id
+                //We look up a DataTypeDefinition that matches
+
+                if (dataTypeDefinition == null)
+                {
+                    var dataTypeDefinitions = legacyPropertyEditorId != Guid.Empty
+                                                  ? _dataTypeService.GetDataTypeDefinitionByControlId(legacyPropertyEditorId)
+                                                  : _dataTypeService.GetDataTypeDefinitionByPropertyEditorAlias(propertyEditorAlias);
+                    if (dataTypeDefinitions != null &amp;&amp; dataTypeDefinitions.Any())
+                    {
+                        dataTypeDefinition = dataTypeDefinitions.FirstOrDefault();
+                    }
+                }
+                else if (legacyPropertyEditorId != Guid.Empty &amp;&amp; dataTypeDefinition.ControlId != legacyPropertyEditorId)
+                {
+                    var dataTypeDefinitions = _dataTypeService.GetDataTypeDefinitionByControlId(legacyPropertyEditorId);
+                    if (dataTypeDefinitions != null &amp;&amp; dataTypeDefinitions.Any())
+                    {
+                        dataTypeDefinition = dataTypeDefinitions.FirstOrDefault();
+                    }
+                }
+                else if (dataTypeDefinition.PropertyEditorAlias != propertyEditorAlias)
+                {
+                    var dataTypeDefinitions = _dataTypeService.GetDataTypeDefinitionByPropertyEditorAlias(propertyEditorAlias);
+                    if (dataTypeDefinitions != null &amp;&amp; dataTypeDefinitions.Any())
+                    {
+                        dataTypeDefinition = dataTypeDefinitions.FirstOrDefault();
+                    }
+                }
+
+                // For backwards compatibility, if no datatype with that ID can be found, we&#39;re letting this fail silently.
+                // This means that the property will not be created.
+                if (dataTypeDefinition == null)
+                {
+                    _logger.Warn&lt;PackagingService&gt;(
+                        string.Format(&quot;Packager: Error handling creation of PropertyType &#39;{0}&#39;. Could not find DataTypeDefintion with unique id &#39;{1}&#39; nor one referencing the DataType with a property editor alias (or legacy control id) &#39;{2}&#39;. Did the package creator forget to package up custom datatypes? This property will be converted to a label/readonly editor if one exists.&quot;,
+                                      property.Element(&quot;Name&quot;).Value,
+                                      dataTypeDefinitionId,
+                                      property.Element(&quot;Type&quot;).Value.Trim()));
+
+                    //convert to a label!
+                    dataTypeDefinition = _dataTypeService.GetDataTypeDefinitionByPropertyEditorAlias(Constants.PropertyEditors.NoEditAlias).FirstOrDefault();
+                    //if for some odd reason this isn&#39;t there then ignore
+                    if (dataTypeDefinition == null) continue;
+                }
+
+                var sortOrder = 0;
+                var sortOrderElement = property.Element(&quot;SortOrder&quot;);
+                if (sortOrderElement != null)
+                    int.TryParse(sortOrderElement.Value, out sortOrder);
+                var propertyType = new PropertyType(dataTypeDefinition, property.Element(&quot;Alias&quot;).Value)
+                {
+                    Name = property.Element(&quot;Name&quot;).Value,
+                    Description = (string)property.Element(&quot;Description&quot;),
+                    Mandatory = property.Element(&quot;Mandatory&quot;) != null ? property.Element(&quot;Mandatory&quot;).Value.ToLowerInvariant().Equals(&quot;true&quot;) : false,
+                    ValidationRegExp = (string)property.Element(&quot;Validation&quot;),
+                    SortOrder = sortOrder
+                };
+
+                var tab = (string)property.Element(&quot;Tab&quot;);
+                if (string.IsNullOrEmpty(tab))
+                {
+                    contentType.AddPropertyType(propertyType);
+                }
+                else
+                {
+                    contentType.AddPropertyType(propertyType, tab);
+                }
+            }
+        }
+
+        private IContentType UpdateContentTypesStructure(IContentType contentType, XElement structureElement)
+        {
+            var allowedChildren = contentType.AllowedContentTypes.ToList();
+            int sortOrder = allowedChildren.Any() ? allowedChildren.Last().SortOrder : 0;
+            foreach (var element in structureElement.Elements(&quot;DocumentType&quot;))
+            {
+                var alias = element.Value;
+                if (_importedContentTypes.ContainsKey(alias))
+                {
+                    var allowedChild = _importedContentTypes[alias];
+                    if (allowedChild == null || allowedChildren.Any(x =&gt; x.Id.IsValueCreated &amp;&amp; x.Id.Value == allowedChild.Id)) continue;
+
+                    allowedChildren.Add(new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; allowedChild.Id), sortOrder, allowedChild.Alias));
+                    sortOrder++;
+                }
+                else
+                {
+                    _logger.Warn&lt;PackagingService&gt;(
+                    string.Format(
+                        &quot;Packager: Error handling DocumentType structure. DocumentType with alias &#39;{0}&#39; could not be found and was not added to the structure for &#39;{1}&#39;.&quot;,
+                        alias, contentType.Alias));
+                }
+            }
+
+            contentType.AllowedContentTypes = allowedChildren;
+            return contentType;
+        }
+
+        /// &lt;summary&gt;
+        /// Used during Content import to ensure that the ContentType of a content item exists
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentTypeAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IContentType FindContentTypeByAlias(string contentTypeAlias)
+        {
+            using (var repository = _repositoryFactory.CreateContentTypeRepository(_uowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContentType&gt;.Builder.Where(x =&gt; x.Alias == contentTypeAlias);
+                var types = repository.GetByQuery(query).ToArray();
+
+                if (types.Any() == false)
+                    throw new Exception(
+                        string.Format(&quot;No ContentType matching the passed in Alias: &#39;{0}&#39; was found&quot;,
+                                      contentTypeAlias));
+
+                var contentType = types.FirstOrDefault();
+
+                if (contentType == null)
+                    throw new Exception(string.Format(&quot;ContentType matching the passed in Alias: &#39;{0}&#39; was null&quot;,
+                                                      contentTypeAlias));
+
+                return contentType;
+            }
+        }
+
+        #endregion
+
+        #region DataTypes
+
+        /// &lt;summary&gt;
+        /// Exports a list of Data Types
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dataTypeDefinitions&quot;&gt;List of data types to export&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the IDataTypeDefinition objects&lt;/returns&gt;
+        public XElement Export(IEnumerable&lt;IDataTypeDefinition&gt; dataTypeDefinitions, bool raiseEvents = true)
+        {
+            var container = new XElement(&quot;DataTypes&quot;);
+            foreach (var dataTypeDefinition in dataTypeDefinitions)
+            {
+                container.Add(Export(dataTypeDefinition, raiseEvents));
+            }
+            return container;
+        }
+
+        /// &lt;summary&gt;
+        /// Exports a single Data Type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dataTypeDefinition&quot;&gt;Data type to export&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the IDataTypeDefinition object&lt;/returns&gt;
+        public XElement Export(IDataTypeDefinition dataTypeDefinition, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ExportingDataType.IsRaisedEventCancelled(new ExportEventArgs&lt;IDataTypeDefinition&gt;(dataTypeDefinition, &quot;DataType&quot;), this))
+                    return new XElement(&quot;DataType&quot;);
+            }
+
+            var exporter = new EntityXmlSerializer();
+            var xml = exporter.Serialize(_dataTypeService, dataTypeDefinition);
+
+            if (raiseEvents)
+                ExportedDataType.RaiseEvent(new ExportEventArgs&lt;IDataTypeDefinition&gt;(dataTypeDefinition, xml, false), this);
+
+            return xml;
+        }
+
+        /// &lt;summary&gt;
+        /// Imports and saves package xml as &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;element&quot;&gt;Xml to import&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the user&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;An enumrable list of generated DataTypeDefinitions&lt;/returns&gt;
+        public IEnumerable&lt;IDataTypeDefinition&gt; ImportDataTypeDefinitions(XElement element, int userId = 0, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ImportingDataType.IsRaisedEventCancelled(new ImportEventArgs&lt;IDataTypeDefinition&gt;(element), this))
+                    return Enumerable.Empty&lt;IDataTypeDefinition&gt;();
+            }
+
+            var name = element.Name.LocalName;
+            if (name.Equals(&quot;DataTypes&quot;) == false &amp;&amp; name.Equals(&quot;DataType&quot;) == false)
+            {
+                throw new ArgumentException(&quot;The passed in XElement is not valid! It does not contain a root element called &#39;DataTypes&#39; for multiple imports or &#39;DataType&#39; for a single import.&quot;);
+            }
+
+            var dataTypes = new Dictionary&lt;string, IDataTypeDefinition&gt;();
+            var dataTypeElements = name.Equals(&quot;DataTypes&quot;)
+                                       ? (from doc in element.Elements(&quot;DataType&quot;) select doc).ToList()
+                                       : new List&lt;XElement&gt; { element };
+
+            var importedFolders = CreateDataTypeFolderStructure(dataTypeElements);
+
+            foreach (var dataTypeElement in dataTypeElements)
+            {
+                var dataTypeDefinitionName = dataTypeElement.Attribute(&quot;Name&quot;).Value;
+
+                Guid legacyPropertyEditorId;
+                Guid.TryParse(dataTypeElement.Attribute(&quot;Id&quot;).Value, out legacyPropertyEditorId);
+
+                var dataTypeDefinitionId = new Guid(dataTypeElement.Attribute(&quot;Definition&quot;).Value);
+                var databaseTypeAttribute = dataTypeElement.Attribute(&quot;DatabaseType&quot;);
+
+                var parentId = -1;
+                if (importedFolders.ContainsKey(dataTypeDefinitionName))
+                    parentId = importedFolders[dataTypeDefinitionName];
+
+                var definition = _dataTypeService.GetDataTypeDefinitionById(dataTypeDefinitionId);
+                //If the datatypedefinition doesn&#39;t already exist we create a new new according to the one in the package xml
+                if (definition == null)
+                {
+                    var databaseType = databaseTypeAttribute != null
+                                           ? databaseTypeAttribute.Value.EnumParse&lt;DataTypeDatabaseType&gt;(true)
+                                           : DataTypeDatabaseType.Ntext;
+
+                    //check if the Id was a GUID, that means it is referenced using the legacy property editor GUID id
+                    if (legacyPropertyEditorId != Guid.Empty)
+                    {
+                        var dataTypeDefinition = new DataTypeDefinition(-1, legacyPropertyEditorId)
+                        {
+                            Key = dataTypeDefinitionId,
+                            Name = dataTypeDefinitionName,
+                            DatabaseType = databaseType,
+                            ParentId = parentId
+                        };
+                        dataTypes.Add(dataTypeDefinitionName, dataTypeDefinition);
+                    }
+                    else
+                    {
+                        //the Id field is actually the string property editor Alias
+                        var dataTypeDefinition = new DataTypeDefinition(dataTypeElement.Attribute(&quot;Id&quot;).Value.Trim())
+                        {
+                            Key = dataTypeDefinitionId,
+                            Name = dataTypeDefinitionName,
+                            DatabaseType = databaseType,
+                            ParentId = parentId
+                        };
+                        dataTypes.Add(dataTypeDefinitionName, dataTypeDefinition);
+                    }
+
+                }
+                else
+                {
+                    definition.ParentId = parentId;
+                    _dataTypeService.Save(definition, userId);
+                }
+            }
+
+            var list = dataTypes.Select(x =&gt; x.Value).ToList();
+            if (list.Any())
+            {
+                //NOTE: As long as we have to deal with the two types of PreValue lists (with/without Keys)
+                //this is a bit of a pain to handle while ensuring that the imported DataTypes has PreValues
+                //place when triggering the save event.
+
+                _dataTypeService.Save(list, userId, false);//Save without raising events
+
+                SavePrevaluesFromXml(list, dataTypeElements);//Save the PreValues for the current list of DataTypes
+
+                _dataTypeService.Save(list, userId, true);//Re-save and raise events
+            }
+
+            if (raiseEvents)
+                ImportedDataType.RaiseEvent(new ImportEventArgs&lt;IDataTypeDefinition&gt;(list, element, false), this);
+
+            return list;
+        }
+
+        private Dictionary&lt;string, int&gt; CreateDataTypeFolderStructure(IEnumerable&lt;XElement&gt; datatypeElements)
+        {
+            var importedFolders = new Dictionary&lt;string, int&gt;();
+            foreach (var datatypeElement in datatypeElements)
+            {
+                var foldersAttribute = datatypeElement.Attribute(&quot;Folders&quot;);
+                if (foldersAttribute != null)
+                {
+                    var name = datatypeElement.Attribute(&quot;Name&quot;).Value;
+                    var folders = foldersAttribute.Value.Split(&#39;/&#39;);
+                    var rootFolder = HttpUtility.UrlDecode(folders[0]);
+                    //there will only be a single result by name for level 1 (root) containers
+                    var current = _dataTypeService.GetContainers(rootFolder, 1).FirstOrDefault();
+
+                    if (current == null)
+                    {
+                        var tryCreateFolder = _dataTypeService.CreateContainer(-1, rootFolder);
+                        if (tryCreateFolder == false)
+                        {
+                            _logger.Error&lt;PackagingService&gt;(&quot;Could not create folder: &quot; + rootFolder, tryCreateFolder.Exception);
+                            throw tryCreateFolder.Exception;
+                        }                        
+                        current = _dataTypeService.GetContainer(tryCreateFolder.Result.Entity.Id);
+                    }
+
+                    importedFolders.Add(name, current.Id);
+
+                    for (var i = 1; i &lt; folders.Length; i++)
+                    {
+                        var folderName = HttpUtility.UrlDecode(folders[i]);
+                        current = CreateDataTypeChildFolder(folderName, current);
+                        importedFolders[name] = current.Id;
+                    }
+                }
+            }
+
+            return importedFolders;
+        }
+
+        private EntityContainer CreateDataTypeChildFolder(string folderName, IUmbracoEntity current)
+        {
+            var children = _entityService.GetChildren(current.Id).ToArray();
+            var found = children.Any(x =&gt; x.Name.InvariantEquals(folderName));
+            if (found)
+            {
+                var containerId = children.Single(x =&gt; x.Name.InvariantEquals(folderName)).Id;
+                return _dataTypeService.GetContainer(containerId);
+            }
+
+            var tryCreateFolder = _dataTypeService.CreateContainer(current.Id, folderName);
+            if (tryCreateFolder == false)
+            {
+                _logger.Error&lt;PackagingService&gt;(&quot;Could not create folder: &quot; + folderName, tryCreateFolder.Exception);
+                throw tryCreateFolder.Exception;
+            }
+            return _dataTypeService.GetContainer(tryCreateFolder.Result.Entity.Id);
+        }
+
+        private void SavePrevaluesFromXml(List&lt;IDataTypeDefinition&gt; dataTypes, IEnumerable&lt;XElement&gt; dataTypeElements)
+        {
+            foreach (var dataTypeElement in dataTypeElements)
+            {
+                var prevaluesElement = dataTypeElement.Element(&quot;PreValues&quot;);
+                if (prevaluesElement == null) continue;
+
+                var dataTypeDefinitionName = dataTypeElement.Attribute(&quot;Name&quot;).Value;
+                var dataTypeDefinition = dataTypes.FirstOrDefault(x =&gt; x.Name == dataTypeDefinitionName);
+
+                if (dataTypeDefinition != null)
+                {
+                    var valuesWithoutKeys = prevaluesElement.Elements(&quot;PreValue&quot;)
+                        .Where(x =&gt; ((string) x.Attribute(&quot;Alias&quot;)).IsNullOrWhiteSpace())
+                        .Select(x =&gt; x.Attribute(&quot;Value&quot;).Value);
+
+                    var valuesWithKeys = prevaluesElement.Elements(&quot;PreValue&quot;)
+                        .Where(x =&gt; ((string) x.Attribute(&quot;Alias&quot;)).IsNullOrWhiteSpace() == false)
+                        .ToDictionary(
+                            key =&gt; (string) key.Attribute(&quot;Alias&quot;),
+                            val =&gt; new PreValue((string) val.Attribute(&quot;Value&quot;)));
+
+                    //save the values with keys
+                    _dataTypeService.SavePreValues(dataTypeDefinition, valuesWithKeys);
+
+                    //save the values without keys (this is legacy)
+                    _dataTypeService.SavePreValues(dataTypeDefinition.Id, valuesWithoutKeys);
+                }
+                else
+                {
+                    _logger.Warn&lt;PackagingService&gt;(&quot;No data type found with name &quot; + dataTypeDefinitionName + &quot; data type pre-values will not be saved&quot;);
+                }
+            }
+        }
+
+        #endregion
+
+        #region Dictionary Items
+
+        /// &lt;summary&gt;
+        /// Exports a list of &lt;see cref=&quot;IDictionaryItem&quot;/&gt; items to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dictionaryItem&quot;&gt;List of dictionary items to export&lt;/param&gt;
+        /// &lt;param name=&quot;includeChildren&quot;&gt;Optional boolean indicating whether or not to include children&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the IDictionaryItem objects&lt;/returns&gt;
+        public XElement Export(IEnumerable&lt;IDictionaryItem&gt; dictionaryItem, bool includeChildren = true, bool raiseEvents = true)
+        {
+            var xml = new XElement(&quot;DictionaryItems&quot;);
+            foreach (var item in dictionaryItem)
+            {
+                xml.Add(Export(item, includeChildren, raiseEvents));
+            }
+            return xml;
+        }
+
+        /// &lt;summary&gt;
+        /// Exports a single &lt;see cref=&quot;IDictionaryItem&quot;/&gt; item to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dictionaryItem&quot;&gt;Dictionary Item to export&lt;/param&gt;
+        /// &lt;param name=&quot;includeChildren&quot;&gt;Optional boolean indicating whether or not to include children&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the IDictionaryItem object&lt;/returns&gt;
+        public XElement Export(IDictionaryItem dictionaryItem, bool includeChildren, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ExportingDictionaryItem.IsRaisedEventCancelled(new ExportEventArgs&lt;IDictionaryItem&gt;(dictionaryItem, &quot;DictionaryItem&quot;), this))
+                    return new XElement(&quot;DictionaryItem&quot;);
+            }
+
+            var exporter = new EntityXmlSerializer();
+            var xml = exporter.Serialize(dictionaryItem);
+
+            if (includeChildren)
+            {
+                var children = _localizationService.GetDictionaryItemChildren(dictionaryItem.Key);
+                foreach (var child in children)
+                {
+                    xml.Add(Export(child, true));
+                }
+            }
+
+            if (raiseEvents)
+                ExportedDictionaryItem.RaiseEvent(new ExportEventArgs&lt;IDictionaryItem&gt;(dictionaryItem, xml, false), this);
+
+            return xml;
+        }
+
+        /// &lt;summary&gt;
+        /// Imports and saves the &#39;DictionaryItems&#39; part of the package xml as a list of &lt;see cref=&quot;IDictionaryItem&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dictionaryItemElementList&quot;&gt;Xml to import&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of dictionary items&lt;/returns&gt;
+        public IEnumerable&lt;IDictionaryItem&gt; ImportDictionaryItems(XElement dictionaryItemElementList, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ImportingDictionaryItem.IsRaisedEventCancelled(new ImportEventArgs&lt;IDictionaryItem&gt;(dictionaryItemElementList), this))
+                    return Enumerable.Empty&lt;IDictionaryItem&gt;();
+            }
+
+            var languages = _localizationService.GetAllLanguages().ToList();
+            return ImportDictionaryItems(dictionaryItemElementList, languages, raiseEvents);
+        }
+
+        private IEnumerable&lt;IDictionaryItem&gt; ImportDictionaryItems(XElement dictionaryItemElementList, List&lt;ILanguage&gt; languages, bool raiseEvents, Guid? parentId = null)
+        {
+            var items = new List&lt;IDictionaryItem&gt;();
+            foreach (var dictionaryItemElement in dictionaryItemElementList.Elements(&quot;DictionaryItem&quot;))
+                items.AddRange(ImportDictionaryItem(dictionaryItemElement, languages, raiseEvents, parentId));
+
+
+            if (raiseEvents)
+                ImportedDictionaryItem.RaiseEvent(new ImportEventArgs&lt;IDictionaryItem&gt;(items, dictionaryItemElementList, false), this);
+
+            return items;
+        }
+
+        private IEnumerable&lt;IDictionaryItem&gt; ImportDictionaryItem(XElement dictionaryItemElement, List&lt;ILanguage&gt; languages, bool raiseEvents, Guid? parentId)
+        {
+            var items = new List&lt;IDictionaryItem&gt;();
+
+            IDictionaryItem dictionaryItem;
+            var key = dictionaryItemElement.Attribute(&quot;Key&quot;).Value;
+            if (_localizationService.DictionaryItemExists(key))
+                dictionaryItem = GetAndUpdateDictionaryItem(key, dictionaryItemElement, languages);
+            else
+                dictionaryItem = CreateNewDictionaryItem(key, dictionaryItemElement, languages, parentId);
+            _localizationService.Save(dictionaryItem);
+            items.Add(dictionaryItem);
+
+            items.AddRange(ImportDictionaryItems(dictionaryItemElement, languages, raiseEvents, dictionaryItem.Key));
+            return items;
+        }
+
+        private IDictionaryItem GetAndUpdateDictionaryItem(string key, XElement dictionaryItemElement, List&lt;ILanguage&gt; languages)
+        {
+            var dictionaryItem = _localizationService.GetDictionaryItemByKey(key);
+            var translations = dictionaryItem.Translations.ToList();
+            foreach (var valueElement in dictionaryItemElement.Elements(&quot;Value&quot;).Where(v =&gt; DictionaryValueIsNew(translations, v)))
+                AddDictionaryTranslation(translations, valueElement, languages);
+            dictionaryItem.Translations = translations;
+            return dictionaryItem;
+        }
+
+        private static DictionaryItem CreateNewDictionaryItem(string key, XElement dictionaryItemElement, List&lt;ILanguage&gt; languages, Guid? parentId)
+        {
+            var dictionaryItem = parentId.HasValue ? new DictionaryItem(parentId.Value, key) : new DictionaryItem(key);
+            var translations = new List&lt;IDictionaryTranslation&gt;();
+
+            foreach (var valueElement in dictionaryItemElement.Elements(&quot;Value&quot;))
+                AddDictionaryTranslation(translations, valueElement, languages);
+
+            dictionaryItem.Translations = translations;
+            return dictionaryItem;
+        }
+
+        private static bool DictionaryValueIsNew(IEnumerable&lt;IDictionaryTranslation&gt; translations, XElement valueElement)
+        {
+            return translations.All(t =&gt;
+                String.Compare(t.Language.IsoCode, valueElement.Attribute(&quot;LanguageCultureAlias&quot;).Value,
+                    StringComparison.InvariantCultureIgnoreCase) != 0
+                );
+        }
+
+        private static void AddDictionaryTranslation(ICollection&lt;IDictionaryTranslation&gt; translations, XElement valueElement, IEnumerable&lt;ILanguage&gt; languages)
+        {
+            var languageId = valueElement.Attribute(&quot;LanguageCultureAlias&quot;).Value;
+            var language = languages.SingleOrDefault(l =&gt; l.IsoCode == languageId);
+            if (language == null)
+                return;
+            var translation = new DictionaryTranslation(language, valueElement.Value);
+            translations.Add(translation);
+        }
+
+        #endregion
+
+        #region Files
+        #endregion
+
+        #region Languages
+
+        /// &lt;summary&gt;
+        /// Exports a list of &lt;see cref=&quot;ILanguage&quot;/&gt; items to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;languages&quot;&gt;List of Languages to export&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the ILanguage objects&lt;/returns&gt;
+        public XElement Export(IEnumerable&lt;ILanguage&gt; languages, bool raiseEvents = true)
+        {
+            var xml = new XElement(&quot;Languages&quot;);
+            foreach (var language in languages)
+            {
+                xml.Add(Export(language, raiseEvents));
+            }
+            return xml;
+        }
+
+        /// &lt;summary&gt;
+        /// Exports a single &lt;see cref=&quot;ILanguage&quot;/&gt; item to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;language&quot;&gt;Language to export&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the ILanguage object&lt;/returns&gt;
+        public XElement Export(ILanguage language, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ExportingLanguage.IsRaisedEventCancelled(new ExportEventArgs&lt;ILanguage&gt;(language, &quot;Language&quot;), this))
+                    return new XElement(&quot;Language&quot;);
+            }
+
+            var exporter = new EntityXmlSerializer();
+            var xml = exporter.Serialize(language);
+
+            if (raiseEvents)
+                ExportedLanguage.RaiseEvent(new ExportEventArgs&lt;ILanguage&gt;(language, xml, false), this);
+
+            return xml;
+        }
+
+        /// &lt;summary&gt;
+        /// Imports and saves the &#39;Languages&#39; part of a package xml as a list of &lt;see cref=&quot;ILanguage&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;languageElementList&quot;&gt;Xml to import&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the User performing the operation&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of generated languages&lt;/returns&gt;
+        public IEnumerable&lt;ILanguage&gt; ImportLanguages(XElement languageElementList, int userId = 0, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ImportingLanguage.IsRaisedEventCancelled(new ImportEventArgs&lt;ILanguage&gt;(languageElementList), this))
+                    return Enumerable.Empty&lt;ILanguage&gt;();
+            }
+
+            var list = new List&lt;ILanguage&gt;();
+            foreach (var languageElement in languageElementList.Elements(&quot;Language&quot;))
+            {
+                var isoCode = languageElement.Attribute(&quot;CultureAlias&quot;).Value;
+                var existingLanguage = _localizationService.GetLanguageByIsoCode(isoCode);
+                if (existingLanguage == null)
+                {
+                    var langauge = new Language(isoCode)
+                    {
+                        CultureName = languageElement.Attribute(&quot;FriendlyName&quot;).Value
+                    };
+                    _localizationService.Save(langauge);
+                    list.Add(langauge);
+                }
+            }
+
+            if (raiseEvents)
+                ImportedLanguage.RaiseEvent(new ImportEventArgs&lt;ILanguage&gt;(list, languageElementList, false), this);
+
+            return list;
+        }
+
+        #endregion
+
+        #region Macros
+
+        /// &lt;summary&gt;
+        /// Imports and saves the &#39;Macros&#39; part of a package xml as a list of &lt;see cref=&quot;IMacro&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;element&quot;&gt;Xml to import&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the User performing the operation&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMacro&gt; ImportMacros(XElement element, int userId = 0, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ImportingMacro.IsRaisedEventCancelled(new ImportEventArgs&lt;IMacro&gt;(element), this))
+                    return Enumerable.Empty&lt;IMacro&gt;();
+            }
+
+            var name = element.Name.LocalName;
+            if (name.Equals(&quot;Macros&quot;) == false &amp;&amp; name.Equals(&quot;macro&quot;) == false)
+            {
+                throw new ArgumentException(&quot;The passed in XElement is not valid! It does not contain a root element called &#39;Macros&#39; for multiple imports or &#39;macro&#39; for a single import.&quot;);
+            }
+
+            var macroElements = name.Equals(&quot;Macros&quot;)
+                                       ? (from doc in element.Elements(&quot;macro&quot;) select doc).ToList()
+                                       : new List&lt;XElement&gt; { element };
+
+            var macros = macroElements.Select(ParseMacroElement).ToList();
+
+            foreach (var macro in macros)
+            {
+                var existing = _macroService.GetByAlias(macro.Alias);
+                if (existing != null)
+                    macro.Id = existing.Id;
+
+                _macroService.Save(macro, userId);
+            }
+
+            if (raiseEvents)
+                ImportedMacro.RaiseEvent(new ImportEventArgs&lt;IMacro&gt;(macros, element, false), this);
+
+            return macros;
+        }
+
+        private IMacro ParseMacroElement(XElement macroElement)
+        {
+            var macroName = macroElement.Element(&quot;name&quot;).Value;
+            var macroAlias = macroElement.Element(&quot;alias&quot;).Value;
+            var controlType = macroElement.Element(&quot;scriptType&quot;).Value;
+            var controlAssembly = macroElement.Element(&quot;scriptAssembly&quot;).Value;
+            var xsltPath = macroElement.Element(&quot;xslt&quot;).Value;
+            var scriptPath = macroElement.Element(&quot;scriptingFile&quot;).Value;
+
+            //Following xml elements are treated as nullable properties
+            var useInEditorElement = macroElement.Element(&quot;useInEditor&quot;);
+            var useInEditor = false;
+            if (useInEditorElement != null &amp;&amp; string.IsNullOrEmpty((string)useInEditorElement) == false)
+            {
+                useInEditor = bool.Parse(useInEditorElement.Value);
+            }
+            var cacheDurationElement = macroElement.Element(&quot;refreshRate&quot;);
+            var cacheDuration = 0;
+            if (cacheDurationElement != null &amp;&amp; string.IsNullOrEmpty((string)cacheDurationElement) == false)
+            {
+                cacheDuration = int.Parse(cacheDurationElement.Value);
+            }
+            var cacheByMemberElement = macroElement.Element(&quot;cacheByMember&quot;);
+            var cacheByMember = false;
+            if (cacheByMemberElement != null &amp;&amp; string.IsNullOrEmpty((string)cacheByMemberElement) == false)
+            {
+                cacheByMember = bool.Parse(cacheByMemberElement.Value);
+            }
+            var cacheByPageElement = macroElement.Element(&quot;cacheByPage&quot;);
+            var cacheByPage = false;
+            if (cacheByPageElement != null &amp;&amp; string.IsNullOrEmpty((string)cacheByPageElement) == false)
+            {
+                cacheByPage = bool.Parse(cacheByPageElement.Value);
+            }
+            var dontRenderElement = macroElement.Element(&quot;dontRender&quot;);
+            var dontRender = true;
+            if (dontRenderElement != null &amp;&amp; string.IsNullOrEmpty((string)dontRenderElement) == false)
+            {
+                dontRender = bool.Parse(dontRenderElement.Value);
+            }
+
+            var existingMacro = _macroService.GetByAlias(macroAlias) as Macro;
+            var macro = existingMacro ?? new Macro(macroAlias, macroName, controlType, controlAssembly, xsltPath, scriptPath,
+                cacheByPage, cacheByMember, dontRender, useInEditor, cacheDuration);
+
+            var properties = macroElement.Element(&quot;properties&quot;);
+            if (properties != null)
+            {
+                int sortOrder = 0;
+                foreach (var property in properties.Elements())
+                {
+                    var propertyName = property.Attribute(&quot;name&quot;).Value;
+                    var propertyAlias = property.Attribute(&quot;alias&quot;).Value;
+                    var editorAlias = property.Attribute(&quot;propertyType&quot;).Value;
+                    var sortOrderAttribute = property.Attribute(&quot;sortOrder&quot;);
+                    if (sortOrderAttribute != null)
+                    {
+                        sortOrder = int.Parse(sortOrderAttribute.Value);
+                    }
+
+                    if (macro.Properties.Any(x =&gt; string.Equals(x.Alias, propertyAlias, StringComparison.OrdinalIgnoreCase))) continue;
+                    macro.Properties.Add(new MacroProperty(propertyAlias, propertyName, sortOrder, editorAlias));
+                    sortOrder++;
+                }
+            }
+            return macro;
+        }
+
+        /// &lt;summary&gt;
+        /// Exports a list of &lt;see cref=&quot;IMacro&quot;/&gt; items to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;macros&quot;&gt;Macros to export&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the IMacro objects&lt;/returns&gt;
+        public XElement Export(IEnumerable&lt;IMacro&gt; macros, bool raiseEvents = true)
+        {
+            var xml = new XElement(&quot;Macros&quot;);
+            foreach (var item in macros)
+            {
+                xml.Add(Export(item, raiseEvents));
+            }
+            return xml;
+        }
+
+        /// &lt;summary&gt;
+        /// Exports a single &lt;see cref=&quot;IMacro&quot;/&gt; item to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;macro&quot;&gt;Macro to export&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the IMacro object&lt;/returns&gt;
+        public XElement Export(IMacro macro, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ExportingMacro.IsRaisedEventCancelled(new ExportEventArgs&lt;IMacro&gt;(macro, &quot;macro&quot;), this))
+                    return new XElement(&quot;macro&quot;);
+            }
+
+            var exporter = new EntityXmlSerializer();
+            var xml = exporter.Serialize(macro);
+
+            if (raiseEvents)
+                ExportedMacro.RaiseEvent(new ExportEventArgs&lt;IMacro&gt;(macro, xml, false), this);
+
+            return xml;
+        }
+
+        #endregion
+
+        #region Members
+
+        /// &lt;summary&gt;
+        /// Exports an &lt;see cref=&quot;IMedia&quot;/&gt; item to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;member&quot;&gt;Member to export&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the Member object&lt;/returns&gt;
+        public XElement Export(IMember member)
+        {
+            var exporter = new EntityXmlSerializer();
+            return exporter.Serialize(_dataTypeService, member);
+        }
+
+        #endregion
+
+        #region Media
+
+        /// &lt;summary&gt;
+        /// Exports an &lt;see cref=&quot;IMedia&quot;/&gt; item to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;media&quot;&gt;Media to export&lt;/param&gt;
+        /// &lt;param name=&quot;deep&quot;&gt;Optional parameter indicating whether to include descendents&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the Media object&lt;/returns&gt;
+        public XElement Export(IMedia media, bool deep = false, bool raiseEvents = true)
+        {
+            var nodeName = UmbracoConfig.For.UmbracoSettings().Content.UseLegacyXmlSchema ? &quot;node&quot; : media.ContentType.Alias.ToSafeAliasWithForcingCheck();
+
+            if (raiseEvents)
+            {
+                if (ExportingMedia.IsRaisedEventCancelled(new ExportEventArgs&lt;IMedia&gt;(media, nodeName), this))
+                    return new XElement(nodeName);
+            }
+
+            var exporter = new EntityXmlSerializer();
+            var xml = exporter.Serialize(_mediaService, _dataTypeService, _userService, media, deep);
+
+            if (raiseEvents)
+                ExportedMedia.RaiseEvent(new ExportEventArgs&lt;IMedia&gt;(media, xml, false), this);
+
+            return xml;
+        }
+
+
+        #endregion
+
+        #region MediaTypes
+
+        /// &lt;summary&gt;
+        /// Exports an &lt;see cref=&quot;IMediaType&quot;/&gt; to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;mediaType&quot;&gt;MediaType to export&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the MediaType item.&lt;/returns&gt;
+        internal XElement Export(IMediaType mediaType)
+        {
+            var exporter = new EntityXmlSerializer();
+            var xml = exporter.Serialize(_dataTypeService, mediaType);
+
+            return xml;
+        }
+
+        #endregion
+
+        #region Package Manifest
+        #endregion
+
+        #region Templates
+
+        /// &lt;summary&gt;
+        /// Imports and saves package xml as &lt;see cref=&quot;ITemplate&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;element&quot;&gt;Xml to import&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional user id&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;An enumrable list of generated Templates&lt;/returns&gt;
+        public IEnumerable&lt;ITemplate&gt; ImportTemplates(XElement element, int userId = 0, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ImportingTemplate.IsRaisedEventCancelled(new ImportEventArgs&lt;ITemplate&gt;(element), this))
+                    return Enumerable.Empty&lt;ITemplate&gt;();
+            }
+
+            var name = element.Name.LocalName;
+            if (name.Equals(&quot;Templates&quot;) == false &amp;&amp; name.Equals(&quot;Template&quot;) == false)
+            {
+                throw new ArgumentException(&quot;The passed in XElement is not valid! It does not contain a root element called &#39;Templates&#39; for multiple imports or &#39;Template&#39; for a single import.&quot;);
+            }
+
+            var templates = new List&lt;ITemplate&gt;();
+            var templateElements = name.Equals(&quot;Templates&quot;)
+                                       ? (from doc in element.Elements(&quot;Template&quot;) select doc).ToList()
+                                       : new List&lt;XElement&gt; { element };
+
+            var fields = new List&lt;TopologicalSorter.DependencyField&lt;XElement&gt;&gt;();
+            foreach (XElement tempElement in templateElements)
+            {
+                var dependencies = new List&lt;string&gt;();
+                var elementCopy = tempElement;
+                //Ensure that the Master of the current template is part of the import, otherwise we ignore this dependency as part of the dependency sorting.
+                if (string.IsNullOrEmpty((string)elementCopy.Element(&quot;Master&quot;)) == false &amp;&amp;
+                    templateElements.Any(x =&gt; (string)x.Element(&quot;Alias&quot;) == (string)elementCopy.Element(&quot;Master&quot;)))
+                {
+                    dependencies.Add((string)elementCopy.Element(&quot;Master&quot;));
+                }
+                else if (string.IsNullOrEmpty((string)elementCopy.Element(&quot;Master&quot;)) == false &amp;&amp;
+                    templateElements.Any(x =&gt; (string)x.Element(&quot;Alias&quot;) == (string)elementCopy.Element(&quot;Master&quot;)) == false)
+                {
+                    _logger.Info&lt;PackagingService&gt;(string.Format(&quot;Template &#39;{0}&#39; has an invalid Master &#39;{1}&#39;, so the reference has been ignored.&quot;, (string)elementCopy.Element(&quot;Alias&quot;), (string)elementCopy.Element(&quot;Master&quot;)));
+                }
+
+                var field = new TopologicalSorter.DependencyField&lt;XElement&gt;
+                {
+                    Alias = (string)elementCopy.Element(&quot;Alias&quot;),
+                    Item = new Lazy&lt;XElement&gt;(() =&gt; elementCopy),
+                    DependsOn = dependencies.ToArray()
+                };
+
+                fields.Add(field);
+            }
+            //Sort templates by dependencies to a potential master template
+            var sortedElements = TopologicalSorter.GetSortedItems(fields);
+            foreach (var templateElement in sortedElements)
+            {
+                var templateName = templateElement.Element(&quot;Name&quot;).Value;
+                var alias = templateElement.Element(&quot;Alias&quot;).Value;
+                var design = templateElement.Element(&quot;Design&quot;).Value;
+                var masterElement = templateElement.Element(&quot;Master&quot;);
+
+                var isMasterPage = IsMasterPageSyntax(design);
+                var path = isMasterPage ? MasterpagePath(alias) : ViewPath(alias);
+
+                var existingTemplate = _fileService.GetTemplate(alias) as Template;
+                var template = existingTemplate ?? new Template(path, templateName, alias);
+                template.Content = design;
+                if (masterElement != null &amp;&amp; string.IsNullOrEmpty((string)masterElement) == false)
+                {
+                    template.MasterTemplateAlias = masterElement.Value;
+                    var masterTemplate = templates.FirstOrDefault(x =&gt; x.Alias == masterElement.Value);
+                    if (masterTemplate != null)
+                        template.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; masterTemplate.Id);
+                }
+                templates.Add(template);
+            }
+
+            if (templates.Any())
+                _fileService.SaveTemplate(templates, userId);
+
+            if (raiseEvents)
+                ImportedTemplate.RaiseEvent(new ImportEventArgs&lt;ITemplate&gt;(templates, element, false), this);
+
+            return templates;
+        }
+
+
+        public IEnumerable&lt;IFile&gt; ImportStylesheets(XElement element, int userId = 0, bool raiseEvents = true)
+        {
+
+            if (raiseEvents)
+            {
+                if (ImportingStylesheets.IsRaisedEventCancelled(new ImportEventArgs&lt;IFile&gt;(element), this))
+                    return Enumerable.Empty&lt;IFile&gt;();
+            }
+
+            IEnumerable&lt;IFile&gt; styleSheets = Enumerable.Empty&lt;IFile&gt;();
+
+            if (element.Elements().Any())
+                throw new NotImplementedException(&quot;This needs to be implimentet&quot;);
+
+
+            if (raiseEvents)
+                ImportingStylesheets.RaiseEvent(new ImportEventArgs&lt;IFile&gt;(styleSheets, element, false), this);
+
+            return styleSheets;
+
+        }
+
+
+        private bool IsMasterPageSyntax(string code)
+        {
+            return Regex.IsMatch(code, @&quot;&lt;%@\s*Master&quot;, RegexOptions.IgnoreCase) ||
+                code.InvariantContains(&quot;&lt;umbraco:Item&quot;) || code.InvariantContains(&quot;&lt;asp:&quot;) || code.InvariantContains(&quot;&lt;umbraco:Macro&quot;);
+        }
+
+        private string ViewPath(string alias)
+        {
+            return SystemDirectories.MvcViews + &quot;/&quot; + alias.Replace(&quot; &quot;, &quot;&quot;) + &quot;.cshtml&quot;;
+        }
+
+        private string MasterpagePath(string alias)
+        {
+            return IOHelper.MapPath(SystemDirectories.Masterpages + &quot;/&quot; + alias.Replace(&quot; &quot;, &quot;&quot;) + &quot;.master&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Exports a list of &lt;see cref=&quot;ITemplate&quot;/&gt; items to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;templates&quot;&gt;List of Templates to export&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the ITemplate objects&lt;/returns&gt;
+        public XElement Export(IEnumerable&lt;ITemplate&gt; templates, bool raiseEvents = true)
+        {
+            var xml = new XElement(&quot;Templates&quot;);
+            foreach (var item in templates)
+            {
+                xml.Add(Export(item, raiseEvents));
+            }
+            return xml;
+        }
+
+        /// &lt;summary&gt;
+        /// Exports a single &lt;see cref=&quot;ITemplate&quot;/&gt; item to xml as an &lt;see cref=&quot;XElement&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;template&quot;&gt;Template to export&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter indicating whether or not to raise events&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;XElement&quot;/&gt; containing the xml representation of the ITemplate object&lt;/returns&gt;
+        public XElement Export(ITemplate template, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (ExportingTemplate.IsRaisedEventCancelled(new ExportEventArgs&lt;ITemplate&gt;(template, &quot;Template&quot;), this))
+                    return new XElement(&quot;Template&quot;);
+            }
+
+            var exporter = new EntityXmlSerializer();
+            var xml = exporter.Serialize(template);
+
+            if (raiseEvents)
+                ExportedTemplate.RaiseEvent(new ExportEventArgs&lt;ITemplate&gt;(template, xml, false), this);
+
+            return xml;
+        }
+
+        #endregion
+
+        #region Stylesheets
+        #endregion
+
+        #region Installation
+
+        internal IPackageInstallation PackageInstallation
+        {
+            private get { return _packageInstallation ?? new PackageInstallation(this, _macroService, _fileService, new PackageExtraction()); }
+            set { _packageInstallation = value; }
+        }
+
+        internal InstallationSummary InstallPackage(string packageFilePath, int userId = 0, bool raiseEvents = false)
+        {
+            if (raiseEvents)
+            {
+                var metaData = GetPackageMetaData(packageFilePath);
+                if (ImportingPackage.IsRaisedEventCancelled(new ImportPackageEventArgs&lt;string&gt;(packageFilePath, metaData), this))
+                {
+                    var initEmpty = new InstallationSummary().InitEmpty();
+                    initEmpty.MetaData = metaData;
+                    return initEmpty;
+                }
+            }
+            var installationSummary = PackageInstallation.InstallPackage(packageFilePath, userId);
+
+            if (raiseEvents)
+            {
+                ImportedPackage.RaiseEvent(new ImportPackageEventArgs&lt;InstallationSummary&gt;(installationSummary, false), this);
+            }
+
+            return installationSummary;
+        }
+
+        internal PreInstallWarnings GetPackageWarnings(string packageFilePath)
+        {
+            return PackageInstallation.GetPreInstallWarnings(packageFilePath);
+        }
+
+        internal MetaData GetPackageMetaData(string packageFilePath)
+        {
+            return PackageInstallation.GetMetaData(packageFilePath);
+        }
+
+        #endregion
+
+        #region Package Building
+        #endregion
+
+        #region Event Handlers
+        /// &lt;summary&gt;
+        /// Occurs before Importing Content
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;IContent&gt;&gt; ImportingContent;
+
+        /// &lt;summary&gt;
+        /// Occurs after Content is Imported and Saved
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;IContent&gt;&gt; ImportedContent;
+
+
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IContent&gt;&gt; ExportingContent;
+
+        /// &lt;summary&gt;
+        /// Occurs after Content is Exported to Xml
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IContent&gt;&gt; ExportedContent;
+
+        /// &lt;summary&gt;
+        /// Occurs before Exporting Media
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IMedia&gt;&gt; ExportingMedia;
+
+        /// &lt;summary&gt;
+        /// Occurs after Media is Exported to Xml
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IMedia&gt;&gt; ExportedMedia;
+
+        /// &lt;summary&gt;
+        /// Occurs before Importing ContentType
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;IContentType&gt;&gt; ImportingContentType;
+
+        /// &lt;summary&gt;
+        /// Occurs after ContentType is Imported and Saved
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;IContentType&gt;&gt; ImportedContentType;
+
+        /// &lt;summary&gt;
+        /// Occurs before Exporting ContentType
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IContentType&gt;&gt; ExportingContentType;
+
+        /// &lt;summary&gt;
+        /// Occurs after ContentType is Exported to Xml
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IContentType&gt;&gt; ExportedContentType;
+
+        /// &lt;summary&gt;
+        /// Occurs before Importing DataType
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;IDataTypeDefinition&gt;&gt; ImportingDataType;
+
+        /// &lt;summary&gt;
+        /// Occurs after DataType is Imported and Saved
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;IDataTypeDefinition&gt;&gt; ImportedDataType;
+
+        /// &lt;summary&gt;
+        /// Occurs before Exporting DataType
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IDataTypeDefinition&gt;&gt; ExportingDataType;
+
+        /// &lt;summary&gt;
+        /// Occurs after DataType is Exported to Xml
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IDataTypeDefinition&gt;&gt; ExportedDataType;
+
+        /// &lt;summary&gt;
+        /// Occurs before Importing DictionaryItem
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;IDictionaryItem&gt;&gt; ImportingDictionaryItem;
+
+        /// &lt;summary&gt;
+        /// Occurs after DictionaryItem is Imported and Saved
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;IDictionaryItem&gt;&gt; ImportedDictionaryItem;
+
+        /// &lt;summary&gt;
+        /// Occurs before Exporting DictionaryItem
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IDictionaryItem&gt;&gt; ExportingDictionaryItem;
+
+        /// &lt;summary&gt;
+        /// Occurs after DictionaryItem is Exported to Xml
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IDictionaryItem&gt;&gt; ExportedDictionaryItem;
+
+        /// &lt;summary&gt;
+        /// Occurs before Importing Macro
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;IMacro&gt;&gt; ImportingMacro;
+
+        /// &lt;summary&gt;
+        /// Occurs after Macro is Imported and Saved
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;IMacro&gt;&gt; ImportedMacro;
+
+        /// &lt;summary&gt;
+        /// Occurs before Exporting Macro
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IMacro&gt;&gt; ExportingMacro;
+
+        /// &lt;summary&gt;
+        /// Occurs after Macro is Exported to Xml
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;IMacro&gt;&gt; ExportedMacro;
+
+        /// &lt;summary&gt;
+        /// Occurs before Importing Language
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;ILanguage&gt;&gt; ImportingLanguage;
+
+        /// &lt;summary&gt;
+        /// Occurs after Language is Imported and Saved
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;ILanguage&gt;&gt; ImportedLanguage;
+
+        /// &lt;summary&gt;
+        /// Occurs before Exporting Language
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;ILanguage&gt;&gt; ExportingLanguage;
+
+        /// &lt;summary&gt;
+        /// Occurs after Language is Exported to Xml
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;ILanguage&gt;&gt; ExportedLanguage;
+
+        /// &lt;summary&gt;
+        /// Occurs before Importing Template
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;ITemplate&gt;&gt; ImportingTemplate;
+
+        /// &lt;summary&gt;
+        /// Occurs before Importing Stylesheets
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;IFile&gt;&gt; ImportingStylesheets;
+
+        /// &lt;summary&gt;
+        /// Occurs after Template is Imported and Saved
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ImportEventArgs&lt;ITemplate&gt;&gt; ImportedTemplate;
+
+        /// &lt;summary&gt;
+        /// Occurs before Exporting Template
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;ITemplate&gt;&gt; ExportingTemplate;
+
+        /// &lt;summary&gt;
+        /// Occurs after Template is Exported to Xml
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPackagingService, ExportEventArgs&lt;ITemplate&gt;&gt; ExportedTemplate;
+
+        /// &lt;summary&gt;
+        /// Occurs before Importing umbraco package
+        /// &lt;/summary&gt;
+        internal static event TypedEventHandler&lt;IPackagingService, ImportPackageEventArgs&lt;string&gt;&gt; ImportingPackage;
+
+        /// &lt;summary&gt;
+        /// Occurs after a apckage is imported
+        /// &lt;/summary&gt;
+        internal static event TypedEventHandler&lt;IPackagingService, ImportPackageEventArgs&lt;InstallationSummary&gt;&gt; ImportedPackage;
+
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[49,9,61,53,1],[62,9,62,10,1],[63,13,63,30,1],[64,13,64,46,1],[65,13,65,54,1],[66,13,66,42,1],[67,13,67,42,1],[68,13,68,48,1],[69,13,69,40,1],[70,13,70,56,1],[71,13,71,44,1],[72,13,72,52,1],[73,13,73,40,1],[74,13,74,40,1],[75,13,75,76,1],[76,9,76,10,1],[88,9,88,10,1],[89,13,89,158,1],[91,13,91,29,1],[92,13,92,14,0],[93,17,93,117,0],[94,21,94,51,0],[95,13,95,14,0],[97,13,97,54,1],[98,13,98,106,1],[100,13,100,29,1],[101,17,101,102,0],[103,13,103,24,1],[104,9,104,10,1],[117,9,117,10,1],[118,13,118,29,1],[119,13,119,14,1],[120,17,120,107,1],[121,21,121,57,0],[122,13,122,14,1],[124,13,124,47,1],[125,13,125,44,1],[126,13,126,14,1],[128,17,129,35,1],[129,35,129,71,1],[129,71,130,40,1],[128,17,130,40,1],[132,17,132,70,1],[133,17,133,36,1],[134,21,134,60,1],[136,17,136,33,1],[137,21,137,111,1],[138,17,138,33,1],[141,13,141,56,0],[142,13,142,35,0],[143,13,143,14,0],[145,17,145,63,0],[146,17,146,73,0],[147,17,147,36,0],[148,21,148,60,0],[150,17,150,33,0],[151,21,151,111,0],[152,17,152,33,0],[155,13,157,125,0],[158,9,158,10,1],[161,9,161,10,1],[162,13,162,49,1],[163,13,163,20,1],[163,22,163,30,1],[163,31,163,33,1],[163,34,163,39,1],[164,13,164,14,1],[165,17,165,93,1],[166,17,168,69,1],[170,17,170,82,1],[171,17,171,18,0],[172,21,172,80,0],[173,21,173,78,0],[174,17,174,18,0],[176,17,176,131,1],[177,17,177,39,1],[179,17,180,38,1],[180,38,180,76,1],[180,76,181,45,1],[179,17,181,45,1],[182,17,182,36,1],[183,21,183,96,1],[184,13,184,14,1],[185,13,185,29,1],[186,9,186,10,1],[189,9,189,10,1],[190,13,190,45,1],[191,13,191,20,1],[191,22,191,31,1],[191,32,191,34,1],[191,35,191,43,1],[192,13,192,14,1],[193,17,195,70,1],[197,17,197,82,1],[198,17,198,18,0],[199,21,199,80,0],[200,21,200,78,0],[201,17,201,18,0],[204,17,204,138,1],[205,17,205,35,1],[208,17,208,41,1],[209,17,210,43,1],[210,43,210,81,1],[210,81,211,50,1],[209,17,211,50,1],[213,17,213,41,1],[214,21,214,97,1],[215,13,215,14,1],[217,13,217,25,1],[218,9,218,10,1],[221,9,221,10,1],[222,13,222,52,1],[223,13,223,58,1],[224,13,224,66,1],[225,13,225,64,1],[226,13,226,56,1],[227,13,227,64,1],[229,13,230,36,1],[230,36,230,71,1],[230,71,231,46,1],[229,13,231,46,1],[233,13,243,38,1],[245,13,245,20,1],[245,22,245,34,1],[245,35,245,37,1],[245,38,245,48,1],[246,13,246,14,1],[247,17,247,121,1],[248,17,248,60,1],[249,17,249,18,1],[250,21,250,56,1],[252,21,252,87,1],[252,87,252,116,1],[252,116,252,118,1],[252,21,252,118,1],[257,21,257,46,1],[258,21,258,22,1],[259,25,259,109,1],[260,25,260,26,1],[263,29,263,96,1],[264,29,264,154,1],[266,29,266,72,1],[267,29,267,36,1],[267,38,267,50,1],[267,51,267,53,1],[267,54,267,78,1],[268,29,268,30,1],[269,33,269,72,1],[269,72,269,91,1],[269,91,269,136,1],[269,33,269,136,1],[270,29,270,30,1],[272,29,272,91,1],[274,25,274,26,1],[275,21,275,22,1],[277,21,277,72,1],[278,17,278,18,1],[279,13,279,14,1],[281,13,281,28,1],[282,9,282,10,1],[295,9,295,10,1],[296,13,296,29,1],[297,13,297,14,1],[298,17,298,135,1],[299,21,299,57,0],[300,13,300,14,1],[302,13,302,54,1],[303,13,303,94,1],[305,13,305,29,1],[306,17,306,114,1],[308,13,308,24,1],[309,9,309,10,1],[319,9,319,10,1],[320,13,320,62,1],[321,9,321,10,1],[332,9,332,10,1],[333,13,333,29,1],[334,13,334,14,1],[335,17,335,115,1],[336,21,336,61,0],[337,13,337,14,1],[339,13,339,47,1],[340,13,340,95,1],[341,13,341,14,0],[342,17,342,203,0],[345,13,345,76,1],[346,13,347,92,1],[347,92,347,95,1],[347,95,348,70,1],[346,13,348,70,1],[352,13,352,82,1],[353,13,353,74,1],[355,13,355,91,1],[357,13,357,48,1],[358,13,358,14,1],[361,17,361,24,1],[361,26,361,42,1],[361,43,361,45,1],[361,46,361,67,1],[362,17,362,18,1],[363,21,363,52,1],[364,21,364,67,1],[365,21,365,62,1],[368,21,368,94,1],[369,21,369,22,1],[370,25,370,79,1],[371,21,371,22,1],[374,21,374,83,1],[375,21,375,88,1],[376,21,376,22,1],[377,25,377,88,1],[378,25,378,48,1],[379,25,379,26,1],[380,29,380,36,1],[380,38,380,53,1],[380,54,380,56,1],[380,57,380,69,1],[381,29,381,30,1],[382,33,382,69,1],[383,29,383,30,1],[384,25,384,26,1],[385,21,385,22,1],[387,21,390,57,1],[390,57,390,68,1],[390,68,392,23,1],[387,21,392,23,1],[394,21,394,39,1],[395,17,395,18,1],[396,13,396,14,1],[399,13,401,69,1],[404,13,404,20,1],[404,22,404,38,1],[404,39,404,41,1],[404,42,404,55,1],[405,13,405,14,1],[406,17,406,81,1],[407,17,407,71,1],[408,17,408,18,1],[409,21,409,81,1],[410,21,412,113,1],[413,17,413,18,1],[414,13,414,14,1],[416,13,416,20,1],[416,22,416,37,1],[416,38,416,40,1],[416,41,416,62,1],[417,13,417,14,1],[418,17,418,44,1],[419,17,419,59,1],[420,17,420,18,0],[421,21,421,61,0],[422,17,422,18,0],[423,13,423,14,1],[426,13,426,58,1],[426,58,426,65,1],[426,65,426,76,1],[426,13,426,76,1],[427,13,427,52,1],[431,13,431,33,1],[432,13,432,14,1],[433,17,433,68,1],[435,17,435,24,1],[435,26,435,42,1],[435,43,435,45,1],[435,46,435,59,1],[436,17,436,18,1],[437,21,437,85,1],[438,21,438,78,1],[440,21,440,110,1],[440,111,440,120,1],[442,21,442,111,1],[443,21,443,54,1],[444,17,444,18,1],[446,17,446,47,1],[447,21,447,75,1],[448,13,448,14,1],[450,13,450,29,1],[451,17,451,111,1],[453,13,453,25,1],[454,9,454,10,1],[457,9,457,10,1],[458,13,458,65,1],[459,13,459,20,1],[459,22,459,38,1],[459,39,459,41,1],[459,42,459,63,1],[460,13,460,14,1],[461,17,461,74,1],[462,17,462,64,1],[463,17,466,85,1],[467,17,467,18,0],[468,21,468,85,0],[469,21,469,69,0],[470,21,470,72,0],[472,21,472,112,0],[474,21,474,41,0],[475,21,475,22,0],[476,25,476,110,0],[477,25,477,54,0],[478,25,478,26,0],[479,29,479,130,0],[480,29,480,61,0],[482,25,482,77,0],[483,25,483,93,0],[484,21,484,22,0],[486,21,486,60,0],[488,26,488,35,0],[488,37,488,55,0],[488,57,488,60,0],[489,21,489,22,0],[490,25,490,76,0],[491,25,491,85,0],[492,25,492,61,0],[493,21,493,22,0],[494,17,494,18,0],[495,13,495,14,1],[497,13,497,36,1],[498,9,498,10,1],[501,9,501,10,0],[502,13,502,77,0],[503,13,503,43,0],[503,43,503,77,0],[503,77,503,79,0],[503,13,503,79,0],[504,13,504,23,0],[505,13,505,14,0],[506,17,506,56,0],[506,56,506,90,0],[506,90,506,95,0],[506,17,506,95,0],[507,17,507,81,0],[510,13,510,106,0],[511,13,511,42,0],[512,13,512,14,0],[513,17,513,118,0],[514,17,514,49,0],[516,13,516,98,0],[517,9,517,10,0],[520,9,520,10,1],[521,13,521,60,1],[524,13,524,63,1],[525,13,525,40,1],[526,13,526,39,1],[527,13,527,14,1],[528,17,528,55,1],[529,17,531,80,1],[532,13,532,14,1],[534,13,534,60,1],[535,13,537,68,1],[539,13,539,32,1],[540,17,540,52,1],[542,13,542,72,1],[543,9,543,10,1],[546,9,546,10,1],[547,13,547,60,1],[548,13,548,81,1],[550,13,550,66,1],[551,13,551,66,1],[552,13,552,76,1],[553,13,553,80,1],[556,13,556,66,1],[557,13,557,37,1],[558,17,558,87,1],[561,13,561,64,1],[562,13,562,36,1],[563,17,563,84,1],[566,13,566,63,1],[567,13,567,39,1],[568,13,568,14,1],[569,17,569,55,1],[570,17,572,71,1],[574,17,574,65,1],[574,65,574,74,1],[574,74,574,77,1],[574,17,574,77,1],[575,13,575,14,1],[578,13,578,75,1],[579,13,579,80,1],[580,13,580,14,1],[581,17,581,80,1],[582,17,582,40,1],[583,17,583,18,1],[584,21,584,28,1],[584,30,584,45,1],[584,46,584,48,1],[584,49,584,61,1],[585,21,585,22,1],[586,25,586,66,1],[587,25,589,84,1],[590,25,590,88,1],[591,21,591,22,1],[592,17,592,18,1],[593,13,593,14,1],[595,13,595,126,1],[596,13,596,79,1],[597,13,597,98,1],[599,13,599,32,1],[600,9,600,10,1],[604,9,604,10,1],[605,13,605,103,1],[606,13,606,14,1],[607,17,607,78,1],[608,17,608,24,1],[608,26,608,45,1],[608,46,608,48,1],[608,49,608,93,1],[609,17,609,18,1],[610,21,610,55,1],[611,21,611,82,1],[612,21,612,42,1],[613,21,613,22,1],[614,25,614,55,1],[614,55,614,74,1],[614,74,614,76,1],[614,25,614,76,1],[614,77,614,86,1],[615,25,615,56,1],[616,21,616,22,1],[618,21,618,22,1],[619,25,622,41,1],[623,21,623,22,1],[624,17,624,18,1],[626,17,626,65,1],[627,13,627,14,1],[629,13,629,79,1],[630,13,630,14,1],[631,17,631,108,1],[632,17,632,45,1],[633,17,633,18,1],[634,21,634,69,1],[635,17,635,18,1],[637,17,637,18,1],[638,21,641,60,1],[642,17,642,18,1],[643,13,643,14,1],[644,9,644,10,1],[647,9,647,10,1],[648,13,648,36,1],[649,17,649,24,0],[651,13,651,51,1],[652,13,652,20,1],[652,22,652,29,1],[652,30,652,32,1],[652,33,652,37,1],[653,13,653,14,1],[654,17,654,50,1],[655,17,655,60,1],[657,17,657,75,1],[658,17,658,18,1],[659,21,659,59,1],[661,17,661,18,1],[664,17,664,117,1],[665,17,665,18,1],[667,21,667,79,1],[668,17,668,18,1],[669,13,669,14,1],[670,9,670,10,1],[673,9,673,10,1],[674,13,674,83,1],[675,13,675,20,1],[675,22,675,34,1],[675,35,675,37,1],[675,38,675,48,1],[676,13,676,14,1],[677,17,677,91,1],[679,17,679,107,1],[685,17,685,57,1],[686,17,686,91,1],[688,17,688,81,1],[693,17,693,48,1],[694,17,694,18,1],[695,21,697,134,1],[698,21,698,82,1],[699,21,699,22,0],[700,25,700,83,0],[701,21,701,22,0],[702,17,702,18,1],[703,22,703,121,1],[704,17,704,18,1],[705,21,705,121,1],[706,21,706,82,1],[707,21,707,22,1],[708,25,708,83,1],[709,21,709,22,1],[710,17,710,18,1],[711,22,711,88,1],[712,17,712,18,1],[713,21,713,128,1],[714,21,714,82,1],[715,21,715,22,0],[716,25,716,83,0],[717,21,717,22,0],[718,17,718,18,1],[722,17,722,48,1],[723,17,723,18,1],[724,21,728,79,1],[731,21,731,158,1],[733,21,733,52,1],[733,53,733,62,0],[734,17,734,18,1],[736,17,736,35,1],[737,17,737,70,1],[738,17,738,46,1],[739,21,739,73,0],[740,17,747,19,1],[749,17,749,59,1],[750,17,750,47,1],[751,17,751,18,1],[752,21,752,63,1],[753,17,753,18,1],[755,17,755,18,1],[756,21,756,68,1],[757,17,757,18,1],[758,13,758,14,1],[759,9,759,10,1],[762,9,762,10,1],[763,13,763,76,1],[764,13,764,90,1],[765,13,765,20,1],[765,22,765,33,1],[765,34,765,36,1],[765,37,765,78,1],[766,13,766,14,1],[767,17,767,43,1],[768,17,768,62,1],[769,17,769,18,1],[770,21,770,69,1],[771,21,771,74,1],[771,74,771,126,1],[771,126,771,128,1],[771,21,771,128,1],[771,129,771,138,1],[773,21,773,81,1],[773,81,773,96,1],[773,96,773,131,1],[773,21,773,131,1],[774,21,774,33,1],[775,17,775,18,1],[777,17,777,18,1],[778,21,781,52,1],[782,17,782,18,1],[783,13,783,14,1],[785,13,785,63,1],[786,13,786,32,1],[787,9,787,10,1],[795,9,795,10,0],[796,20,796,113,0],[797,13,797,14,0],[798,17,798,97,0],[799,17,799,68,0],[801,17,801,42,0],[802,21,804,58,0],[806,17,806,58,0],[808,17,808,41,0],[809,21,810,74,0],[812,17,812,36,0],[814,9,814,10,0],[827,9,827,10,0],[828,13,828,55,0],[829,13,829,20,0],[829,22,829,44,0],[829,45,829,47,0],[829,48,829,67,0],[830,13,830,14,0],[831,17,831,72,0],[832,13,832,14,0],[833,13,833,30,0],[834,9,834,10,0],[843,9,843,10,0],[844,13,844,29,0],[845,13,845,14,0],[846,17,846,142,0],[847,21,847,53,0],[848,13,848,14,0],[850,13,850,54,0],[851,13,851,80,0],[853,13,853,29,0],[854,17,854,125,0],[856,13,856,24,0],[857,9,857,10,0],[867,9,867,10,1],[868,13,868,29,1],[869,13,869,14,1],[870,17,870,119,1],[871,21,871,68,0],[872,13,872,14,1],[874,13,874,47,1],[875,13,875,87,1],[876,13,876,14,0],[877,17,877,195,0],[880,13,880,75,1],[881,13,882,91,1],[882,91,882,94,1],[882,94,883,73,1],[881,13,883,73,1],[885,13,885,83,1],[887,13,887,20,1],[887,22,887,41,1],[887,42,887,44,1],[887,45,887,61,1],[888,13,888,14,1],[889,17,889,86,1],[892,17,892,98,1],[894,17,894,100,1],[895,17,895,87,1],[897,17,897,35,1],[898,17,898,73,1],[899,21,899,72,0],[901,17,901,99,1],[903,17,903,40,1],[904,17,904,18,1],[905,21,907,73,1],[910,21,910,62,1],[911,21,911,22,1],[912,25,918,27,1],[919,25,919,83,1],[920,21,920,22,1],[922,21,922,22,1],[924,25,930,27,1],[931,25,931,83,1],[932,21,932,22,1],[934,17,934,18,1],[936,17,936,18,0],[937,21,937,52,0],[938,21,938,63,0],[939,17,939,18,0],[940,13,940,14,1],[942,13,942,46,1],[942,46,942,53,1],[942,53,942,64,1],[942,13,942,64,1],[943,13,943,28,1],[944,13,944,14,1],[949,17,949,60,1],[951,17,951,62,1],[953,17,953,59,1],[954,13,954,14,1],[956,13,956,29,1],[957,17,957,115,1],[959,13,959,25,1],[960,9,960,10,1],[963,9,963,10,1],[964,13,964,65,1],[965,13,965,20,1],[965,22,965,41,1],[965,42,965,44,1],[965,45,965,61,1],[966,13,966,14,1],[967,17,967,77,1],[968,17,968,46,1],[969,17,969,18,0],[970,21,970,72,0],[971,21,971,69,0],[972,21,972,72,0],[974,21,974,98,0],[976,21,976,41,0],[977,21,977,22,0],[978,25,978,96,0],[979,25,979,54,0],[980,25,980,26,0],[981,29,981,130,0],[982,29,982,61,0],[984,25,984,99,0],[985,21,985,22,0],[987,21,987,59,0],[989,26,989,35,0],[989,37,989,55,0],[989,57,989,60,0],[990,21,990,22,0],[991,25,991,76,0],[992,25,992,82,0],[993,25,993,60,0],[994,21,994,22,0],[995,17,995,18,0],[996,13,996,14,1],[998,13,998,36,1],[999,9,999,10,1],[1002,9,1002,10,0],[1003,13,1003,77,0],[1004,13,1004,43,0],[1004,43,1004,77,0],[1004,77,1004,79,0],[1004,13,1004,79,0],[1005,13,1005,23,0],[1006,13,1006,14,0],[1007,17,1007,56,0],[1007,56,1007,90,0],[1007,90,1007,95,0],[1007,17,1007,95,0],[1008,17,1008,67,0],[1011,13,1011,92,0],[1012,13,1012,42,0],[1013,13,1013,14,0],[1014,17,1014,118,0],[1015,17,1015,49,0],[1017,13,1017,84,0],[1018,9,1018,10,0],[1021,9,1021,10,1],[1022,13,1022,20,1],[1022,22,1022,41,1],[1022,42,1022,44,1],[1022,45,1022,61,1],[1023,13,1023,14,1],[1024,17,1024,77,1],[1025,17,1025,46,1],[1025,47,1025,56,1],[1027,17,1027,86,1],[1028,17,1028,72,1],[1028,72,1028,104,1],[1028,104,1028,106,1],[1028,17,1028,106,1],[1030,17,1030,48,1],[1031,17,1031,18,1],[1032,21,1033,37,1],[1033,37,1033,89,1],[1033,89,1034,38,1],[1034,38,1034,64,1],[1034,64,1034,66,1],[1032,21,1034,66,1],[1036,21,1037,37,1],[1037,37,1037,98,1],[1037,98,1039,36,1],[1039,36,1039,67,1],[1039,67,1040,36,1],[1040,36,1040,81,1],[1040,81,1040,83,1],[1036,21,1040,83,1],[1043,21,1043,88,1],[1046,21,1046,94,1],[1047,17,1047,18,1],[1049,17,1049,18,0],[1050,21,1050,154,0],[1051,17,1051,18,0],[1052,13,1052,14,1],[1053,9,1053,10,1],[1067,9,1067,10,1],[1068,13,1068,55,1],[1069,13,1069,20,1],[1069,22,1069,30,1],[1069,31,1069,33,1],[1069,34,1069,48,1],[1070,13,1070,14,1],[1071,17,1071,69,1],[1072,13,1072,14,1],[1073,13,1073,24,1],[1074,9,1074,10,1],[1084,9,1084,10,1],[1085,13,1085,29,1],[1086,13,1086,14,1],[1087,17,1087,146,1],[1088,21,1088,59,0],[1089,13,1089,14,1],[1091,13,1091,54,1],[1092,13,1092,58,1],[1094,13,1094,33,1],[1095,13,1095,14,1],[1096,17,1096,99,1],[1097,17,1097,24,1],[1097,26,1097,35,1],[1097,36,1097,38,1],[1097,39,1097,47,1],[1098,17,1098,18,1],[1099,21,1099,50,1],[1100,17,1100,18,1],[1101,13,1101,14,1],[1103,13,1103,29,1],[1104,17,1104,123,1],[1106,13,1106,24,1],[1107,9,1107,10,1],[1116,9,1116,10,1],[1117,13,1117,29,1],[1118,13,1118,14,1],[1119,17,1119,139,1],[1120,21,1120,64,0],[1121,13,1121,14,1],[1123,13,1123,77,1],[1124,13,1124,93,1],[1125,9,1125,10,1],[1128,9,1128,10,1],[1129,13,1129,53,1],[1130,13,1130,20,1],[1130,22,1130,47,1],[1130,48,1130,50,1],[1130,51,1130,103,1],[1131,17,1131,111,1],[1134,13,1134,29,1],[1135,17,1135,136,1],[1137,13,1137,26,1],[1138,9,1138,10,1],[1141,9,1141,10,1],[1142,13,1142,53,1],[1145,13,1145,68,1],[1146,13,1146,64,1],[1147,17,1147,100,1],[1149,17,1149,107,1],[1150,13,1150,55,1],[1151,13,1151,39,1],[1153,13,1153,118,1],[1154,13,1154,26,1],[1155,9,1155,10,1],[1158,9,1158,10,1],[1159,13,1159,83,1],[1160,13,1160,69,1],[1161,13,1161,20,1],[1161,22,1161,38,1],[1161,39,1161,41,1],[1161,42,1161,93,1],[1161,93,1161,130,1],[1161,130,1161,131,1],[1161,42,1161,131,1],[1162,17,1162,81,1],[1163,13,1163,56,1],[1164,13,1164,35,1],[1165,9,1165,10,1],[1168,9,1168,10,1],[1169,13,1169,120,1],[1170,13,1170,67,1],[1172,13,1172,20,1],[1172,22,1172,38,1],[1172,39,1172,41,1],[1172,42,1172,81,1],[1173,17,1173,81,1],[1175,13,1175,56,1],[1176,13,1176,35,1],[1177,9,1177,10,1],[1180,9,1180,10,1],[1181,13,1182,17,1],[1182,17,1183,70,1],[1183,70,1184,19,1],[1181,13,1184,19,1],[1185,9,1185,10,1],[1188,9,1188,10,1],[1189,13,1189,83,1],[1190,13,1190,59,1],[1190,59,1190,82,1],[1190,82,1190,84,1],[1190,13,1190,84,1],[1191,13,1191,34,1],[1192,17,1192,24,0],[1193,13,1193,87,1],[1194,13,1194,43,1],[1195,9,1195,10,1],[1211,9,1211,10,1],[1212,13,1212,49,1],[1213,13,1213,20,1],[1213,22,1213,34,1],[1213,35,1213,37,1],[1213,38,1213,47,1],[1214,13,1214,14,1],[1215,17,1215,56,1],[1216,13,1216,14,1],[1217,13,1217,24,1],[1218,9,1218,10,1],[1227,9,1227,10,1],[1228,13,1228,29,1],[1229,13,1229,14,1],[1230,17,1230,122,1],[1231,21,1231,53,0],[1232,13,1232,14,1],[1234,13,1234,54,1],[1235,13,1235,52,1],[1237,13,1237,29,1],[1238,17,1238,105,1],[1240,13,1240,24,1],[1241,9,1241,10,1],[1251,9,1251,10,1],[1252,13,1252,29,1],[1253,13,1253,14,1],[1254,17,1254,121,1],[1255,21,1255,58,0],[1256,13,1256,14,1],[1258,13,1258,46,1],[1259,13,1259,20,1],[1259,22,1259,41,1],[1259,42,1259,44,1],[1259,45,1259,85,1],[1260,13,1260,14,1],[1261,17,1261,79,1],[1262,17,1262,91,1],[1263,17,1263,46,1],[1264,17,1264,18,1],[1265,21,1268,23,1],[1269,21,1269,57,1],[1270,21,1270,40,1],[1271,17,1271,18,1],[1272,13,1272,14,1],[1274,13,1274,29,1],[1275,17,1275,117,1],[1277,13,1277,25,1],[1278,9,1278,10,1],[1292,9,1292,10,1],[1293,13,1293,29,1],[1294,13,1294,14,1],[1295,17,1295,103,1],[1296,21,1296,55,0],[1297,13,1297,14,1],[1299,13,1299,47,1],[1300,13,1300,81,1],[1301,13,1301,14,0],[1302,17,1302,189,0],[1305,13,1306,88,1],[1306,88,1306,91,1],[1306,91,1307,73,1],[1305,13,1307,73,1],[1309,13,1309,75,1],[1311,13,1311,20,1],[1311,22,1311,31,1],[1311,32,1311,34,1],[1311,35,1311,41,1],[1312,13,1312,14,1],[1313,17,1313,70,1],[1314,17,1314,38,1],[1315,21,1315,44,0],[1317,17,1317,51,1],[1318,13,1318,14,1],[1320,13,1320,29,1],[1321,17,1321,101,1],[1323,13,1323,27,1],[1324,9,1324,10,1],[1327,9,1327,10,1],[1328,13,1328,64,1],[1329,13,1329,66,1],[1330,13,1330,72,1],[1331,13,1331,80,1],[1332,13,1332,63,1],[1333,13,1333,74,1],[1336,13,1336,74,1],[1337,13,1337,37,1],[1338,13,1338,105,1],[1339,13,1339,14,1],[1340,17,1340,68,1],[1341,13,1341,14,1],[1342,13,1342,76,1],[1343,13,1343,35,1],[1344,13,1344,109,1],[1345,13,1345,14,1],[1346,17,1346,71,1],[1347,13,1347,14,1],[1348,13,1348,78,1],[1349,13,1349,39,1],[1350,13,1350,109,1],[1351,13,1351,14,0],[1352,17,1352,72,0],[1353,13,1353,14,0],[1354,13,1354,74,1],[1355,13,1355,37,1],[1356,13,1356,105,1],[1357,13,1357,14,0],[1358,17,1358,68,0],[1359,13,1359,14,0],[1360,13,1360,72,1],[1361,13,1361,35,1],[1362,13,1362,103,1],[1363,13,1363,14,0],[1364,17,1364,66,0],[1365,13,1365,14,0],[1367,13,1367,79,1],[1368,13,1369,85,1],[1371,13,1371,65,1],[1372,13,1372,36,1],[1373,13,1373,14,1],[1374,17,1374,35,1],[1375,17,1375,24,1],[1375,26,1375,38,1],[1375,39,1375,41,1],[1375,42,1375,63,1],[1376,17,1376,18,1],[1377,21,1377,73,1],[1378,21,1378,75,1],[1379,21,1379,80,1],[1380,21,1380,78,1],[1381,21,1381,52,1],[1382,21,1382,22,0],[1383,25,1383,73,0],[1384,21,1384,22,0],[1386,21,1386,51,1],[1386,51,1386,124,1],[1386,124,1386,126,1],[1386,21,1386,126,1],[1386,127,1386,136,0],[1387,21,1387,114,1],[1388,21,1388,33,1],[1389,17,1389,18,1],[1390,13,1390,14,1],[1391,13,1391,26,1],[1392,9,1392,10,1],[1401,9,1401,10,0],[1402,13,1402,46,0],[1403,13,1403,20,0],[1403,22,1403,30,0],[1403,31,1403,33,0],[1403,34,1403,40,0],[1404,13,1404,14,0],[1405,17,1405,52,0],[1406,13,1406,14,0],[1407,13,1407,24,0],[1408,9,1408,10,0],[1417,9,1417,10,1],[1418,13,1418,29,1],[1419,13,1419,14,1],[1420,17,1420,110,1],[1421,21,1421,50,0],[1422,13,1422,14,1],[1424,13,1424,54,1],[1425,13,1425,49,1],[1427,13,1427,29,1],[1428,17,1428,96,1],[1430,13,1430,24,1],[1431,9,1431,10,1],[1443,9,1443,10,0],[1444,13,1444,54,0],[1445,13,1445,65,0],[1446,9,1446,10,0],[1460,9,1460,10,1],[1461,13,1461,156,1],[1463,13,1463,29,1],[1464,13,1464,14,0],[1465,17,1465,111,0],[1466,21,1466,51,0],[1467,13,1467,14,0],[1469,13,1469,54,1],[1470,13,1470,102,1],[1472,13,1472,29,1],[1473,17,1473,96,0],[1475,13,1475,24,1],[1476,9,1476,10,1],[1489,9,1489,10,0],[1490,13,1490,54,0],[1491,13,1491,71,0],[1493,13,1493,24,0],[1494,9,1494,10,0],[1511,9,1511,10,1],[1512,13,1512,29,1],[1513,13,1513,14,1],[1514,17,1514,109,1],[1515,21,1515,58,0],[1516,13,1516,14,1],[1518,13,1518,47,1],[1519,13,1519,87,1],[1520,13,1520,14,0],[1521,17,1521,195,0],[1524,13,1524,51,1],[1525,13,1526,91,1],[1526,91,1526,94,1],[1526,94,1527,73,1],[1525,13,1527,73,1],[1529,13,1529,82,1],[1530,13,1530,20,1],[1530,22,1530,42,1],[1530,43,1530,45,1],[1530,46,1530,62,1],[1531,13,1531,14,1],[1532,17,1532,55,1],[1533,17,1533,47,1],[1535,17,1536,47,1],[1536,47,1536,114,1],[1536,114,1536,116,1],[1535,17,1536,116,1],[1537,17,1537,18,1],[1538,21,1538,77,1],[1539,17,1539,18,1],[1540,22,1541,47,1],[1541,47,1541,114,1],[1541,114,1541,125,1],[1540,22,1541,125,1],[1542,17,1542,18,1],[1543,21,1543,226,1],[1544,17,1544,18,1],[1546,17,1549,53,1],[1549,53,1549,64,1],[1549,64,1551,19,1],[1546,17,1551,19,1],[1553,17,1553,35,1],[1554,13,1554,14,1],[1556,13,1556,75,1],[1557,13,1557,20,1],[1557,22,1557,41,1],[1557,42,1557,44,1],[1557,45,1557,59,1],[1558,13,1558,14,1],[1559,17,1559,74,1],[1560,17,1560,68,1],[1561,17,1561,70,1],[1562,17,1562,71,1],[1564,17,1564,63,1],[1565,17,1565,83,1],[1567,17,1567,84,1],[1568,17,1568,92,1],[1569,17,1569,43,1],[1570,17,1570,99,1],[1571,17,1571,18,1],[1572,21,1572,72,1],[1573,21,1573,72,1],[1573,72,1573,102,1],[1573,102,1573,104,1],[1573,21,1573,104,1],[1574,21,1574,48,1],[1575,25,1575,73,1],[1575,73,1575,90,1],[1575,90,1575,92,1],[1575,25,1575,92,1],[1576,17,1576,18,1],[1577,17,1577,41,1],[1578,13,1578,14,1],[1580,13,1580,33,1],[1581,17,1581,62,1],[1583,13,1583,29,1],[1584,17,1584,110,1],[1586,13,1586,30,1],[1587,9,1587,10,1],[1591,9,1591,10,0],[1593,13,1593,29,0],[1594,13,1594,14,0],[1595,17,1595,108,0],[1596,21,1596,54,0],[1597,13,1597,14,0],[1599,13,1599,72,0],[1601,13,1601,42,0],[1602,17,1602,83,0],[1605,13,1605,29,0],[1606,17,1606,112,0],[1608,13,1608,32,0],[1610,9,1610,10,0],[1614,9,1614,10,1],[1615,13,1616,136,1],[1617,9,1617,10,1],[1620,9,1620,10,1],[1621,13,1621,90,1],[1622,9,1622,10,1],[1625,9,1625,10,1],[1626,13,1626,111,1],[1627,9,1627,10,1],[1636,9,1636,10,0],[1637,13,1637,49,0],[1638,13,1638,20,0],[1638,22,1638,30,0],[1638,31,1638,33,0],[1638,34,1638,43,0],[1639,13,1639,14,0],[1640,17,1640,52,0],[1641,13,1641,14,0],[1642,13,1642,24,0],[1643,9,1643,10,0],[1652,9,1652,10,0],[1653,13,1653,29,0],[1654,13,1654,14,0],[1655,17,1655,122,0],[1656,21,1656,53,0],[1657,13,1657,14,0],[1659,13,1659,54,0],[1660,13,1660,52,0],[1662,13,1662,29,0],[1663,17,1663,105,0],[1665,13,1665,24,0],[1666,9,1666,10,0],[1677,25,1677,26,1],[1677,27,1677,142,1],[1677,143,1677,144,1],[1678,17,1678,18,0],[1678,19,1678,48,0],[1678,49,1678,50,0],[1682,9,1682,10,1],[1683,13,1683,29,1],[1684,13,1684,14,0],[1685,17,1685,68,0],[1686,17,1686,130,0],[1687,17,1687,18,0],[1688,21,1688,75,0],[1689,21,1689,51,0],[1690,21,1690,38,0],[1692,13,1692,14,0],[1693,13,1693,99,1],[1695,13,1695,29,1],[1696,13,1696,14,0],[1697,17,1697,127,0],[1698,13,1698,14,0],[1700,13,1700,40,1],[1701,9,1701,10,1],[1704,9,1704,10,1],[1705,13,1705,79,1],[1706,9,1706,10,1],[1709,9,1709,10,1],[1710,13,1710,69,1],[1711,9,1711,10,1]]);
+    </script>
+  </body>
+</html>

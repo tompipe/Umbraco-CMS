@@ -1,0 +1,1943 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\macro.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Net.Security;
+using System.Reflection;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Web;
+using System.Web.Caching;
+using System.Web.UI;
+using System.Web.UI.WebControls;
+using System.Xml;
+using System.Xml.XPath;
+using System.Xml.Xsl;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Events;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Macros;
+using Umbraco.Core.Models;
+using Umbraco.Core.Services;
+using Umbraco.Core.Xml.XPath;
+using Umbraco.Core.Profiling;
+using umbraco.interfaces;
+using Umbraco.Web;
+using Umbraco.Web.Cache;
+using Umbraco.Web.Macros;
+using Umbraco.Web.Models;
+using Umbraco.Web.Templates;
+using umbraco.BusinessLogic;
+using umbraco.cms.businesslogic.macro;
+using umbraco.DataLayer;
+using umbraco.NodeFactory;
+using umbraco.presentation.templateControls;
+using Umbraco.Web.umbraco.presentation;
+using Content = umbraco.cms.businesslogic.Content;
+using Macro = umbraco.cms.businesslogic.macro.Macro;
+using MacroErrorEventArgs = Umbraco.Core.Events.MacroErrorEventArgs;
+using System.Linq;
+using File = System.IO.File;
+using MacroTypes = umbraco.cms.businesslogic.macro.MacroTypes;
+using Member = umbraco.cms.businesslogic.member.Member;
+
+namespace umbraco
+{
+    /// &lt;summary&gt;
+    /// Summary description for macro.
+    /// &lt;/summary&gt;
+    public class macro
+    {
+        #region private properties
+
+        /// &lt;summary&gt;Cache for &lt;see cref=&quot;GetPredefinedXsltExtensions&quot;/&gt;.&lt;/summary&gt;
+        private static Dictionary&lt;string, object&gt; _predefinedExtensions;
+        private static XsltSettings _xsltSettings;
+        private const string LoadUserControlKey = &quot;loadUserControl&quot;;
+        private readonly StringBuilder _content = new StringBuilder();
+        private const string MacrosAddedKey = &quot;macrosAdded&quot;;
+        public IList&lt;Exception&gt; Exceptions = new List&lt;Exception&gt;();
+
+        /// &lt;summary&gt;
+        /// Unused, please do not use
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Obsolete, For querying the database use the new UmbracoDatabase object ApplicationContext.Current.DatabaseContext.Database&quot;, false)]
+        protected static ISqlHelper SqlHelper
+        {
+            get { return Application.SqlHelper; }
+        }
+
+        static macro()
+        {
+            _xsltSettings = GlobalSettings.ApplicationTrustLevel &gt; AspNetHostingPermissionLevel.Medium
+                ? XsltSettings.TrustedXslt
+                : XsltSettings.Default;
+        }
+
+        #endregion
+
+        #region public properties
+
+        public bool CacheByPersonalization
+        {
+            get { return Model.CacheByMember; }
+        }
+
+        public bool CacheByPage
+        {
+            get { return Model.CacheByPage; }
+        }
+
+        public bool DontRenderInEditor
+        {
+            get { return !Model.RenderInEditor; }
+        }
+
+        public int RefreshRate
+        {
+            get { return Model.CacheDuration; }
+        }
+
+        public String Alias
+        {
+            get { return Model.Alias; }
+        }
+
+        public String Name
+        {
+            get { return Model.Name; }
+        }
+
+        public String XsltFile
+        {
+            get { return Model.Xslt; }
+        }
+
+        public String ScriptFile
+        {
+            get { return Model.ScriptName; }
+        }
+
+        public String ScriptType
+        {
+            get { return Model.TypeName; }
+        }
+
+        public String ScriptAssembly
+        {
+            get { return Model.TypeName; }
+        }
+
+        public int MacroType
+        {
+            get { return (int)Model.MacroType; }
+        }
+
+        public String MacroContent
+        {
+            set { _content.Append(value); }
+            get { return _content.ToString(); }
+        }
+
+        #endregion
+
+        #region REFACTOR
+
+        /// &lt;summary&gt;
+        /// Creates a macro object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Specify the macro-id which should be loaded (from table macro)&lt;/param&gt;
+        public macro(int id)
+        {
+            Macro m = Macro.GetById(id);
+            Model = new MacroModel(m);
+        }
+
+        public macro(string alias)
+        {
+            Macro m = Macro.GetByAlias(alias);
+            Model = new MacroModel(m);
+        }
+
+        public MacroModel Model { get; set; }
+
+        public static macro GetMacro(string alias)
+        {
+            return new macro(alias);
+        }
+
+        public static macro GetMacro(int id)
+        {
+            return new macro(id);
+        }
+
+        #endregion
+
+        private const string XsltExtensionsCacheKey = &quot;UmbracoXsltExtensions&quot;;
+
+        /// &lt;summary&gt;
+        /// Creates an empty macro object.
+        /// &lt;/summary&gt;
+        public macro()
+        {
+            Model = new MacroModel();
+        }
+
+
+        public override string ToString()
+        {
+            return Model.Name;
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes macro definition from cache.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;True if succesfull, false if nothing has been removed&lt;/returns&gt;
+        [Obsolete(&quot;Use DistributedCache.Instance.RemoveMacroCache instead, macro cache will automatically be cleared and shouldn&#39;t need to be manually cleared.&quot;)]
+        public bool removeFromCache()
+        {
+            if (this.Model != null)
+            {
+                DistributedCache.Instance.RemoveMacroCache(this);
+            }
+
+            //this always returned false... hrm. oh well i guess we leave it like that
+            return false;
+        }
+
+        string GetCacheIdentifier(MacroModel model, Hashtable pageElements, int pageId)
+        {
+            var id = new StringBuilder();
+
+            var alias = string.IsNullOrEmpty(model.ScriptCode) ? model.Alias : Macro.GenerateCacheKeyFromCode(model.ScriptCode);
+            id.AppendFormat(&quot;{0}-&quot;, alias);
+
+            if (CacheByPage)
+            {
+                id.AppendFormat(&quot;{0}-&quot;, pageId);
+            }
+
+            if (CacheByPersonalization)
+            {
+                object memberId = 0;
+                if (HttpContext.Current.User.Identity.IsAuthenticated)
+                {
+                    var provider = Umbraco.Core.Security.MembershipProviderExtensions.GetMembersMembershipProvider();
+                    var member = Umbraco.Core.Security.MembershipProviderExtensions.GetCurrentUser(provider);
+                    if (member != null)
+                    {
+                        memberId = member.ProviderUserKey ?? 0;
+                    }
+                }
+                id.AppendFormat(&quot;m{0}-&quot;, memberId);
+            }
+
+            foreach (var prop in model.Properties)
+            {
+                var propValue = prop.Value;
+                id.AppendFormat(&quot;{0}-&quot;, propValue.Length &lt;= 255 ? propValue : propValue.Substring(0, 255));
+            }
+
+            return id.ToString();
+        }
+
+        public Control renderMacro(Hashtable attributes, Hashtable pageElements, int pageId)
+        {
+            // TODO: Parse attributes
+            UpdateMacroModel(attributes);
+            return renderMacro(pageElements, pageId);
+        }
+
+        /// &lt;summary&gt;
+        /// An event that is raised just before the macro is rendered allowing developers to modify the macro before it executes.
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;macro, MacroRenderingEventArgs&gt; MacroRendering;
+
+        /// &lt;summary&gt;
+        /// Raises the MacroRendering event
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        protected void OnMacroRendering(MacroRenderingEventArgs e)
+        {
+            if (MacroRendering != null)
+                MacroRendering(this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Renders the macro
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pageElements&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;pageId&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public Control renderMacro(Hashtable pageElements, int pageId)
+        {
+            // Event to allow manipulation of Macro Model
+            OnMacroRendering(new MacroRenderingEventArgs(pageElements, pageId));
+
+            var macroInfo = (Model.MacroType == MacroTypes.Script &amp;&amp; Model.Name.IsNullOrWhiteSpace())
+                                ? string.Format(&quot;Render Inline Macro, Cache: {0})&quot;, Model.CacheDuration)
+                                : string.Format(&quot;Render Macro: {0}, type: {1}, cache: {2})&quot;, Name, Model.MacroType, Model.CacheDuration);
+
+            using (DisposableTimer.DebugDuration&lt;macro&gt;(macroInfo))
+            {
+                TraceInfo(&quot;renderMacro&quot;, macroInfo, excludeProfiling: true);
+
+                StateHelper.SetContextValue(MacrosAddedKey, StateHelper.GetContextValue&lt;int&gt;(MacrosAddedKey) + 1);
+
+                // zb-00037 #29875 : parse attributes here (and before anything else)
+                foreach (MacroPropertyModel prop in Model.Properties)
+                    prop.Value = helper.parseAttribute(pageElements, prop.Value);
+
+                Model.CacheIdentifier = GetCacheIdentifier(Model, pageElements, pageId);
+
+                string macroHtml;
+                Control macroControl;
+                //get the macro from cache if it is there
+                GetMacroFromCache(out macroHtml, out macroControl);
+
+                // FlorisRobbemont: Empty macroHtml (not null, but &quot;&quot;) doesn&#39;t mean a re-render is necessary
+                if (macroHtml == null &amp;&amp; macroControl == null)
+                {
+                    var renderFailed = false;
+                    var macroType = Model.MacroType != MacroTypes.Unknown
+                                        ? (int)Model.MacroType
+                                        : MacroType;
+                    var textService = ApplicationContext.Current.Services.TextService;
+
+                    switch (macroType)
+                    {
+                        case (int)MacroTypes.PartialView:
+
+                            //error handler for partial views, is an action because we need to re-use it twice below
+                            Func&lt;Exception, Control&gt; handleError = e =&gt;
+                                {
+                                    LogHelper.WarnWithException&lt;macro&gt;(&quot;Error loading Partial View (file: &quot; + ScriptFile + &quot;)&quot;, true, e);
+                                    // Invoke any error handlers for this macro
+                                    var macroErrorEventArgs =
+                                        new MacroErrorEventArgs
+                                            {
+                                                Name = Model.Name,
+                                                Alias = Model.Alias,
+                                                ItemKey = Model.ScriptName,
+                                                Exception = e,
+                                                Behaviour = UmbracoConfig.For.UmbracoSettings().Content.MacroErrorBehaviour
+                                            };
+
+                                    var errorMessage = textService.Localize(&quot;errors/macroErrorLoadingPartialView&quot;, new[] { ScriptFile });
+                                    return GetControlForErrorBehavior(errorMessage, macroErrorEventArgs);
+                                };
+
+                            using (DisposableTimer.DebugDuration&lt;macro&gt;(&quot;Executing Partial View: &quot; + Model.TypeName))
+                            {
+                                TraceInfo(&quot;umbracoMacro&quot;, &quot;Partial View added (&quot; + Model.TypeName + &quot;)&quot;, excludeProfiling: true);
+                                try
+                                {
+                                    var result = LoadPartialViewMacro(Model);
+                                    macroControl = new LiteralControl(result.Result);
+                                    if (result.ResultException != null)
+                                    {
+                                        renderFailed = true;
+                                        Exceptions.Add(result.ResultException);
+                                        macroControl = handleError(result.ResultException);
+                                        //if it is null, then we are supposed to throw the exception
+                                        if (macroControl == null)
+                                        {
+                                            throw result.ResultException;
+                                        }
+                                    }
+                                }
+                                catch (Exception e)
+                                {
+                                    LogHelper.WarnWithException&lt;macro&gt;(
+                                        &quot;Error loading partial view macro (View: &quot; + Model.ScriptName + &quot;)&quot;, true, e);
+
+                                    renderFailed = true;
+                                    Exceptions.Add(e);
+                                    macroControl = handleError(e);
+                                    //if it is null, then we are supposed to throw the (original) exception
+                                    // see: http://issues.umbraco.org/issue/U4-497 at the end
+                                    if (macroControl == null)
+                                    {
+                                        throw;
+                                    }
+                                }
+
+                                break;
+                            }
+                        case (int)MacroTypes.UserControl:
+
+                            using (DisposableTimer.DebugDuration&lt;macro&gt;(&quot;Executing UserControl: &quot; + Model.TypeName))
+                            {
+                                try
+                                {
+                                    TraceInfo(&quot;umbracoMacro&quot;, &quot;Usercontrol added (&quot; + Model.TypeName + &quot;)&quot;, excludeProfiling: true);
+
+                                    // Add tilde for v4 defined macros
+                                    if (string.IsNullOrEmpty(Model.TypeName) == false &amp;&amp;
+                                        Model.TypeName.StartsWith(&quot;~&quot;) == false)
+                                        Model.TypeName = &quot;~/&quot; + Model.TypeName;
+
+                                    macroControl = loadUserControl(ScriptType, Model, pageElements);
+                                    break;
+                                }
+                                catch (Exception e)
+                                {
+                                    renderFailed = true;
+                                    Exceptions.Add(e);
+                                    LogHelper.WarnWithException&lt;macro&gt;(&quot;Error loading userControl (&quot; + Model.TypeName + &quot;)&quot;, true, e);
+
+                                    // Invoke any error handlers for this macro
+                                    var macroErrorEventArgs = new MacroErrorEventArgs
+                                    {
+                                        Name = Model.Name,
+                                        Alias = Model.Alias,
+                                        ItemKey = Model.TypeName,
+                                        Exception = e,
+                                        Behaviour = UmbracoConfig.For.UmbracoSettings().Content.MacroErrorBehaviour
+                                    };
+
+                                    var errorMessage = textService.Localize(&quot;errors/macroErrorLoadingUsercontrol&quot;, new[] { Model.TypeName });
+                                    macroControl = GetControlForErrorBehavior(errorMessage, macroErrorEventArgs);
+                                    //if it is null, then we are supposed to throw the (original) exception
+                                    // see: http://issues.umbraco.org/issue/U4-497 at the end
+                                    if (macroControl == null)
+                                    {
+                                        throw;
+                                    }
+
+                                    break;
+                                }
+                            }
+
+                        case (int)MacroTypes.CustomControl:
+
+                            using (DisposableTimer.DebugDuration&lt;macro&gt;(&quot;Executing CustomControl: &quot; + Model.TypeName + &quot;.&quot; + Model.TypeAssembly))
+                            {
+                                try
+                                {
+                                    TraceInfo(&quot;umbracoMacro&quot;, &quot;Custom control added (&quot; + Model.TypeName + &quot;), ScriptAssembly: &quot; + Model.TypeAssembly, excludeProfiling: true);
+                                    macroControl = loadControl(Model.TypeAssembly, ScriptType, Model, pageElements);
+                                    break;
+                                }
+                                catch (Exception e)
+                                {
+                                    renderFailed = true;
+                                    Exceptions.Add(e);
+
+                                    LogHelper.WarnWithException&lt;macro&gt;(
+                                        &quot;Error loading customControl (Assembly: &quot; + Model.TypeAssembly + &quot;, Type: &#39;&quot; +
+                                        Model.TypeName + &quot;&#39;&quot;, true, e);
+
+                                    // Invoke any error handlers for this macro
+                                    var macroErrorEventArgs = new MacroErrorEventArgs
+                                    {
+                                        Name = Model.Name,
+                                        Alias = Model.Alias,
+                                        ItemKey = Model.TypeAssembly,
+                                        Exception = e,
+                                        Behaviour = UmbracoConfig.For.UmbracoSettings().Content.MacroErrorBehaviour
+                                    };
+
+                                    var errorMessage = textService.Localize(&quot;errors/macroErrorLoadingCustomControl&quot;, new[] { Model.TypeAssembly, Model.TypeName });
+                                    macroControl = GetControlForErrorBehavior(errorMessage, macroErrorEventArgs);
+                                    //if it is null, then we are supposed to throw the (original) exception
+                                    // see: http://issues.umbraco.org/issue/U4-497 at the end
+                                    if (macroControl == null)
+                                    {
+                                        throw;
+                                    }
+
+                                    break;
+                                }
+                            }
+                        case (int)MacroTypes.XSLT:
+                            macroControl = LoadMacroXslt(this, Model, pageElements, true);
+                            break;
+                        case (int)MacroTypes.Script:
+
+                            //error handler for partial views, is an action because we need to re-use it twice below
+                            Func&lt;Exception, Control&gt; handleMacroScriptError = e =&gt;
+                                {
+                                    LogHelper.WarnWithException&lt;macro&gt;(&quot;Error loading MacroEngine script (file: &quot; + ScriptFile + &quot;, Type: &#39;&quot; + Model.TypeName + &quot;&#39;&quot;, true, e);
+
+                                    // Invoke any error handlers for this macro
+                                    var macroErrorEventArgs =
+                                        new MacroErrorEventArgs
+                                            {
+                                                Name = Model.Name,
+                                                Alias = Model.Alias,
+                                                ItemKey = ScriptFile,
+                                                Exception = e,
+                                                Behaviour = UmbracoConfig.For.UmbracoSettings().Content.MacroErrorBehaviour
+                                            };
+
+                                    var errorMessage = textService.Localize(&quot;errors/macroErrorLoadingMacroEngineScript&quot;, new[] { ScriptFile });
+                                    return GetControlForErrorBehavior(errorMessage, macroErrorEventArgs);
+                                };
+
+                            using (DisposableTimer.DebugDuration&lt;macro&gt;(&quot;Executing MacroEngineScript: &quot; + ScriptFile))
+                            {
+                                try
+                                {
+                                    TraceInfo(&quot;umbracoMacro&quot;, &quot;MacroEngine script added (&quot; + ScriptFile + &quot;)&quot;, excludeProfiling: true);
+                                    ScriptingMacroResult result = loadMacroScript(Model);
+                                    macroControl = new LiteralControl(result.Result);
+                                    if (result.ResultException != null)
+                                    {
+                                        renderFailed = true;
+                                        Exceptions.Add(result.ResultException);
+                                        macroControl = handleMacroScriptError(result.ResultException);
+                                        //if it is null, then we are supposed to throw the exception
+                                        if (macroControl == null)
+                                        {
+                                            throw result.ResultException;
+                                        }
+                                    }
+                                    break;
+                                }
+                                catch (Exception e)
+                                {
+                                    renderFailed = true;
+                                    Exceptions.Add(e);
+
+                                    macroControl = handleMacroScriptError(e);
+                                    //if it is null, then we are supposed to throw the (original) exception
+                                    // see: http://issues.umbraco.org/issue/U4-497 at the end
+                                    if (macroControl == null)
+                                    {
+                                        throw;
+                                    }
+                                    break;
+                                }
+                            }
+                        case (int)MacroTypes.Unknown:
+                        default:
+                            if (GlobalSettings.DebugMode)
+                            {
+                                macroControl = new LiteralControl(&quot;&amp;lt;Macro: &quot; + Name + &quot; (&quot; + ScriptAssembly + &quot;,&quot; + ScriptType + &quot;)&amp;gt;&quot;);
+                            }
+                            break;
+                    }
+
+                    //add to cache if render is successful
+                    if (renderFailed == false)
+                    {
+                        macroControl = AddMacroResultToCache(macroControl);
+                    }
+
+                }
+                else if (macroControl == null)
+                {
+                    macroControl = new LiteralControl(macroHtml);
+                }
+
+                return macroControl;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Adds the macro result to cache and returns the control since it might be updated
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;macroControl&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private Control AddMacroResultToCache(Control macroControl)
+        {
+            // Add result to cache if successful (and cache is enabled)
+            if (UmbracoContext.Current.InPreviewMode == false &amp;&amp; Model.CacheDuration &gt; 0)
+            {
+                // do not add to cache if there&#39;s no member and it should cache by personalization
+                if (!Model.CacheByMember || (Model.CacheByMember &amp;&amp; Member.IsLoggedOn()))
+                {
+                    if (macroControl != null)
+                    {
+                        string dateAddedCacheKey;
+
+                        using (DisposableTimer.DebugDuration&lt;macro&gt;(&quot;Saving MacroContent To Cache: &quot; + Model.CacheIdentifier))
+                        {
+
+                            // NH: Scripts and XSLT can be generated as strings, but not controls as page events wouldn&#39;t be hit (such as Page_Load, etc)
+                            if (CacheMacroAsString(Model))
+                            {
+                                var outputCacheString = &quot;&quot;;
+
+                                using (var sw = new StringWriter())
+                                {
+                                    var hw = new HtmlTextWriter(sw);
+                                    macroControl.RenderControl(hw);
+
+                                    outputCacheString = sw.ToString();
+                                }
+
+                                //insert the cache string result
+                                ApplicationContext.Current.ApplicationCache.RuntimeCache.InsertCacheItem(
+                                    CacheKeys.MacroHtmlCacheKey + Model.CacheIdentifier,
+                                    priority:       CacheItemPriority.NotRemovable,
+                                    timeout:        new TimeSpan(0, 0, Model.CacheDuration),
+                                    getCacheItem:   () =&gt; outputCacheString);
+
+                                dateAddedCacheKey = CacheKeys.MacroHtmlDateAddedCacheKey + Model.CacheIdentifier;
+
+                                // zb-00003 #29470 : replace by text if not already text
+                                // otherwise it is rendered twice
+                                if (!(macroControl is LiteralControl))
+                                    macroControl = new LiteralControl(outputCacheString);
+
+                                TraceInfo(&quot;renderMacro&quot;,
+                                          string.Format(&quot;Macro Content saved to cache &#39;{0}&#39;.&quot;, Model.CacheIdentifier));
+                            }
+                            else
+                            {
+                                //insert the cache control result
+                                ApplicationContext.Current.ApplicationCache.RuntimeCache.InsertCacheItem(
+                                    CacheKeys.MacroControlCacheKey + Model.CacheIdentifier,
+                                    priority:       CacheItemPriority.NotRemovable,
+                                    timeout:        new TimeSpan(0, 0, Model.CacheDuration),
+                                    getCacheItem:   () =&gt; new MacroCacheContent(macroControl, macroControl.ID));
+
+                                dateAddedCacheKey = CacheKeys.MacroControlDateAddedCacheKey + Model.CacheIdentifier;
+
+                                TraceInfo(&quot;renderMacro&quot;,
+                                          string.Format(&quot;Macro Control saved to cache &#39;{0}&#39;.&quot;, Model.CacheIdentifier));
+                            }
+
+                            //insert the date inserted (so we can check file modification date)
+                            ApplicationContext.Current.ApplicationCache.RuntimeCache.InsertCacheItem(
+                                dateAddedCacheKey,
+                                priority:       CacheItemPriority.NotRemovable,
+                                timeout:        new TimeSpan(0, 0, Model.CacheDuration),
+                                getCacheItem:   () =&gt; DateTime.Now);
+
+                        }
+
+                    }
+                }
+            }
+
+            return macroControl;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the cached version of this macro either as a string or as a Control
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;macroHtml&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;macroControl&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Depending on the type of macro, this will return the result as a string or as a control. This also 
+        /// checks to see if preview mode is activated, if it is then we don&#39;t return anything from cache.
+        /// &lt;/remarks&gt;
+        private void GetMacroFromCache(out string macroHtml, out Control macroControl)
+        {
+            macroHtml = null;
+            macroControl = null;
+
+            if (UmbracoContext.Current.InPreviewMode == false &amp;&amp; Model.CacheDuration &gt; 0)
+            {
+                var macroFile = GetMacroFile(Model);
+                var fileInfo = new FileInfo(HttpContext.Current.Server.MapPath(macroFile));
+
+                if (CacheMacroAsString(Model))
+                {
+                    macroHtml = ApplicationContext.Current.ApplicationCache.RuntimeCache.GetCacheItem&lt;string&gt;(
+                        CacheKeys.MacroHtmlCacheKey + Model.CacheIdentifier);
+
+                    // FlorisRobbemont: 
+                    // An empty string means: macroHtml has been cached before, but didn&#39;t had any output (Macro doesn&#39;t need to be rendered again)
+                    // An empty reference (null) means: macroHtml has NOT been cached before
+                    if (macroHtml != null)
+                    {
+                        if (MacroNeedsToBeClearedFromCache(Model, CacheKeys.MacroHtmlDateAddedCacheKey + Model.CacheIdentifier, fileInfo))
+                        {
+                            macroHtml = null;
+                            TraceInfo(&quot;renderMacro&quot;,
+                                      string.Format(&quot;Macro removed from cache due to file change &#39;{0}&#39;.&quot;,
+                                                    Model.CacheIdentifier));
+                        }
+                        else
+                        {
+                            TraceInfo(&quot;renderMacro&quot;,
+                                      string.Format(&quot;Macro Content loaded from cache &#39;{0}&#39;.&quot;,
+                                                    Model.CacheIdentifier));
+                        }
+
+                    }
+                }
+                else
+                {
+                    var cacheContent = ApplicationContext.Current.ApplicationCache.RuntimeCache.GetCacheItem&lt;MacroCacheContent&gt;(
+                        CacheKeys.MacroControlCacheKey + Model.CacheIdentifier);
+
+                    if (cacheContent != null)
+                    {
+                        macroControl = cacheContent.Content;
+                        macroControl.ID = cacheContent.ID;
+
+                        if (MacroNeedsToBeClearedFromCache(Model, CacheKeys.MacroControlDateAddedCacheKey + Model.CacheIdentifier, fileInfo))
+                        {
+                            TraceInfo(&quot;renderMacro&quot;,
+                                      string.Format(&quot;Macro removed from cache due to file change &#39;{0}&#39;.&quot;,
+                                                    Model.CacheIdentifier));
+                            macroControl = null;
+                        }
+                        else
+                        {
+                            TraceInfo(&quot;renderMacro&quot;,
+                                      string.Format(&quot;Macro Control loaded from cache &#39;{0}&#39;.&quot;,
+                                                    Model.CacheIdentifier));
+                        }
+
+                    }
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Raises the error event and based on the error behavior either return a control to display or throw the exception
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;msg&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;args&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private Control GetControlForErrorBehavior(string msg, MacroErrorEventArgs args)
+        {
+            OnError(args);
+
+            switch (args.Behaviour)
+            {
+                case MacroErrorBehaviour.Inline:
+                    return new LiteralControl(msg);
+                case MacroErrorBehaviour.Silent:
+                    return new LiteralControl(&quot;&quot;);
+                case MacroErrorBehaviour.Throw:
+                default:
+                    return null;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// check that the file has not recently changed
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dateAddedKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;macroFile&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// The only reason this is necessary is because a developer might update a file associated with the 
+        /// macro, we need to ensure if that is the case that the cache not be used and it is refreshed.
+        /// &lt;/remarks&gt;
+        internal static bool MacroNeedsToBeClearedFromCache(MacroModel model, string dateAddedKey, FileInfo macroFile)
+        {
+            if (MacroIsFileBased(model))
+            {
+                var cacheResult = ApplicationContext.Current.ApplicationCache.RuntimeCache.GetCacheItem&lt;DateTime?&gt;(dateAddedKey);
+
+                if (cacheResult != null)
+                {
+                    var dateMacroAdded = cacheResult;
+
+                    if (macroFile.LastWriteTime.CompareTo(dateMacroAdded) == 1)
+                    {
+                        TraceInfo(&quot;renderMacro&quot;, string.Format(&quot;Macro needs to be removed from cache due to file change &#39;{0}&#39;.&quot;, model.CacheIdentifier));
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        internal static string GetMacroFile(MacroModel model)
+        {
+            switch (model.MacroType)
+            {
+                case MacroTypes.XSLT:
+                    return string.Concat(&quot;~/xslt/&quot;, model.Xslt);
+                case MacroTypes.Python:
+                case MacroTypes.Script:
+                    return string.Concat(&quot;~/macroScripts/&quot;, model.ScriptName);
+                case MacroTypes.PartialView:
+                    return model.ScriptName; //partial views are saved with the full virtual path
+                case MacroTypes.UserControl:
+                    return model.TypeName; //user controls saved with the full virtual path
+                case MacroTypes.CustomControl:
+                case MacroTypes.Unknown:
+                default:
+                    return &quot;/&quot; + model.TypeName;
+            }
+        }
+
+        internal static bool MacroIsFileBased(MacroModel model)
+        {
+            return model.MacroType != MacroTypes.CustomControl &amp;&amp; model.MacroType != MacroTypes.Unknown;
+        }
+
+        /// &lt;summary&gt;
+        /// Determine if macro can be cached as string
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Scripts and XSLT can be generated as strings, but not controls as page events wouldn&#39;t be hit (such as Page_Load, etc)
+        /// &lt;/remarks&gt;
+        internal static bool CacheMacroAsString(MacroModel model)
+        {
+            switch (model.MacroType)
+            {
+                case MacroTypes.XSLT:
+                case MacroTypes.Python:
+                case MacroTypes.Script:
+                case MacroTypes.PartialView:
+                    return true;
+                case MacroTypes.UserControl:
+                case MacroTypes.CustomControl:
+                case MacroTypes.Unknown:
+                default:
+                    return false;
+            }
+        }
+
+        public static XslCompiledTransform getXslt(string XsltFile)
+        {
+            //TODO: SD: Do we really need to cache this??
+            return ApplicationContext.Current.ApplicationCache.GetCacheItem(
+                CacheKeys.MacroXsltCacheKey + XsltFile,
+                CacheItemPriority.Default,
+                new CacheDependency(IOHelper.MapPath(SystemDirectories.Xslt + &quot;/&quot; + XsltFile)),
+                () =&gt;
+                {
+                    using (var xslReader = new XmlTextReader(IOHelper.MapPath(SystemDirectories.Xslt.EnsureEndsWith(&#39;/&#39;) + XsltFile)))
+                    {
+                        return CreateXsltTransform(xslReader, GlobalSettings.DebugMode);
+                    }
+                });
+        }
+
+        public void UpdateMacroModel(Hashtable attributes)
+        {
+            foreach (MacroPropertyModel mp in Model.Properties)
+            {
+                if (attributes.ContainsKey(mp.Key.ToLowerInvariant()))
+                {
+                    var item = attributes[mp.Key.ToLowerInvariant()];
+
+                    mp.Value = item == null ? string.Empty : item.ToString();
+                }
+                else
+                {
+                    mp.Value = string.Empty;
+                }
+            }
+        }
+
+        public void GenerateMacroModelPropertiesFromAttributes(Hashtable attributes)
+        {
+            foreach (string key in attributes.Keys)
+            {
+                Model.Properties.Add(new MacroPropertyModel(key, attributes[key].ToString()));
+            }
+        }
+
+
+        public static XslCompiledTransform CreateXsltTransform(XmlTextReader xslReader, bool debugMode)
+        {
+            var macroXslt = new XslCompiledTransform(debugMode);
+            var xslResolver = new XmlUrlResolver
+                {
+                    Credentials = CredentialCache.DefaultCredentials
+                };
+
+            xslReader.EntityHandling = EntityHandling.ExpandEntities;
+
+            try
+            {
+                macroXslt.Load(xslReader, _xsltSettings, xslResolver);
+            }
+            finally
+            {
+                xslReader.Close();
+            }
+
+            return macroXslt;
+        }
+
+        [Obsolete(&quot;This is no longer used in the codebase and will be removed in future versions&quot;)]
+        public static void unloadXslt(string XsltFile)
+        {
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(CacheKeys.MacroXsltCacheKey + XsltFile);
+        }
+
+        #region LoadMacroXslt
+
+        // gets the control for the macro, using GetXsltTransform methods for execution
+        // will pick XmlDocument or Navigator mode depending on the capabilities of the published caches
+        internal Control LoadMacroXslt(macro macro, MacroModel model, Hashtable pageElements, bool throwError)
+        {
+            if (XsltFile.Trim() == string.Empty)
+            {
+                TraceWarn(&quot;macro&quot;, &quot;Xslt is empty&quot;);
+                return new LiteralControl(string.Empty);
+            }
+
+            using (DisposableTimer.DebugDuration&lt;macro&gt;(&quot;Executing XSLT: &quot; + XsltFile))
+            {
+                XmlDocument macroXml = null;
+                MacroNavigator macroNavigator = null;
+                NavigableNavigator contentNavigator = null;
+
+                var canNavigate =
+                    UmbracoContext.Current.ContentCache.XPathNavigatorIsNavigable &amp;&amp;
+                    UmbracoContext.Current.MediaCache.XPathNavigatorIsNavigable;
+
+                if (!canNavigate)
+                {
+                    // get master xml document
+                    var cache = UmbracoContext.Current.ContentCache.InnerCache as Umbraco.Web.PublishedCache.XmlPublishedCache.PublishedContentCache;
+                    if (cache == null) throw new Exception(&quot;Unsupported IPublishedContentCache, only the Xml one is supported.&quot;);
+                    XmlDocument umbracoXml = cache.GetXml(UmbracoContext.Current, UmbracoContext.Current.InPreviewMode);
+                    macroXml = new XmlDocument();
+                    macroXml.LoadXml(&quot;&lt;macro/&gt;&quot;);
+                    foreach (var prop in macro.Model.Properties)
+                    {
+                        AddMacroXmlNode(umbracoXml, macroXml, prop.Key, prop.Type, prop.Value);
+                    }
+                }
+                else
+                {
+                    var parameters = new List&lt;MacroNavigator.MacroParameter&gt;();
+                    contentNavigator = UmbracoContext.Current.ContentCache.GetXPathNavigator() as NavigableNavigator;
+                    var mediaNavigator = UmbracoContext.Current.MediaCache.GetXPathNavigator() as NavigableNavigator;
+                    foreach (var prop in macro.Model.Properties)
+                    {
+                        AddMacroParameter(parameters, contentNavigator, mediaNavigator, prop.Key, prop.Type, prop.Value);
+                    }
+                    macroNavigator = new MacroNavigator(parameters);
+                }
+
+                if (HttpContext.Current.Request.QueryString[&quot;umbDebug&quot;] != null &amp;&amp; GlobalSettings.DebugMode)
+                {
+                    var outerXml = macroXml == null ? macroNavigator.OuterXml : macroXml.OuterXml;
+                    return
+                        new LiteralControl(&quot;&lt;div style=\&quot;border: 2px solid green; padding: 5px;\&quot;&gt;&lt;b&gt;Debug from &quot; +
+                                           macro.Name +
+                                           &quot;&lt;/b&gt;&lt;br/&gt;&lt;p&gt;&quot; + HttpContext.Current.Server.HtmlEncode(outerXml) +
+                                           &quot;&lt;/p&gt;&lt;/div&gt;&quot;);
+                }
+                
+                var textService = ApplicationContext.Current.Services.TextService;
+                try
+                {
+                    var xsltFile = getXslt(XsltFile);
+
+                    using (DisposableTimer.DebugDuration&lt;macro&gt;(&quot;Performing transformation&quot;))
+                    {
+                        try
+                        {
+                            var transformed = canNavigate
+                                ? GetXsltTransformResult(macroNavigator, contentNavigator, xsltFile) // better?
+                                : GetXsltTransformResult(macroXml, xsltFile); // document
+                            var result = CreateControlsFromText(transformed);
+
+                            return result;
+                        }
+                        catch (Exception e)
+                        {
+                            Exceptions.Add(e);
+                            LogHelper.WarnWithException&lt;macro&gt;(&quot;Error parsing XSLT file&quot;, e);
+
+                            var macroErrorEventArgs = new MacroErrorEventArgs { Name = Model.Name, Alias = Model.Alias, ItemKey = Model.Xslt, Exception = e, Behaviour = UmbracoConfig.For.UmbracoSettings().Content.MacroErrorBehaviour };
+
+                            var errorMessage = textService.Localize(&quot;errors/macroErrorParsingXSLTFile&quot;, new[] { XsltFile });
+                            var macroControl = GetControlForErrorBehavior(errorMessage, macroErrorEventArgs);
+                            //if it is null, then we are supposed to throw the (original) exception
+                            // see: http://issues.umbraco.org/issue/U4-497 at the end
+                            if (macroControl == null &amp;&amp; throwError)
+                            {
+                                throw;
+                            }
+                            return macroControl;
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    Exceptions.Add(e);
+                    LogHelper.WarnWithException&lt;macro&gt;(&quot;Error loading XSLT &quot; + Model.Xslt, true, e);
+
+                    // Invoke any error handlers for this macro
+                    var macroErrorEventArgs = new MacroErrorEventArgs { Name = Model.Name, Alias = Model.Alias, ItemKey = Model.Xslt, Exception = e, Behaviour = UmbracoConfig.For.UmbracoSettings().Content.MacroErrorBehaviour };
+                    var errorMessage = textService.Localize(&quot;errors/macroErrorReadingXSLTFile&quot;, new[] { XsltFile });
+                    var macroControl = GetControlForErrorBehavior(errorMessage + XsltFile, macroErrorEventArgs);
+                    //if it is null, then we are supposed to throw the (original) exception
+                    // see: http://issues.umbraco.org/issue/U4-497 at the end
+                    if (macroControl == null &amp;&amp; throwError)
+                    {
+                        throw;
+                    }
+                    return macroControl;
+                }
+            }
+        }
+
+        // gets the control for the macro, using GetXsltTransform methods for execution
+        public Control loadMacroXSLT(macro macro, MacroModel model, Hashtable pageElements)
+        {
+            return LoadMacroXslt(macro, model, pageElements, false);
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Parses the text for umbraco Item controls that need to be rendered.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;text&quot;&gt;The text to parse.&lt;/param&gt;
+        /// &lt;returns&gt;A control containing the parsed text.&lt;/returns&gt;
+        protected Control CreateControlsFromText(string text)
+        {
+            // the beginning and end tags
+            const string tagStart = &quot;[[[[umbraco:Item&quot;;
+            const string tagEnd = &quot;]]]]&quot;;
+
+            // container that will hold parsed controls
+            var container = new PlaceHolder();
+
+            // loop through all text
+            int textPos = 0;
+            while (textPos &lt; text.Length)
+            {
+                // try to find an item tag, carefully staying inside the string bounds (- 1)
+                int tagStartPos = text.IndexOf(tagStart, textPos);
+                int tagEndPos = tagStartPos &lt; 0 ? -1 : text.IndexOf(tagEnd, tagStartPos + tagStart.Length - 1);
+
+                // item tag found?
+                if (tagStartPos &gt;= 0 &amp;&amp; tagEndPos &gt;= 0)
+                {
+                    // add the preceding text as a literal control
+                    if (tagStartPos &gt; textPos)
+                        container.Controls.Add(new LiteralControl(text.Substring(textPos, tagStartPos - textPos)));
+
+                    // extract the tag and parse it
+                    string tag = text.Substring(tagStartPos, (tagEndPos + tagEnd.Length) - tagStartPos);
+                    Hashtable attributes = helper.ReturnAttributes(tag);
+
+                    // create item with the parameters specified in the tag
+                    var item = new Item();
+                    item.NodeId = helper.FindAttribute(attributes, &quot;nodeid&quot;);
+                    item.Field = helper.FindAttribute(attributes, &quot;field&quot;);
+                    item.Xslt = helper.FindAttribute(attributes, &quot;xslt&quot;);
+                    item.XsltDisableEscaping = helper.FindAttribute(attributes, &quot;xsltdisableescaping&quot;) == &quot;true&quot;;
+                    container.Controls.Add(item);
+
+                    // advance past the end of the tag
+                    textPos = tagEndPos + tagEnd.Length;
+                }
+                else
+                {
+                    // no more tags found, just add the remaning text
+                    container.Controls.Add(new LiteralControl(text.Substring(textPos)));
+                    textPos = text.Length;
+                }
+            }
+            return container;
+        }
+
+        #region GetXsltTransform
+
+        // gets the result of the xslt transform with no parameters - XmlDocument mode
+        public static string GetXsltTransformResult(XmlDocument macroXml, XslCompiledTransform xslt)
+        {
+            return GetXsltTransformResult(macroXml, xslt, null);
+        }
+
+        // gets the result of the xslt transform - XmlDocument mode
+        public static string GetXsltTransformResult(XmlDocument macroXml, XslCompiledTransform xslt, Dictionary&lt;string, object&gt; parameters)
+        {
+            TextWriter tw = new StringWriter();
+
+            XsltArgumentList xslArgs;
+
+            using (DisposableTimer.DebugDuration&lt;macro&gt;(&quot;Adding XSLT Extensions&quot;))
+            {
+                xslArgs = AddXsltExtensions();
+                var lib = new library();
+                xslArgs.AddExtensionObject(&quot;urn:umbraco.library&quot;, lib);
+            }
+
+            // Add parameters
+            if (parameters == null || !parameters.ContainsKey(&quot;currentPage&quot;))
+            {
+                xslArgs.AddParam(&quot;currentPage&quot;, string.Empty, library.GetXmlNodeCurrent());
+            }
+            if (parameters != null)
+            {
+                foreach (var parameter in parameters)
+                    xslArgs.AddParam(parameter.Key, string.Empty, parameter.Value);
+            }
+
+            // Do transformation
+            using (DisposableTimer.DebugDuration&lt;macro&gt;(&quot;Executing XSLT transform&quot;))
+            {
+                xslt.Transform(macroXml.CreateNavigator(), xslArgs, tw);
+            }
+            return TemplateUtilities.ResolveUrlsFromTextString(tw.ToString());
+        }
+
+        // gets the result of the xslt transform with no parameters - Navigator mode
+        public static string GetXsltTransformResult(XPathNavigator macroNavigator, XPathNavigator contentNavigator,
+            XslCompiledTransform xslt)
+        {
+            return GetXsltTransformResult(macroNavigator, contentNavigator, xslt, null);
+        }
+
+        // gets the result of the xslt transform - Navigator mode
+        public static string GetXsltTransformResult(XPathNavigator macroNavigator, XPathNavigator contentNavigator,
+            XslCompiledTransform xslt, Dictionary&lt;string, object&gt; parameters)
+        {
+            TextWriter tw = new StringWriter();
+
+            XsltArgumentList xslArgs;
+            using (DisposableTimer.DebugDuration&lt;macro&gt;(&quot;Adding XSLT Extensions&quot;))
+            {
+                xslArgs = AddXsltExtensions();
+                var lib = new library();
+                xslArgs.AddExtensionObject(&quot;urn:umbraco.library&quot;, lib);
+            }
+
+            // Add parameters
+            if (parameters == null || !parameters.ContainsKey(&quot;currentPage&quot;))
+            {
+                var current = contentNavigator.Clone().Select(&quot;//* [@id=&quot; + HttpContext.Current.Items[&quot;pageID&quot;] + &quot;]&quot;);
+                xslArgs.AddParam(&quot;currentPage&quot;, string.Empty, current);
+            }
+            if (parameters != null)
+            {
+                foreach (var parameter in parameters)
+                    xslArgs.AddParam(parameter.Key, string.Empty, parameter.Value);
+            }
+
+            // Do transformation
+            using (DisposableTimer.DebugDuration&lt;macro&gt;(&quot;Executing XSLT transform&quot;))
+            {
+                xslt.Transform(macroNavigator, xslArgs, tw);
+            }
+            return TemplateUtilities.ResolveUrlsFromTextString(tw.ToString());
+        }
+
+        #endregion
+
+        public static XsltArgumentList AddXsltExtensions()
+        {
+            return AddMacroXsltExtensions();
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of all XSLT extensions for macros, including predefined extensions.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;A dictionary of name/extension instance pairs.&lt;/returns&gt;
+        public static Dictionary&lt;string, object&gt; GetXsltExtensions()
+        {
+            return XsltExtensionsResolver.Current.XsltExtensions
+                                         .ToDictionary(x =&gt; x.Namespace, x =&gt; x.ExtensionObject);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns an XSLT argument list with all XSLT extensions added,
+        /// both predefined and configured ones.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;A new XSLT argument list.&lt;/returns&gt;
+        public static XsltArgumentList AddMacroXsltExtensions()
+        {
+            var xslArgs = new XsltArgumentList();
+
+            foreach (var extension in GetXsltExtensions())
+            {
+                string extensionNamespace = &quot;urn:&quot; + extension.Key;
+                xslArgs.AddExtensionObject(extensionNamespace, extension.Value);
+                TraceInfo(&quot;umbracoXsltExtension&quot;,
+                          String.Format(&quot;Extension added: {0}, {1}&quot;,
+                                        extensionNamespace, extension.Value.GetType().Name));
+            }
+
+            return xslArgs;
+        }
+
+        #region LoadMacroXslt (2)
+
+        // add elements to the &lt;macro&gt; root node, corresponding to parameters
+        private void AddMacroXmlNode(XmlDocument umbracoXml, XmlDocument macroXml,
+            string macroPropertyAlias, string macroPropertyType, string macroPropertyValue)
+        {
+            XmlNode macroXmlNode = macroXml.CreateNode(XmlNodeType.Element, macroPropertyAlias, string.Empty);
+            var x = new XmlDocument();
+
+            // if no value is passed, then use the current &quot;pageID&quot; as value
+            var contentId = macroPropertyValue == string.Empty ? UmbracoContext.Current.PageId.ToString() : macroPropertyValue;
+
+            TraceInfo(&quot;umbracoMacro&quot;,
+                      &quot;Xslt node adding search start (&quot; + macroPropertyAlias + &quot;,&#39;&quot; +
+                      macroPropertyValue + &quot;&#39;)&quot;);
+
+            //TODO: WE need to fix this so that we give control of this stuff over to the actual parameter editors!
+
+            switch (macroPropertyType)
+            {
+                case &quot;contentTree&quot;:
+                    var nodeId = macroXml.CreateAttribute(&quot;nodeID&quot;);
+                    nodeId.Value = contentId;
+                    macroXmlNode.Attributes.SetNamedItem(nodeId);
+
+                    // Get subs
+                    try
+                    {
+                        macroXmlNode.AppendChild(macroXml.ImportNode(umbracoXml.GetElementById(contentId), true));
+                    }
+                    catch
+                    { }
+                    break;
+
+                case &quot;contentCurrent&quot;:
+                    var importNode = macroPropertyValue == string.Empty
+                        ? umbracoXml.GetElementById(contentId)
+                        : umbracoXml.GetElementById(macroPropertyValue);
+
+                    var currentNode = macroXml.ImportNode(importNode, true);
+
+                    // remove all sub content nodes
+                    foreach (XmlNode n in currentNode.SelectNodes(&quot;node|*[@isDoc]&quot;))
+                        currentNode.RemoveChild(n);
+
+                    macroXmlNode.AppendChild(currentNode);
+
+                    break;
+
+                case &quot;contentAll&quot;:
+                    macroXmlNode.AppendChild(macroXml.ImportNode(umbracoXml.DocumentElement, true));
+                    break;
+
+                case &quot;contentRandom&quot;:
+                    XmlNode source = umbracoXml.GetElementById(contentId);
+                    if (source != null)
+                    {
+                        var sourceList = source.SelectNodes(&quot;node|*[@isDoc]&quot;);
+                        if (sourceList.Count &gt; 0)
+                        {
+                            int rndNumber;
+                            var r = library.GetRandom();
+                            lock (r)
+                            {
+                                rndNumber = r.Next(sourceList.Count);
+                            }
+                            var node = macroXml.ImportNode(sourceList[rndNumber], true);
+                            // remove all sub content nodes
+                            foreach (XmlNode n in node.SelectNodes(&quot;node|*[@isDoc]&quot;))
+                                node.RemoveChild(n);
+
+                            macroXmlNode.AppendChild(node);
+                        }
+                        else
+                            TraceWarn(&quot;umbracoMacro&quot;,
+                                      &quot;Error adding random node - parent (&quot; + macroPropertyValue +
+                                      &quot;) doesn&#39;t have children!&quot;);
+                    }
+                    else
+                        TraceWarn(&quot;umbracoMacro&quot;,
+                                  &quot;Error adding random node - parent (&quot; + macroPropertyValue +
+                                  &quot;) doesn&#39;t exists!&quot;);
+                    break;
+
+                case &quot;mediaCurrent&quot;:
+                    if (string.IsNullOrEmpty(macroPropertyValue) == false)
+                    {
+                        var c = new Content(int.Parse(macroPropertyValue));
+                        macroXmlNode.AppendChild(macroXml.ImportNode(c.ToXml(umbraco.content.Instance.XmlContent, false), true));
+                    }
+                    break;
+
+                default:
+                    macroXmlNode.InnerText = HttpContext.Current.Server.HtmlDecode(macroPropertyValue);
+                    break;
+            }
+            macroXml.FirstChild.AppendChild(macroXmlNode);
+        }
+
+        // add parameters to the macro parameters collection
+        private void AddMacroParameter(ICollection&lt;MacroNavigator.MacroParameter&gt; parameters,
+            NavigableNavigator contentNavigator, NavigableNavigator mediaNavigator,
+            string macroPropertyAlias, string macroPropertyType, string macroPropertyValue)
+        {
+            // if no value is passed, then use the current &quot;pageID&quot; as value
+            var contentId = macroPropertyValue == string.Empty ? UmbracoContext.Current.PageId.ToString() : macroPropertyValue;
+
+            TraceInfo(&quot;umbracoMacro&quot;,
+                      &quot;Xslt node adding search start (&quot; + macroPropertyAlias + &quot;,&#39;&quot; +
+                      macroPropertyValue + &quot;&#39;)&quot;);
+
+            // beware! do not use the raw content- or media- navigators, but clones !!
+
+            switch (macroPropertyType)
+            {
+                case &quot;contentTree&quot;:
+                    parameters.Add(new MacroNavigator.MacroParameter(
+                        macroPropertyAlias,
+                        contentNavigator.CloneWithNewRoot(contentId), // null if not found - will be reported as empty
+                        attributes: new Dictionary&lt;string, string&gt; { { &quot;nodeID&quot;, contentId } }));
+
+                    break;
+
+                case &quot;contentPicker&quot;:
+                    parameters.Add(new MacroNavigator.MacroParameter(
+                        macroPropertyAlias,
+                        contentNavigator.CloneWithNewRoot(contentId), // null if not found - will be reported as empty
+                        0));
+                    break;
+
+                case &quot;contentSubs&quot;:
+                    parameters.Add(new MacroNavigator.MacroParameter(
+                        macroPropertyAlias,
+                        contentNavigator.CloneWithNewRoot(contentId), // null if not found - will be reported as empty
+                        1));
+                    break;
+
+                case &quot;contentAll&quot;:
+                    parameters.Add(new MacroNavigator.MacroParameter(macroPropertyAlias, contentNavigator.Clone()));
+                    break;
+
+                case &quot;contentRandom&quot;:
+                    var nav = contentNavigator.Clone();
+                    if (nav.MoveToId(contentId))
+                    {
+                        var descendantIterator = nav.Select(&quot;./* [@isDoc]&quot;);
+                        if (descendantIterator.MoveNext())
+                        {
+                            // not empty - and won&#39;t change
+                            var descendantCount = descendantIterator.Count;
+
+                            int index;
+                            var r = library.GetRandom();
+                            lock (r)
+                            {
+                                index = r.Next(descendantCount);
+                            }
+
+                            while (index &gt; 0 &amp;&amp; descendantIterator.MoveNext())
+                                index--;
+
+                            var node = descendantIterator.Current.UnderlyingObject as INavigableContent;
+                            if (node != null)
+                            {
+                                nav = contentNavigator.CloneWithNewRoot(node.Id.ToString(CultureInfo.InvariantCulture));
+                                parameters.Add(new MacroNavigator.MacroParameter(macroPropertyAlias, nav, 0));
+                            }
+                            else
+                                throw new InvalidOperationException(&quot;Iterator contains non-INavigableContent elements.&quot;);
+                        }
+                        else
+                            TraceWarn(&quot;umbracoMacro&quot;,
+                                      &quot;Error adding random node - parent (&quot; + macroPropertyValue +
+                                      &quot;) doesn&#39;t have children!&quot;);
+                    }
+                    else
+                        TraceWarn(&quot;umbracoMacro&quot;,
+                                  &quot;Error adding random node - parent (&quot; + macroPropertyValue +
+                                  &quot;) doesn&#39;t exists!&quot;);
+                    break;
+
+                case &quot;mediaCurrent&quot;:
+                    parameters.Add(new MacroNavigator.MacroParameter(
+                        macroPropertyAlias,
+                        mediaNavigator.CloneWithNewRoot(contentId), // null if not found - will be reported as empty
+                        0));
+                    break;
+
+                default:
+                    parameters.Add(new MacroNavigator.MacroParameter(macroPropertyAlias, HttpContext.Current.Server.HtmlDecode(macroPropertyValue)));
+                    break;
+            }
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Renders a Partial View Macro
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;macro&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal ScriptingMacroResult LoadPartialViewMacro(MacroModel macro)
+        {
+            var retVal = new ScriptingMacroResult();
+            IMacroEngine engine = null;
+
+            engine = MacroEngineFactory.GetEngine(PartialViewMacroEngine.EngineName);
+            var ret = engine.Execute(macro, GetCurrentNode());
+
+            // if the macro engine supports success reporting and executing failed, then return an empty control so it&#39;s not cached
+            if (engine is IMacroEngineResultStatus)
+            {
+                var result = engine as IMacroEngineResultStatus;
+                if (!result.Success)
+                {
+                    retVal.ResultException = result.ResultException;
+                }
+            }
+            retVal.Result = ret;
+            return retVal;
+        }
+
+        public ScriptingMacroResult loadMacroScript(MacroModel macro)
+        {
+            var retVal = new ScriptingMacroResult();
+            string ret = String.Empty;
+            IMacroEngine engine = null;
+            if (!String.IsNullOrEmpty(macro.ScriptCode))
+            {
+                engine = MacroEngineFactory.GetByExtension(macro.ScriptLanguage);
+                ret = engine.Execute(
+                    macro,
+                    GetCurrentNode());
+            }
+            else
+            {
+                string path = IOHelper.MapPath(SystemDirectories.MacroScripts + &quot;/&quot; + macro.ScriptName);
+                engine = MacroEngineFactory.GetByFilename(path);
+                ret = engine.Execute(macro, GetCurrentNode());
+            }
+
+            // if the macro engine supports success reporting and executing failed, then return an empty control so it&#39;s not cached
+            if (engine is IMacroEngineResultStatus)
+            {
+                var result = engine as IMacroEngineResultStatus;
+                if (!result.Success)
+                {
+                    retVal.ResultException = result.ResultException;
+                }
+            }
+            retVal.Result = ret;
+            return retVal;
+        }
+
+        /// &lt;summary&gt;
+        /// Loads a custom or webcontrol using reflection into the macro object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;fileName&quot;&gt;The assembly to load from&lt;/param&gt;
+        /// &lt;param name=&quot;controlName&quot;&gt;Name of the control&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public Control loadControl(string fileName, string controlName, MacroModel model)
+        {
+            return loadControl(fileName, controlName, model, null);
+        }
+
+        /// &lt;summary&gt;
+        /// Loads a custom or webcontrol using reflection into the macro object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;fileName&quot;&gt;The assembly to load from&lt;/param&gt;
+        /// &lt;param name=&quot;controlName&quot;&gt;Name of the control&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public Control loadControl(string fileName, string controlName, MacroModel model, Hashtable pageElements)
+        {
+            Type type;
+            Assembly asm;
+            try
+            {
+                string currentAss = IOHelper.MapPath(string.Format(&quot;{0}/{1}.dll&quot;, SystemDirectories.Bin, fileName));
+
+                if (!File.Exists(currentAss))
+                    return new LiteralControl(&quot;Unable to load user control because is does not exist: &quot; + fileName);
+                asm = Assembly.LoadFrom(currentAss);
+
+                TraceInfo(&quot;umbracoMacro&quot;, &quot;Assembly file &quot; + currentAss + &quot; LOADED!!&quot;);
+            }
+            catch
+            {
+                throw new ArgumentException(string.Format(&quot;ASSEMBLY NOT LOADED PATH: {0} NOT FOUND!!&quot;,
+                                                          IOHelper.MapPath(SystemDirectories.Bin + &quot;/&quot; + fileName +
+                                                                           &quot;.dll&quot;)));
+            }
+
+            TraceInfo(&quot;umbracoMacro&quot;, string.Format(&quot;Assembly Loaded from ({0}.dll)&quot;, fileName));
+            type = asm.GetType(controlName);
+            if (type == null)
+                return new LiteralControl(string.Format(&quot;Unable to get type {0} from assembly {1}&quot;,
+                                                        controlName, asm.FullName));
+
+            var control = Activator.CreateInstance(type) as Control;
+            if (control == null)
+                return new LiteralControl(string.Format(&quot;Unable to create control {0} from assembly {1}&quot;,
+                                                        controlName, asm.FullName));
+
+            AddCurrentNodeToControl(control);
+
+            // Properties
+            UpdateControlProperties(control, model);
+            return control;
+        }
+
+        //TODO: SD : We *really* need to get macro&#39;s rendering properly with a real macro engine
+        // and move logic like this (after it is completely overhauled) to a UserControlMacroEngine.
+        internal static void UpdateControlProperties(Control control, MacroModel model)
+        {
+            var type = control.GetType();
+
+            foreach (var mp in model.Properties)
+            {
+                var prop = type.GetProperty(mp.Key);
+                if (prop == null)
+                {
+                    TraceWarn(&quot;macro&quot;, string.Format(&quot;control property &#39;{0}&#39; doesn&#39;t exist or aren&#39;t accessible (public)&quot;, mp.Key));
+                    continue;
+                }
+
+                var tryConvert = mp.Value.TryConvertTo(prop.PropertyType);
+                if (tryConvert.Success)
+                {
+                    try
+                    {
+                        prop.SetValue(control, tryConvert.Result, null);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogHelper.WarnWithException&lt;macro&gt;(string.Format(&quot;Error adding property &#39;{0}&#39; with value &#39;{1}&#39;&quot;, mp.Key, mp.Value), ex);
+                        if (GlobalSettings.DebugMode)
+                        {
+                            TraceWarn(&quot;macro.loadControlProperties&quot;, string.Format(&quot;Error adding property &#39;{0}&#39; with value &#39;{1}&#39;&quot;, mp.Key, mp.Value), ex);
+                        }
+                    }
+
+                    if (GlobalSettings.DebugMode)
+                    {
+                        TraceInfo(&quot;macro.UpdateControlProperties&quot;, string.Format(&quot;Property added &#39;{0}&#39; with value &#39;{1}&#39;&quot;, mp.Key, mp.Value));
+                    }
+                }
+                else
+                {
+                    LogHelper.Warn&lt;macro&gt;(string.Format(&quot;Error adding property &#39;{0}&#39; with value &#39;{1}&#39;&quot;, mp.Key, mp.Value));
+                    if (GlobalSettings.DebugMode)
+                    {
+                        TraceWarn(&quot;macro.loadControlProperties&quot;, string.Format(&quot;Error adding property &#39;{0}&#39; with value &#39;{1}&#39;&quot;, mp.Key, mp.Value));
+                    }
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Loads an usercontrol using reflection into the macro object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;fileName&quot;&gt;Filename of the usercontrol - ie. ~wulff.ascx&lt;/param&gt;
+        /// &lt;param name=&quot;model&quot;&gt; &lt;/param&gt;
+        /// &lt;param name=&quot;pageElements&quot;&gt;The page elements.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public Control loadUserControl(string fileName, MacroModel model, Hashtable pageElements)
+        {
+            Mandate.ParameterNotNullOrEmpty(fileName, &quot;fileName&quot;);
+            Mandate.ParameterNotNull(model, &quot;model&quot;);
+
+            try
+            {
+                string userControlPath = IOHelper.FindFile(fileName);
+
+                if (!File.Exists(IOHelper.MapPath(userControlPath)))
+                    throw new UmbracoException(string.Format(&quot;UserControl {0} does not exist.&quot;, fileName));
+
+                var oControl = (UserControl)new UserControl().LoadControl(userControlPath);
+
+                int slashIndex = fileName.LastIndexOf(&quot;/&quot;) + 1;
+                if (slashIndex &lt; 0)
+                    slashIndex = 0;
+
+                if (!String.IsNullOrEmpty(model.MacroControlIdentifier))
+                    oControl.ID = model.MacroControlIdentifier;
+                else
+                    oControl.ID =
+                        string.Format(&quot;{0}_{1}&quot;, fileName.Substring(slashIndex, fileName.IndexOf(&quot;.ascx&quot;) - slashIndex),
+                                      StateHelper.GetContextValue&lt;int&gt;(MacrosAddedKey));
+
+                TraceInfo(LoadUserControlKey, string.Format(&quot;Usercontrol added with id &#39;{0}&#39;&quot;, oControl.ID));
+
+                AddCurrentNodeToControl(oControl);
+                UpdateControlProperties(oControl, model);
+                return oControl;
+            }
+            catch (Exception e)
+            {
+                LogHelper.WarnWithException&lt;macro&gt;(string.Format(&quot;Error creating usercontrol ({0})&quot;, fileName), true, e);
+                throw;
+            }
+        }
+
+        private static void AddCurrentNodeToControl(Control control)
+        {
+            var type = control.GetType();
+
+            PropertyInfo currentNodeProperty = type.GetProperty(&quot;CurrentNode&quot;);
+            if (currentNodeProperty != null &amp;&amp; currentNodeProperty.CanWrite &amp;&amp;
+                currentNodeProperty.PropertyType.IsAssignableFrom(typeof(Node)))
+            {
+                currentNodeProperty.SetValue(control, GetCurrentNode(), null);
+            }
+            currentNodeProperty = type.GetProperty(&quot;currentNode&quot;);
+            if (currentNodeProperty != null &amp;&amp; currentNodeProperty.CanWrite &amp;&amp;
+                currentNodeProperty.PropertyType.IsAssignableFrom(typeof(Node)))
+            {
+                currentNodeProperty.SetValue(control, GetCurrentNode(), null);
+            }
+        }
+
+        private static void TraceInfo(string category, string message, bool excludeProfiling = false)
+        {
+            if (HttpContext.Current != null)
+                HttpContext.Current.Trace.Write(category, message);
+
+            //Trace out to profiling... doesn&#39;t actually profile, just for informational output.
+            if (excludeProfiling == false)
+            {
+                using (ApplicationContext.Current.ProfilingLogger.DebugDuration&lt;macro&gt;(string.Format(&quot;{0}&quot;, message)))
+                {
+                }
+            }
+        }
+
+        private static void TraceWarn(string category, string message, bool excludeProfiling = false)
+        {
+            if (HttpContext.Current != null)
+                HttpContext.Current.Trace.Warn(category, message);
+
+            //Trace out to profiling... doesn&#39;t actually profile, just for informational output.
+            if (excludeProfiling == false)
+            {
+                using (ApplicationContext.Current.ProfilingLogger.TraceDuration&lt;macro&gt;(string.Format(&quot;Warning: {0}&quot;, message)))
+                {
+                }
+            }
+        }
+
+        private static void TraceWarn(string category, string message, Exception ex, bool excludeProfiling = false)
+        {
+            if (HttpContext.Current != null)
+                HttpContext.Current.Trace.Warn(category, message, ex);
+
+            //Trace out to profiling... doesn&#39;t actually profile, just for informational output.
+            if (excludeProfiling == false)
+            {
+                using (ApplicationContext.Current.ProfilingLogger.TraceDuration&lt;macro&gt;(string.Format(&quot;{0}, Error: {1}&quot;, message, ex)))
+                {
+                }
+            }
+        }
+
+        public static string renderMacroStartTag(Hashtable attributes, int pageId, Guid versionId)
+        {
+            string div = &quot;&lt;div &quot;;
+
+            IDictionaryEnumerator ide = attributes.GetEnumerator();
+            while (ide.MoveNext())
+            {
+                div += string.Format(&quot;umb_{0}=\&quot;{1}\&quot; &quot;, ide.Key, EncodeMacroAttribute((ide.Value ?? string.Empty).ToString()));
+            }
+
+            div += &quot;ismacro=\&quot;true\&quot; onresizestart=\&quot;return false;\&quot; umbVersionId=\&quot;&quot; + versionId +
+                   &quot;\&quot; umbPageid=\&quot;&quot; +
+                   pageId +
+                   &quot;\&quot; title=\&quot;This is rendered content from macro\&quot; class=\&quot;umbMacroHolder\&quot;&gt;&lt;!-- startUmbMacro --&gt;&quot;;
+
+            return div;
+        }
+
+        private static string EncodeMacroAttribute(string attributeContents)
+        {
+            // Replace linebreaks
+            attributeContents = attributeContents.Replace(&quot;\n&quot;, &quot;\\n&quot;).Replace(&quot;\r&quot;, &quot;\\r&quot;);
+
+            // Replace quotes
+            attributeContents =
+                attributeContents.Replace(&quot;\&quot;&quot;, &quot;&amp;quot;&quot;);
+
+            // Replace tag start/ends
+            attributeContents =
+                attributeContents.Replace(&quot;&lt;&quot;, &quot;&amp;lt;&quot;).Replace(&quot;&gt;&quot;, &quot;&amp;gt;&quot;);
+
+
+            return attributeContents;
+        }
+
+        public static string renderMacroEndTag()
+        {
+            return &quot;&lt;!-- endUmbMacro --&gt;&lt;/div&gt;&quot;;
+        }
+
+        public static string GetRenderedMacro(int MacroId, page umbPage, Hashtable attributes, int pageId)
+        {
+            macro m = GetMacro(MacroId);
+            Control c = m.renderMacro(attributes, umbPage.Elements, pageId);
+            TextWriter writer = new StringWriter();
+            var ht = new HtmlTextWriter(writer);
+            c.RenderControl(ht);
+            string result = writer.ToString();
+
+            // remove hrefs
+            string pattern = &quot;href=\&quot;([^\&quot;]*)\&quot;&quot;;
+            MatchCollection hrefs =
+                Regex.Matches(result, pattern, RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+            foreach (Match href in hrefs)
+                result = result.Replace(href.Value, &quot;href=\&quot;javascript:void(0)\&quot;&quot;);
+
+            return result;
+        }
+
+        public static string MacroContentByHttp(int PageID, Guid PageVersion, Hashtable attributes)
+        {
+
+            if (SystemUtilities.GetCurrentTrustLevel() != AspNetHostingPermissionLevel.Unrestricted)
+            {
+                return &quot;&lt;span style=&#39;color: red&#39;&gt;Cannot render macro content in the rich text editor when the application is running in a Partial Trust environment&lt;/span&gt;&quot;;
+            }
+
+            string tempAlias = (attributes[&quot;macroalias&quot;] != null)
+                                   ? attributes[&quot;macroalias&quot;].ToString()
+                                   : attributes[&quot;macroAlias&quot;].ToString();
+            macro currentMacro = GetMacro(tempAlias);
+            if (!currentMacro.DontRenderInEditor)
+            {
+                string querystring = &quot;umbPageId=&quot; + PageID + &quot;&amp;umbVersionId=&quot; + PageVersion;
+                IDictionaryEnumerator ide = attributes.GetEnumerator();
+                while (ide.MoveNext())
+                    querystring += &quot;&amp;umb_&quot; + ide.Key + &quot;=&quot; + HttpContext.Current.Server.UrlEncode((ide.Value ?? string.Empty).ToString());
+
+                // Create a new &#39;HttpWebRequest&#39; Object to the mentioned URL.
+                string retVal = string.Empty;
+                string protocol = GlobalSettings.UseSSL ? &quot;https&quot; : &quot;http&quot;;
+                string url = string.Format(&quot;{0}://{1}:{2}{3}/macroResultWrapper.aspx?{4}&quot;, protocol,
+                                           HttpContext.Current.Request.ServerVariables[&quot;SERVER_NAME&quot;],
+                                           HttpContext.Current.Request.ServerVariables[&quot;SERVER_PORT&quot;],
+                                           IOHelper.ResolveUrl(SystemDirectories.Umbraco), querystring);
+
+                var myHttpWebRequest = (HttpWebRequest)WebRequest.Create(url);
+
+                // allows for validation of SSL conversations (to bypass SSL errors in debug mode!)
+                ServicePointManager.ServerCertificateValidationCallback += ValidateRemoteCertificate;
+
+                // propagate the user&#39;s context
+                // zb-00004 #29956 : refactor cookies names &amp; handling
+
+                //TODO: This is the worst thing ever. This will also not work if people decide to put their own
+                // custom auth system in place.
+
+                HttpCookie inCookie = StateHelper.Cookies.UserContext.RequestCookie;
+                var cookie = new Cookie(inCookie.Name, inCookie.Value, inCookie.Path,
+                                        HttpContext.Current.Request.ServerVariables[&quot;SERVER_NAME&quot;]);
+                myHttpWebRequest.CookieContainer = new CookieContainer();
+                myHttpWebRequest.CookieContainer.Add(cookie);
+
+                // Assign the response object of &#39;HttpWebRequest&#39; to a &#39;HttpWebResponse&#39; variable.
+                HttpWebResponse myHttpWebResponse = null;
+                try
+                {
+                    myHttpWebResponse = (HttpWebResponse)myHttpWebRequest.GetResponse();
+                    if (myHttpWebResponse.StatusCode == HttpStatusCode.OK)
+                    {
+                        Stream streamResponse = myHttpWebResponse.GetResponseStream();
+                        var streamRead = new StreamReader(streamResponse);
+                        var readBuff = new Char[256];
+                        int count = streamRead.Read(readBuff, 0, 256);
+                        while (count &gt; 0)
+                        {
+                            var outputData = new String(readBuff, 0, count);
+                            retVal += outputData;
+                            count = streamRead.Read(readBuff, 0, 256);
+                        }
+                        // Close the Stream object.
+                        streamResponse.Close();
+                        streamRead.Close();
+
+                        // Find the content of a form
+                        string grabStart = &quot;&lt;!-- grab start --&gt;&quot;;
+                        string grabEnd = &quot;&lt;!-- grab end --&gt;&quot;;
+                        int grabStartPos = retVal.IndexOf(grabStart) + grabStart.Length;
+                        int grabEndPos = retVal.IndexOf(grabEnd) - grabStartPos;
+                        retVal = retVal.Substring(grabStartPos, grabEndPos);
+                    }
+                    else
+                        retVal = ShowNoMacroContent(currentMacro);
+
+                    // Release the HttpWebResponse Resource.
+                    myHttpWebResponse.Close();
+                }
+                catch (Exception)
+                {
+                    retVal = ShowNoMacroContent(currentMacro);
+                }
+                finally
+                {
+                    // Release the HttpWebResponse Resource.
+                    if (myHttpWebResponse != null)
+                        myHttpWebResponse.Close();
+                }
+
+                return retVal.Replace(&quot;\n&quot;, string.Empty).Replace(&quot;\r&quot;, string.Empty);
+            }
+
+            return ShowNoMacroContent(currentMacro);
+        }
+
+        private static string ShowNoMacroContent(macro currentMacro)
+        {
+            return &quot;&lt;span style=\&quot;color: green\&quot;&gt;&lt;strong&gt;&quot; + currentMacro.Name +
+                   &quot;&lt;/strong&gt;&lt;br /&gt;No macro content available for WYSIWYG editing&lt;/span&gt;&quot;;
+        }
+
+        private static bool ValidateRemoteCertificate(
+            object sender,
+            X509Certificate certificate,
+            X509Chain chain,
+            SslPolicyErrors policyErrors
+            )
+        {
+            if (GlobalSettings.DebugMode)
+            {
+                // allow any old dodgy certificate...
+                return true;
+            }
+            else
+            {
+                return policyErrors == SslPolicyErrors.None;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Adds the XSLT extension namespaces to the XSLT header using 
+        /// {0} as the container for the namespace references and
+        /// {1} as the container for the exclude-result-prefixes
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xslt&quot;&gt;The XSLT&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static string AddXsltExtensionsToHeader(string xslt)
+        {
+            var namespaceList = new StringBuilder();
+            var namespaceDeclaractions = new StringBuilder();
+            foreach (var extension in GetXsltExtensions())
+            {
+                namespaceList.Append(extension.Key).Append(&#39; &#39;);
+                namespaceDeclaractions.AppendFormat(&quot;xmlns:{0}=\&quot;urn:{0}\&quot; &quot;, extension.Key);
+            }
+
+            // parse xslt
+            xslt = xslt.Replace(&quot;{0}&quot;, namespaceDeclaractions.ToString());
+            xslt = xslt.Replace(&quot;{1}&quot;, namespaceList.ToString());
+            return xslt;
+        }
+
+        [Obsolete(&quot;Please stop using these as they&#39;ll be removed in v4.8&quot;)]
+        public static bool TryGetColumnString(IRecordsReader reader, string columnName, out string value)
+        {
+            if (reader.ContainsField(columnName) &amp;&amp; !reader.IsNull(columnName))
+            {
+                value = reader.GetString(columnName);
+                return true;
+            }
+
+            value = string.Empty;
+            return false;
+        }
+
+        [Obsolete(&quot;Please stop using these as they&#39;ll be removed in v4.8&quot;)]
+        public static bool TryGetColumnInt32(IRecordsReader reader, string columnName, out int value)
+        {
+            if (reader.ContainsField(columnName) &amp;&amp; !reader.IsNull(columnName))
+            {
+                value = reader.GetInt(columnName);
+                return true;
+            }
+
+            value = -1;
+            return false;
+        }
+
+        [Obsolete(&quot;Please stop using these as they&#39;ll be removed in v4.8&quot;)]
+        public static bool TryGetColumnBool(IRecordsReader reader, string columnName, out bool value)
+        {
+            if (reader.ContainsField(columnName) &amp;&amp; !reader.IsNull(columnName))
+            {
+                value = reader.GetBoolean(columnName);
+                return true;
+            }
+
+            value = false;
+            return false;
+        }
+
+        private static INode GetCurrentNode()
+        {
+            //Get the current content request
+
+            IPublishedContent content;
+            if (UmbracoContext.Current.IsFrontEndUmbracoRequest)
+            {
+                content = UmbracoContext.Current.PublishedContentRequest != null
+                    ? UmbracoContext.Current.PublishedContentRequest.PublishedContent
+                    : null;
+            }
+            else
+            {
+                var pageId = UmbracoContext.Current.PageId;
+                content = pageId.HasValue ? UmbracoContext.Current.ContentCache.GetById(pageId.Value) : null;
+            }
+
+            return content == null ? null : LegacyNodeHelper.ConvertToNode(content);
+        }
+
+        #region Events
+
+        /// &lt;summary&gt;
+        /// Occurs when a macro error is raised.
+        /// &lt;/summary&gt;
+        public static event EventHandler&lt;MacroErrorEventArgs&gt; Error;
+
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;MacroErrorEventArgs&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;MacroErrorEventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected void OnError(MacroErrorEventArgs e)
+        {
+            if (Error != null)
+            {
+                Error(this, e);
+            }
+        }
+
+        #endregion
+    }
+
+    /// &lt;summary&gt;
+    /// Event arguments used for the MacroRendering event
+    /// &lt;/summary&gt;
+    public class MacroRenderingEventArgs : EventArgs
+    {
+        public Hashtable PageElements { get; private set; }
+        public int PageId { get; private set; }
+
+        public MacroRenderingEventArgs(Hashtable pageElements, int pageId)
+        {
+            PageElements = pageElements;
+            PageId = pageId;
+        }
+    }
+
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[63,9,63,71,0],[63,9,63,71,0],[63,9,63,71,0],[65,9,65,68,0],[65,9,65,68,0],[65,9,65,68,0],[73,17,73,18,0],[73,19,73,48,0],[73,49,73,50,0],[77,9,77,10,1],[78,13,80,40,1],[81,9,81,10,1],[89,17,89,18,0],[89,19,89,46,0],[89,47,89,48,0],[94,17,94,18,0],[94,19,94,44,0],[94,45,94,46,0],[99,17,99,18,0],[99,19,99,48,0],[99,49,99,50,0],[104,17,104,18,0],[104,19,104,46,0],[104,47,104,48,0],[109,17,109,18,0],[109,19,109,38,0],[109,39,109,40,0],[114,17,114,18,0],[114,19,114,37,0],[114,38,114,39,0],[119,17,119,18,0],[119,19,119,37,0],[119,38,119,39,0],[124,17,124,18,0],[124,19,124,43,0],[124,44,124,45,0],[129,17,129,18,0],[129,19,129,41,0],[129,42,129,43,0],[134,17,134,18,0],[134,19,134,41,0],[134,42,134,43,0],[139,17,139,18,0],[139,19,139,47,0],[139,48,139,49,0],[144,17,144,18,0],[144,19,144,42,0],[144,43,144,44,0],[145,17,145,18,0],[145,19,145,46,0],[145,47,145,48,0],[156,9,156,29,0],[157,9,157,10,0],[158,13,158,41,0],[159,13,159,39,0],[160,9,160,10,0],[162,9,162,35,0],[163,9,163,10,0],[164,13,164,47,0],[165,13,165,39,0],[166,9,166,10,0],[168,35,168,39,0],[168,40,168,44,0],[171,9,171,10,0],[172,13,172,37,0],[173,9,173,10,0],[176,9,176,10,0],[177,13,177,34,0],[178,9,178,10,0],[187,9,187,23,0],[188,9,188,10,0],[189,13,189,38,0],[190,9,190,10,0],[194,9,194,10,0],[195,13,195,31,0],[196,9,196,10,0],[204,9,204,10,0],[205,13,205,36,0],[206,13,206,14,0],[207,17,207,66,0],[208,13,208,14,0],[211,13,211,26,0],[212,9,212,10,0],[215,9,215,10,0],[216,13,216,42,0],[218,13,218,129,0],[219,13,219,44,0],[221,13,221,29,0],[222,13,222,14,0],[223,17,223,49,0],[224,13,224,14,0],[226,13,226,40,0],[227,13,227,14,0],[228,17,228,37,0],[229,17,229,71,0],[230,17,230,18,0],[231,21,231,118,0],[232,21,232,110,0],[233,21,233,40,0],[234,21,234,22,0],[235,25,235,64,0],[236,21,236,22,0],[237,17,237,18,0],[238,17,238,52,0],[239,13,239,14,0],[241,13,241,20,0],[241,22,241,30,0],[241,31,241,33,0],[241,34,241,50,0],[242,13,242,14,0],[243,17,243,44,0],[244,17,244,108,0],[245,13,245,14,0],[247,13,247,34,0],[248,9,248,10,0],[251,9,251,10,0],[253,13,253,42,0],[254,13,254,54,0],[255,9,255,10,0],[267,9,267,10,0],[268,13,268,40,0],[269,17,269,41,0],[270,9,270,10,0],[279,9,279,10,0],[281,13,281,81,0],[283,13,285,138,0],[287,13,287,68,0],[288,13,288,14,0],[289,17,289,77,0],[291,17,291,115,0],[294,17,294,24,0],[294,26,294,49,0],[294,50,294,52,0],[294,53,294,69,0],[295,21,295,82,0],[297,17,297,89,0],[302,17,302,68,0],[305,17,305,63,0],[306,17,306,18,0],[307,21,307,46,0],[308,21,310,53,0],[311,21,311,87,0],[313,21,313,39,0],[318,29,319,33,0],[319,33,319,34,0],[319,34,320,37,0],[320,37,320,138,0],[320,138,322,37,0],[322,37,330,47,0],[330,47,332,37,0],[332,37,332,138,0],[332,138,333,37,0],[333,37,333,106,0],[333,106,334,33,0],[334,33,334,34,0],[334,34,334,35,0],[318,29,334,35,0],[336,29,336,118,0],[337,29,337,30,0],[338,33,338,130,0],[340,33,340,34,0],[341,37,341,78,0],[342,37,342,86,0],[343,37,343,72,0],[344,37,344,38,0],[345,41,345,61,0],[346,41,346,80,0],[347,41,347,92,0],[349,41,349,66,0],[350,41,350,42,0],[351,45,351,74,0],[353,37,353,38,0],[354,33,354,34,0],[355,33,355,52,0],[356,33,356,34,0],[357,37,358,119,0],[360,37,360,57,0],[361,37,361,55,0],[362,37,362,67,0],[365,37,365,62,0],[366,37,366,38,0],[367,41,367,47,0],[369,33,369,34,0],[371,33,371,39,0],[375,29,375,117,0],[376,29,376,30,0],[378,33,378,34,0],[379,37,379,133,0],[382,37,383,81,0],[384,41,384,80,0],[386,37,386,101,0],[387,37,387,43,0],[389,33,389,52,0],[390,33,390,34,0],[391,37,391,57,0],[392,37,392,55,0],[393,37,393,135,0],[396,37,403,39,0],[405,37,405,142,0],[406,37,406,114,0],[409,37,409,62,0],[410,37,410,38,0],[411,41,411,47,0],[414,37,414,43,0],[420,29,420,146,0],[421,29,421,30,0],[423,33,423,34,0],[424,37,424,175,0],[425,37,425,117,0],[426,37,426,43,0],[428,33,428,52,0],[429,33,429,34,0],[430,37,430,57,0],[431,37,431,55,0],[433,37,435,72,0],[438,37,445,39,0],[447,37,447,164,0],[448,37,448,114,0],[451,37,451,62,0],[452,37,452,38,0],[453,41,453,47,0],[456,37,456,43,0],[460,29,460,91,0],[461,29,461,35,0],[465,29,466,33,0],[466,33,466,34,0],[466,34,467,37,0],[467,37,467,175,0],[467,175,470,37,0],[470,37,478,47,0],[478,47,480,37,0],[480,37,480,144,0],[480,144,481,37,0],[481,37,481,106,0],[481,106,482,33,0],[482,33,482,34,0],[482,34,482,35,0],[465,29,482,35,0],[484,29,484,119,0],[485,29,485,30,0],[487,33,487,34,0],[488,37,488,136,0],[489,37,489,90,0],[490,37,490,86,0],[491,37,491,72,0],[492,37,492,38,0],[493,41,493,61,0],[494,41,494,80,0],[495,41,495,103,0],[497,41,497,66,0],[498,41,498,42,0],[499,45,499,74,0],[501,37,501,38,0],[502,37,502,43,0],[504,33,504,52,0],[505,33,505,34,0],[506,37,506,57,0],[507,37,507,55,0],[509,37,509,78,0],[512,37,512,62,0],[513,37,513,38,0],[514,41,514,47,0],[516,37,516,43,0],[521,29,521,58,0],[522,29,522,30,0],[523,33,523,142,0],[524,29,524,30,0],[525,29,525,35,0],[529,21,529,47,0],[530,21,530,22,0],[531,25,531,76,0],[532,21,532,22,0],[534,17,534,18,0],[535,22,535,47,0],[536,17,536,18,0],[537,21,537,66,0],[538,17,538,18,0],[540,17,540,37,0],[542,9,542,10,0],[550,9,550,10,0],[552,13,552,90,0],[553,13,553,14,0],[555,17,555,90,0],[556,17,556,18,0],[557,21,557,46,0],[558,21,558,22,0],[561,25,561,127,0],[562,25,562,26,0],[565,29,565,59,0],[566,29,566,30,0],[567,33,567,60,0],[569,40,569,67,0],[570,33,570,34,0],[571,37,571,69,0],[572,37,572,68,0],[574,37,574,71,0],[575,33,575,34,0],[578,33,582,59,0],[582,59,582,76,0],[582,76,582,78,0],[578,33,582,78,0],[584,33,584,114,0],[588,33,588,71,0],[589,37,589,90,0],[591,33,592,120,0],[593,29,593,30,0],[595,29,595,30,0],[597,33,601,59,0],[601,59,601,111,0],[601,111,601,113,0],[597,33,601,113,0],[603,33,603,117,0],[605,33,606,120,0],[607,29,607,30,0],[610,29,614,55,0],[614,55,614,67,0],[614,67,614,69,0],[610,29,614,69,0],[616,25,616,26,0],[618,21,618,22,0],[619,17,619,18,0],[620,13,620,14,0],[622,13,622,33,0],[623,9,623,10,0],[636,9,636,10,0],[637,13,637,30,0],[638,13,638,33,0],[640,13,640,90,0],[641,13,641,14,0],[642,17,642,53,0],[643,17,643,92,0],[645,17,645,47,0],[646,17,646,18,0],[647,21,648,78,0],[653,21,653,43,0],[654,21,654,22,0],[655,25,655,139,0],[656,25,656,26,0],[657,29,657,46,0],[658,29,660,77,0],[661,25,661,26,0],[663,25,663,26,0],[664,29,666,77,0],[667,25,667,26,0],[669,21,669,22,0],[670,17,670,18,0],[672,17,672,18,0],[673,21,674,81,0],[676,21,676,46,0],[677,21,677,22,0],[678,25,678,61,0],[679,25,679,59,0],[681,25,681,142,0],[682,25,682,26,0],[683,29,685,77,0],[686,29,686,49,0],[687,25,687,26,0],[689,25,689,26,0],[690,29,692,77,0],[693,25,693,26,0],[695,21,695,22,0],[696,17,696,18,0],[697,13,697,14,0],[698,9,698,10,0],[707,9,707,10,0],[708,13,708,27,0],[710,13,710,36,0],[713,21,713,52,0],[715,21,715,51,0],[718,21,718,33,0],[720,9,720,10,0],[734,9,734,10,1],[735,13,735,41,1],[736,13,736,14,1],[737,17,737,130,1],[739,17,739,41,1],[740,17,740,18,1],[741,21,741,54,1],[743,21,743,80,1],[744,21,744,22,1],[745,25,745,154,1],[746,25,746,37,1],[748,17,748,18,1],[749,13,749,14,1],[751,13,751,26,1],[752,9,752,10,1],[755,9,755,10,1],[756,13,756,37,1],[759,21,759,65,1],[762,21,762,79,1],[764,21,764,45,1],[766,21,766,43,1],[770,21,770,49,0],[772,9,772,10,1],[775,9,775,10,1],[776,13,776,105,1],[777,9,777,10,1],[788,9,788,10,1],[789,13,789,37,1],[795,21,795,33,1],[800,21,800,34,1],[802,9,802,10,1],[805,9,805,10,0],[807,13,812,17,0],[812,17,812,18,0],[812,18,813,28,0],[813,28,813,134,0],[813,134,814,21,0],[814,21,814,22,0],[814,22,815,25,0],[815,25,815,89,0],[815,89,817,17,0],[817,17,817,18,0],[817,18,817,20,0],[807,13,817,20,0],[818,9,818,10,0],[821,9,821,10,0],[822,13,822,20,0],[822,22,822,43,0],[822,44,822,46,0],[822,47,822,63,0],[823,13,823,14,0],[824,17,824,71,0],[825,17,825,18,0],[826,21,826,70,0],[828,21,828,78,0],[829,17,829,18,0],[831,17,831,18,0],[832,21,832,45,0],[833,17,833,18,0],[834,13,834,14,0],[835,9,835,10,0],[838,9,838,10,0],[839,13,839,20,0],[839,22,839,32,0],[839,33,839,35,0],[839,36,839,51,0],[840,13,840,14,0],[841,17,841,95,0],[842,13,842,14,0],[843,9,843,10,0],[847,9,847,10,0],[848,13,848,65,0],[849,13,852,19,0],[854,13,854,70,0],[857,13,857,14,0],[858,17,858,71,0],[859,13,859,14,0],[861,13,861,14,0],[862,17,862,35,0],[863,13,863,14,0],[865,13,865,30,0],[866,9,866,10,0],[870,9,870,10,0],[871,13,871,132,0],[872,9,872,10,0],[879,9,879,10,0],[880,13,880,49,0],[881,13,881,14,0],[882,17,882,53,0],[883,17,883,57,0],[886,13,886,88,0],[887,13,887,14,0],[888,17,888,45,0],[889,17,889,54,0],[890,17,890,60,0],[892,17,894,81,0],[896,17,896,34,0],[897,17,897,18,0],[899,21,899,150,0],[900,21,900,39,0],[900,40,900,130,0],[901,21,901,121,0],[902,21,902,50,0],[903,21,903,50,0],[904,21,904,28,0],[904,30,904,38,0],[904,39,904,41,0],[904,42,904,64,0],[905,21,905,22,0],[906,25,906,96,0],[907,21,907,22,0],[908,17,908,18,0],[910,17,910,18,0],[911,21,911,80,0],[912,21,912,118,0],[913,21,913,118,0],[914,21,914,28,0],[914,30,914,38,0],[914,39,914,41,0],[914,42,914,64,0],[915,21,915,22,0],[916,25,916,122,0],[917,21,917,22,0],[918,21,918,69,0],[919,17,919,18,0],[921,17,921,109,0],[922,17,922,18,0],[923,21,923,99,0],[924,21,928,58,0],[931,17,931,83,0],[933,17,933,18,0],[934,21,934,54,0],[936,21,936,94,0],[937,21,937,22,0],[939,25,939,26,0],[940,29,942,78,0],[943,29,943,78,0],[945,29,945,43,0],[947,25,947,44,0],[948,25,948,26,0],[949,29,949,47,0],[950,29,950,94,0],[952,29,952,236,0],[954,29,954,125,0],[955,29,955,110,0],[958,29,958,68,0],[959,29,959,30,0],[960,33,960,39,0],[962,29,962,49,0],[966,17,966,36,0],[967,17,967,18,0],[968,21,968,39,0],[969,21,969,101,0],[972,21,972,228,0],[973,21,973,117,0],[974,21,974,113,0],[977,21,977,60,0],[978,21,978,22,0],[979,25,979,31,0],[981,21,981,41,0],[984,9,984,10,0],[988,9,988,10,0],[989,13,989,69,0],[990,9,990,10,0],[1000,9,1000,10,0],[1006,13,1006,47,0],[1009,13,1009,29,0],[1010,13,1010,42,0],[1011,13,1011,14,0],[1013,17,1013,67,0],[1014,17,1014,112,0],[1017,17,1017,56,0],[1018,17,1018,18,0],[1020,21,1020,47,0],[1021,25,1021,116,0],[1024,21,1024,105,0],[1025,21,1025,73,0],[1028,21,1028,43,0],[1029,21,1029,78,0],[1030,21,1030,76,0],[1031,21,1031,74,0],[1032,21,1032,114,0],[1033,21,1033,50,0],[1036,21,1036,57,0],[1037,17,1037,18,0],[1039,17,1039,18,0],[1041,21,1041,89,0],[1042,21,1042,43,0],[1043,17,1043,18,0],[1044,13,1044,14,0],[1045,13,1045,30,0],[1046,9,1046,10,0],[1052,9,1052,10,0],[1053,13,1053,65,0],[1054,9,1054,10,0],[1058,9,1058,10,0],[1059,13,1059,48,0],[1063,13,1063,83,0],[1064,13,1064,14,0],[1065,17,1065,47,0],[1066,17,1066,41,0],[1067,17,1067,72,0],[1068,13,1068,14,0],[1071,13,1071,78,0],[1072,13,1072,14,0],[1073,17,1073,92,0],[1074,13,1074,14,0],[1075,13,1075,36,0],[1076,13,1076,14,0],[1077,17,1077,24,0],[1077,26,1077,39,0],[1077,40,1077,42,0],[1077,43,1077,53,0],[1078,21,1078,84,0],[1079,13,1079,14,0],[1082,13,1082,85,0],[1083,13,1083,14,0],[1084,17,1084,73,0],[1085,13,1085,14,0],[1086,13,1086,79,0],[1087,9,1087,10,0],[1092,9,1092,10,0],[1093,13,1093,89,0],[1094,9,1094,10,0],[1099,9,1099,10,0],[1100,13,1100,48,0],[1103,13,1103,83,0],[1104,13,1104,14,0],[1105,17,1105,47,0],[1106,17,1106,41,0],[1107,17,1107,72,0],[1108,13,1108,14,0],[1111,13,1111,78,0],[1112,13,1112,14,0],[1113,17,1113,120,0],[1114,17,1114,72,0],[1115,13,1115,14,0],[1116,13,1116,36,0],[1117,13,1117,14,0],[1118,17,1118,24,0],[1118,26,1118,39,0],[1118,40,1118,42,0],[1118,43,1118,53,0],[1119,21,1119,84,0],[1120,13,1120,14,0],[1123,13,1123,85,0],[1124,13,1124,14,0],[1125,17,1125,61,0],[1126,13,1126,14,0],[1127,13,1127,79,0],[1128,9,1128,10,0],[1133,9,1133,10,0],[1134,13,1134,45,0],[1135,9,1135,10,0],[1142,9,1142,10,0],[1143,13,1144,61,0],[1144,61,1144,72,0],[1144,72,1144,79,0],[1144,79,1144,96,0],[1144,96,1144,98,0],[1143,13,1144,98,0],[1145,9,1145,10,0],[1153,9,1153,10,0],[1154,13,1154,50,0],[1156,13,1156,20,0],[1156,22,1156,35,0],[1156,36,1156,38,0],[1156,39,1156,58,0],[1157,13,1157,14,0],[1158,17,1158,68,0],[1159,17,1159,81,0],[1160,17,1162,94,0],[1163,13,1163,14,0],[1165,13,1165,28,0],[1166,9,1166,10,0],[1173,9,1173,10,0],[1174,13,1174,111,0],[1175,13,1175,39,0],[1178,13,1178,128,0],[1180,13,1182,50,0],[1186,13,1186,39,0],[1189,21,1189,69,0],[1190,21,1190,46,0],[1191,21,1191,66,0],[1195,21,1195,22,0],[1196,25,1196,115,0],[1197,21,1197,22,0],[1198,21,1198,26,0],[1199,21,1199,22,0],[1199,23,1199,24,0],[1200,21,1200,27,0],[1203,21,1205,73,0],[1207,21,1207,77,0],[1210,21,1210,28,0],[1210,30,1210,39,0],[1210,40,1210,42,0],[1210,43,1210,84,0],[1211,25,1211,52,0],[1213,21,1213,59,0],[1215,21,1215,27,0],[1218,21,1218,101,0],[1219,21,1219,27,0],[1222,21,1222,75,0],[1223,21,1223,40,0],[1224,21,1224,22,0],[1225,25,1225,79,0],[1226,25,1226,50,0],[1227,25,1227,26,0],[1229,29,1229,57,0],[1230,29,1230,37,0],[1231,29,1231,30,0],[1232,33,1232,70,0],[1233,29,1233,30,0],[1234,29,1234,89,0],[1236,29,1236,36,0],[1236,38,1236,47,0],[1236,48,1236,50,0],[1236,51,1236,85,0],[1237,33,1237,53,0],[1239,29,1239,60,0],[1240,25,1240,26,0],[1242,29,1244,67,0],[1245,21,1245,22,0],[1247,25,1249,56,0],[1250,21,1250,27,0],[1253,21,1253,75,0],[1254,21,1254,22,0],[1255,25,1255,76,0],[1256,25,1256,130,0],[1257,21,1257,22,0],[1258,21,1258,27,0],[1261,21,1261,104,0],[1262,21,1262,27,0],[1264,13,1264,59,0],[1265,9,1265,10,0],[1271,9,1271,10,0],[1273,13,1273,128,0],[1275,13,1277,50,0],[1281,13,1281,39,0],[1284,21,1287,98,0],[1289,21,1289,27,0],[1292,21,1295,29,0],[1296,21,1296,27,0],[1299,21,1302,29,0],[1303,21,1303,27,0],[1306,21,1306,117,0],[1307,21,1307,27,0],[1310,21,1310,56,0],[1311,21,1311,49,0],[1312,21,1312,22,0],[1313,25,1313,77,0],[1314,25,1314,59,0],[1315,25,1315,26,0],[1317,29,1317,76,0],[1320,29,1320,57,0],[1321,29,1321,37,0],[1322,29,1322,30,0],[1323,33,1323,65,0],[1324,29,1324,30,0],[1326,29,1326,79,0],[1327,33,1327,41,0],[1329,29,1329,105,0],[1330,29,1330,46,0],[1331,29,1331,30,0],[1332,33,1332,121,0],[1333,33,1333,111,0],[1334,29,1334,30,0],[1336,33,1336,122,0],[1337,25,1337,26,0],[1339,29,1341,67,0],[1342,21,1342,22,0],[1344,25,1346,56,0],[1347,21,1347,27,0],[1350,21,1353,29,0],[1354,21,1354,27,0],[1357,21,1357,150,0],[1358,21,1358,27,0],[1360,9,1360,10,0],[1370,9,1370,10,0],[1371,13,1371,53,0],[1372,13,1372,40,0],[1374,13,1374,86,0],[1375,13,1375,63,0],[1378,13,1378,52,0],[1379,13,1379,14,0],[1380,17,1380,65,0],[1381,17,1381,37,0],[1382,17,1382,18,0],[1383,21,1383,69,0],[1384,17,1384,18,0],[1385,13,1385,14,0],[1386,13,1386,33,0],[1387,13,1387,27,0],[1388,9,1388,10,0],[1391,9,1391,10,0],[1392,13,1392,53,0],[1393,13,1393,39,0],[1394,13,1394,40,0],[1395,13,1395,57,0],[1396,13,1396,14,0],[1397,17,1397,82,0],[1398,17,1400,39,0],[1401,13,1401,14,0],[1403,13,1403,14,0],[1404,17,1404,105,0],[1405,17,1405,65,0],[1406,17,1406,63,0],[1407,13,1407,14,0],[1410,13,1410,52,0],[1411,13,1411,14,0],[1412,17,1412,65,0],[1413,17,1413,37,0],[1414,17,1414,18,0],[1415,21,1415,69,0],[1416,17,1416,18,0],[1417,13,1417,14,0],[1418,13,1418,33,0],[1419,13,1419,27,0],[1420,9,1420,10,0],[1429,9,1429,10,0],[1430,13,1430,68,0],[1431,9,1431,10,0],[1440,9,1440,10,0],[1444,13,1444,14,0],[1445,17,1445,117,0],[1447,17,1447,46,0],[1448,21,1448,117,0],[1449,17,1449,53,0],[1451,17,1451,88,0],[1452,13,1452,14,0],[1453,13,1453,18,0],[1454,13,1454,14,0],[1455,17,1457,86,0],[1460,13,1460,98,0],[1461,13,1461,45,0],[1462,13,1462,30,0],[1463,17,1464,85,0],[1466,13,1466,69,0],[1467,13,1467,33,0],[1468,17,1469,85,0],[1471,13,1471,46,0],[1474,13,1474,53,0],[1475,13,1475,28,0],[1476,9,1476,10,0],[1481,9,1481,10,1],[1482,13,1482,42,1],[1484,13,1484,20,1],[1484,22,1484,28,1],[1484,29,1484,31,1],[1484,32,1484,48,1],[1485,13,1485,14,1],[1486,17,1486,53,1],[1487,17,1487,34,1],[1488,17,1488,18,0],[1489,21,1489,133,0],[1490,21,1490,30,0],[1493,17,1493,75,1],[1494,17,1494,40,1],[1495,17,1495,18,1],[1497,21,1497,22,1],[1498,25,1498,73,1],[1499,21,1499,22,1],[1500,21,1500,41,0],[1501,21,1501,22,0],[1502,25,1502,145,0],[1503,25,1503,54,0],[1504,25,1504,26,0],[1505,29,1505,155,0],[1506,25,1506,26,0],[1507,21,1507,22,0],[1509,21,1509,50,1],[1510,21,1510,22,1],[1511,25,1511,142,1],[1512,21,1512,22,1],[1513,17,1513,18,1],[1515,17,1515,18,0],[1516,21,1516,124,0],[1517,21,1517,50,0],[1518,21,1518,22,0],[1519,25,1519,147,0],[1520,21,1520,22,0],[1521,17,1521,18,0],[1522,13,1522,14,1],[1523,9,1523,10,1],[1533,9,1533,10,0],[1534,13,1534,67,0],[1535,13,1535,54,0],[1538,13,1538,14,0],[1539,17,1539,70,0],[1541,17,1541,69,0],[1542,21,1542,108,0],[1544,17,1544,92,0],[1546,17,1546,64,0],[1547,17,1547,36,0],[1548,21,1548,36,0],[1550,17,1550,73,0],[1551,21,1551,64,0],[1553,21,1555,89,0],[1557,17,1557,110,0],[1559,17,1559,51,0],[1560,17,1560,58,0],[1561,17,1561,33,0],[1563,13,1563,32,0],[1564,13,1564,14,0],[1565,17,1565,122,0],[1566,17,1566,23,0],[1568,9,1568,10,0],[1571,9,1571,10,0],[1572,13,1572,42,0],[1574,13,1574,80,0],[1575,13,1576,81,0],[1577,13,1577,14,0],[1578,17,1578,79,0],[1579,13,1579,14,0],[1580,13,1580,67,0],[1581,13,1582,81,0],[1583,13,1583,14,0],[1584,17,1584,79,0],[1585,13,1585,14,0],[1586,9,1586,10,0],[1589,9,1589,10,1],[1590,13,1590,45,1],[1591,17,1591,68,0],[1594,13,1594,43,1],[1595,13,1595,14,1],[1596,17,1596,119,1],[1597,17,1597,18,1],[1598,17,1598,18,1],[1599,13,1599,14,1],[1600,9,1600,10,1],[1603,9,1603,10,0],[1604,13,1604,45,0],[1605,17,1605,67,0],[1608,13,1608,43,0],[1609,13,1609,14,0],[1610,17,1610,128,0],[1611,17,1611,18,0],[1612,17,1612,18,0],[1613,13,1613,14,0],[1614,9,1614,10,0],[1617,9,1617,10,0],[1618,13,1618,45,0],[1619,17,1619,71,0],[1622,13,1622,43,0],[1623,13,1623,14,0],[1624,17,1624,135,0],[1625,17,1625,18,0],[1626,17,1626,18,0],[1627,13,1627,14,0],[1628,9,1628,10,0],[1631,9,1631,10,0],[1632,13,1632,34,0],[1634,13,1634,68,0],[1635,13,1635,35,0],[1636,13,1636,14,0],[1637,17,1637,129,0],[1638,13,1638,14,0],[1640,13,1643,119,0],[1645,13,1645,24,0],[1646,9,1646,10,0],[1649,9,1649,10,0],[1651,13,1651,93,0],[1654,13,1655,59,0],[1658,13,1659,77,0],[1662,13,1662,38,0],[1663,9,1663,10,0],[1666,9,1666,10,0],[1667,13,1667,49,0],[1668,9,1668,10,0],[1671,9,1671,10,0],[1672,13,1672,41,0],[1673,13,1673,77,0],[1674,13,1674,52,0],[1675,13,1675,49,0],[1676,13,1676,33,0],[1677,13,1677,47,0],[1680,13,1680,50,0],[1681,13,1682,112,0],[1683,13,1683,20,0],[1683,22,1683,32,0],[1683,33,1683,35,0],[1683,36,1683,41,0],[1684,17,1684,84,0],[1686,13,1686,27,0],[1687,9,1687,10,0],[1690,9,1690,10,0],[1692,13,1692,101,0],[1693,13,1693,14,0],[1694,17,1694,173,0],[1697,13,1699,74,0],[1700,13,1700,54,0],[1701,13,1701,50,0],[1702,13,1702,14,0],[1703,17,1703,93,0],[1704,17,1704,72,0],[1705,17,1705,39,0],[1706,21,1706,139,0],[1709,17,1709,46,0],[1710,17,1710,76,0],[1711,17,1714,105,0],[1716,17,1716,79,0],[1719,17,1719,102,0],[1727,17,1727,85,0],[1728,17,1729,101,0],[1730,17,1730,74,0],[1731,17,1731,62,0],[1734,17,1734,58,0],[1736,17,1736,18,0],[1737,21,1737,89,0],[1738,21,1738,75,0],[1739,21,1739,22,0],[1740,25,1740,87,0],[1741,25,1741,75,0],[1742,25,1742,54,0],[1743,25,1743,71,0],[1744,25,1744,42,0],[1745,25,1745,26,0],[1746,29,1746,77,0],[1747,29,1747,50,0],[1748,29,1748,71,0],[1749,25,1749,26,0],[1751,25,1751,48,0],[1752,25,1752,44,0],[1755,25,1755,66,0],[1756,25,1756,62,0],[1757,25,1757,89,0],[1758,25,1758,81,0],[1759,25,1759,77,0],[1760,21,1760,22,0],[1762,25,1762,67,0],[1765,21,1765,47,0],[1766,17,1766,18,0],[1767,17,1767,34,0],[1768,17,1768,18,0],[1769,21,1769,63,0],[1770,17,1770,18,0],[1772,17,1772,18,0],[1774,21,1774,51,0],[1775,25,1775,51,0],[1776,17,1776,18,0],[1778,17,1778,87,0],[1781,13,1781,53,0],[1782,9,1782,10,0],[1785,9,1785,10,0],[1786,13,1787,91,0],[1788,9,1788,10,0],[1796,9,1796,10,0],[1797,13,1797,42,0],[1798,13,1798,14,0],[1800,17,1800,29,0],[1803,13,1803,14,0],[1804,17,1804,61,0],[1806,9,1806,10,0],[1816,9,1816,10,0],[1817,13,1817,53,0],[1818,13,1818,62,0],[1819,13,1819,20,0],[1819,22,1819,35,0],[1819,36,1819,38,0],[1819,39,1819,58,0],[1820,13,1820,14,0],[1821,17,1821,65,0],[1822,17,1822,94,0],[1823,13,1823,14,0],[1826,13,1826,75,0],[1827,13,1827,66,0],[1828,13,1828,25,0],[1829,9,1829,10,0],[1833,9,1833,10,0],[1834,13,1834,80,0],[1835,13,1835,14,0],[1836,17,1836,54,0],[1837,17,1837,29,0],[1840,13,1840,34,0],[1841,13,1841,26,0],[1842,9,1842,10,0],[1846,9,1846,10,0],[1847,13,1847,80,0],[1848,13,1848,14,0],[1849,17,1849,51,0],[1850,17,1850,29,0],[1853,13,1853,24,0],[1854,13,1854,26,0],[1855,9,1855,10,0],[1859,9,1859,10,0],[1860,13,1860,80,0],[1861,13,1861,14,0],[1862,17,1862,55,0],[1863,17,1863,29,0],[1866,13,1866,27,0],[1867,13,1867,26,0],[1868,9,1868,10,0],[1871,9,1871,10,0],[1875,13,1875,65,0],[1876,13,1876,14,0],[1877,17,1879,28,0],[1880,13,1880,14,0],[1882,13,1882,14,0],[1883,17,1883,60,0],[1884,17,1884,110,0],[1885,13,1885,14,0],[1887,13,1887,85,0],[1888,9,1888,10,0],[1902,9,1902,10,0],[1903,13,1903,31,0],[1904,13,1904,14,0],[1905,17,1905,32,0],[1906,13,1906,14,0],[1907,9,1907,10,0],[1917,41,1917,45,0],[1917,46,1917,58,0],[1918,29,1918,33,0],[1918,34,1918,46,0],[1920,9,1920,75,0],[1921,9,1921,10,0],[1922,13,1922,41,0],[1923,13,1923,29,0],[1924,9,1924,10,0]]);
+    </script>
+  </body>
+</html>

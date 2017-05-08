@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\MainDom.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Web.Hosting;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Core
+{
+    /// &lt;summary&gt;
+    /// Represents the main AppDomain running for a given application.
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// &lt;para&gt;There can be only one &quot;main&quot; AppDomain running for a given application at a time.&lt;/para&gt;
+    /// &lt;para&gt;When an AppDomain starts, it tries to acquire the main domain status.&lt;/para&gt;
+    /// &lt;para&gt;When an AppDomain stops (eg the application is restarting) it should release the main domain status.&lt;/para&gt;
+    /// &lt;para&gt;It is possible to register against the MainDom and be notified when it is released.&lt;/para&gt;
+    /// &lt;/remarks&gt;
+    internal class MainDom : IRegisteredObject
+    {
+        #region Vars
+
+        private readonly ILogger _logger;
+
+        // our own lock for local consistency
+        private readonly object _locko = new object();
+
+        // async lock representing the main domain lock
+        private readonly AsyncLock _asyncLock;
+        private IDisposable _asyncLocker;
+
+        // event wait handle used to notify current main domain that it should
+        // release the lock because a new domain wants to be the main domain
+        private readonly EventWaitHandle _signal;
+
+        // indicates whether...
+        private volatile bool _isMainDom; // we are the main domain
+        private volatile bool _signaled; // we have been signaled
+
+        // actions to run before releasing the main domain
+        private readonly SortedList&lt;int, Action&gt; _callbacks = new SortedList&lt;int, Action&gt;(new WeightComparer());
+
+        private const int LockTimeoutMilliseconds = 90000; // (1.5 * 60 * 1000) == 1 min 30 seconds
+
+        private class WeightComparer : IComparer&lt;int&gt;
+        {
+            public int Compare(int x, int y)
+            {
+                var result = x.CompareTo(y);
+                // return &quot;equal&quot; as &quot;greater than&quot;
+                return result == 0 ? 1 : result;
+            }
+        }
+
+        #endregion
+
+        #region Ctor
+
+        // initializes a new instance of MainDom
+        internal MainDom(ILogger logger)
+        {
+            _logger = logger;
+
+            var appId = string.Empty;
+            // HostingEnvironment.ApplicationID is null in unit tests, making ReplaceNonAlphanumericChars fail
+            if (HostingEnvironment.ApplicationID != null)
+                appId = HostingEnvironment.ApplicationID.ReplaceNonAlphanumericChars(string.Empty);
+
+            // combining with the physical path because if running on eg IIS Express,
+            // two sites could have the same appId even though they are different.
+            //
+            // now what could still collide is... two sites, running in two different processes
+            // and having the same appId, and running on the same app physical path
+            //
+            // we *cannot* use the process ID here because when an AppPool restarts it is
+            // a new process for the same application path
+
+            var appPath = HostingEnvironment.ApplicationPhysicalPath;
+            var hash = (appId + &quot;:::&quot; + appPath).ToSHA1();
+
+            var lockName = &quot;UMBRACO-&quot; + hash + &quot;-MAINDOM-LCK&quot;;
+            _asyncLock = new AsyncLock(lockName);
+
+            var eventName = &quot;UMBRACO-&quot; + hash + &quot;-MAINDOM-EVT&quot;;
+            _signal = new EventWaitHandle(false, EventResetMode.AutoReset, eventName);
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Registers a resource that requires the current AppDomain to be the main domain to function.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;release&quot;&gt;An action to execute before the AppDomain releases the main domain status.&lt;/param&gt;
+        /// &lt;param name=&quot;weight&quot;&gt;An optional weight (lower goes first).&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether it was possible to register.&lt;/returns&gt;
+        public bool Register(Action release, int weight = 100)
+        {
+            return Register(null, release, weight);
+        }
+
+        /// &lt;summary&gt;
+        /// Registers a resource that requires the current AppDomain to be the main domain to function.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;install&quot;&gt;An action to execute when registering.&lt;/param&gt;
+        /// &lt;param name=&quot;release&quot;&gt;An action to execute before the AppDomain releases the main domain status.&lt;/param&gt;
+        /// &lt;param name=&quot;weight&quot;&gt;An optional weight (lower goes first).&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether it was possible to register.&lt;/returns&gt;
+        /// &lt;remarks&gt;If registering is successful, then the &lt;paramref name=&quot;install&quot;/&gt; action
+        /// is guaranteed to execute before the AppDomain releases the main domain status.&lt;/remarks&gt;
+        public bool Register(Action install, Action release, int weight = 100)
+        {
+            lock (_locko)
+            {
+                if (_signaled) return false;
+                if (install != null)
+                    install();
+                if (release != null)
+                    _callbacks.Add(weight, release);
+                return true;
+            }
+        }
+
+        // handles the signal requesting that the main domain is released
+        private void OnSignal(string source)
+        {
+            // once signaled, we stop waiting, but then there is the hosting environment
+            // so we have to make sure that we only enter that method once
+
+            lock (_locko)
+            {
+                _logger.Debug&lt;MainDom&gt;(&quot;Signaled&quot; + (_signaled ? &quot; (again)&quot; : &quot;&quot;) + &quot; (&quot; + source + &quot;).&quot;);
+                if (_signaled) return;
+                if (_isMainDom == false) return; // probably not needed
+                _signaled = true;
+            }
+
+            try
+            {
+                _logger.Info&lt;MainDom&gt;(&quot;Stopping...&quot;);
+                foreach (var callback in _callbacks.Values)
+                {
+                    try
+                    {
+                        callback(); // no timeout on callbacks
+                    }
+                    catch (Exception e)
+                    {
+                        _logger.Error&lt;MainDom&gt;(&quot;Error while running callback, remaining callbacks will not run.&quot;, e);
+                        throw;
+                    }
+
+                }
+                _logger.Debug&lt;MainDom&gt;(&quot;Stopped.&quot;);
+            }
+            finally
+            {
+                // in any case...
+                _isMainDom = false;
+                _asyncLocker.Dispose();
+                _logger.Info&lt;MainDom&gt;(&quot;Released MainDom.&quot;);
+            }
+        }
+
+        // acquires the main domain
+        internal bool Acquire()
+        {
+            lock (_locko) // we don&#39;t want the hosting environment to interfere by signaling
+            {
+                // if signaled, too late to acquire, give up
+                // the handler is not installed so that would be the hosting environment
+                if (_signaled)
+                {
+                    _logger.Info&lt;MainDom&gt;(&quot;Cannot acquire MainDom (signaled).&quot;);
+                    return false;
+                }
+
+                _logger.Info&lt;MainDom&gt;(&quot;Acquiring MainDom...&quot;);
+
+                // signal other instances that we want the lock, then wait one the lock,
+                // which may timeout, and this is accepted - see comments below
+
+                // signal, then wait for the lock, then make sure the event is
+                // resetted (maybe there was noone listening..)
+                _signal.Set();
+
+                // if more than 1 instance reach that point, one will get the lock
+                // and the other one will timeout, which is accepted
+
+                _asyncLocker = _asyncLock.Lock(LockTimeoutMilliseconds);
+                _isMainDom = true;
+
+                // we need to reset the event, because otherwise we would end up
+                // signaling ourselves and commiting suicide immediately.
+                // only 1 instance can reach that point, but other instances may
+                // have started and be trying to get the lock - they will timeout,
+                // which is accepted
+
+                _signal.Reset();
+                _signal.WaitOneAsync()
+                    .ContinueWith(_ =&gt; OnSignal(&quot;signal&quot;));
+
+                HostingEnvironment.RegisterObject(this);
+
+                _logger.Info&lt;MainDom&gt;(&quot;Acquired MainDom.&quot;);
+                return true;
+            }
+        }
+
+        // gets a value indicating whether we are the main domain
+        public bool IsMainDom
+        {
+            get { return _isMainDom; }
+        }
+
+        // IRegisteredObject
+        void IRegisteredObject.Stop(bool immediate)
+        {
+            try
+            {
+                OnSignal(&quot;environment&quot;); // will run once
+            }
+            finally
+            {
+                HostingEnvironment.UnregisterObject(this);
+            }
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,9,25,55,1],[40,9,40,113,1],[47,13,47,14,0],[48,17,48,45,0],[50,17,50,49,0],[51,13,51,14,0],[59,9,59,41,1],[60,9,60,10,1],[61,13,61,30,1],[63,13,63,38,1],[65,13,65,58,1],[66,17,66,100,0],[77,13,77,70,1],[78,13,78,59,1],[80,13,80,63,1],[81,13,81,50,1],[83,13,83,64,1],[84,13,84,87,1],[85,9,85,10,1],[96,9,96,10,0],[97,13,97,52,0],[98,9,98,10,0],[110,9,110,10,0],[111,13,111,26,0],[112,13,112,14,0],[113,17,113,31,0],[113,32,113,45,0],[114,17,114,37,0],[115,21,115,31,0],[116,17,116,37,0],[117,21,117,53,0],[118,17,118,29,0],[120,9,120,10,0],[124,9,124,10,1],[128,13,128,26,1],[129,13,129,14,1],[130,17,130,107,1],[131,17,131,31,1],[131,32,131,39,0],[132,17,132,41,1],[132,42,132,49,0],[133,17,133,34,1],[134,13,134,14,1],[137,13,137,14,1],[138,17,138,54,1],[139,17,139,24,1],[139,26,139,38,0],[139,39,139,41,1],[139,42,139,59,1],[140,17,140,18,0],[142,21,142,22,0],[143,25,143,36,0],[144,21,144,22,0],[145,21,145,40,0],[146,21,146,22,0],[147,25,147,118,0],[148,25,148,31,0],[151,17,151,18,0],[152,17,152,52,1],[153,13,153,14,1],[155,13,155,14,1],[157,17,157,36,1],[158,17,158,40,1],[159,17,159,60,1],[160,13,160,14,1],[161,9,161,10,1],[165,9,165,10,1],[166,13,166,26,1],[167,13,167,14,1],[170,17,170,31,1],[171,17,171,18,0],[172,21,172,81,0],[173,21,173,34,0],[176,17,176,63,1],[183,17,183,31,1],[188,17,188,73,1],[189,17,189,35,1],[197,17,197,33,1],[198,17,199,40,1],[199,40,199,58,1],[199,58,199,60,1],[198,17,199,60,1],[201,17,201,57,1],[203,17,203,60,1],[204,17,204,29,1],[206,9,206,10,1],[211,17,211,18,0],[211,19,211,37,0],[211,38,211,39,0],[216,9,216,10,0],[218,13,218,14,0],[219,17,219,41,0],[220,13,220,14,0],[222,13,222,14,0],[223,17,223,59,0],[224,13,224,14,0],[225,9,225,10,0]]);
+    </script>
+  </body>
+</html>

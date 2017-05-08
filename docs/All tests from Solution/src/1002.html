@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\PropertyEditors\ValueListPreValueEditor.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.PropertyEditors;
+using umbraco;
+
+namespace Umbraco.Web.PropertyEditors
+{
+    /// &lt;summary&gt;
+    /// Pre-value editor used to create a list of items
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// This pre-value editor is shared with editors like drop down, checkbox list, etc....
+    /// &lt;/remarks&gt;
+    internal class ValueListPreValueEditor : PreValueEditor
+    {
+
+        public ValueListPreValueEditor()
+        {
+            Fields.AddRange(CreatePreValueFields());
+        }
+
+        /// &lt;summary&gt;
+        /// Creates the pre-value fields
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected List&lt;PreValueField&gt; CreatePreValueFields()
+        {
+            return new List&lt;PreValueField&gt;
+                {
+                    new PreValueField(new EnsureUniqueValuesValidator())
+                        {
+                            Description = &quot;Add and remove values for the list&quot;,
+                            //we&#39;re going to call this &#39;items&#39; because we are going to override the 
+                            //serialization of the pre-values to ensure that each one gets saved with it&#39;s own key 
+                            //(new db row per pre-value, thus to maintain backwards compatibility)
+
+                            //It&#39;s also important to note that by default the dropdown angular controller is expecting the 
+                            // config options to come in with a property called &#39;items&#39;
+                            Key = &quot;items&quot;,
+                            Name = ui.Text(&quot;editdatatype&quot;, &quot;addPrevalue&quot;),
+                            View = &quot;multivalues&quot;
+                        }                   
+                };
+        } 
+
+        /// &lt;summary&gt;
+        /// The editor is expecting a json array for a field with a key named &quot;items&quot; so we need to format the persisted values
+        /// to this format to be used in the editor.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;defaultPreVals&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;persistedPreVals&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override IDictionary&lt;string, object&gt; ConvertDbToEditor(IDictionary&lt;string, object&gt; defaultPreVals, PreValueCollection persistedPreVals)
+        {
+            var dictionary = persistedPreVals.FormatAsDictionary();
+            var arrayOfVals = dictionary.Select(item =&gt; item.Value)
+                //ensure they are sorted - though this isn&#39;t too important because in json in may not maintain
+                // the sorted order and the js has to sort anyways.
+                .OrderBy(x =&gt; x.SortOrder)
+                .ToList();
+          
+            //the items list will be a dictionary of it&#39;s id -&gt; value we need to use the id for persistence for backwards compatibility
+            return new Dictionary&lt;string, object&gt; {{&quot;items&quot;, arrayOfVals.ToDictionary(x =&gt; x.Id, x =&gt; PreValueAsDictionary(x))}};
+        }
+
+        /// &lt;summary&gt;
+        /// Formats the prevalue as a dictionary (as we need to return not just the value, but also the sort-order, to the client)
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;preValue&quot;&gt;The prevalue to format&lt;/param&gt;
+        /// &lt;returns&gt;Dictionary object containing the prevalue formatted with the field names as keys and the value of those fields as the values&lt;/returns&gt;
+        private IDictionary&lt;string, object&gt; PreValueAsDictionary(PreValue preValue)
+        {
+            return new Dictionary&lt;string, object&gt;() { { &quot;value&quot;, preValue.Value }, {&quot;sortOrder&quot;, preValue.SortOrder } };
+        }
+
+        /// &lt;summary&gt;
+        /// Need to format the delimited posted string to individual values
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;editorValue&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;currentValue&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A string/string dictionary since all values that need to be persisted in the database are strings.
+        /// &lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This is mostly because we want to maintain compatibility with v6 drop down property editors that store their prevalues in different db rows.
+        /// &lt;/remarks&gt;
+        public override IDictionary&lt;string, PreValue&gt; ConvertEditorToDb(IDictionary&lt;string, object&gt; editorValue, PreValueCollection currentValue)
+        {
+            var val = editorValue[&quot;items&quot;] as JArray;
+            var result = new Dictionary&lt;string, PreValue&gt;();
+            
+            if (val == null)
+            {
+                return result;
+            }
+
+            try
+            {
+                var index = 0;
+
+                //get all values in the array that are not empty 
+                foreach (var item in val.OfType&lt;JObject&gt;()
+                    .Where(jItem =&gt; jItem[&quot;value&quot;] != null)
+                    .Select(jItem =&gt; new
+                        {
+                            idAsString = jItem[&quot;id&quot;] == null ? &quot;0&quot; : jItem[&quot;id&quot;].ToString(), 
+                            valAsString = jItem[&quot;value&quot;].ToString()
+                        })
+                    .Where(x =&gt; x.valAsString.IsNullOrWhiteSpace() == false))
+                {
+                    var id = 0;
+                    int.TryParse(item.idAsString, out id);
+                    result.Add(index.ToInvariantString(), new PreValue(id, item.valAsString));
+                    index++;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Error&lt;ValueListPreValueEditor&gt;(&quot;Could not deserialize the posted value: &quot; + val, ex);                
+            }
+
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// A custom validator to ensure that all values in the list are unique
+        /// &lt;/summary&gt;
+        internal class EnsureUniqueValuesValidator : IPropertyValidator
+        {
+            public IEnumerable&lt;ValidationResult&gt; Validate(object value, PreValueCollection preValues, PropertyEditor editor)
+            {
+                var json = value as JArray;
+                if (json == null) yield break;
+
+                //get all values in the array that are not empty (we&#39;ll remove empty values when persisting anyways)
+                var groupedValues = json.OfType&lt;JObject&gt;()
+                                        .Where(jItem =&gt; jItem[&quot;value&quot;] != null)
+                                        .Select((jItem, index) =&gt; new {value = jItem[&quot;value&quot;].ToString(), index = index})
+                                        .Where(asString =&gt; asString.value.IsNullOrWhiteSpace() == false)
+                                        .GroupBy(x =&gt; x.value);
+                
+                foreach (var g in groupedValues.Where(g =&gt; g.Count() &gt; 1))
+                {
+                    yield return new ValidationResult(&quot;The value &quot; + g.Last().value + &quot; must be unique&quot;, new[]
+                        {
+                            //we&#39;ll make the server field the index number of the value so it can be wired up to the view
+                            &quot;item_&quot; + g.Last().index.ToInvariantString()
+                        });
+                }
+
+
+            }
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,9,25,41,1],[26,9,26,10,1],[27,13,27,53,1],[28,9,28,10,1],[35,9,35,10,1],[36,13,51,19,1],[52,9,52,10,1],[62,9,62,10,1],[63,13,63,68,1],[64,13,64,57,1],[64,57,64,67,1],[64,67,67,31,1],[67,31,67,42,1],[67,42,68,27,1],[64,13,68,27,1],[71,13,71,92,1],[71,92,71,96,1],[71,96,71,103,1],[71,103,71,126,1],[71,126,71,130,1],[71,13,71,130,1],[72,9,72,10,1],[80,9,80,10,1],[81,13,81,121,1],[82,9,82,10,1],[96,9,96,10,0],[97,13,97,54,0],[98,13,98,61,0],[100,13,100,29,0],[101,13,101,14,0],[102,17,102,31,0],[106,13,106,14,0],[107,17,107,31,0],[110,17,110,24,0],[110,26,110,34,0],[110,35,110,37,0],[110,38,111,37,0],[111,37,111,59,0],[111,59,112,38,0],[112,38,116,26,0],[116,26,117,33,0],[117,33,117,76,0],[117,76,117,77,0],[110,38,117,77,0],[118,17,118,18,0],[119,21,119,32,0],[120,21,120,59,0],[121,21,121,95,0],[122,21,122,29,0],[123,17,123,18,0],[124,13,124,14,0],[125,13,125,33,0],[126,13,126,14,0],[127,17,127,112,0],[128,13,128,14,0],[130,13,130,27,0],[131,9,131,10,0]]);
+    </script>
+  </body>
+</html>

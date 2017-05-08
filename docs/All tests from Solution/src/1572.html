@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Security\BackOfficeUserStore.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Common;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Web.Security;
+using AutoMapper;
+using Microsoft.AspNet.Identity;
+using Microsoft.Owin;
+using Umbraco.Core.Models.Identity;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Core.Security
+{
+    public class BackOfficeUserStore : DisposableObject, 
+        IUserStore&lt;BackOfficeIdentityUser, int&gt;, 
+        IUserPasswordStore&lt;BackOfficeIdentityUser, int&gt;, 
+        IUserEmailStore&lt;BackOfficeIdentityUser, int&gt;, 
+        IUserLoginStore&lt;BackOfficeIdentityUser, int&gt;,
+        IUserRoleStore&lt;BackOfficeIdentityUser, int&gt;,
+        IUserSecurityStampStore&lt;BackOfficeIdentityUser, int&gt;,
+        IUserLockoutStore&lt;BackOfficeIdentityUser, int&gt;,
+        IUserTwoFactorStore&lt;BackOfficeIdentityUser, int&gt;
+
+        //TODO: This would require additional columns/tables for now people will need to implement this on their own
+        //IUserPhoneNumberStore&lt;BackOfficeIdentityUser, int&gt;,
+        //TODO: To do this we need to implement IQueryable -  we&#39;ll have an IQuerable implementation soon with the UmbracoLinqPadDriver implementation
+        //IQueryableUserStore&lt;BackOfficeIdentityUser, int&gt;
+    {
+        private readonly IUserService _userService;
+        private readonly IExternalLoginService _externalLoginService;
+        private bool _disposed = false;
+
+        public BackOfficeUserStore(IUserService userService, IExternalLoginService externalLoginService, MembershipProviderBase usersMembershipProvider)
+        {
+            _userService = userService;
+            _externalLoginService = externalLoginService;
+            if (userService == null) throw new ArgumentNullException(&quot;userService&quot;);
+            if (usersMembershipProvider == null) throw new ArgumentNullException(&quot;usersMembershipProvider&quot;);
+            if (externalLoginService == null) throw new ArgumentNullException(&quot;externalLoginService&quot;);
+
+            _userService = userService;
+            _externalLoginService = externalLoginService;
+
+            if (usersMembershipProvider.PasswordFormat != MembershipPasswordFormat.Hashed)
+            {
+                throw new InvalidOperationException(&quot;Cannot use ASP.Net Identity with UmbracoMembersUserStore when the password format is not Hashed&quot;);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Handles the disposal of resources. Derived from abstract class &lt;see cref=&quot;DisposableObject&quot;/&gt; which handles common required locking logic.
+        /// &lt;/summary&gt;
+        protected override void DisposeResources()
+        {
+            _disposed = true;
+        }
+
+        /// &lt;summary&gt;
+        /// Insert a new user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task CreateAsync(BackOfficeIdentityUser user)
+        {
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            var userType = _userService.GetUserTypeByAlias(
+                user.UserTypeAlias.IsNullOrWhiteSpace() ? _userService.GetDefaultMemberType() : user.UserTypeAlias);
+
+            var member = new User(userType)
+            {
+                DefaultToLiveEditing = false,
+                Email = user.Email,
+                Language = user.Culture ?? Configuration.GlobalSettings.DefaultUILanguage,
+                Name = user.Name,
+                Username = user.UserName,
+                StartContentId = user.StartContentId == 0 ? -1 : user.StartContentId,
+                StartMediaId = user.StartMediaId == 0 ? -1 : user.StartMediaId,
+                IsLockedOut = user.IsLockedOut,
+                IsApproved = true
+            };
+
+            UpdateMemberProperties(member, user);
+
+            //the password must be &#39;something&#39; it could be empty if authenticating
+            // with an external provider so we&#39;ll just generate one and prefix it, the 
+            // prefix will help us determine if the password hasn&#39;t actually been specified yet.
+            if (member.RawPasswordValue.IsNullOrWhiteSpace())
+            {
+                //this will hash the guid with a salt so should be nicely random
+                var aspHasher = new PasswordHasher();
+                member.RawPasswordValue = &quot;___UIDEMPTYPWORD__&quot; +
+                    aspHasher.HashPassword(Guid.NewGuid().ToString(&quot;N&quot;));
+
+            }
+            _userService.Save(member);
+
+            if (member.Id == 0) throw new DataException(&quot;Could not create the user, check logs for details&quot;);
+
+            //re-assign id
+            user.Id = member.Id;
+
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Update a user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public async Task UpdateAsync(BackOfficeIdentityUser user)
+        {
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            var asInt = user.Id.TryConvertTo&lt;int&gt;();
+            if (asInt == false)
+            {
+                throw new InvalidOperationException(&quot;The user id must be an integer to work with the Umbraco&quot;);
+            }
+
+            var found = _userService.GetUserById(asInt.Result);
+            if (found != null)
+            {
+                if (UpdateMemberProperties(found, user))
+                {
+                    _userService.Save(found);
+                }
+
+                if (user.LoginsChanged)
+                {
+                    var logins = await GetLoginsAsync(user);
+                    _externalLoginService.SaveUserLogins(found.Id, logins);
+                }
+            }           
+        }
+
+        /// &lt;summary&gt;
+        /// Delete a user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task DeleteAsync(BackOfficeIdentityUser user)
+        {
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            var asInt = user.Id.TryConvertTo&lt;int&gt;();
+            if (asInt == false)
+            {
+                throw new InvalidOperationException(&quot;The user id must be an integer to work with the Umbraco&quot;);
+            }
+
+            var found = _userService.GetUserById(asInt.Result);
+            if (found != null)
+            {
+                _userService.Delete(found);
+            }
+            _externalLoginService.DeleteUserLogins(asInt.Result);
+
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Finds a user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userId&quot;/&gt;
+        /// &lt;returns/&gt;
+        public async Task&lt;BackOfficeIdentityUser&gt; FindByIdAsync(int userId)
+        {
+            ThrowIfDisposed();
+            var user = _userService.GetUserById(userId);
+            if (user == null)
+            {
+                return null;
+            }
+            return await Task.FromResult(AssignLoginsCallback(Mapper.Map&lt;BackOfficeIdentityUser&gt;(user)));
+        }
+
+        /// &lt;summary&gt;
+        /// Find a user by name
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userName&quot;/&gt;
+        /// &lt;returns/&gt;
+        public async Task&lt;BackOfficeIdentityUser&gt; FindByNameAsync(string userName)
+        {
+            ThrowIfDisposed();
+            var user = _userService.GetByUsername(userName);
+            if (user == null)
+            {
+                return null;
+            }
+
+            var result = AssignLoginsCallback(Mapper.Map&lt;BackOfficeIdentityUser&gt;(user));
+
+            return await Task.FromResult(result);
+        }
+
+        /// &lt;summary&gt;
+        /// Set the user password hash
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;passwordHash&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task SetPasswordHashAsync(BackOfficeIdentityUser user, string passwordHash)
+        {
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            if (passwordHash.IsNullOrWhiteSpace()) throw new ArgumentNullException(&quot;passwordHash&quot;);
+
+            user.PasswordHash = passwordHash;
+
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Get the user password hash
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;string&gt; GetPasswordHashAsync(BackOfficeIdentityUser user)
+        {
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            return Task.FromResult(user.PasswordHash);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns true if a user has a password set
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;bool&gt; HasPasswordAsync(BackOfficeIdentityUser user)
+        {
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            return Task.FromResult(user.PasswordHash.IsNullOrWhiteSpace() == false);
+        }
+
+        /// &lt;summary&gt;
+        /// Set the user email
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;email&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task SetEmailAsync(BackOfficeIdentityUser user, string email)
+        {
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            if (email.IsNullOrWhiteSpace()) throw new ArgumentNullException(&quot;email&quot;);
+
+            user.Email = email;
+
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Get the user email
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;string&gt; GetEmailAsync(BackOfficeIdentityUser user)
+        {
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            return Task.FromResult(user.Email);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns true if the user email is confirmed
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;bool&gt; GetEmailConfirmedAsync(BackOfficeIdentityUser user)
+        {
+            ThrowIfDisposed();
+            throw new NotImplementedException();
+        }
+
+        /// &lt;summary&gt;
+        /// Sets whether the user email is confirmed
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;confirmed&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task SetEmailConfirmedAsync(BackOfficeIdentityUser user, bool confirmed)
+        {
+            ThrowIfDisposed();
+            throw new NotImplementedException();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the user associated with this email
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;email&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;BackOfficeIdentityUser&gt; FindByEmailAsync(string email)
+        {
+            ThrowIfDisposed();
+            var user = _userService.GetByEmail(email);
+            var result = user == null
+                ? null
+                : Mapper.Map&lt;BackOfficeIdentityUser&gt;(user);
+
+            return Task.FromResult(AssignLoginsCallback(result));
+        }
+
+        /// &lt;summary&gt;
+        /// Adds a user login with the specified provider and key
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;login&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task AddLoginAsync(BackOfficeIdentityUser user, UserLoginInfo login)
+        {
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            if (login == null) throw new ArgumentNullException(&quot;login&quot;);
+
+            var logins = user.Logins;
+            var instance = new IdentityUserLogin(login.LoginProvider, login.ProviderKey, user.Id);
+            var userLogin = instance;
+            logins.Add(userLogin);
+
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Removes the user login with the specified combination if it exists
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;login&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task RemoveLoginAsync(BackOfficeIdentityUser user, UserLoginInfo login)
+        {
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            if (login == null) throw new ArgumentNullException(&quot;login&quot;);
+
+            var provider = login.LoginProvider;
+            var key = login.ProviderKey;
+            var userLogin = user.Logins.SingleOrDefault((l =&gt; l.LoginProvider == provider &amp;&amp; l.ProviderKey == key));
+            if (userLogin != null)
+                user.Logins.Remove(userLogin);
+
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the linked accounts for this user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;IList&lt;UserLoginInfo&gt;&gt; GetLoginsAsync(BackOfficeIdentityUser user)
+        {
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            return Task.FromResult((IList&lt;UserLoginInfo&gt;)
+                user.Logins.Select(l =&gt; new UserLoginInfo(l.LoginProvider, l.ProviderKey)).ToList());
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the user associated with this login
+        /// &lt;/summary&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;BackOfficeIdentityUser&gt; FindAsync(UserLoginInfo login)
+        {            
+            ThrowIfDisposed();
+            if (login == null) throw new ArgumentNullException(&quot;login&quot;);
+
+            //get all logins associated with the login id
+            var result = _externalLoginService.Find(login).ToArray();
+            if (result.Any())
+            {
+                //return the first member that matches the result
+                var output = (from l in result
+                            select _userService.GetUserById(l.UserId)
+                                into user
+                                where user != null
+                                  select Mapper.Map&lt;BackOfficeIdentityUser&gt;(user)).FirstOrDefault();
+
+                return Task.FromResult(AssignLoginsCallback(output));
+            }
+
+            return Task.FromResult&lt;BackOfficeIdentityUser&gt;(null);
+        }
+
+
+        /// &lt;summary&gt;
+        /// Adds a user to a role (section)
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;roleName&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task AddToRoleAsync(BackOfficeIdentityUser user, string roleName)
+        {            
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            if (user.AllowedSections.InvariantContains(roleName)) return Task.FromResult(0);
+            
+            var asInt = user.Id.TryConvertTo&lt;int&gt;();
+            if (asInt == false)
+            {
+                throw new InvalidOperationException(&quot;The user id must be an integer to work with the Umbraco&quot;);
+            }
+
+            var found = _userService.GetUserById(asInt.Result);
+
+            if (found != null)
+            {
+                found.AddAllowedSection(roleName);
+            }
+
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Removes the role (allowed section) for the user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;roleName&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task RemoveFromRoleAsync(BackOfficeIdentityUser user, string roleName)
+        {            
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            if (user.AllowedSections.InvariantContains(roleName) == false) return Task.FromResult(0);
+
+            var asInt = user.Id.TryConvertTo&lt;int&gt;();
+            if (asInt == false)
+            {
+                throw new InvalidOperationException(&quot;The user id must be an integer to work with the Umbraco&quot;);
+            }
+
+            var found = _userService.GetUserById(asInt.Result);
+
+            if (found != null)
+            {
+                found.RemoveAllowedSection(roleName);
+            }
+
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the roles for this user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;IList&lt;string&gt;&gt; GetRolesAsync(BackOfficeIdentityUser user)
+        {            
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            return Task.FromResult((IList&lt;string&gt;)user.AllowedSections.ToList());
+        }
+
+        /// &lt;summary&gt;
+        /// Returns true if a user is in the role
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;roleName&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;bool&gt; IsInRoleAsync(BackOfficeIdentityUser user, string roleName)
+        {            
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            return Task.FromResult(user.AllowedSections.InvariantContains(roleName));
+        }
+
+        /// &lt;summary&gt;
+        /// Set the security stamp for the user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;stamp&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task SetSecurityStampAsync(BackOfficeIdentityUser user, string stamp)
+        {   
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            user.SecurityStamp = stamp;
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Get the user security stamp
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;string&gt; GetSecurityStampAsync(BackOfficeIdentityUser user)
+        {            
+            ThrowIfDisposed();
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            //the stamp cannot be null, so if it is currently null then we&#39;ll just return a hash of the password
+            return Task.FromResult(user.SecurityStamp.IsNullOrWhiteSpace() 
+                ? user.PasswordHash.ToMd5()
+                : user.SecurityStamp);
+        }
+
+        private BackOfficeIdentityUser AssignLoginsCallback(BackOfficeIdentityUser user)
+        {
+            if (user != null)
+            {
+                user.SetLoginsCallback(new Lazy&lt;IEnumerable&lt;IIdentityUserLogin&gt;&gt;(() =&gt;
+                            _externalLoginService.GetAll(user.Id)));
+            }
+            return user;
+        }
+
+        /// &lt;summary&gt;
+        /// Sets whether two factor authentication is enabled for the user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;enabled&quot;/&gt;
+        /// &lt;returns/&gt;
+        public virtual Task SetTwoFactorEnabledAsync(BackOfficeIdentityUser user, bool enabled)
+        {
+            user.TwoFactorEnabled = false;
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns whether two factor authentication is enabled for the user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public virtual Task&lt;bool&gt; GetTwoFactorEnabledAsync(BackOfficeIdentityUser user)
+        {
+            return Task.FromResult(false);
+        }
+
+        #region IUserLockoutStore
+        
+        /// &lt;summary&gt;
+        /// Returns the DateTimeOffset that represents the end of a user&#39;s lockout, any time in the past should be considered not locked out.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        /// &lt;remarks&gt;
+        /// Currently we do not suport a timed lock out, when they are locked out, an admin will  have to reset the status
+        /// &lt;/remarks&gt;
+        public Task&lt;DateTimeOffset&gt; GetLockoutEndDateAsync(BackOfficeIdentityUser user)
+        {
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            return user.LockoutEndDateUtc.HasValue
+                ? Task.FromResult(DateTimeOffset.MaxValue)
+                : Task.FromResult(DateTimeOffset.MinValue);
+        }
+
+        /// &lt;summary&gt;
+        /// Locks a user out until the specified end date (set to a past date, to unlock a user)
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;lockoutEnd&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task SetLockoutEndDateAsync(BackOfficeIdentityUser user, DateTimeOffset lockoutEnd)
+        {
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            user.LockoutEndDateUtc = lockoutEnd.UtcDateTime;
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Used to record when an attempt to access the user has failed
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;int&gt; IncrementAccessFailedCountAsync(BackOfficeIdentityUser user)
+        {
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            user.AccessFailedCount++;
+            return Task.FromResult(user.AccessFailedCount);
+        }
+
+        /// &lt;summary&gt;
+        /// Used to reset the access failed count, typically after the account is successfully accessed
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task ResetAccessFailedCountAsync(BackOfficeIdentityUser user)
+        {
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            user.AccessFailedCount = 0;
+            return Task.FromResult(0);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the current number of failed access attempts.  This number usually will be reset whenever the password is
+        ///                 verified or the account is locked out.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;int&gt; GetAccessFailedCountAsync(BackOfficeIdentityUser user)
+        {
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            return Task.FromResult(user.AccessFailedCount);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns true
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task&lt;bool&gt; GetLockoutEnabledAsync(BackOfficeIdentityUser user)
+        {
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            return Task.FromResult(user.LockoutEnabled);
+        }
+
+        /// &lt;summary&gt;
+        /// Doesn&#39;t actually perform any function, users can always be locked out
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;/&gt;&lt;param name=&quot;enabled&quot;/&gt;
+        /// &lt;returns/&gt;
+        public Task SetLockoutEnabledAsync(BackOfficeIdentityUser user, bool enabled)
+        {
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+            user.LockoutEnabled = enabled;
+            return Task.FromResult(0);
+        }
+        #endregion
+
+        private bool UpdateMemberProperties(Models.Membership.IUser user, BackOfficeIdentityUser identityUser)
+        {
+            var anythingChanged = false;
+            //don&#39;t assign anything if nothing has changed as this will trigger
+            //the track changes of the model
+            if ((user.LastLoginDate != default(DateTime) &amp;&amp; identityUser.LastLoginDateUtc.HasValue == false)
+                || identityUser.LastLoginDateUtc.HasValue &amp;&amp; user.LastLoginDate.ToUniversalTime() != identityUser.LastLoginDateUtc.Value)
+            {
+                anythingChanged = true;
+                user.LastLoginDate = identityUser.LastLoginDateUtc.Value.ToLocalTime();
+            }
+            if (user.Name != identityUser.Name &amp;&amp; identityUser.Name.IsNullOrWhiteSpace() == false)
+            {
+                anythingChanged = true;
+                user.Name = identityUser.Name;
+            }
+            if (user.Email != identityUser.Email &amp;&amp; identityUser.Email.IsNullOrWhiteSpace() == false)
+            {
+                anythingChanged = true;
+                user.Email = identityUser.Email;
+            }
+            if (user.FailedPasswordAttempts != identityUser.AccessFailedCount)
+            {
+                anythingChanged = true;
+                user.FailedPasswordAttempts = identityUser.AccessFailedCount;
+            }
+            if (user.IsLockedOut != identityUser.IsLockedOut)
+            {
+                anythingChanged = true;
+                user.IsLockedOut = identityUser.IsLockedOut;
+
+                if (user.IsLockedOut)
+                {
+                    //need to set the last lockout date
+                    user.LastLockoutDate = DateTime.Now;
+                }
+
+            }
+            if (user.Username != identityUser.UserName &amp;&amp; identityUser.UserName.IsNullOrWhiteSpace() == false)
+            {
+                anythingChanged = true;
+                user.Username = identityUser.UserName;
+            }
+            if (user.RawPasswordValue != identityUser.PasswordHash &amp;&amp; identityUser.PasswordHash.IsNullOrWhiteSpace() == false)
+            {
+                anythingChanged = true;
+                user.RawPasswordValue = identityUser.PasswordHash;
+            }
+
+            if (user.Language != identityUser.Culture &amp;&amp; identityUser.Culture.IsNullOrWhiteSpace() == false)
+            {
+                anythingChanged = true;
+                user.Language = identityUser.Culture;
+            }
+            if (user.StartMediaId != identityUser.StartMediaId)
+            {
+                anythingChanged = true;
+                user.StartMediaId = identityUser.StartMediaId;
+            }
+            if (user.StartContentId != identityUser.StartContentId)
+            {
+                anythingChanged = true;
+                user.StartContentId = identityUser.StartContentId;
+            }
+            if (user.SecurityStamp != identityUser.SecurityStamp)
+            {
+                anythingChanged = true;
+                user.SecurityStamp = identityUser.SecurityStamp;
+            }
+            
+            if (user.AllowedSections.ContainsAll(identityUser.AllowedSections) == false
+                || identityUser.AllowedSections.ContainsAll(user.AllowedSections) == false)
+            {
+                anythingChanged = true;
+                foreach (var allowedSection in user.AllowedSections)
+                {
+                    user.RemoveAllowedSection(allowedSection);
+                }
+                foreach (var allowedApplication in identityUser.AllowedSections)
+                {
+                    user.AddAllowedSection(allowedApplication);
+                }
+            }
+
+            return anythingChanged;
+        }
+
+
+        private void ThrowIfDisposed()
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(GetType().Name);
+        }
+
+      
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[34,9,34,40,0],[36,9,36,153,0],[37,9,37,10,0],[38,13,38,40,0],[39,13,39,58,0],[40,13,40,37,0],[40,38,40,85,0],[41,13,41,49,0],[41,50,41,109,0],[42,13,42,46,0],[42,47,42,103,0],[44,13,44,40,0],[45,13,45,58,0],[47,13,47,91,0],[48,13,48,14,0],[49,17,49,152,0],[51,9,51,10,0],[57,9,57,10,0],[58,13,58,30,0],[59,9,59,10,0],[67,9,67,10,0],[68,13,68,31,0],[69,13,69,30,0],[69,31,69,71,0],[71,13,72,117,0],[74,13,85,15,0],[87,13,87,50,0],[92,13,92,62,0],[93,13,93,14,0],[95,17,95,54,0],[96,17,97,74,0],[99,13,99,14,0],[100,13,100,39,0],[102,13,102,32,0],[102,33,102,110,0],[105,13,105,33,0],[107,13,107,39,0],[108,9,108,10,0],[116,9,116,10,0],[117,13,117,31,0],[118,13,118,30,0],[118,31,118,71,0],[120,13,120,53,0],[121,13,121,32,0],[122,13,122,14,0],[123,17,123,112,0],[126,13,126,64,0],[127,13,127,31,0],[128,13,128,14,0],[129,17,129,57,0],[130,17,130,18,0],[131,21,131,46,0],[132,17,132,18,0],[134,17,134,40,0],[135,17,135,18,0],[136,21,136,61,0],[137,21,137,76,0],[138,17,138,18,0],[139,13,139,14,0],[140,9,140,10,0],[148,9,148,10,0],[149,13,149,31,0],[150,13,150,30,0],[150,31,150,71,0],[152,13,152,53,0],[153,13,153,32,0],[154,13,154,14,0],[155,17,155,112,0],[158,13,158,64,0],[159,13,159,31,0],[160,13,160,14,0],[161,17,161,44,0],[162,13,162,14,0],[163,13,163,66,0],[165,13,165,39,0],[166,9,166,10,0],[174,9,174,10,0],[175,13,175,31,0],[176,13,176,57,0],[177,13,177,30,0],[178,13,178,14,0],[179,17,179,29,0],[181,13,181,106,0],[182,9,182,10,0],[190,9,190,10,0],[191,13,191,31,0],[192,13,192,61,0],[193,13,193,30,0],[194,13,194,14,0],[195,17,195,29,0],[198,13,198,89,0],[200,13,200,50,0],[201,9,201,10,0],[209,9,209,10,0],[210,13,210,31,0],[211,13,211,30,0],[211,31,211,71,0],[212,13,212,51,0],[212,52,212,100,0],[214,13,214,46,0],[216,13,216,39,0],[217,9,217,10,0],[225,9,225,10,0],[226,13,226,31,0],[227,13,227,30,0],[227,31,227,71,0],[229,13,229,55,0],[230,9,230,10,0],[238,9,238,10,0],[239,13,239,31,0],[240,13,240,30,0],[240,31,240,71,0],[242,13,242,85,0],[243,9,243,10,0],[251,9,251,10,0],[252,13,252,31,0],[253,13,253,30,0],[253,31,253,71,0],[254,13,254,44,0],[254,45,254,86,0],[256,13,256,32,0],[258,13,258,39,0],[259,9,259,10,0],[267,9,267,10,0],[268,13,268,31,0],[269,13,269,30,0],[269,31,269,71,0],[271,13,271,48,0],[272,9,272,10,0],[280,9,280,10,0],[281,13,281,31,0],[282,13,282,49,0],[291,9,291,10,0],[292,13,292,31,0],[293,13,293,49,0],[302,9,302,10,0],[303,13,303,31,0],[304,13,304,55,0],[305,13,307,60,0],[309,13,309,66,0],[310,9,310,10,0],[318,9,318,10,0],[319,13,319,31,0],[320,13,320,30,0],[320,31,320,71,0],[321,13,321,31,0],[321,32,321,73,0],[323,13,323,38,0],[324,13,324,99,0],[325,13,325,38,0],[326,13,326,35,0],[328,13,328,39,0],[329,9,329,10,0],[337,9,337,10,0],[338,13,338,31,0],[339,13,339,30,0],[339,31,339,71,0],[340,13,340,31,0],[340,32,340,73,0],[342,13,342,48,0],[343,13,343,41,0],[344,13,344,63,0],[344,63,344,114,0],[344,114,344,117,0],[344,13,344,117,0],[345,13,345,35,0],[346,17,346,47,0],[348,13,348,39,0],[349,9,349,10,0],[357,9,357,10,0],[358,13,358,31,0],[359,13,359,30,0],[359,31,359,71,0],[360,13,361,41,0],[361,41,361,90,0],[361,90,361,102,0],[360,13,361,102,0],[362,9,362,10,0],[369,9,369,10,0],[370,13,370,31,0],[371,13,371,31,0],[371,32,371,73,0],[374,13,374,70,0],[375,13,375,30,0],[376,13,376,14,0],[378,17,379,36,0],[379,36,379,70,0],[379,70,381,39,0],[381,39,381,51,0],[381,51,382,42,0],[382,42,382,82,0],[382,82,382,101,0],[378,17,382,101,0],[384,17,384,70,0],[387,13,387,66,0],[388,9,388,10,0],[397,9,397,10,0],[398,13,398,31,0],[399,13,399,30,0],[399,31,399,71,0],[401,13,401,66,0],[401,67,401,93,0],[403,13,403,53,0],[404,13,404,32,0],[405,13,405,14,0],[406,17,406,112,0],[409,13,409,64,0],[411,13,411,31,0],[412,13,412,14,0],[413,17,413,51,0],[414,13,414,14,0],[416,13,416,39,0],[417,9,417,10,0],[425,9,425,10,0],[426,13,426,31,0],[427,13,427,30,0],[427,31,427,71,0],[429,13,429,75,0],[429,76,429,102,0],[431,13,431,53,0],[432,13,432,32,0],[433,13,433,14,0],[434,17,434,112,0],[437,13,437,64,0],[439,13,439,31,0],[440,13,440,14,0],[441,17,441,54,0],[442,13,442,14,0],[444,13,444,39,0],[445,9,445,10,0],[453,9,453,10,0],[454,13,454,31,0],[455,13,455,30,0],[455,31,455,71,0],[456,13,456,82,0],[457,9,457,10,0],[465,9,465,10,0],[466,13,466,31,0],[467,13,467,30,0],[467,31,467,71,0],[468,13,468,86,0],[469,9,469,10,0],[477,9,477,10,0],[478,13,478,31,0],[479,13,479,30,0],[479,31,479,71,0],[481,13,481,40,0],[482,13,482,39,0],[483,9,483,10,0],[491,9,491,10,0],[492,13,492,31,0],[493,13,493,30,0],[493,31,493,71,0],[496,13,498,39,0],[499,9,499,10,0],[502,9,502,10,0],[503,13,503,30,0],[504,13,504,14,0],[505,17,506,29,0],[506,29,506,66,0],[506,66,506,69,0],[505,17,506,69,0],[507,13,507,14,0],[508,13,508,25,0],[509,9,509,10,0],[517,9,517,10,0],[518,13,518,43,0],[519,13,519,39,0],[520,9,520,10,0],[528,9,528,10,0],[529,13,529,43,0],[530,9,530,10,0],[543,9,543,10,0],[544,13,544,30,0],[544,31,544,71,0],[546,13,548,60,0],[549,9,549,10,0],[557,9,557,10,0],[558,13,558,30,0],[558,31,558,71,0],[559,13,559,61,0],[560,13,560,39,0],[561,9,561,10,0],[569,9,569,10,0],[570,13,570,30,0],[570,31,570,71,0],[571,13,571,38,0],[572,13,572,60,0],[573,9,573,10,0],[581,9,581,10,0],[582,13,582,30,0],[582,31,582,71,0],[583,13,583,40,0],[584,13,584,39,0],[585,9,585,10,0],[594,9,594,10,0],[595,13,595,30,0],[595,31,595,71,0],[596,13,596,60,0],[597,9,597,10,0],[605,9,605,10,0],[606,13,606,30,0],[606,31,606,71,0],[607,13,607,57,0],[608,9,608,10,0],[616,9,616,10,0],[617,13,617,30,0],[617,31,617,71,0],[618,13,618,43,0],[619,13,619,39,0],[620,9,620,10,0],[624,9,624,10,0],[625,13,625,41,0],[628,13,629,138,0],[630,13,630,14,0],[631,17,631,40,0],[632,17,632,88,0],[633,13,633,14,0],[634,13,634,99,0],[635,13,635,14,0],[636,17,636,40,0],[637,17,637,47,0],[638,13,638,14,0],[639,13,639,102,0],[640,13,640,14,0],[641,17,641,40,0],[642,17,642,49,0],[643,13,643,14,0],[644,13,644,79,0],[645,13,645,14,0],[646,17,646,40,0],[647,17,647,78,0],[648,13,648,14,0],[649,13,649,62,0],[650,13,650,14,0],[651,17,651,40,0],[652,17,652,61,0],[654,17,654,38,0],[655,17,655,18,0],[657,21,657,57,0],[658,17,658,18,0],[660,13,660,14,0],[661,13,661,111,0],[662,13,662,14,0],[663,17,663,40,0],[664,17,664,55,0],[665,13,665,14,0],[666,13,666,127,0],[667,13,667,14,0],[668,17,668,40,0],[669,17,669,67,0],[670,13,670,14,0],[672,13,672,109,0],[673,13,673,14,0],[674,17,674,40,0],[675,17,675,54,0],[676,13,676,14,0],[677,13,677,64,0],[678,13,678,14,0],[679,17,679,40,0],[680,17,680,63,0],[681,13,681,14,0],[682,13,682,68,0],[683,13,683,14,0],[684,17,684,40,0],[685,17,685,67,0],[686,13,686,14,0],[687,13,687,66,0],[688,13,688,14,0],[689,17,689,40,0],[690,17,690,65,0],[691,13,691,14,0],[693,13,694,92,0],[695,13,695,14,0],[696,17,696,40,0],[697,17,697,24,0],[697,26,697,44,0],[697,45,697,47,0],[697,48,697,68,0],[698,17,698,18,0],[699,21,699,63,0],[700,17,700,18,0],[701,17,701,24,0],[701,26,701,48,0],[701,49,701,51,0],[701,52,701,80,0],[702,17,702,18,0],[703,21,703,64,0],[704,17,704,18,0],[705,13,705,14,0],[707,13,707,36,0],[708,9,708,10,0],[712,9,712,10,0],[713,13,713,27,0],[714,17,714,67,0],[715,9,715,10,0]]);
+    </script>
+  </body>
+</html>

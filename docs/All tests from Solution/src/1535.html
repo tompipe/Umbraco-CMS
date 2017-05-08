@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\ServerRegistrationService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Web;
+using Umbraco.Core.Events;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Sync;
+
+namespace Umbraco.Core.Services
+{
+    /// &lt;summary&gt;
+    /// Manages server registrations in the database.
+    /// &lt;/summary&gt;
+    public sealed class ServerRegistrationService : RepositoryService, IServerRegistrationService
+    {
+        private readonly static string CurrentServerIdentityValue = NetworkHelper.MachineName // eg DOMAIN\SERVER
+                                                            + &quot;/&quot; + HttpRuntime.AppDomainAppId; // eg /LM/S3SVC/11/ROOT
+
+        private static readonly int[] LockingRepositoryIds = { Constants.System.ServersLock };
+        private ServerRole _currentServerRole = ServerRole.Unknown;
+        private readonly LockingRepository&lt;IServerRegistrationRepository&gt; _lrepo;
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;ServerRegistrationService&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uowProvider&quot;&gt;A UnitOfWork provider.&lt;/param&gt;
+        /// &lt;param name=&quot;repositoryFactory&quot;&gt;A repository factory.&lt;/param&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;A logger.&lt;/param&gt;
+        /// &lt;param name=&quot;eventMessagesFactory&quot;&gt;&lt;/param&gt;
+        public ServerRegistrationService(IDatabaseUnitOfWorkProvider uowProvider, RepositoryFactory repositoryFactory, ILogger logger, IEventMessagesFactory eventMessagesFactory)
+            : base(uowProvider, repositoryFactory, logger, eventMessagesFactory)
+        {
+            _lrepo = new LockingRepository&lt;IServerRegistrationRepository&gt;(UowProvider,
+                x =&gt; RepositoryFactory.CreateServerRegistrationRepository(x),
+                LockingRepositoryIds, LockingRepositoryIds);
+        }
+
+        /// &lt;summary&gt;
+        /// Touches a server to mark it as active; deactivate stale servers.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;serverAddress&quot;&gt;The server url.&lt;/param&gt;
+        /// &lt;param name=&quot;serverIdentity&quot;&gt;The server unique identity.&lt;/param&gt;
+        /// &lt;param name=&quot;staleTimeout&quot;&gt;The time after which a server is considered stale.&lt;/param&gt;
+        public void TouchServer(string serverAddress, string serverIdentity, TimeSpan staleTimeout)
+        {
+            _lrepo.WithWriteLocked(xr =&gt;
+            {
+                ((ServerRegistrationRepository) xr.Repository).ReloadCache(); // ensure we have up-to-date cache
+
+                var regs = xr.Repository.GetAll().ToArray();
+                var hasMaster = regs.Any(x =&gt; ((ServerRegistration)x).IsMaster);
+                var server = regs.FirstOrDefault(x =&gt; x.ServerIdentity.InvariantEquals(serverIdentity));
+
+                if (server == null)
+                {
+                    server = new ServerRegistration(serverAddress, serverIdentity, DateTime.Now);
+                }
+                else
+                {
+                    server.ServerAddress = serverAddress; // should not really change but it might!
+                    server.UpdateDate = DateTime.Now;
+                }
+
+                server.IsActive = true;
+                if (hasMaster == false)
+                    server.IsMaster = true;
+
+                xr.Repository.AddOrUpdate(server);
+                xr.UnitOfWork.Commit(); // triggers a cache reload
+                xr.Repository.DeactiveStaleServers(staleTimeout); // triggers a cache reload
+
+                // reload - cheap, cached
+                regs = xr.Repository.GetAll().ToArray();
+
+                // default role is single server, but if registrations contain more
+                // than one active server, then role is master or slave
+                _currentServerRole = regs.Count(x =&gt; x.IsActive) &gt; 1
+                    ? (server.IsMaster ? ServerRole.Master : ServerRole.Slave)
+                    : ServerRole.Single;
+            });
+        }
+
+        /// &lt;summary&gt;
+        /// Deactivates a server.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;serverIdentity&quot;&gt;The server unique identity.&lt;/param&gt;
+        public void DeactiveServer(string serverIdentity)
+        {
+            //_lrepo.WithWriteLocked(xr =&gt;
+            //{
+            //    var query = Query&lt;IServerRegistration&gt;.Builder.Where(x =&gt; x.ServerIdentity.ToUpper() == serverIdentity.ToUpper());
+            //    var server = xr.Repository.GetByQuery(query).FirstOrDefault();
+            //    if (server == null) return;
+
+            //    server.IsActive = false;
+            //    server.IsMaster = false;
+            //    xr.Repository.AddOrUpdate(server);
+            //});
+
+            // because the repository caches &quot;all&quot; and has queries disabled...
+
+            _lrepo.WithWriteLocked(xr =&gt;
+            {
+                ((ServerRegistrationRepository)xr.Repository).ReloadCache(); // ensure we have up-to-date cache
+
+                var server = xr.Repository.GetAll().FirstOrDefault(x =&gt; x.ServerIdentity.InvariantEquals(serverIdentity));
+                if (server == null) return;
+                server.IsActive = server.IsMaster = false;
+                xr.Repository.AddOrUpdate(server); // will trigger a cache reload
+            });
+        }
+
+        /// &lt;summary&gt;
+        /// Deactivates stale servers.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;staleTimeout&quot;&gt;The time after which a server is considered stale.&lt;/param&gt;
+        public void DeactiveStaleServers(TimeSpan staleTimeout)
+        {
+            _lrepo.WithWriteLocked(xr =&gt; xr.Repository.DeactiveStaleServers(staleTimeout));
+        }
+
+        /// &lt;summary&gt;
+        /// Return all active servers.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IServerRegistration&gt; GetActiveServers()
+        {
+            //return _lrepo.WithReadLocked(xr =&gt;
+            //{
+            //    var query = Query&lt;IServerRegistration&gt;.Builder.Where(x =&gt; x.IsActive);
+            //    return xr.Repository.GetByQuery(query).ToArray();
+            //});
+
+            // because the repository caches &quot;all&quot; we should use the following code
+            // in order to ensure we use the cache and not hit the database each time
+
+            //return _lrepo.WithReadLocked(xr =&gt; xr.Repository.GetAll().Where(x =&gt; x.IsActive).ToArray());
+
+            // however, WithReadLocked (as any other LockingRepository methods) will attempt
+            // to properly lock the repository using a database-level lock, which wants
+            // the transaction isolation level to be RepeatableRead, which it is not by default,
+            // and then, see U4-7046.
+            //
+            // in addition, LockingRepository methods need to hit the database in order to
+            // ensure proper locking, and so if we know that the repository might not need the
+            // database, we cannot use these methods - and then what?
+            //
+            // this raises a good number of questions, including whether caching anything in
+            // repositories works at all in a LB environment - TODO: figure it out
+
+            var uow = UowProvider.GetUnitOfWork();
+            var repo = RepositoryFactory.CreateServerRegistrationRepository(uow);
+            return repo.GetAll().Where(x =&gt; x.IsActive).ToArray(); // fast, cached
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the local server identity.
+        /// &lt;/summary&gt;
+        public string CurrentServerIdentity { get { return CurrentServerIdentityValue; } }
+
+        /// &lt;summary&gt;
+        /// Gets the role of the current server.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;The role of the current server.&lt;/returns&gt;
+        public ServerRole GetCurrentServerRole()
+        {
+            return _currentServerRole;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[20,9,21,96,0],[23,9,23,95,0],[24,9,24,68,0],[35,15,35,81,0],[36,9,36,10,0],[37,13,38,22,0],[38,22,38,77,0],[38,77,39,61,0],[37,13,39,61,0],[40,9,40,10,0],[49,9,49,10,0],[50,13,51,13,0],[51,13,51,14,0],[51,14,52,17,0],[52,17,52,78,0],[52,78,54,17,0],[54,17,54,61,0],[54,61,55,17,0],[55,17,55,47,0],[55,47,55,79,0],[55,79,55,81,0],[55,17,55,81,0],[55,81,56,17,0],[56,17,56,55,0],[56,55,56,103,0],[56,103,56,105,0],[56,17,56,105,0],[56,105,58,17,0],[58,17,58,36,0],[58,36,59,17,0],[59,17,59,18,0],[59,18,60,21,0],[60,21,60,98,0],[60,98,61,17,0],[61,17,61,18,0],[61,18,63,17,0],[63,17,63,18,0],[63,18,64,21,0],[64,21,64,58,0],[64,58,65,21,0],[65,21,65,54,0],[65,54,66,17,0],[66,17,66,18,0],[66,18,68,17,0],[68,17,68,40,0],[68,40,69,17,0],[69,17,69,40,0],[69,40,70,21,0],[70,21,70,44,0],[70,44,72,17,0],[72,17,72,51,0],[72,51,73,17,0],[73,17,73,40,0],[73,40,74,17,0],[74,17,74,66,0],[74,66,77,17,0],[77,17,77,57,0],[77,57,81,17,0],[81,17,81,54,0],[81,54,81,64,0],[81,64,83,41,0],[81,17,83,41,0],[83,41,84,13,0],[84,13,84,14,0],[84,14,84,16,0],[50,13,84,16,0],[85,9,85,10,0],[92,9,92,10,0],[106,13,107,13,0],[107,13,107,14,0],[107,14,108,17,0],[108,17,108,77,0],[108,77,110,17,0],[110,17,110,73,0],[110,73,110,121,0],[110,121,110,123,0],[110,17,110,123,0],[110,123,111,17,0],[111,17,111,36,0],[111,36,111,37,0],[111,37,111,44,0],[111,44,112,17,0],[112,17,112,59,0],[112,59,113,17,0],[113,17,113,51,0],[113,51,114,13,0],[114,13,114,14,0],[114,14,114,16,0],[106,13,114,16,0],[115,9,115,10,0],[122,9,122,10,0],[123,13,123,42,0],[123,42,123,90,0],[123,90,123,92,0],[123,13,123,92,0],[124,9,124,10,0],[131,9,131,10,0],[155,13,155,51,0],[156,13,156,82,0],[157,13,157,45,0],[157,45,157,55,0],[157,55,157,67,0],[157,13,157,67,0],[158,9,158,10,0],[163,51,163,52,0],[163,53,163,87,0],[163,88,163,89,0],[170,9,170,10,0],[171,13,171,39,0],[172,9,172,10,0]]);
+    </script>
+  </body>
+</html>

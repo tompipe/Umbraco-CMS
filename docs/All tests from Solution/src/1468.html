@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\ObjectResolution\ApplicationEventsResolver.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using Umbraco.Core.Logging;
+using umbraco.interfaces;
+
+namespace Umbraco.Core.ObjectResolution
+{
+    /// &lt;summary&gt;
+	/// A resolver to return all IApplicationEvents objects
+	/// &lt;/summary&gt;
+	/// &lt;remarks&gt;
+	/// &lt;para&gt;This is disposable because after the app has started it should be disposed to release any memory being occupied by instances.&lt;/para&gt;
+	/// &lt;para&gt;Ordering handlers: handlers are ordered by (ascending) weight. By default, handlers from the Umbraco.* or Concorde.*
+	/// assemblies have a -100 weight whereas any other handler has a weight of +100. A custom weight can be assigned to a handler
+	/// by marking the class with the WeightAttribute. For example, the CacheRefresherEventHandler is marked with [Weight(int.MinValue)]
+	/// because its events need to run before anything else. Positive weights are considered &quot;user-space&quot; while negative weights are
+	/// &quot;core&quot;. Finally, users can register a filter to process the list (after it has been ordered) and re-order it, or remove handlers.&lt;/para&gt;
+	/// &lt;para&gt;BEWARE! handlers order is an important thing, and removing handlers or reordering handlers can have unexpected consequences.&lt;/para&gt;
+	/// &lt;/remarks&gt;
+    public sealed class ApplicationEventsResolver : ManyObjectsResolverBase&lt;ApplicationEventsResolver, IApplicationEventHandler&gt;, IDisposable
+	{
+	    private readonly LegacyStartupHandlerResolver _legacyResolver;
+
+	    /// &lt;summary&gt;
+	    /// Constructor
+	    /// &lt;/summary&gt;
+	    /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;applicationEventHandlers&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;serviceProvider&quot;&gt;&lt;/param&gt;
+	    internal ApplicationEventsResolver(IServiceProvider serviceProvider, ILogger logger, IEnumerable&lt;Type&gt; applicationEventHandlers)
+            : base(serviceProvider, logger, applicationEventHandlers)
+	    {
+            //create the legacy resolver and only include the legacy types
+            _legacyResolver = new LegacyStartupHandlerResolver(
+                serviceProvider, logger,
+	            applicationEventHandlers.Where(x =&gt; TypeHelper.IsTypeAssignableFrom&lt;IApplicationEventHandler&gt;(x) == false));
+		}
+
+        /// &lt;summary&gt;
+        /// Override in order to only return types of IApplicationEventHandler and above,
+        /// do not include the legacy types of IApplicationStartupHandler
+        /// &lt;/summary&gt;
+        protected override IEnumerable&lt;Type&gt; InstanceTypes
+        {
+            get { return base.InstanceTypes.Where(TypeHelper.IsTypeAssignableFrom&lt;IApplicationEventHandler&gt;); }
+        }
+
+	    private List&lt;IApplicationEventHandler&gt; _orderedAndFiltered;
+
+        /// &lt;summary&gt;
+        /// Gets the &lt;see cref=&quot;IApplicationEventHandler&quot;/&gt; implementations.
+        /// &lt;/summary&gt;
+        public IEnumerable&lt;IApplicationEventHandler&gt; ApplicationEventHandlers
+		{
+	        get
+	        {
+	            if (_orderedAndFiltered == null)
+	            {
+                    _orderedAndFiltered = GetSortedValues().ToList();
+                    if (FilterCollection != null)
+                        FilterCollection(_orderedAndFiltered);
+                }
+	            return _orderedAndFiltered;
+	        }
+		}
+
+        /// &lt;summary&gt;
+        /// Gets or sets a delegate to filter the event handler list (EXPERT!).
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// &lt;para&gt;This can be set on startup in the pre-boot process in either a custom boot manager or global.asax (UmbracoApplication).&lt;/para&gt;
+        /// &lt;para&gt;Allows custom logic to execute in order to filter and/or re-order the event handlers prior to executing.&lt;/para&gt;
+        /// &lt;para&gt;To be used by custom boot sequences where the boot loader needs to remove some handlers, or raise their priority.&lt;/para&gt;
+        /// &lt;para&gt;Filtering the event handler collection can have ugly consequences. Use with care.&lt;/para&gt;
+        /// &lt;/remarks&gt;
+        public Action&lt;IList&lt;IApplicationEventHandler&gt;&gt; FilterCollection
+	    {
+	        get { return _filterCollection; }
+	        set
+	        {
+                if (_orderedAndFiltered != null)
+                    throw new InvalidOperationException(&quot;Cannot set the FilterCollection delegate once the ApplicationEventHandlers are resolved&quot;);
+                if (_filterCollection != null)
+                    throw new InvalidOperationException(&quot;Cannot set the FilterCollection delegate once it&#39;s already been specified&quot;);
+
+                _filterCollection = value;
+	        }
+	    }
+
+	    protected override int GetObjectWeight(object o)
+	    {
+            var type = o.GetType();
+            var attr = type.GetCustomAttribute&lt;WeightAttribute&gt;(true);
+            if (attr != null) return attr.Weight;
+            var name = type.Assembly.FullName;
+
+            // we should really attribute all our Core handlers, so this is temp
+            var core = name.InvariantStartsWith(&quot;Umbraco.&quot;) || name.InvariantStartsWith(&quot;Concorde.&quot;);
+            return core ? -DefaultPluginWeight : DefaultPluginWeight;
+        }
+
+        /// &lt;summary&gt;
+        /// Create instances of all of the legacy startup handlers
+        /// &lt;/summary&gt;
+	    public void InstantiateLegacyStartupHandlers()
+	    {
+            //this will instantiate them all
+	        var handlers = _legacyResolver.LegacyStartupHandlers;
+	    }
+
+		protected override bool SupportsClear
+		{
+            get { return false; }
+		}
+
+		protected override bool SupportsInsert
+		{
+			get { return false; }
+		}
+
+	    private class LegacyStartupHandlerResolver : ManyObjectsResolverBase&lt;ApplicationEventsResolver, IApplicationStartupHandler&gt;, IDisposable
+	    {
+	        internal LegacyStartupHandlerResolver(IServiceProvider serviceProvider, ILogger logger, IEnumerable&lt;Type&gt; legacyStartupHandlers)
+                : base(serviceProvider, logger, legacyStartupHandlers)
+	        {
+
+	        }
+
+            public IEnumerable&lt;IApplicationStartupHandler&gt; LegacyStartupHandlers
+            {
+                get { return Values; }
+            }
+
+	        public void Dispose()
+	        {
+                ResetCollections();
+	        }
+	    }
+
+	    private bool _disposed;
+		private readonly ReaderWriterLockSlim _disposalLocker = new ReaderWriterLockSlim();
+	    private Action&lt;IList&lt;IApplicationEventHandler&gt;&gt; _filterCollection;
+
+	    /// &lt;summary&gt;
+		/// Gets a value indicating whether this instance is disposed.
+		/// &lt;/summary&gt;
+		/// &lt;value&gt;
+		/// 	&lt;c&gt;true&lt;/c&gt; if this instance is disposed; otherwise, &lt;c&gt;false&lt;/c&gt;.
+		/// &lt;/value&gt;
+		public bool IsDisposed
+		{
+			get { return _disposed; }
+		}
+
+		/// &lt;summary&gt;
+		/// Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
+		/// &lt;/summary&gt;
+		/// &lt;filterpriority&gt;2&lt;/filterpriority&gt;
+		public void Dispose()
+		{
+			Dispose(true);
+
+			// Use SupressFinalize in case a subclass of this type implements a finalizer.
+			GC.SuppressFinalize(this);
+		}
+
+        ~ApplicationEventsResolver()
+		{
+			// Run dispose but let the class know it was due to the finalizer running.
+			Dispose(false);
+		}
+
+		private void Dispose(bool disposing)
+		{
+			// Only operate if we haven&#39;t already disposed
+			if (IsDisposed || disposing == false) return;
+
+			using (new WriteLock(_disposalLocker))
+			{
+				// Check again now we&#39;re inside the lock
+				if (IsDisposed) return;
+
+				// Call to actually release resources. This method is only
+				// kept separate so that the entire disposal logic can be used as a VS snippet
+				DisposeResources();
+
+				// Indicate that the instance has been disposed.
+				_disposed = true;
+			}
+		}
+
+	    /// &lt;summary&gt;
+	    /// Clear out all of the instances, we don&#39;t want them hanging around and cluttering up memory
+	    /// &lt;/summary&gt;
+	    private void DisposeResources()
+	    {
+            _legacyResolver.Dispose();
+            ResetCollections();
+            _orderedAndFiltered.Clear();
+	        _orderedAndFiltered = null;
+	    }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[33,15,33,70,1],[34,6,34,7,1],[36,13,38,50,1],[38,50,38,119,1],[38,119,38,122,1],[36,13,38,122,1],[39,3,39,4,1],[47,17,47,18,1],[47,19,47,110,1],[47,111,47,112,1],[58,10,58,11,1],[59,14,59,46,1],[60,14,60,15,1],[61,21,61,70,1],[62,21,62,50,1],[63,25,63,63,0],[64,17,64,18,1],[65,14,65,41,1],[66,10,66,11,1],[80,14,80,15,1],[80,16,80,41,1],[80,42,80,43,1],[82,10,82,11,0],[83,17,83,49,0],[84,21,84,148,0],[85,17,85,47,0],[86,21,86,134,0],[88,17,88,43,0],[89,10,89,11,0],[93,6,93,7,0],[94,13,94,36,0],[95,13,95,71,0],[96,13,96,30,0],[96,31,96,50,0],[97,13,97,47,0],[100,13,100,102,0],[101,13,101,70,0],[102,9,102,10,0],[108,6,108,7,1],[110,10,110,63,1],[111,6,111,7,1],[115,17,115,18,0],[115,19,115,32,0],[115,33,115,34,0],[120,8,120,9,0],[120,10,120,23,0],[120,24,120,25,0],[126,19,126,71,1],[127,10,127,11,1],[129,10,129,11,1],[133,21,133,22,1],[133,23,133,37,1],[133,38,133,39,1],[137,10,137,11,1],[138,17,138,36,1],[139,10,139,11,1],[143,3,143,86,1],[154,8,154,9,1],[154,10,154,27,1],[154,28,154,29,1],[162,3,162,4,1],[163,4,163,18,1],[166,4,166,30,1],[167,3,167,4,1],[170,3,170,4,0],[170,3,170,4,0],[172,4,172,19,0],[173,3,173,4,0],[173,3,173,4,0],[176,3,176,4,1],[178,4,178,41,1],[178,42,178,49,0],[180,4,180,42,1],[181,4,181,5,1],[183,5,183,20,1],[183,21,183,28,0],[187,5,187,24,1],[190,5,190,22,1],[191,4,191,5,1],[192,3,192,4,1],[198,6,198,7,1],[199,13,199,39,1],[200,13,200,32,1],[201,13,201,41,1],[202,10,202,37,1],[203,6,203,7,1]]);
+    </script>
+  </body>
+</html>

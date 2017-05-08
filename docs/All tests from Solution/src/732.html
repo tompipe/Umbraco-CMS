@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\UmbracoModule.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Security.Principal;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web;
+using System.Web.Mvc;
+using System.Web.Routing;
+using Newtonsoft.Json;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Security;
+using Umbraco.Web.Editors;
+using Umbraco.Web.Routing;
+using Umbraco.Web.Security;
+using umbraco;
+using Umbraco.Core.Sync;
+using GlobalSettings = Umbraco.Core.Configuration.GlobalSettings;
+using ObjectExtensions = Umbraco.Core.ObjectExtensions;
+using RenderingEngine = Umbraco.Core.RenderingEngine;
+
+namespace Umbraco.Web
+{
+	// also look at IOHelper.ResolveUrlsFromTextString - nightmarish?!
+
+	// context.RewritePath supports ~/ or else must begin with /vdir
+	//  Request.RawUrl is still there
+	// response.Redirect does?! always remap to /vdir?!
+
+	public class UmbracoModule : IHttpModule
+	{
+		#region HttpModule event handlers
+
+		/// &lt;summary&gt;
+		/// Begins to process a request.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+        static void BeginRequest(HttpContextBase httpContext)
+		{
+            // ensure application url is initialized
+            ApplicationUrlHelper.EnsureApplicationUrl(ApplicationContext.Current, httpContext.Request);
+
+            // do not process if client-side request
+			if (httpContext.Request.Url.IsClientSideRequest())
+				return;
+
+			//write the trace output for diagnostics at the end of the request
+			httpContext.Trace.Write(&quot;UmbracoModule&quot;, &quot;Umbraco request begins&quot;);
+
+            // ok, process
+
+            // create the LegacyRequestInitializer
+            // and initialize legacy stuff
+            var legacyRequestInitializer = new LegacyRequestInitializer(httpContext.Request.Url, httpContext);
+            legacyRequestInitializer.InitializeRequest();
+
+            // create the UmbracoContext singleton, one per request, and assign
+            // NOTE: we assign &#39;true&#39; to ensure the context is replaced if it is already set (i.e. during app startup)
+            UmbracoContext.EnsureContext(
+                httpContext,
+                ApplicationContext.Current,
+                new WebSecurity(httpContext, ApplicationContext.Current),
+                true);
+		}
+
+		/// &lt;summary&gt;
+		/// Processses the Umbraco Request
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+		/// &lt;remarks&gt;
+		///
+		/// This will check if we are trying to route to the default back office page (i.e. ~/Umbraco/ or ~/Umbraco or ~/Umbraco/Default )
+		/// and ensure that the MVC handler executes for that. This is required because the route for /Umbraco will never execute because
+        /// files/folders exist there and we cannot set the RouteCollection.RouteExistingFiles = true since that will muck a lot of other things up.
+        /// So we handle it here and explicitly execute the MVC controller.
+		///
+		/// &lt;/remarks&gt;
+		void ProcessRequest(HttpContextBase httpContext)
+		{
+			// do not process if client-side request
+			if (httpContext.Request.Url.IsClientSideRequest())
+				return;
+
+			if (UmbracoContext.Current == null)
+				throw new InvalidOperationException(&quot;The UmbracoContext.Current is null, ProcessRequest cannot proceed unless there is a current UmbracoContext&quot;);
+			if (UmbracoContext.Current.RoutingContext == null)
+				throw new InvalidOperationException(&quot;The UmbracoContext.RoutingContext has not been assigned, ProcessRequest cannot proceed unless there is a RoutingContext assigned to the UmbracoContext&quot;);
+
+			var umbracoContext = UmbracoContext.Current;
+
+            //re-write for the default back office path
+            if (httpContext.Request.Url.IsDefaultBackOfficeRequest())
+            {
+                if (EnsureIsConfigured(httpContext, umbracoContext.OriginalRequestUrl))
+                {
+                    RewriteToBackOfficeHandler(httpContext);
+                }
+                return;
+            }
+
+			// do not process but remap to handler if it is a base rest request
+			if (BaseRest.BaseRestHandler.IsBaseRestRequest(umbracoContext.OriginalRequestUrl))
+			{
+				httpContext.RemapHandler(new BaseRest.BaseRestHandler());
+				return;
+			}
+
+			// do not process if this request is not a front-end routable page
+		    var isRoutableAttempt = EnsureUmbracoRoutablePage(umbracoContext, httpContext);
+            //raise event here
+            OnRouteAttempt(new RoutableAttemptEventArgs(isRoutableAttempt.Result, umbracoContext, httpContext));
+            if (!isRoutableAttempt.Success)
+			{
+                return;
+			}
+
+
+			httpContext.Trace.Write(&quot;UmbracoModule&quot;, &quot;Umbraco request confirmed&quot;);
+
+			// ok, process
+
+			// note: requestModule.UmbracoRewrite also did some stripping of &amp;umbPage
+			// from the querystring... that was in v3.x to fix some issues with pre-forms
+			// auth. Paul Sterling confirmed in jan. 2013 that we can get rid of it.
+
+			// instanciate, prepare and process the published content request
+			// important to use CleanedUmbracoUrl - lowercase path-only version of the current url
+			var pcr = new PublishedContentRequest(umbracoContext.CleanedUmbracoUrl, umbracoContext.RoutingContext);
+			umbracoContext.PublishedContentRequest = pcr;
+			pcr.Prepare();
+
+            // HandleHttpResponseStatus returns a value indicating that the request should
+            // not be processed any further, eg because it has been redirect. then, exit.
+            if (HandleHttpResponseStatus(httpContext, pcr))
+		        return;
+
+            if (!pcr.HasPublishedContent)
+				httpContext.RemapHandler(new PublishedContentNotFoundHandler());
+			else
+				RewriteToUmbracoHandler(httpContext, pcr);
+		}
+
+		#endregion
+
+		#region Methods
+
+		/// &lt;summary&gt;
+		/// Checks the current request and ensures that it is routable based on the structure of the request and URI
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;context&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+        internal Attempt&lt;EnsureRoutableOutcome&gt; EnsureUmbracoRoutablePage(UmbracoContext context, HttpContextBase httpContext)
+		{
+			var uri = context.OriginalRequestUrl;
+
+		    var reason = EnsureRoutableOutcome.IsRoutable;
+
+			// ensure this is a document request
+			if (!EnsureDocumentRequest(httpContext, uri))
+			{
+			    reason = EnsureRoutableOutcome.NotDocumentRequest;
+			}
+			// ensure Umbraco is ready to serve documents
+			else if (!EnsureIsReady(httpContext, uri))
+			{
+			    reason = EnsureRoutableOutcome.NotReady;
+			}
+			// ensure Umbraco is properly configured to serve documents
+			else if (!EnsureIsConfigured(httpContext, uri))
+            {
+                reason = EnsureRoutableOutcome.NotConfigured;
+            }
+            // ensure Umbraco has documents to serve
+            else if (!EnsureHasContent(context, httpContext))
+            {
+                reason = EnsureRoutableOutcome.NoContent;
+            }
+
+            return Attempt.If(reason == EnsureRoutableOutcome.IsRoutable, reason);
+		}
+
+		/// &lt;summary&gt;
+		/// Ensures that the request is a document request (i.e. one that the module should handle)
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;uri&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		bool EnsureDocumentRequest(HttpContextBase httpContext, Uri uri)
+		{
+			var maybeDoc = true;
+			var lpath = uri.AbsolutePath.ToLowerInvariant();
+
+			// handle directory-urls used for asmx
+			// legacy - what&#39;s the point really?
+			if (/*maybeDoc &amp;&amp;*/ GlobalSettings.UseDirectoryUrls)
+			{
+				int asmxPos = lpath.IndexOf(&quot;.asmx/&quot;, StringComparison.OrdinalIgnoreCase);
+				if (asmxPos &gt;= 0)
+				{
+					// use uri.AbsolutePath, not path, &#39;cos path has been lowercased
+					httpContext.RewritePath(uri.AbsolutePath.Substring(0, asmxPos + 5), // filePath
+						uri.AbsolutePath.Substring(asmxPos + 5), // pathInfo
+						uri.Query.TrimStart(&#39;?&#39;));
+					maybeDoc = false;
+				}
+			}
+
+			// a document request should be
+			// /foo/bar/nil
+			// /foo/bar/nil/
+			// /foo/bar/nil.aspx
+			// where /foo is not a reserved path
+
+			// if the path contains an extension that is not .aspx
+			// then it cannot be a document request
+		    var extension = Path.GetExtension(lpath);
+            if (maybeDoc &amp;&amp; extension.IsNullOrWhiteSpace() == false &amp;&amp; extension != &quot;.aspx&quot;)
+				maybeDoc = false;
+
+			// at that point, either we have no extension, or it is .aspx
+
+			// if the path is reserved then it cannot be a document request
+            if (maybeDoc &amp;&amp; GlobalSettings.IsReservedPathOrUrl(lpath, httpContext, _combinedRouteCollection.Value))
+				maybeDoc = false;
+
+			//NOTE: No need to warn, plus if we do we should log the document, as this message doesn&#39;t really tell us anything :)
+			//if (!maybeDoc)
+			//{
+			//	LogHelper.Warn&lt;UmbracoModule&gt;(&quot;Not a document&quot;);
+			//}
+
+			return maybeDoc;
+		}
+
+		// ensures Umbraco is ready to handle requests
+		// if not, set status to 503 and transfer request, and return false
+		// if yes, return true
+	    static bool EnsureIsReady(HttpContextBase httpContext, Uri uri)
+		{
+			var ready = ApplicationContext.Current.IsReady;
+
+			// ensure we are ready
+			if (!ready)
+			{
+				LogHelper.Warn&lt;UmbracoModule&gt;(&quot;Umbraco is not ready&quot;);
+
+                if (UmbracoConfig.For.UmbracoSettings().Content.EnableSplashWhileLoading == false)
+				{
+					// let requests pile up and wait for 10s then show the splash anyway
+					ready = ApplicationContext.Current.WaitForReady(10 * 1000);
+				}
+
+				if (!ready)
+				{
+					httpContext.Response.StatusCode = 503;
+
+                    var bootUrl = &quot;~/config/splashes/booting.aspx&quot;;
+
+					httpContext.RewritePath(UriUtility.ToAbsolute(bootUrl) + &quot;?url=&quot; + HttpUtility.UrlEncode(uri.ToString()));
+
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		// ensures Umbraco has at least one published node
+		// if not, rewrites to splash and return false
+		// if yes, return true
+	    private static bool EnsureHasContent(UmbracoContext context, HttpContextBase httpContext)
+		{
+            if (context.ContentCache.HasContent())
+		        return true;
+
+            LogHelper.Warn&lt;UmbracoModule&gt;(&quot;Umbraco has no content&quot;);
+
+			const string noContentUrl = &quot;~/config/splashes/noNodes.aspx&quot;;
+			httpContext.RewritePath(UriUtility.ToAbsolute(noContentUrl));
+
+			return false;
+		}
+
+	    private bool _notConfiguredReported;
+
+		// ensures Umbraco is configured
+		// if not, redirect to install and return false
+		// if yes, return true
+	    private bool EnsureIsConfigured(HttpContextBase httpContext, Uri uri)
+	    {
+	        if (ApplicationContext.Current.IsConfigured)
+	            return true;
+
+	        if (_notConfiguredReported)
+	        {
+                // remember it&#39;s been reported so we don&#39;t flood the log
+                // no thread-safety so there may be a few log entries, doesn&#39;t matter
+                _notConfiguredReported = true;
+                LogHelper.Warn&lt;UmbracoModule&gt;(&quot;Umbraco is not configured&quot;);
+            }
+
+			var installPath = UriUtility.ToAbsolute(SystemDirectories.Install);
+			var installUrl = string.Format(&quot;{0}/?redir=true&amp;url={1}&quot;, installPath, HttpUtility.UrlEncode(uri.ToString()));
+			httpContext.Response.Redirect(installUrl, true);
+			return false;
+		}
+
+        // returns a value indicating whether redirection took place and the request has
+        // been completed - because we don&#39;t want to Response.End() here to terminate
+        // everything properly.
+        internal static bool HandleHttpResponseStatus(HttpContextBase context, PublishedContentRequest pcr)
+        {
+            var end = false;
+            var response = context.Response;
+
+            LogHelper.Debug&lt;UmbracoModule&gt;(&quot;Response status: Redirect={0}, Is404={1}, StatusCode={2}&quot;,
+                () =&gt; pcr.IsRedirect ? (pcr.IsRedirectPermanent ? &quot;permanent&quot; : &quot;redirect&quot;) : &quot;none&quot;,
+                () =&gt; pcr.Is404 ? &quot;true&quot; : &quot;false&quot;, () =&gt; pcr.ResponseStatusCode);
+            
+            if(pcr.Cacheability != default(HttpCacheability))
+                response.Cache.SetCacheability(pcr.Cacheability);
+
+            foreach (var cacheExtension in pcr.CacheExtensions)
+                response.Cache.AppendCacheExtension(cacheExtension);
+
+            foreach (var header in pcr.Headers)
+                response.AppendHeader(header.Key, header.Value);
+
+            if (pcr.IsRedirect)
+            {
+                if (pcr.IsRedirectPermanent)
+                    response.RedirectPermanent(pcr.RedirectUrl, false); // do not end response
+                else
+                    response.Redirect(pcr.RedirectUrl, false); // do not end response
+                end = true;
+            }
+            else if (pcr.Is404)
+            {
+                response.StatusCode = 404;
+                response.TrySkipIisCustomErrors = UmbracoConfig.For.UmbracoSettings().WebRouting.TrySkipIisCustomErrors;
+
+                if (response.TrySkipIisCustomErrors == false)
+                    LogHelper.Warn&lt;UmbracoModule&gt;(&quot;Status code is 404 yet TrySkipIisCustomErrors is false - IIS will take over.&quot;);
+            }
+
+            if (pcr.ResponseStatusCode &gt; 0)
+            {
+                // set status code -- even for redirects
+                response.StatusCode = pcr.ResponseStatusCode;
+                response.StatusDescription = pcr.ResponseStatusDescription;
+            }
+            //if (pcr.IsRedirect)
+            //    response.End(); // end response -- kills the thread and does not return!
+
+            if (pcr.IsRedirect)
+            {
+                response.Flush();
+                // bypass everything and directly execute EndRequest event -- but returns
+                context.ApplicationInstance.CompleteRequest();
+                // though some say that .CompleteRequest() does not properly shutdown the response
+                // and the request will hang until the whole code has run... would need to test?
+                LogHelper.Debug&lt;UmbracoModule&gt;(&quot;Response status: redirecting, complete request now.&quot;);
+            }
+
+            return end;
+        }
+
+        /// &lt;summary&gt;
+        /// Rewrites to the default back office page.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;context&quot;&gt;&lt;/param&gt;
+        private static void RewriteToBackOfficeHandler(HttpContextBase context)
+        {
+            // GlobalSettings.Path has already been through IOHelper.ResolveUrl() so it begins with / and vdir (if any)
+            var rewritePath = GlobalSettings.Path.TrimEnd(new[] { &#39;/&#39; }) + &quot;/Default&quot;;
+            // rewrite the path to the path of the handler (i.e. /umbraco/RenderMvc)
+            context.RewritePath(rewritePath, &quot;&quot;, &quot;&quot;, false);
+
+            //if it is MVC we need to do something special, we are not using TransferRequest as this will
+            //require us to rewrite the path with query strings and then reparse the query strings, this would
+            //also mean that we need to handle IIS 7 vs pre-IIS 7 differently. Instead we are just going to create
+            //an instance of the UrlRoutingModule and call it&#39;s PostResolveRequestCache method. This does:
+            // * Looks up the route based on the new rewritten URL
+            // * Creates the RequestContext with all route parameters and then executes the correct handler that matches the route
+            //we also cannot re-create this functionality because the setter for the HttpContext.Request.RequestContext is internal
+            //so really, this is pretty much the only way without using Server.TransferRequest and if we did that, we&#39;d have to rethink
+            //a bunch of things!
+            var urlRouting = new UrlRoutingModule();
+            urlRouting.PostResolveRequestCache(context);
+        }
+
+        /// &lt;summary&gt;
+		/// Rewrites to the Umbraco handler - we always send the request via our MVC rendering engine, this will deal with
+		/// requests destined for webforms.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;context&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;pcr&quot;&gt; &lt;/param&gt;
+        private static void RewriteToUmbracoHandler(HttpContextBase context, PublishedContentRequest pcr)
+        {
+            // NOTE: we do not want to use TransferRequest even though many docs say it is better with IIS7, turns out this is
+            // not what we need. The purpose of TransferRequest is to ensure that .net processes all of the rules for the newly
+            // rewritten url, but this is not what we want!
+            // read: http://forums.iis.net/t/1146511.aspx
+
+			var query = pcr.Uri.Query.TrimStart(new[] { &#39;?&#39; });
+
+            // GlobalSettings.Path has already been through IOHelper.ResolveUrl() so it begins with / and vdir (if any)
+            var rewritePath = GlobalSettings.Path.TrimEnd(new[] { &#39;/&#39; }) + &quot;/RenderMvc&quot;;
+            // rewrite the path to the path of the handler (i.e. /umbraco/RenderMvc)
+            context.RewritePath(rewritePath, &quot;&quot;, query, false);
+
+            //if it is MVC we need to do something special, we are not using TransferRequest as this will
+            //require us to rewrite the path with query strings and then reparse the query strings, this would
+            //also mean that we need to handle IIS 7 vs pre-IIS 7 differently. Instead we are just going to create
+            //an instance of the UrlRoutingModule and call it&#39;s PostResolveRequestCache method. This does:
+            // * Looks up the route based on the new rewritten URL
+            // * Creates the RequestContext with all route parameters and then executes the correct handler that matches the route
+            //we also cannot re-create this functionality because the setter for the HttpContext.Request.RequestContext is internal
+            //so really, this is pretty much the only way without using Server.TransferRequest and if we did that, we&#39;d have to rethink
+            //a bunch of things!
+            var urlRouting = new UrlRoutingModule();
+            urlRouting.PostResolveRequestCache(context);
+        }
+
+
+	    /// &lt;summary&gt;
+        /// Any object that is in the HttpContext.Items collection that is IDisposable will get disposed on the end of the request
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;http&quot;&gt;&lt;/param&gt;
+        private static void DisposeHttpContextItems(HttpContext http)
+        {
+            // do not process if client-side request
+            if (http.Request.Url.IsClientSideRequest())
+                return;
+
+            //get a list of keys to dispose
+            var keys = new HashSet&lt;object&gt;();
+            foreach (DictionaryEntry i in http.Items)
+            {
+                if (i.Value is IDisposeOnRequestEnd || i.Key is IDisposeOnRequestEnd)
+                {
+                    keys.Add(i.Key);
+                }
+            }
+            //dispose each item and key that was found as disposable.
+            foreach (var k in keys)
+            {
+                try
+                {
+                    http.Items[k].DisposeIfDisposable();
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.Error&lt;UmbracoModule&gt;(&quot;Could not dispose item with key &quot; + k, ex);
+                }
+                try
+                {
+                    k.DisposeIfDisposable();
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.Error&lt;UmbracoModule&gt;(&quot;Could not dispose item key &quot; + k, ex);
+                }
+            }
+        }
+
+		#endregion
+
+		#region IHttpModule
+
+		/// &lt;summary&gt;
+		/// Initialize the module,  this will trigger for each new application
+		/// and there may be more than 1 application per application domain
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+		public void Init(HttpApplication app)
+		{
+			app.BeginRequest += (sender, e) =&gt;
+				{
+					var httpContext = ((HttpApplication)sender).Context;
+				    LogHelper.Debug&lt;UmbracoModule&gt;(&quot;Begin request: {0}.&quot;, () =&gt; httpContext.Request.Url);
+                    BeginRequest(new HttpContextWrapper(httpContext));
+				};
+
+            //disable asp.net headers (security)
+            // This is the correct place to modify headers according to MS:
+            // https://our.umbraco.org/forum/umbraco-7/using-umbraco-7/65241-Heap-error-from-header-manipulation?p=0#comment220889
+		    app.PostReleaseRequestState += (sender, args) =&gt;
+		    {
+                var httpContext = ((HttpApplication)sender).Context;
+                try
+                {
+                    httpContext.Response.Headers.Remove(&quot;Server&quot;);
+                    //this doesn&#39;t normally work since IIS sets it but we&#39;ll keep it here anyways.
+                    httpContext.Response.Headers.Remove(&quot;X-Powered-By&quot;);
+                    httpContext.Response.Headers.Remove(&quot;X-AspNet-Version&quot;);
+                    httpContext.Response.Headers.Remove(&quot;X-AspNetMvc-Version&quot;);
+                }
+                catch (PlatformNotSupportedException ex)
+                {
+                    // can&#39;t remove headers this way on IIS6 or cassini.
+                }
+		    };
+
+            app.PostResolveRequestCache += (sender, e) =&gt;
+				{
+					var httpContext = ((HttpApplication)sender).Context;
+					ProcessRequest(new HttpContextWrapper(httpContext));
+				};
+
+			app.EndRequest += (sender, args) =&gt;
+				{
+					var httpContext = ((HttpApplication)sender).Context;
+					if (UmbracoContext.Current != null &amp;&amp; UmbracoContext.Current.IsFrontEndUmbracoRequest)
+					{
+						LogHelper.Debug&lt;UmbracoModule&gt;(
+                            &quot;Total milliseconds for umbraco request to process: {0}&quot;, () =&gt; DateTime.Now.Subtract(UmbracoContext.Current.ObjectCreated).TotalMilliseconds);
+					}
+
+                    OnEndRequest(new UmbracoRequestEventArgs(UmbracoContext.Current, new HttpContextWrapper(httpContext)));
+
+                    DisposeHttpContextItems(httpContext);
+				};
+
+		}
+
+		public void Dispose()
+		{
+
+		}
+
+        #endregion
+
+        #region Events
+
+        public static event EventHandler&lt;RoutableAttemptEventArgs&gt; RouteAttempt;
+        private void OnRouteAttempt(RoutableAttemptEventArgs args)
+        {
+            if (RouteAttempt != null)
+                RouteAttempt(this, args);
+        }
+
+        public static event EventHandler&lt;UmbracoRequestEventArgs&gt; EndRequest;
+        private void OnEndRequest(UmbracoRequestEventArgs args)
+        {
+            if (EndRequest != null)
+                EndRequest(this, args);
+        }
+        #endregion
+
+
+        /// &lt;summary&gt;
+        /// This is used to be passed into the GlobalSettings.IsReservedPathOrUrl and will include some &#39;fake&#39; routes
+        /// used to determine if a path is reserved.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This is basically used to reserve paths dynamically
+        /// &lt;/remarks&gt;
+        private readonly Lazy&lt;RouteCollection&gt; _combinedRouteCollection = new Lazy&lt;RouteCollection&gt;(() =&gt;
+        {
+            var allRoutes = new RouteCollection();
+            foreach (var route in RouteTable.Routes)
+            {
+                allRoutes.Add(route);
+            }
+            foreach (var reservedPath in ReservedPaths)
+            {
+                try
+                {
+                    allRoutes.Add(&quot;_umbreserved_&quot; + reservedPath.ReplaceNonAlphanumericChars(&quot;&quot;),
+                                new Route(reservedPath.TrimStart(&#39;/&#39;), new StopRoutingHandler()));
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.Error&lt;UmbracoModule&gt;(&quot;Could not add reserved path route&quot;, ex);
+                }
+            }
+
+            return allRoutes;
+        });
+
+        /// &lt;summary&gt;
+        /// This is used internally to track any registered callback paths for Identity providers. If the request path matches
+        /// any of the registered paths, then the module will let the request keep executing
+        /// &lt;/summary&gt;
+        internal static readonly ConcurrentHashSet&lt;string&gt; ReservedPaths = new ConcurrentHashSet&lt;string&gt;();
+	}
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[45,3,45,4,0],[47,13,47,104,0],[50,4,50,54,0],[51,5,51,12,0],[54,4,54,71,0],[60,13,60,111,0],[61,13,61,58,0],[65,13,69,23,0],[70,3,70,4,0],[85,3,85,4,0],[87,4,87,54,0],[88,5,88,12,0],[90,4,90,39,0],[91,5,91,151,0],[92,4,92,54,0],[93,5,93,195,0],[95,4,95,48,0],[98,13,98,70,0],[99,13,99,14,0],[100,17,100,88,0],[101,17,101,18,0],[102,21,102,61,0],[103,17,103,18,0],[104,17,104,24,0],[108,4,108,86,0],[109,4,109,5,0],[110,5,110,62,0],[111,5,111,12,0],[115,7,115,86,0],[117,13,117,113,0],[118,13,118,44,0],[119,4,119,5,0],[120,17,120,24,0],[124,4,124,74,0],[134,4,134,107,0],[135,4,135,49,0],[136,4,136,18,0],[140,13,140,60,0],[141,11,141,18,0],[143,13,143,42,0],[144,5,144,69,0],[146,5,146,47,0],[147,3,147,4,0],[160,3,160,4,1],[161,4,161,41,1],[163,7,163,53,1],[166,4,166,49,1],[167,4,167,5,1],[168,8,168,58,1],[169,4,169,5,1],[171,9,171,46,1],[172,4,172,5,0],[173,8,173,48,0],[174,4,174,5,0],[176,9,176,51,1],[177,13,177,14,0],[178,17,178,62,0],[179,13,179,14,0],[181,18,181,62,1],[182,13,182,14,0],[183,17,183,58,0],[184,13,184,14,0],[186,13,186,83,1],[187,3,187,4,1],[196,3,196,4,1],[197,4,197,24,1],[198,4,198,52,1],[202,4,202,56,1],[203,4,203,5,0],[204,5,204,79,0],[205,5,205,22,0],[206,5,206,6,0],[208,6,210,33,0],[211,6,211,23,0],[212,5,212,6,0],[213,4,213,5,0],[223,7,223,48,1],[224,13,224,93,1],[225,5,225,22,1],[230,13,230,116,1],[231,5,231,22,1],[239,4,239,20,1],[240,3,240,4,1],[246,3,246,4,1],[247,4,247,51,1],[250,4,250,15,1],[251,4,251,5,0],[252,5,252,59,0],[254,17,254,99,0],[255,5,255,6,0],[257,6,257,65,0],[258,5,258,6,0],[260,5,260,16,0],[261,5,261,6,0],[262,6,262,44,0],[264,21,264,68,0],[266,6,266,112,0],[268,6,268,19,0],[270,4,270,5,0],[272,4,272,16,1],[273,3,273,4,1],[279,3,279,4,1],[280,13,280,51,1],[281,11,281,23,1],[283,13,283,69,0],[286,4,286,65,0],[288,4,288,17,0],[289,3,289,4,1],[297,6,297,7,1],[298,10,298,54,1],[299,14,299,26,1],[301,10,301,37,0],[302,10,302,11,0],[305,17,305,47,0],[306,17,306,76,0],[307,13,307,14,0],[309,4,309,71,0],[310,4,310,114,0],[311,4,311,52,0],[312,4,312,17,0],[313,3,313,4,1],[319,9,319,10,0],[320,13,320,29,0],[321,13,321,45,0],[323,13,324,23,0],[324,23,324,101,0],[324,101,325,23,0],[325,23,325,51,0],[325,51,325,59,0],[325,59,325,81,0],[325,81,325,83,0],[323,13,325,83,0],[327,13,327,62,0],[328,17,328,66,0],[330,13,330,20,0],[330,22,330,40,0],[330,41,330,43,0],[330,44,330,63,0],[331,17,331,69,0],[333,13,333,20,0],[333,22,333,32,0],[333,33,333,35,0],[333,36,333,47,0],[334,17,334,65,0],[336,13,336,32,0],[337,13,337,14,0],[338,17,338,45,0],[339,21,339,72,0],[341,21,341,63,0],[342,17,342,28,0],[343,13,343,14,0],[344,18,344,32,0],[345,13,345,14,0],[346,17,346,43,0],[347,17,347,121,0],[349,17,349,62,0],[350,21,350,131,0],[351,13,351,14,0],[353,13,353,44,0],[354,13,354,14,0],[356,17,356,62,0],[357,17,357,76,0],[358,13,358,14,0],[362,13,362,32,0],[363,13,363,14,0],[364,17,364,34,0],[366,17,366,63,0],[369,17,369,103,0],[370,13,370,14,0],[372,13,372,24,0],[373,9,373,10,0],[380,9,380,10,0],[382,13,382,87,0],[384,13,384,61,0],[395,13,395,53,0],[396,13,396,57,0],[397,9,397,10,0],[406,9,406,10,0],[412,4,412,55,0],[415,13,415,89,0],[417,13,417,64,0],[428,13,428,53,0],[429,13,429,57,0],[430,9,430,10,0],[438,9,438,10,0],[440,13,440,56,0],[441,17,441,24,0],[444,13,444,46,0],[445,13,445,20,0],[445,22,445,39,0],[445,40,445,42,0],[445,43,445,53,0],[446,13,446,14,0],[447,17,447,86,0],[448,17,448,18,0],[449,21,449,37,0],[450,17,450,18,0],[451,13,451,14,0],[453,13,453,20,0],[453,22,453,27,0],[453,28,453,30,0],[453,31,453,35,0],[454,13,454,14,0],[456,17,456,18,0],[457,21,457,57,0],[458,17,458,18,0],[459,17,459,37,0],[460,17,460,18,0],[461,21,461,96,0],[462,17,462,18,0],[464,17,464,18,0],[465,21,465,45,0],[466,17,466,18,0],[467,17,467,37,0],[468,17,468,18,0],[469,21,469,91,0],[470,17,470,18,0],[471,13,471,14,0],[472,9,472,10,0],[484,3,484,4,0],[485,4,486,5,0],[486,5,486,6,0],[486,6,487,6,0],[487,6,487,58,0],[487,58,488,9,0],[488,9,488,69,0],[488,69,488,92,0],[488,92,488,94,0],[488,9,488,94,0],[488,94,489,21,0],[489,21,489,71,0],[489,71,490,5,0],[490,5,490,6,0],[490,6,490,7,0],[485,4,490,7,0],[495,7,496,7,0],[496,7,496,8,0],[496,8,497,17,0],[497,17,497,69,0],[497,69,499,17,0],[499,17,499,18,0],[499,18,500,21,0],[500,21,500,67,0],[500,67,502,21,0],[502,21,502,73,0],[502,73,503,21,0],[503,21,503,77,0],[503,77,504,21,0],[504,21,504,80,0],[504,80,505,17,0],[505,17,505,18,0],[505,18,506,17,0],[506,17,506,57,0],[506,57,507,17,0],[507,17,507,18,0],[507,18,509,17,0],[509,17,509,18,0],[509,18,510,7,0],[510,7,510,8,0],[510,8,510,9,0],[495,7,510,9,0],[512,13,513,5,0],[513,5,513,6,0],[513,6,514,6,0],[514,6,514,58,0],[514,58,515,6,0],[515,6,515,58,0],[515,58,516,5,0],[516,5,516,6,0],[516,6,516,7,0],[512,13,516,7,0],[518,4,519,5,0],[519,5,519,6,0],[519,6,520,6,0],[520,6,520,58,0],[520,58,521,6,0],[521,6,521,92,0],[521,92,522,6,0],[522,6,522,7,0],[522,7,523,7,0],[523,7,524,93,0],[524,93,524,170,0],[524,170,524,172,0],[523,7,524,172,0],[524,172,525,6,0],[525,6,525,7,0],[525,7,527,21,0],[527,21,527,124,0],[527,124,529,21,0],[529,21,529,58,0],[529,58,530,5,0],[530,5,530,6,0],[530,6,530,7,0],[518,4,530,7,0],[532,3,532,4,0],[535,3,535,4,0],[537,3,537,4,0],[545,9,545,10,0],[546,13,546,38,0],[547,17,547,42,0],[548,9,548,10,0],[552,9,552,10,0],[553,13,553,36,0],[554,17,554,40,0],[555,9,555,10,0],[566,9,567,9,1],[567,9,567,10,1],[567,10,568,13,1],[568,13,568,51,1],[568,51,569,13,1],[569,13,569,20,1],[569,20,569,22,1],[569,22,569,31,0],[569,31,569,32,1],[569,32,569,34,1],[569,34,569,35,1],[569,35,569,52,1],[569,52,570,13,1],[570,13,570,14,0],[570,14,571,17,1],[571,17,571,38,0],[571,38,572,13,1],[572,13,572,14,0],[572,14,573,13,1],[573,13,573,20,1],[573,20,573,22,1],[573,22,573,38,0],[573,38,573,39,1],[573,39,573,41,1],[573,41,573,42,1],[573,42,573,55,1],[573,55,574,13,1],[574,13,574,14,0],[574,14,576,17,1],[576,17,576,18,0],[576,18,577,21,1],[577,21,578,99,0],[578,99,579,17,1],[579,17,579,18,0],[579,18,580,17,1],[580,17,580,37,0],[580,37,581,17,1],[581,17,581,18,0],[581,18,582,21,1],[582,21,582,93,0],[582,93,583,17,1],[583,17,583,18,0],[583,18,584,13,1],[584,13,584,14,0],[584,14,586,13,1],[586,13,586,30,1],[586,30,587,9,1],[587,9,587,10,1],[587,10,587,12,1],[566,9,587,12,1],[593,9,593,108,1]]);
+    </script>
+  </body>
+</html>

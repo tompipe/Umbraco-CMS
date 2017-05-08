@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Mvc\UmbracoViewPageOfTModel.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Globalization;
+using System.Text;
+using System.Web;
+using System.Web.Mvc;
+using System.Web.WebPages;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Models;
+using Umbraco.Web.Models;
+using Umbraco.Web.Routing;
+using Umbraco.Web.Security;
+
+namespace Umbraco.Web.Mvc
+{
+    /// &lt;summary&gt;
+    /// The View that umbraco front-end views inherit from
+    /// &lt;/summary&gt;
+    public abstract class UmbracoViewPage&lt;TModel&gt; : WebViewPage&lt;TModel&gt;
+    {
+        /// &lt;summary&gt;
+        /// Returns the current UmbracoContext
+        /// &lt;/summary&gt;
+        public UmbracoContext UmbracoContext
+        {
+            get
+            {
+                //we should always try to return the context from the data tokens just in case its a custom context and not 
+                //using the UmbracoContext.Current, we will fallback to the singleton if necessary.
+                var umbCtx = ViewContext.GetUmbracoContext()
+                    //lastly, we will use the singleton, the only reason this should ever happen is is someone is rendering a page that inherits from this
+                    //class and are rendering it outside of the normal Umbraco routing process. Very unlikely.
+                    ?? UmbracoContext.Current;
+                
+                return umbCtx;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the current ApplicationContext
+        /// &lt;/summary&gt;
+        public ApplicationContext ApplicationContext
+        {
+            get { return UmbracoContext.Application; }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the current PublishedContentRequest
+        /// &lt;/summary&gt;
+        internal PublishedContentRequest PublishedContentRequest
+        {
+            get
+            {
+                //we should always try to return the object from the data tokens just in case its a custom object and not 
+                //using the UmbracoContext.Current.
+                //we will fallback to the singleton if necessary.
+                if (ViewContext.RouteData.DataTokens.ContainsKey(Core.Constants.Web.PublishedDocumentRequestDataToken))
+                {
+                    return (PublishedContentRequest)ViewContext.RouteData.DataTokens.GetRequiredObject(Core.Constants.Web.PublishedDocumentRequestDataToken);
+                }
+                //next check if it is a child action and see if the parent has it set in data tokens
+                if (ViewContext.IsChildAction)
+                {
+                    if (ViewContext.ParentActionViewContext.RouteData.DataTokens.ContainsKey(Core.Constants.Web.PublishedDocumentRequestDataToken))
+                    {
+                        return (PublishedContentRequest)ViewContext.ParentActionViewContext.RouteData.DataTokens.GetRequiredObject(Core.Constants.Web.PublishedDocumentRequestDataToken);
+                    }
+                }
+
+                //lastly, we will use the singleton, the only reason this should ever happen is is someone is rendering a page that inherits from this
+                //class and are rendering it outside of the normal Umbraco routing process. Very unlikely.
+                return UmbracoContext.Current.PublishedContentRequest;
+            }
+        }
+
+        private UmbracoHelper _helper;
+        private MembershipHelper _membershipHelper;
+
+        /// &lt;summary&gt;
+        /// Gets an UmbracoHelper
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This constructs the UmbracoHelper with the content model of the page routed to
+        /// &lt;/remarks&gt;
+        public virtual UmbracoHelper Umbraco
+        {
+            get
+            {
+                if (_helper == null)
+                {
+                    var model = ViewData.Model;
+                    var content = model as IPublishedContent;
+                    if (content == null &amp;&amp; model is IRenderModel)
+                        content = ((IRenderModel) model).Content;
+                    _helper = content == null
+                        ? new UmbracoHelper(UmbracoContext)
+                        : new UmbracoHelper(UmbracoContext, content);
+                }
+                return _helper;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the MemberHelper instance
+        /// &lt;/summary&gt;
+        public MembershipHelper Members
+        {
+            get { return _membershipHelper ?? (_membershipHelper = new MembershipHelper(UmbracoContext)); }
+        }
+
+        /// &lt;summary&gt;
+        /// Ensure that the current view context is added to the route data tokens so we can extract it if we like
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Currently this is required by mvc macro engines
+        /// &lt;/remarks&gt;
+        protected override void InitializePage()
+        {
+            base.InitializePage();
+            if (ViewContext.IsChildAction == false)
+            {
+                //this is used purely for partial view macros that contain forms 
+                // and mostly just when rendered within the RTE - This should already be set with the 
+                // EnsurePartialViewMacroViewContextFilterAttribute
+                if (ViewContext.RouteData.DataTokens.ContainsKey(Constants.DataTokenCurrentViewContext) == false)
+                {
+                    ViewContext.RouteData.DataTokens.Add(Constants.DataTokenCurrentViewContext, ViewContext);
+                }
+            }
+
+        }
+
+        // maps model
+        protected override void SetViewData(ViewDataDictionary viewData)
+        {
+            // capture the model before we tinker with the viewData
+            var viewDataModel = viewData.Model;
+
+            // map the view data (may change its type, may set model to null)
+            viewData = MapViewDataDictionary(viewData, typeof (TModel));
+
+            var culture = CultureInfo.CurrentCulture;
+            // bind the model (use context culture as default, if available)
+            if (UmbracoContext.PublishedContentRequest != null &amp;&amp; UmbracoContext.PublishedContentRequest.Culture != null)
+                culture = UmbracoContext.PublishedContentRequest.Culture;
+            viewData.Model = RenderModelBinder.BindModel(viewDataModel, typeof (TModel), culture);
+
+            // set the view data
+            base.SetViewData(viewData);
+        }
+
+        // viewData is the ViewDataDictionary (maybe &lt;TModel&gt;) that we have
+        // modelType is the type of the model that we need to bind to
+        //
+        // figure out whether viewData can accept modelType else replace it
+        //
+        private static ViewDataDictionary MapViewDataDictionary(ViewDataDictionary viewData, Type modelType)
+        {
+            var viewDataType = viewData.GetType();
+
+            // if viewData is not generic then it is a simple ViewDataDictionary instance and its
+            // Model property is of type &#39;object&#39; and will accept anything, so it is safe to use
+            // viewData
+            if (viewDataType.IsGenericType == false)
+                return viewData;
+
+            // ensure it is the proper generic type
+            var def = viewDataType.GetGenericTypeDefinition();
+            if (def != typeof(ViewDataDictionary&lt;&gt;))
+                throw new Exception(&quot;Could not map viewData of type \&quot;&quot; + viewDataType.FullName + &quot;\&quot;.&quot;);
+
+            // get the viewData model type and compare with the actual view model type:
+            // viewData is ViewDataDictionary&lt;viewDataModelType&gt; and we will want to assign an
+            // object of type modelType to the Model property of type viewDataModelType, we
+            // need to check whether that is possible
+            var viewDataModelType = viewDataType.GenericTypeArguments[0];
+
+            if (viewDataModelType.IsAssignableFrom(modelType))
+                return viewData;
+
+            // if not possible then we need to create a new ViewDataDictionary
+            var nViewDataType = typeof(ViewDataDictionary&lt;&gt;).MakeGenericType(modelType);
+            var tViewData = new ViewDataDictionary(viewData) { Model = null }; // temp view data to copy values
+            var nViewData = (ViewDataDictionary)Activator.CreateInstance(nViewDataType, tViewData);
+            return nViewData;
+        }
+
+        /// &lt;summary&gt;
+        /// This will detect the end /body tag and insert the preview badge if in preview mode
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;&lt;/param&gt;
+        public override void WriteLiteral(object value)
+        {
+            // filter / add preview banner
+            if (Response.ContentType.InvariantEquals(&quot;text/html&quot;)) // ASP.NET default value
+            {
+                if (UmbracoContext.Current.IsDebug || UmbracoContext.Current.InPreviewMode)
+                {
+                    var text = value.ToString();
+                    var pos = text.IndexOf(&quot;&lt;/body&gt;&quot;, StringComparison.InvariantCultureIgnoreCase);
+
+                    if (pos &gt; -1)
+                    {
+                        string markupToInject;
+
+                        if (UmbracoContext.Current.InPreviewMode)
+                        {
+                            // creating previewBadge markup
+                            markupToInject =
+                                String.Format(UmbracoConfig.For.UmbracoSettings().Content.PreviewBadge,
+                                    IOHelper.ResolveUrl(SystemDirectories.Umbraco),
+                                    IOHelper.ResolveUrl(SystemDirectories.UmbracoClient),
+                                    Server.UrlEncode(UmbracoContext.Current.HttpContext.Request.Path));
+                        }
+                        else
+                        {
+                            // creating mini-profiler markup
+                            markupToInject = Html.RenderProfiler().ToHtmlString();
+                        }
+
+                        var sb = new StringBuilder(text);
+                        sb.Insert(pos, markupToInject);
+
+                        base.WriteLiteral(sb.ToString());
+                        return;
+                    }
+                }
+            }
+
+            base.WriteLiteral(value);
+
+
+        }
+
+        public HelperResult RenderSection(string name, Func&lt;dynamic, HelperResult&gt; defaultContents)
+        {
+            return WebViewPageExtensions.RenderSection(this, name, defaultContents);
+        }
+
+        public HelperResult RenderSection(string name, HelperResult defaultContents)
+        {
+            return WebViewPageExtensions.RenderSection(this, name, defaultContents);
+        }
+
+        public HelperResult RenderSection(string name, string defaultContents)
+        {
+            return WebViewPageExtensions.RenderSection(this, name, defaultContents);
+        }
+        
+        public HelperResult RenderSection(string name, IHtmlString defaultContents)
+        {
+            return WebViewPageExtensions.RenderSection(this, name, defaultContents);
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[28,13,28,14,1],[31,17,34,47,1],[36,17,36,31,1],[37,13,37,14,1],[45,17,45,18,0],[45,19,45,53,0],[45,54,45,55,0],[54,13,54,14,0],[58,17,58,120,0],[59,17,59,18,0],[60,21,60,158,0],[63,17,63,47,0],[64,17,64,18,0],[65,21,65,148,0],[66,21,66,22,0],[67,25,67,186,0],[69,17,69,18,0],[73,17,73,71,0],[74,13,74,14,0],[89,13,89,14,0],[90,17,90,37,0],[91,17,91,18,0],[92,21,92,48,0],[93,21,93,62,0],[94,21,94,66,0],[95,25,95,66,0],[96,21,98,70,0],[99,17,99,18,0],[100,17,100,32,0],[101,13,101,14,0],[109,17,109,18,0],[109,19,109,106,0],[109,107,109,108,0],[119,9,119,10,0],[120,13,120,35,0],[121,13,121,52,0],[122,13,122,14,0],[126,17,126,114,0],[127,17,127,18,0],[128,21,128,110,0],[129,17,129,18,0],[130,13,130,14,0],[132,9,132,10,0],[136,9,136,10,1],[138,13,138,48,1],[141,13,141,73,1],[143,13,143,54,1],[145,13,145,122,1],[146,17,146,74,1],[147,13,147,99,1],[150,13,150,40,1],[151,9,151,10,1],[159,9,159,10,1],[160,13,160,51,1],[165,13,165,53,1],[166,17,166,33,1],[169,13,169,63,0],[170,13,170,53,0],[171,17,171,106,0],[177,13,177,74,0],[179,13,179,63,0],[180,17,180,33,0],[183,13,183,89,0],[184,13,184,79,0],[185,13,185,100,0],[186,13,186,30,0],[187,9,187,10,1],[194,9,194,10,0],[196,13,196,67,0],[197,13,197,14,0],[198,17,198,92,0],[199,17,199,18,0],[200,21,200,49,0],[201,21,201,100,0],[203,21,203,34,0],[204,21,204,22,0],[207,25,207,66,0],[208,25,208,26,0],[210,29,214,104,0],[215,25,215,26,0],[217,25,217,26,0],[219,29,219,83,0],[220,25,220,26,0],[222,25,222,58,0],[223,25,223,56,0],[225,25,225,58,0],[226,25,226,32,0],[228,17,228,18,0],[229,13,229,14,0],[231,13,231,38,0],[234,9,234,10,0],[237,9,237,10,0],[238,13,238,85,0],[239,9,239,10,0],[242,9,242,10,0],[243,13,243,85,0],[244,9,244,10,0],[247,9,247,10,0],[248,13,248,85,0],[249,9,249,10,0],[252,9,252,10,0],[253,13,253,85,0],[254,9,254,10,0]]);
+    </script>
+  </body>
+</html>

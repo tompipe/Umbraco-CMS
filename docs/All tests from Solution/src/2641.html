@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.editorControls\tinyMCE3\webcontrol\TinyMCEWebControl.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Linq;
+using System.Text;
+using System.Web.UI;
+using System.Web.UI.WebControls;
+using System.Collections;
+using System.Collections.Specialized;
+using System.Text.RegularExpressions;
+using Umbraco.Core;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using ClientDependency.Core.Controls;
+using ClientDependency.Core;
+using File = System.IO.File;
+
+namespace umbraco.editorControls.tinyMCE3.webcontrol
+{
+    [Obsolete(&quot;IDataType and all other references to the legacy property editors are no longer used this will be removed from the codebase in future versions&quot;)]
+    public class TinyMCEWebControl : TextBox
+    {
+        internal readonly MediaFileSystem _fs;
+
+        public NameValueCollection config = new NameValueCollection();
+        private string temp;
+
+        private int _nodeId = 0;
+        private Guid _versionId;
+
+        public int NodeId
+        {
+            set { _nodeId = value; }
+            get { return _nodeId; }
+        }
+
+        public Guid VersionId
+        {
+            set { _versionId = value; }
+            get { return _versionId; }
+        }
+
+        public string InstallPath
+        {
+            get
+            {
+                if (installPath == null)
+                    installPath = this.config[&quot;InstallPath&quot;];
+
+                return installPath;
+            }
+            set { installPath = value; }
+        }
+
+        #region private
+        private static readonly object TextChangedEvent = new object();
+        private int rows = 10;
+        private int cols = 70;
+        private bool gzipEnabled, merged;
+        private string installPath, mode;
+        private System.Text.StringBuilder m_scriptInitBlock = new StringBuilder();
+        #endregion
+
+        public TinyMCEWebControl()
+            : base()
+        {
+            _fs = FileSystemProviderManager.Current.GetFileSystemProvider&lt;MediaFileSystem&gt;();
+
+            base.TextMode = TextBoxMode.MultiLine;
+            base.Attributes.Add(&quot;style&quot;, &quot;visibility: hidden&quot;);
+            config.Add(&quot;mode&quot;, &quot;exact&quot;);
+            config.Add(&quot;theme&quot;, &quot;umbraco&quot;);
+            config.Add(&quot;umbraco_path&quot;, global::Umbraco.Core.IO.IOHelper.ResolveUrl(global::Umbraco.Core.IO.SystemDirectories.Umbraco));
+            CssClass = &quot;tinymceContainer&quot;;
+            plugin.ConfigSection configSection = (plugin.ConfigSection)System.Web.HttpContext.Current.GetSection(&quot;TinyMCE&quot;);
+
+            if (configSection != null)
+            {
+                this.installPath = configSection.InstallPath;
+                this.mode = configSection.Mode;
+                this.gzipEnabled = configSection.GzipEnabled;
+
+                // Copy items into local config collection
+                foreach (string key in configSection.GlobalSettings.Keys)
+                    this.config[key] = configSection.GlobalSettings[key];
+            }
+            else
+            {
+                configSection = new plugin.ConfigSection();
+                configSection.GzipExpiresOffset = TimeSpan.FromDays(10).Ticks;
+                this.gzipEnabled = false;
+                this.InstallPath = umbraco.editorControls.tinymce.tinyMCEConfiguration.JavascriptPath;
+
+            }
+
+        }
+
+        protected override void OnPreRender(EventArgs e)
+        {
+            base.OnPreRender(e);
+            // update macro&#39;s and images in text
+            if (_nodeId != 0)
+            {
+                base.Text = ParseMacrosToHtml(FormatMedia(base.Text));
+            }
+
+        }
+
+        protected override void Render(HtmlTextWriter writer)
+        {
+            base.Render(writer);
+            // add a marker to tell Live Editing when a tinyMCE control is on the page
+            writer.Write(&quot;&lt;input type=&#39;hidden&#39; id=&#39;__umbraco_tinyMCE&#39; /&gt;&quot;);
+        }
+
+        protected override void OnLoad(EventArgs args)
+        {
+            this.config[&quot;elements&quot;] = this.ClientID;
+               
+
+            bool first = true;
+
+            //TinyMCE uses it&#39;s own compressor so leave it up to ScriptManager to render
+            ScriptManager.RegisterClientScriptInclude(this, this.GetType(), _versionId.ToString(), this.ScriptURI);
+
+            // Write script tag start
+            m_scriptInitBlock.Append(HtmlTextWriter.TagLeftChar.ToString());
+            m_scriptInitBlock.Append(&quot;script&quot;);
+            m_scriptInitBlock.Append(&quot; type=\&quot;text/javascript\&quot;&quot;);
+            m_scriptInitBlock.Append(HtmlTextWriter.TagRightChar.ToString());
+            m_scriptInitBlock.Append(&quot;\n&quot;);
+
+            m_scriptInitBlock.Append(&quot;tinyMCE.init({\n&quot;);
+
+            // Write options
+            foreach (string key in this.config.Keys)
+            {
+                //TODO: This is a hack to test if we can prevent tinymce from automatically download languages
+                string val = this.config[key];
+
+                if (!first)
+                    m_scriptInitBlock.Append(&quot;,\n&quot;);
+                else
+                    first = false;
+
+                // Is boolean state or string
+                if (val == &quot;true&quot; || val == &quot;false&quot;)
+                    m_scriptInitBlock.Append(key + &quot;:&quot; + this.config[key]);
+                else
+                    m_scriptInitBlock.Append(key + &quot;:&#39;&quot; + this.config[key] + &quot;&#39;&quot;);
+            }
+
+            m_scriptInitBlock.Append(&quot;\n});\n&quot;);
+            
+
+            // Write script tag end
+            m_scriptInitBlock.Append(HtmlTextWriter.EndTagLeftChars);
+            m_scriptInitBlock.Append(&quot;script&quot;);
+            m_scriptInitBlock.Append(HtmlTextWriter.TagRightChar.ToString());
+            
+
+        }
+
+
+        string ScriptURI
+        {
+            get
+            {
+                string suffix = &quot;&quot;, outURI;
+
+                if (this.InstallPath == null)
+                    throw new Exception(&quot;Required installPath setting is missing, add it to your web.config. You can also add it directly to your tinymce:TextArea element using InstallPath but the web.config method is recommended since it allows you to switch over to gzip compression.&quot;);
+
+                if (this.mode != null)
+                    suffix = &quot;_&quot; + this.mode;
+
+                outURI = this.InstallPath + &quot;/tiny_mce_src&quot; + suffix + &quot;.js&quot;;
+                if (!File.Exists(global::Umbraco.Core.IO.IOHelper.MapPath(outURI)))
+                    throw new Exception(&quot;Could not locate TinyMCE by URI:&quot; + outURI + &quot;, Physical path:&quot; + global::Umbraco.Core.IO.IOHelper.MapPath(outURI) + &quot;. Make sure that you configured the installPath to a valid location in your web.config. This path should be an relative or site absolute URI to where TinyMCE is located.&quot;);
+
+                // Collect themes, languages and plugins and build gzip URI
+                // TODO: Make sure gzip is re-enabled
+                this.gzipEnabled = true;
+                if (this.gzipEnabled)
+                {
+                    ArrayList themes = new ArrayList(), plugins = new ArrayList(), languages = new ArrayList();
+
+                    // Add themes
+                    if (config[&quot;theme&quot;] == null)
+                        config[&quot;theme&quot;] = &quot;simple&quot;;
+
+                    foreach (string theme in config[&quot;theme&quot;].Split(&#39;,&#39;))
+                    {
+                        string themeVal = theme.Trim();
+
+                        if (themes.IndexOf(themeVal) == -1)
+                            themes.Add(themeVal);
+                    }
+
+                    // Add plugins
+                    if (config[&quot;plugins&quot;] != null)
+                    {
+                        foreach (string plugin in config[&quot;plugins&quot;].Split(&#39;,&#39;))
+                        {
+                            string pluginVal = plugin.Trim();
+
+                            if (plugins.IndexOf(pluginVal) == -1)
+                                plugins.Add(pluginVal);
+                        }
+                    }
+
+                    // Add language
+                    if (config[&quot;language&quot;] == null)
+                        config[&quot;language&quot;] = &quot;en&quot;;
+
+                    if (languages.IndexOf(config[&quot;language&quot;]) == -1)
+                        languages.Add(config[&quot;language&quot;]);
+
+                    // NH: No clue why these extra dashes are added, but the affect other parts of the implementation
+                    // Skip loading of themes and plugins
+                    //                        area.config[&quot;theme&quot;] = &quot;-&quot; + area.config[&quot;theme&quot;];
+
+                    //                        if (area.config[&quot;plugins&quot;] != null)
+                    //                            area.config[&quot;plugins&quot;] = &quot;-&quot; + String.Join(&quot;,-&quot;, area.config[&quot;plugins&quot;].Split(&#39;,&#39;));
+
+                    // Build output URI
+                    // NH: Use versionId for randomize to ensure we don&#39;t download a new tinymce on every single call
+                    outURI = umbraco.editorControls.tinymce.tinyMCEConfiguration.PluginPath + &quot;/tinymce3tinymceCompress.aspx?rnd=&quot; + this._versionId.ToString() + &quot;&amp;module=gzipmodule&quot;;
+
+                    if (themes.Count &gt; 0)
+                        outURI += &quot;&amp;themes=&quot; + String.Join(&quot;,&quot;, ((string[])themes.ToArray(typeof(string))));
+
+                    if (plugins.Count &gt; 0)
+                        outURI += &quot;&amp;plugins=&quot; + String.Join(&quot;,&quot;, ((string[])plugins.ToArray(typeof(string))));
+
+                    if (languages.Count &gt; 0)
+                        outURI += &quot;&amp;languages=&quot; + String.Join(&quot;,&quot;, ((string[])languages.ToArray(typeof(string))));
+                }
+
+                return outURI;
+            }
+        }
+
+
+        private string FormatMedia(string html)
+        {
+            // root media url
+            var rootMediaUrl = _fs.GetUrl(&quot;&quot;);
+
+            // Find all media images
+            var pattern = string.Format(&quot;&lt;img [^&gt;]*src=\&quot;(?&lt;mediaString&gt;{0}[^\&quot;]*)\&quot; [^&gt;]*&gt;&quot;, rootMediaUrl);
+
+            var tags = Regex.Matches(html, pattern, RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+
+            foreach (Match tag in tags)
+            {
+                if (tag.Groups.Count &lt;= 0)
+                    continue;
+
+                // Replace /&gt; to ensure we&#39;re in old-school html mode
+                var tempTag = &quot;&lt;img&quot;;
+                var orgSrc = tag.Groups[&quot;mediaString&quot;].Value;
+
+                // gather all attributes
+                // TODO: This should be replaced with a general helper method - but for now we&#39;ll wanna leave umbraco.dll alone for this patch
+                var ht = new Hashtable();
+                var m = Regex.Matches(tag.Value.Replace(&quot;&gt;&quot;, &quot; &gt;&quot;),
+                                  &quot;(?&lt;attributeName&gt;\\S*)=\&quot;(?&lt;attributeValue&gt;[^\&quot;]*)\&quot;|(?&lt;attributeName&gt;\\S*)=(?&lt;attributeValue&gt;[^\&quot;|\\s]*)\\s&quot;,
+                                  RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+
+                //GE: Add ContainsKey check and expand the ifs for readability
+                foreach (Match attributeSet in m)
+                {
+                    if (attributeSet.Groups[&quot;attributeName&quot;].Value.ToLower() != &quot;src&quot; &amp;&amp; ht.ContainsKey(attributeSet.Groups[&quot;attributeName&quot;].Value) == false)
+                    {
+                        ht.Add(attributeSet.Groups[&quot;attributeName&quot;].Value, attributeSet.Groups[&quot;attributeValue&quot;].Value);
+                    }
+                }
+
+                // build the element
+                // Build image tag
+                var ide = ht.GetEnumerator();
+                while (ide.MoveNext())
+                    tempTag += string.Format(&quot; {0}=\&quot;{1}\&quot;&quot;, ide.Key, ide.Value);
+
+                orgSrc = IOHelper.ResolveUrl(orgSrc.Replace(&quot;%20&quot;, &quot; &quot;));
+
+                var mediaService = ApplicationContext.Current.Services.MediaService;
+                var imageMedia = mediaService.GetMediaByPath(orgSrc);
+
+                if (imageMedia == null)
+                {
+                    tempTag = string.Format(&quot;{0} src=\&quot;{1}\&quot; /&gt;&quot;, tempTag, IOHelper.ResolveUrl(orgSrc));
+                }
+                else
+                {
+                    // We&#39;re doing .Any checks here instead of FirstOrDefault because the default value of Properties
+                    // is not null but default(KeyedCollection&lt;string, Property&gt;). This is a bit easier to read.
+                    // To clarify: imageMedia.Properties.FirstOrDefault(x =&gt; x.Alias == &quot;umbracoWidth&quot;) == null; will NOT work.
+
+                    var widthValue = string.Empty;
+                    if (imageMedia.Properties.Any(x =&gt; x.Alias == &quot;umbracoWidth&quot;))
+                        widthValue = imageMedia.Properties.First(x =&gt; x.Alias == &quot;umbracoWidth&quot;).Value.ToString();
+
+                    var heightValue = string.Empty;
+                    if (imageMedia.Properties.Any(x =&gt; x.Alias == &quot;umbracoHeight&quot;))
+                        heightValue = imageMedia.Properties.First(x =&gt; x.Alias == &quot;umbracoHeight&quot;).Value.ToString();
+                    
+                    // Format the tag
+                    if (imageMedia.Properties.Any(x =&gt; x.Alias == &quot;umbracoFile&quot;))
+                    {
+                        var umbracoFileProperty = imageMedia.Properties.First(x =&gt; x.Alias == &quot;umbracoFile&quot;);
+                        tempTag = string.Format(&quot;{0} rel=\&quot;{1},{2}\&quot; src=\&quot;{3}\&quot; /&gt;&quot;, tempTag, widthValue, heightValue, umbracoFileProperty.Value);
+                    }
+                }
+
+                html = html.Replace(tag.Value, tempTag);
+            }
+
+            return html;
+        }
+
+        private string ParseMacrosToHtml(string input)
+        {
+            int nodeId = _nodeId;
+            Guid versionId = _versionId;
+            string content = input;
+
+
+            string pattern = @&quot;(&lt;\?UMBRACO_MACRO\W*[^&gt;]*/&gt;)&quot;;
+            MatchCollection tags =
+            Regex.Matches(content, pattern, RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+
+            // Page for macro rendering
+            //          page p = new page(nodeId, versionId);
+
+
+            System.Web.HttpContext.Current.Items[&quot;macrosAdded&quot;] = 0;
+            System.Web.HttpContext.Current.Items[&quot;pageID&quot;] = nodeId.ToString();
+
+            foreach (Match tag in tags)
+            {
+                try
+                {
+                    // Create div
+                    Hashtable attributes = helper.ReturnAttributes(tag.Groups[1].Value);
+                    string div = macro.renderMacroStartTag(attributes, nodeId, versionId); //.Replace(&quot;&amp;quot;&quot;, &quot;&amp;amp;quot;&quot;);
+
+                    // Insert macro contents here...
+                    macro m;
+                    if (helper.FindAttribute(attributes, &quot;macroID&quot;) != &quot;&quot;)
+                        m = macro.GetMacro(int.Parse(helper.FindAttribute(attributes, &quot;macroID&quot;)));
+                    else
+                    {
+                        // legacy: Check if the macroAlias is typed in lowercasing
+                        string macroAlias = helper.FindAttribute(attributes, &quot;macroAlias&quot;);
+                        if (macroAlias == &quot;&quot;)
+                        {
+                            macroAlias = helper.FindAttribute(attributes, &quot;macroalias&quot;);
+                            attributes.Remove(&quot;macroalias&quot;);
+                            attributes.Add(&quot;macroAlias&quot;, macroAlias);
+                        }
+
+                        if (macroAlias != &quot;&quot;)
+                            m = macro.GetMacro(macroAlias);
+                        else
+                            throw new ArgumentException(&quot;umbraco is unable to identify the macro. No id or macroalias was provided for the macro in the macro tag.&quot;, tag.Groups[1].Value);
+                    }
+
+                    if (helper.FindAttribute(attributes, &quot;macroAlias&quot;) == &quot;&quot;)
+                        attributes.Add(&quot;macroAlias&quot;, m.Alias);
+
+
+                    try
+                    {
+                        div += macro.MacroContentByHttp(nodeId, versionId, attributes);
+                    }
+                    catch
+                    {
+                        div += &quot;&lt;span style=\&quot;color: green\&quot;&gt;No macro content available for WYSIWYG editing&lt;/span&gt;&quot;;
+                    }
+
+
+                    div += macro.renderMacroEndTag();
+                    content = content.Replace(tag.Groups[1].Value, div);
+                }
+                catch (Exception ee)
+                {
+                    LogHelper.Error&lt;TinyMCEWebControl&gt;(&quot;Macro Parsing Error&quot;, ee);
+                    string div = &quot;&lt;div class=\&quot;umbMacroHolder mceNonEditable\&quot;&gt;&lt;p style=\&quot;color: red\&quot;&gt;&lt;strong&gt;umbraco was unable to parse a macro tag, which means that parts of this content might be corrupt.&lt;/strong&gt; &lt;br /&gt;&lt;br /&gt;Best solution is to rollback to a previous version by right clicking the node in the tree and then try to insert the macro again. &lt;br/&gt;&lt;br/&gt;Please report this to your system administrator as well - this error has been logged.&lt;/p&gt;&lt;/div&gt;&quot;;
+                    content = content.Replace(tag.Groups[1].Value, div);
+                }
+
+            }
+            return content;
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,9,24,71,0],[27,9,27,33,0],[32,17,32,18,0],[32,19,32,35,0],[32,36,32,37,0],[33,17,33,18,0],[33,19,33,34,0],[33,35,33,36,0],[38,17,38,18,0],[38,19,38,38,0],[38,39,38,40,0],[39,17,39,18,0],[39,19,39,37,0],[39,38,39,39,0],[45,13,45,14,0],[46,17,46,41,0],[47,21,47,62,0],[49,17,49,36,0],[50,13,50,14,0],[51,17,51,18,0],[51,19,51,39,0],[51,40,51,41,0],[55,9,55,72,0],[56,9,56,31,0],[57,9,57,31,0],[60,9,60,83,0],[64,15,64,21,0],[65,9,65,10,0],[66,13,66,94,0],[68,13,68,51,0],[69,13,69,64,0],[70,13,70,41,0],[71,13,71,44,0],[72,13,72,136,0],[73,13,73,43,0],[74,13,74,125,0],[76,13,76,39,0],[77,13,77,14,0],[78,17,78,62,0],[79,17,79,48,0],[80,17,80,62,0],[83,17,83,24,0],[83,26,83,36,0],[83,37,83,39,0],[83,40,83,73,0],[84,21,84,74,0],[85,13,85,14,0],[87,13,87,14,0],[88,17,88,60,0],[89,17,89,79,0],[90,17,90,42,0],[91,17,91,103,0],[93,13,93,14,0],[95,9,95,10,0],[98,9,98,10,0],[99,13,99,33,0],[101,13,101,30,0],[102,13,102,14,0],[103,17,103,71,0],[104,13,104,14,0],[106,9,106,10,0],[109,9,109,10,0],[110,13,110,33,0],[112,13,112,76,0],[113,9,113,10,0],[116,9,116,10,0],[117,13,117,53,0],[120,13,120,31,0],[123,13,123,116,0],[126,13,126,77,0],[127,13,127,48,0],[128,13,128,67,0],[129,13,129,78,0],[130,13,130,44,0],[132,13,132,58,0],[135,13,135,20,0],[135,22,135,32,0],[135,33,135,35,0],[135,36,135,52,0],[136,13,136,14,0],[138,17,138,47,0],[140,17,140,28,0],[141,21,141,53,0],[143,21,143,35,0],[146,17,146,53,0],[147,21,147,76,0],[149,21,149,83,0],[150,13,150,14,0],[152,13,152,49,0],[156,13,156,70,0],[157,13,157,48,0],[158,13,158,78,0],[161,9,161,10,0],[167,13,167,14,0],[168,17,168,35,0],[170,17,170,46,0],[171,21,171,289,0],[173,17,173,39,0],[174,21,174,46,0],[176,17,176,78,0],[177,17,177,84,0],[178,21,178,332,0],[182,17,182,41,0],[183,17,183,38,0],[184,17,184,18,0],[185,21,185,55,0],[185,57,185,82,0],[185,84,185,111,0],[188,21,188,49,0],[189,25,189,52,0],[191,21,191,28,0],[191,30,191,42,0],[191,43,191,45,0],[191,46,191,72,0],[192,21,192,22,0],[193,25,193,56,0],[195,25,195,60,0],[196,29,196,50,0],[197,21,197,22,0],[200,21,200,51,0],[201,21,201,22,0],[202,25,202,32,0],[202,34,202,47,0],[202,48,202,50,0],[202,51,202,79,0],[203,25,203,26,0],[204,29,204,62,0],[206,29,206,66,0],[207,33,207,56,0],[208,25,208,26,0],[209,21,209,22,0],[212,21,212,52,0],[213,25,213,51,0],[215,21,215,69,0],[216,25,216,59,0],[227,21,227,184,0],[229,21,229,42,0],[230,25,230,109,0],[232,21,232,43,0],[233,25,233,111,0],[235,21,235,45,0],[236,25,236,115,0],[237,17,237,18,0],[239,17,239,31,0],[240,13,240,14,0],[245,9,245,10,0],[247,13,247,47,0],[250,13,250,109,0],[252,13,252,117,0],[254,13,254,20,0],[254,22,254,31,0],[254,32,254,34,0],[254,35,254,39,0],[255,13,255,14,0],[256,17,256,43,0],[257,21,257,30,0],[260,17,260,38,0],[261,17,261,62,0],[265,17,265,42,0],[266,17,268,99,0],[271,17,271,24,0],[271,26,271,44,0],[271,45,271,47,0],[271,48,271,49,0],[272,17,272,18,0],[273,21,273,158,0],[274,21,274,22,0],[275,25,275,121,0],[276,21,276,22,0],[277,17,277,18,0],[281,17,281,46,0],[282,17,282,39,0],[283,21,283,82,0],[285,17,285,74,0],[287,17,287,85,0],[288,17,288,70,0],[290,17,290,40,0],[291,17,291,18,0],[292,21,292,105,0],[293,17,293,18,0],[295,17,295,18,0],[300,21,300,51,0],[301,21,301,56,0],[301,56,301,81,0],[301,81,301,83,0],[301,21,301,83,0],[302,25,302,71,0],[302,71,302,96,0],[302,96,302,115,0],[302,25,302,115,0],[304,21,304,52,0],[305,21,305,56,0],[305,56,305,82,0],[305,82,305,84,0],[305,21,305,84,0],[306,25,306,72,0],[306,72,306,98,0],[306,98,306,117,0],[306,25,306,117,0],[309,21,309,56,0],[309,56,309,80,0],[309,80,309,82,0],[309,21,309,82,0],[310,21,310,22,0],[311,25,311,84,0],[311,84,311,108,0],[311,108,311,110,0],[311,25,311,110,0],[312,25,312,148,0],[313,21,313,22,0],[314,17,314,18,0],[316,17,316,57,0],[317,13,317,14,0],[319,13,319,25,0],[320,9,320,10,0],[323,9,323,10,0],[324,13,324,34,0],[325,13,325,41,0],[326,13,326,36,0],[329,13,329,62,0],[330,13,331,109,0],[337,13,337,69,0],[338,13,338,80,0],[340,13,340,20,0],[340,22,340,31,0],[340,32,340,34,0],[340,35,340,39,0],[341,13,341,14,0],[343,17,343,18,0],[345,21,345,89,0],[346,21,346,91,0],[350,21,350,75,0],[351,25,351,100,0],[353,21,353,22,0],[355,25,355,92,0],[356,25,356,46,0],[357,25,357,26,0],[358,29,358,89,0],[359,29,359,61,0],[360,29,360,70,0],[361,25,361,26,0],[363,25,363,46,0],[364,29,364,60,0],[366,29,366,187,0],[367,21,367,22,0],[369,21,369,78,0],[370,25,370,63,0],[374,21,374,22,0],[375,25,375,88,0],[376,21,376,22,0],[377,21,377,26,0],[378,21,378,22,0],[379,25,379,117,0],[380,21,380,22,0],[383,21,383,54,0],[384,21,384,73,0],[385,17,385,18,0],[386,17,386,37,0],[387,17,387,18,0],[388,21,388,83,0],[389,21,389,468,0],[390,21,390,73,0],[391,17,391,18,0],[393,13,393,14,0],[394,13,394,28,0],[395,9,395,10,0]]);
+    </script>
+  </body>
+</html>

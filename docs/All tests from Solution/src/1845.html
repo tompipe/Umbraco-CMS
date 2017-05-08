@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Migrations\Upgrades\TargetVersionSevenThreeZero\AddForeignKeysForLanguageAndDictionaryTables.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Data;
+using System.Linq;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.SqlSyntax;
+
+namespace Umbraco.Core.Persistence.Migrations.Upgrades.TargetVersionSevenThreeZero
+{
+    [Migration(&quot;7.3.0&quot;, 14, GlobalSettings.UmbracoMigrationName)]
+    public class AddForeignKeysForLanguageAndDictionaryTables : MigrationBase
+    {
+        public AddForeignKeysForLanguageAndDictionaryTables(ISqlSyntaxProvider sqlSyntax, ILogger logger)
+            : base(sqlSyntax, logger)
+        {
+        }
+
+        public override void Up()
+        {
+            var constraints = SqlSyntax.GetConstraintsPerColumn(Context.Database).Distinct().ToArray();
+
+            //if the FK doesn&#39;t exist
+            if (constraints.Any(x =&gt; x.Item1.InvariantEquals(&quot;cmsLanguageText&quot;) &amp;&amp; x.Item2.InvariantEquals(&quot;languageId&quot;) &amp;&amp; x.Item3.InvariantEquals(&quot;FK_cmsLanguageText_umbracoLanguage_id&quot;)) == false)
+            {
+                //Somehow, a language text item might end up with a language Id of zero or one that no longer exists
+                //before we add the foreign key
+                foreach (var pk in Context.Database.Query&lt;int&gt;(
+                    &quot;SELECT cmsLanguageText.pk FROM cmsLanguageText WHERE cmsLanguageText.languageId NOT IN (SELECT umbracoLanguage.id FROM umbracoLanguage)&quot;))
+                {
+                    Delete.FromTable(&quot;cmsLanguageText&quot;).Row(new { pk = pk });
+                }
+
+                var columns = SqlSyntax.GetColumnsInSchema(Context.Database).Distinct().ToArray();
+
+                if (columns.Any(x =&gt; x.ColumnName.InvariantEquals(&quot;id&quot;) 
+                    &amp;&amp; x.TableName.InvariantEquals(&quot;umbracoLanguage&quot;) 
+                    &amp;&amp; x.DataType.InvariantEquals(&quot;smallint&quot;)))
+                {
+                    //Ensure that the umbracoLanguage PK is INT and not SmallInt (which it  might be in older db versions)
+                    // In order to &#39;change&#39; this to an INT, we have to run a full migration script which is super annoying
+                    Create.Table(&quot;umbracoLanguage_TEMP&quot;)
+                        .WithColumn(&quot;id&quot;).AsInt32().NotNullable().Identity()
+                        .WithColumn(&quot;languageISOCode&quot;).AsString(10).Nullable()
+                        .WithColumn(&quot;languageCultureName&quot;).AsString(50).Nullable();
+                
+                    var currentData = this.Context.Database.Fetch&lt;LanguageDto&gt;(new Sql().Select(&quot;*&quot;).From&lt;LanguageDto&gt;(SqlSyntax));
+                    foreach (var languageDto in currentData)
+                    {
+                        Insert.IntoTable(&quot;umbracoLanguage_TEMP&quot;)
+                            .EnableIdentityInsert()
+                            .Row(new {id = languageDto.Id, languageISOCode = languageDto.IsoCode, languageCultureName = languageDto.CultureName});
+                    }
+                    
+                    //ok, all data has been copied over, drop the old table, rename the temp table and re-add constraints.
+                    Delete.Table(&quot;umbracoLanguage&quot;);
+                    Rename.Table(&quot;umbracoLanguage_TEMP&quot;).To(&quot;umbracoLanguage&quot;);
+
+                    //add the pk
+                    Create.PrimaryKey(&quot;PK_language&quot;).OnTable(&quot;umbracoLanguage&quot;).Column(&quot;id&quot;);
+                }
+
+                var dbIndexes = SqlSyntax.GetDefinedIndexes(Context.Database)
+                    .Select(x =&gt; new DbIndexDefinition
+                    {
+                        TableName = x.Item1,
+                        IndexName = x.Item2,
+                        ColumnName = x.Item3,
+                        IsUnique = x.Item4
+                    }).ToArray();
+
+                //make sure it doesn&#39;t already exist
+                if (dbIndexes.Any(x =&gt; x.IndexName.InvariantEquals(&quot;IX_cmsDictionary_id&quot;)) == false)
+                {
+                    Create.Index(&quot;IX_cmsDictionary_id&quot;).OnTable(&quot;cmsDictionary&quot;)
+                        .OnColumn(&quot;id&quot;).Ascending()
+                        .WithOptions().NonClustered()
+                        .WithOptions().Unique();
+                }
+
+                //now we need to create a foreign key
+                Create.ForeignKey(&quot;FK_cmsLanguageText_umbracoLanguage_id&quot;).FromTable(&quot;cmsLanguageText&quot;).ForeignColumn(&quot;languageId&quot;)
+                    .ToTable(&quot;umbracoLanguage&quot;).PrimaryColumn(&quot;id&quot;).OnDeleteOrUpdate(Rule.None);
+
+                Alter.Table(&quot;cmsDictionary&quot;).AlterColumn(&quot;parent&quot;).AsGuid().Nullable();
+
+                //set the parent to null if it equals the default dictionary item root id
+                foreach (var pk in Context.Database.Query&lt;int&gt;(&quot;SELECT pk FROM cmsDictionary WHERE parent NOT IN (SELECT id FROM cmsDictionary)&quot;))
+                {
+                    Update.Table(&quot;cmsDictionary&quot;).Set(new { parent = (Guid?)null }).Where(new { pk = pk });
+                }
+
+                Create.ForeignKey(&quot;FK_cmsDictionary_cmsDictionary_id&quot;).FromTable(&quot;cmsDictionary&quot;).ForeignColumn(&quot;parent&quot;)
+                    .ToTable(&quot;cmsDictionary&quot;).PrimaryColumn(&quot;id&quot;).OnDeleteOrUpdate(Rule.None);
+            }
+
+
+            
+        }
+
+        public override void Down()
+        {
+            throw new NotImplementedException();
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[16,15,16,38,0],[17,9,17,10,0],[18,9,18,10,0],[21,9,21,10,0],[22,13,22,104,0],[25,13,25,38,0],[25,38,25,189,0],[25,189,25,200,0],[25,13,25,200,0],[26,13,26,14,0],[29,17,29,24,0],[29,26,29,32,0],[29,33,29,35,0],[29,36,30,159,0],[31,17,31,18,0],[32,21,32,78,0],[33,17,33,18,0],[35,17,35,99,0],[37,17,37,38,0],[37,38,39,62,0],[39,62,39,64,0],[37,17,39,64,0],[40,17,40,18,0],[43,21,46,84,0],[48,21,48,132,0],[49,21,49,28,0],[49,30,49,45,0],[49,46,49,48,0],[49,49,49,60,0],[50,21,50,22,0],[51,25,53,147,0],[54,21,54,22,0],[57,21,57,53,0],[58,21,58,80,0],[61,21,61,94,0],[62,17,62,18,0],[64,17,65,34,0],[65,34,71,22,0],[71,22,71,34,0],[64,17,71,34,0],[74,17,74,40,0],[74,40,74,90,0],[74,90,74,101,0],[74,17,74,101,0],[75,17,75,18,0],[76,21,79,49,0],[80,17,80,18,0],[83,17,84,97,0],[86,17,86,88,0],[89,17,89,24,0],[89,26,89,32,0],[89,33,89,35,0],[89,36,89,146,0],[90,17,90,18,0],[91,21,91,108,0],[92,17,92,18,0],[94,17,95,95,0],[96,13,96,14,0],[100,9,100,10,0],[103,9,103,10,0],[104,13,104,49,0]]);
+    </script>
+  </body>
+</html>

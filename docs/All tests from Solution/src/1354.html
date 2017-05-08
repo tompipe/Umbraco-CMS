@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Cache\ContentTypeCacheRefresher.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Web.Script.Serialization;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.PublishedContent;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Web.PublishedCache;
+using Umbraco.Web.PublishedCache.XmlPublishedCache;
+
+namespace Umbraco.Web.Cache
+{
+
+    /// &lt;summary&gt;
+    /// A cache refresher to ensure content type cache is updated when content types change - this is applicable to content, media and member types
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// This is not intended to be used directly in your code
+    /// &lt;/remarks&gt;
+    public sealed class ContentTypeCacheRefresher : JsonCacheRefresherBase&lt;ContentTypeCacheRefresher&gt;
+    {
+
+        #region Static helpers
+
+        /// &lt;summary&gt;
+        /// Converts the json to a JsonPayload object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;json&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static JsonPayload[] DeserializeFromJsonPayload(string json)
+        {
+            var serializer = new JavaScriptSerializer();
+            var jsonObject = serializer.Deserialize&lt;JsonPayload[]&gt;(json);
+            return jsonObject;
+        }
+
+        /// &lt;summary&gt;
+        /// Converts a content type to a jsonPayload object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;isDeleted&quot;&gt;if the item was deleted&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static JsonPayload FromContentType(IContentTypeBase contentType, bool isDeleted = false)
+        {
+            var payload = new JsonPayload
+            {
+                Alias = contentType.Alias,
+                Id = contentType.Id,
+                PropertyTypeIds = contentType.PropertyTypes.Select(x =&gt; x.Id).ToArray(),
+                //either IContentType or IMediaType or IMemberType
+                Type = (contentType is IContentType)
+                    ? typeof(IContentType).Name
+                    : (contentType is IMediaType)
+                        ? typeof(IMediaType).Name
+                        : typeof(IMemberType).Name,
+                DescendantPayloads = contentType.Descendants().Select(x =&gt; FromContentType(x)).ToArray(),
+                WasDeleted = isDeleted,
+                PropertyRemoved = contentType.WasPropertyDirty(&quot;HasPropertyTypeBeenRemoved&quot;),
+                AliasChanged = contentType.WasPropertyDirty(&quot;Alias&quot;),
+                PropertyTypeAliasChanged = contentType.PropertyTypes.Any(x =&gt; x.WasPropertyDirty(&quot;Alias&quot;)),
+                IsNew = contentType.WasPropertyDirty(&quot;HasIdentity&quot;)
+            };
+
+
+            return payload;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates the custom Json payload used to refresh cache amongst the servers
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;isDeleted&quot;&gt;specify false if this is an update, otherwise true if it is a deletion&lt;/param&gt;
+        /// &lt;param name=&quot;contentTypes&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static string SerializeToJsonPayload(bool isDeleted, params IContentTypeBase[] contentTypes)
+        {
+            var serializer = new JavaScriptSerializer();
+            var items = contentTypes.Select(x =&gt; FromContentType(x, isDeleted)).ToArray();
+            var json = serializer.Serialize(items);
+            return json;
+        }
+
+        #endregion
+
+        #region Sub classes
+
+        internal class JsonPayload
+        {
+            public JsonPayload()
+            {
+                WasDeleted = false;
+                IsNew = false;
+            }
+            public string Alias { get; set; }
+            public int Id { get; set; }
+            public int[] PropertyTypeIds { get; set; }
+            public string Type { get; set; }
+            public bool AliasChanged { get; set; }
+            public bool PropertyRemoved { get; set; }
+            public bool PropertyTypeAliasChanged { get; set; }
+            public JsonPayload[] DescendantPayloads { get; set; }
+            public bool WasDeleted { get; set; }
+            public bool IsNew { get; set; }
+        }
+
+        #endregion
+
+        protected override ContentTypeCacheRefresher Instance
+        {
+            get { return this; }
+        }
+
+        public override Guid UniqueIdentifier
+        {
+            get { return new Guid(DistributedCache.ContentTypeCacheRefresherId); }
+        }
+        public override string Name
+        {
+            get { return &quot;ContentTypeCacheRefresher&quot;; }
+        }
+
+        public override void RefreshAll()
+        {
+            ClearAllIsolatedCacheByEntityType&lt;IContent&gt;();
+            ClearAllIsolatedCacheByEntityType&lt;IContentType&gt;();
+            ClearAllIsolatedCacheByEntityType&lt;IMedia&gt;();
+            ClearAllIsolatedCacheByEntityType&lt;IMediaType&gt;();
+            ClearAllIsolatedCacheByEntityType&lt;IMember&gt;();
+            ClearAllIsolatedCacheByEntityType&lt;IMemberType&gt;();
+            
+            //all content type property cache
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(CacheKeys.ContentTypePropertiesCacheKey);     
+            //all content type cache
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(CacheKeys.ContentTypeCacheKey);
+            //clear static object cache
+            global::umbraco.cms.businesslogic.ContentType.RemoveAllDataTypeCache();
+
+            PublishedContentType.ClearAll();
+
+            base.RefreshAll();
+        }
+
+        public override void Refresh(int id)
+        {
+            ClearContentTypeCache(false, id);
+            base.Refresh(id);
+        }
+
+        public override void Remove(int id)
+        {
+            ClearContentTypeCache(true, id);
+            base.Remove(id);
+        }
+
+        /// &lt;summary&gt;
+        /// Refreshes the cache using the custom jsonPayload provided
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;jsonPayload&quot;&gt;&lt;/param&gt;
+        public override void Refresh(string jsonPayload)
+        {
+            var payload = DeserializeFromJsonPayload(jsonPayload);
+            ClearContentTypeCache(payload);
+            base.Refresh(jsonPayload);
+        }
+
+        /// &lt;summary&gt;
+        /// This clears out all cache associated with a content type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;payloads&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// The cache that is required to be cleared when a content type is updated is as follows:
+        /// - ApplicationCache (keys to clear):
+        /// -- CacheKeys.PropertyTypeCacheKey + propertyType.Id (each property type assigned)
+        /// -- CacheKeys.ContentTypePropertiesCacheKey + contentType.Id
+        /// - ContentType.RemoveFromDataTypeCache (clears static object/dictionary cache)
+        /// - InMemoryCacheProvider.Current.Clear();
+        /// - RoutesCache.Clear();        
+        /// &lt;/remarks&gt;
+        private void ClearContentTypeCache(JsonPayload[] payloads)
+        {
+            var needsContentRefresh = false;
+
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(CacheKeys.IdToKeyCacheKey);
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(CacheKeys.KeyToIdCacheKey);
+
+            foreach (var payload in payloads)
+            {
+                //clear the cache for each item
+                ClearContentTypeCache(payload);
+
+                //we only need to do this for IContentType NOT for IMediaType, we don&#39;t want to refresh the whole cache.
+                //if the item was deleted or the alias changed or property removed then we need to refresh the content.
+                //and, don&#39;t refresh the cache if it is new.
+                if (payload.Type == typeof(IContentType).Name
+                    &amp;&amp; payload.IsNew == false
+                    &amp;&amp; (payload.WasDeleted || payload.AliasChanged || payload.PropertyRemoved || payload.PropertyTypeAliasChanged))
+                {
+                    needsContentRefresh = true;
+                }
+            }
+
+            //need to refresh the xml content cache if required
+            if (needsContentRefresh)
+            {
+                var pageRefresher = CacheRefreshersResolver.Current.GetById(new Guid(DistributedCache.PageCacheRefresherId));
+                pageRefresher.RefreshAll();
+            }
+
+            //clear the cache providers if there were any content types to clear
+            if (payloads.Any())
+            {
+                if (payloads.Any(x =&gt; x.Type == typeof (IContentType).Name))
+                {
+                    ClearAllIsolatedCacheByEntityType&lt;IContent&gt;();
+                    ClearAllIsolatedCacheByEntityType&lt;IContentType&gt;();
+                }
+                if (payloads.Any(x =&gt; x.Type == typeof(IMediaType).Name))
+                {
+                    ClearAllIsolatedCacheByEntityType&lt;IMedia&gt;();
+                    ClearAllIsolatedCacheByEntityType&lt;IMediaType&gt;();
+                }
+                if (payloads.Any(x =&gt; x.Type == typeof(IMemberType).Name))
+                {
+                    ClearAllIsolatedCacheByEntityType&lt;IMember&gt;();
+                    ClearAllIsolatedCacheByEntityType&lt;IMemberType&gt;();
+                }
+                
+
+                //we only need to do this for IContentType NOT for IMediaType, we don&#39;t want to refresh the whole routes
+                //cache if only a media type has changed.
+                //we don&#39;t want to update the routes cache if all of the content types here are new.
+                if (payloads.Any(x =&gt; x.Type ==  typeof(IContentType).Name) 
+                    &amp;&amp; payloads.All(x =&gt; x.IsNew) == false) //if they are all new then don&#39;t proceed
+                {
+                    // SD: we need to clear the routes cache here!             
+                    //
+                    // zpqrtbnk: no, not here, in fact the caches should subsribe to refresh events else we
+                    // are creating a nasty dependency - but keep it like that for the time being while
+                    // SD is cleaning cache refreshers up.
+                    if (UmbracoContext.Current != null)
+                    {
+                        var contentCache = UmbracoContext.Current.ContentCache.InnerCache as PublishedContentCache;
+                        if (contentCache != null)
+                            contentCache.RoutesCache.Clear();
+                    }
+                }                
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Clears cache for an individual IContentTypeBase object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;payload&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// See notes for the other overloaded ClearContentTypeCache for 
+        /// full details on clearing cache.
+        /// &lt;/remarks&gt;
+        /// &lt;returns&gt;
+        /// Return true if the alias of the content type changed
+        /// &lt;/returns&gt;
+        private static void ClearContentTypeCache(JsonPayload payload)
+        {
+            //clears the cache associated with the Content type itself
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheItem(string.Format(&quot;{0}{1}&quot;, CacheKeys.ContentTypeCacheKey, payload.Id));
+            //clears the cache associated with the content type properties collection
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheItem(CacheKeys.ContentTypePropertiesCacheKey + payload.Id);
+
+            //clears the dictionary object cache of the legacy ContentType
+            global::umbraco.cms.businesslogic.ContentType.RemoveFromDataTypeCache(payload.Alias);
+
+            PublishedContentType.ClearContentType(payload.Id);
+
+            //need to recursively clear the cache for each child content type
+            foreach (var descendant in payload.DescendantPayloads)
+            {
+                ClearContentTypeCache(descendant);
+            }            
+        }
+
+        /// &lt;summary&gt;
+        /// Clears the cache for any content type with the specified Ids
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;isDeleted&quot;&gt;true if the entity was deleted, false if it is just an update&lt;/param&gt;
+        /// &lt;param name=&quot;ids&quot;&gt;&lt;/param&gt;
+        private void ClearContentTypeCache(bool isDeleted, params int[] ids)
+        {
+            ClearContentTypeCache(
+                ids.Select(
+                    x =&gt;
+                    ApplicationContext.Current.Services.ContentTypeService.GetContentType(x) as IContentTypeBase)
+                   .WhereNotNull()
+                   .Select(x =&gt; FromContentType(x, isDeleted))
+                   .ToArray());
+        }
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[36,9,36,10,0],[37,13,37,57,0],[38,13,38,74,0],[39,13,39,31,0],[40,9,40,10,0],[49,9,49,10,0],[50,13,54,73,0],[54,73,54,77,0],[54,77,61,76,0],[61,76,61,94,0],[61,94,65,79,0],[65,79,65,106,0],[65,106,67,15,0],[50,13,67,15,0],[70,13,70,28,0],[71,9,71,10,0],[80,9,80,10,0],[81,13,81,57,0],[82,13,82,50,0],[82,50,82,79,0],[82,79,82,91,0],[82,13,82,91,0],[83,13,83,52,0],[84,13,84,25,0],[85,9,85,10,0],[93,13,93,33,0],[94,13,94,14,0],[95,17,95,36,0],[96,17,96,31,0],[97,13,97,14,0],[98,35,98,39,0],[98,40,98,44,0],[99,29,99,33,0],[99,34,99,38,0],[100,44,100,48,0],[100,49,100,53,0],[101,34,101,38,0],[101,39,101,43,0],[102,40,102,44,0],[102,45,102,49,0],[103,43,103,47,0],[103,48,103,52,0],[104,52,104,56,0],[104,57,104,61,0],[105,55,105,59,0],[105,60,105,64,0],[106,38,106,42,0],[106,43,106,47,0],[107,33,107,37,0],[107,38,107,42,0],[114,17,114,18,0],[114,19,114,31,0],[114,32,114,33,0],[119,17,119,18,0],[119,19,119,81,0],[119,82,119,83,0],[123,17,123,18,0],[123,19,123,54,0],[123,55,123,56,0],[127,9,127,10,0],[128,13,128,59,0],[129,13,129,63,0],[130,13,130,57,0],[131,13,131,61,0],[132,13,132,58,0],[133,13,133,62,0],[136,13,136,133,0],[138,13,138,123,0],[140,13,140,84,0],[142,13,142,45,0],[144,13,144,31,0],[145,9,145,10,0],[148,9,148,10,0],[149,13,149,46,0],[150,13,150,30,0],[151,9,151,10,0],[154,9,154,10,0],[155,13,155,45,0],[156,13,156,29,0],[157,9,157,10,0],[164,9,164,10,0],[165,13,165,67,0],[166,13,166,44,0],[167,13,167,39,0],[168,9,168,10,0],[184,9,184,10,0],[185,13,185,45,0],[187,13,187,119,0],[188,13,188,119,0],[190,13,190,20,0],[190,22,190,33,0],[190,34,190,36,0],[190,37,190,45,0],[191,13,191,14,0],[193,17,193,48,0],[198,17,200,132,0],[201,17,201,18,0],[202,21,202,48,0],[203,17,203,18,0],[204,13,204,14,0],[207,13,207,37,0],[208,13,208,14,0],[209,17,209,126,0],[210,17,210,44,0],[211,13,211,14,0],[214,13,214,32,0],[215,13,215,14,0],[216,17,216,39,0],[216,39,216,75,0],[216,75,216,77,0],[216,17,216,77,0],[217,17,217,18,0],[218,21,218,67,0],[219,21,219,71,0],[220,17,220,18,0],[221,17,221,39,0],[221,39,221,72,0],[221,72,221,74,0],[221,17,221,74,0],[222,17,222,18,0],[223,21,223,65,0],[224,21,224,69,0],[225,17,225,18,0],[226,17,226,39,0],[226,39,226,73,0],[226,73,226,75,0],[226,17,226,75,0],[227,17,227,18,0],[228,21,228,66,0],[229,21,229,70,0],[230,17,230,18,0],[236,17,236,39,0],[236,39,236,75,0],[236,75,237,42,0],[237,42,237,49,0],[237,49,237,60,0],[236,17,237,60,0],[238,17,238,18,0],[244,21,244,56,0],[245,21,245,22,0],[246,25,246,116,0],[247,25,247,50,0],[248,29,248,62,0],[249,21,249,22,0],[250,17,250,18,0],[251,13,251,14,0],[252,9,252,10,0],[266,9,266,10,0],[268,13,268,153,0],[270,13,270,139,0],[273,13,273,98,0],[275,13,275,63,0],[278,13,278,20,0],[278,22,278,36,0],[278,37,278,39,0],[278,40,278,66,0],[279,13,279,14,0],[280,17,280,51,0],[281,13,281,14,0],[282,9,282,10,0],[290,9,290,10,0],[291,13,294,21,0],[294,21,294,113,0],[294,113,296,33,0],[296,33,296,62,0],[296,62,297,32,0],[291,13,297,32,0],[298,9,298,10,0]]);
+    </script>
+  </body>
+</html>

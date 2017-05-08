@@ -1,0 +1,2554 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\PetaPoco.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+/* PetaPoco v4.0.3 - A Tiny ORMish thing for your POCO&#39;s.
+ * Copyright &#169; 2011 Topten Software.  All Rights Reserved.
+ *
+ * Apache License 2.0 - http://www.toptensoftware.com/petapoco/license
+ *
+ * Special thanks to Rob Conery (@robconery) for original inspiration (ie:Massive) and for
+ * use of Subsonic&#39;s T4 templates, Rob Sullivan (@DataChomp) for hard core DBA advice
+ * and Adam Schroder (@schotime) for lots of suggestions, improvements and Oracle support
+ */
+
+// Define PETAPOCO_NO_DYNAMIC in your project settings on .NET 3.5
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.Caching;
+using System.Security;
+using System.Security.Permissions;
+using System.Text;
+using System.Configuration;
+using System.Data.Common;
+using System.Data;
+using System.Text.RegularExpressions;
+using System.Reflection;
+using System.Reflection.Emit;
+using System.Linq.Expressions;
+
+namespace Umbraco.Core.Persistence
+{
+	// Poco&#39;s marked [Explicit] require all column properties to be marked
+	[AttributeUsage(AttributeTargets.Class)]
+	public class ExplicitColumnsAttribute : Attribute
+	{
+	}
+	// For non-explicit pocos, causes a property to be ignored
+	[AttributeUsage(AttributeTargets.Property)]
+	public class IgnoreAttribute : Attribute
+	{
+	}
+
+	// For explicit pocos, marks property as a column and optionally supplies column name
+	[AttributeUsage(AttributeTargets.Property)]
+	public class ColumnAttribute : Attribute
+	{
+		public ColumnAttribute() { }
+		public ColumnAttribute(string name) { Name = name; }
+		public string Name { get; set; }
+	}
+
+	// For explicit pocos, marks property as a result column and optionally supplies column name
+	[AttributeUsage(AttributeTargets.Property)]
+	public class ResultColumnAttribute : ColumnAttribute
+	{
+		public ResultColumnAttribute() { }
+		public ResultColumnAttribute(string name) : base(name) { }
+	}
+
+	// Specify the table name of a poco
+	[AttributeUsage(AttributeTargets.Class)]
+	public class TableNameAttribute : Attribute
+	{
+		public TableNameAttribute(string tableName)
+		{
+			Value = tableName;
+		}
+		public string Value { get; private set; }
+	}
+
+	// Specific the primary key of a poco class (and optional sequence name for Oracle)
+	[AttributeUsage(AttributeTargets.Class)]
+	public class PrimaryKeyAttribute : Attribute
+	{
+		public PrimaryKeyAttribute(string primaryKey)
+		{
+			Value = primaryKey;
+			autoIncrement = true;
+		}
+
+		public string Value { get; private set; }
+		public string sequenceName { get; set; }
+		public bool autoIncrement { get; set; }
+	}
+
+	[AttributeUsage(AttributeTargets.Property)]
+	public class AutoJoinAttribute : Attribute
+	{
+		public AutoJoinAttribute() { }
+	}
+
+	// Results from paged request
+	public class Page&lt;T&gt;
+	{
+		public long CurrentPage { get; set; }
+		public long TotalPages { get; set; }
+		public long TotalItems { get; set; }
+		public long ItemsPerPage { get; set; }
+		public List&lt;T&gt; Items { get; set; }
+		public object Context { get; set; }
+	}
+
+	// Pass as parameter value to force to DBType.AnsiString
+	public class AnsiString
+	{
+		public AnsiString(string str)
+		{
+			Value = str;
+		}
+		public string Value { get; private set; }
+	}
+
+	// Used by IMapper to override table bindings for an object
+	public class TableInfo
+	{
+		public string TableName { get; set; }
+		public string PrimaryKey { get; set; }
+		public bool AutoIncrement { get; set; }
+		public string SequenceName { get; set; }
+	}
+
+	// Optionally provide an implementation of this to Database.Mapper
+	public interface IMapper
+	{
+		void GetTableInfo(Type t, TableInfo ti);
+        bool MapPropertyToColumn(Type t, PropertyInfo pi, ref string columnName, ref bool resultColumn);
+		Func&lt;object, object&gt; GetFromDbConverter(PropertyInfo pi, Type SourceType);
+		Func&lt;object, object&gt; GetToDbConverter(Type SourceType);
+	}
+
+	// This will be merged with IMapper in the next major version
+	public interface IMapper2 : IMapper
+	{
+		Func&lt;object, object&gt; GetFromDbConverter(Type DestType, Type SourceType);
+	}
+
+	// Database class ... this is where most of the action happens
+	public class Database : IDisposable
+	{
+		public Database(IDbConnection connection)
+		{
+			_sharedConnection = connection;
+			_connectionString = connection.ConnectionString;
+			_sharedConnectionDepth = 2;		// Prevent closing external connection
+			CommonConstruct();
+		}
+
+		public Database(string connectionString, string providerName)
+		{
+			_connectionString = connectionString;
+			_providerName = providerName;
+			CommonConstruct();
+		}
+
+		public Database(string connectionString, DbProviderFactory provider)
+		{
+			_connectionString = connectionString;
+			_factory = provider;
+			CommonConstruct();
+		}
+
+		public Database(string connectionStringName)
+		{
+			// Use first?
+			if (connectionStringName == &quot;&quot;)
+				connectionStringName = ConfigurationManager.ConnectionStrings[0].Name;
+
+			// Work out connection string and provider name
+			var providerName = Constants.DatabaseProviders.SqlServer;
+			if (ConfigurationManager.ConnectionStrings[connectionStringName] != null)
+			{
+				if (!string.IsNullOrEmpty(ConfigurationManager.ConnectionStrings[connectionStringName].ProviderName))
+					providerName = ConfigurationManager.ConnectionStrings[connectionStringName].ProviderName;
+			}
+			else
+			{
+				throw new InvalidOperationException(&quot;Can&#39;t find a connection string with the name &#39;&quot; + connectionStringName + &quot;&#39;&quot;);
+			}
+
+			// Store factory and connection string
+			_connectionString = ConfigurationManager.ConnectionStrings[connectionStringName].ConnectionString;
+			_providerName = providerName;
+			CommonConstruct();
+		}
+
+		internal enum DBType
+		{
+			SqlServer,
+			SqlServerCE,
+			MySql,
+			PostgreSQL,
+			Oracle,
+            SQLite
+		}
+		DBType _dbType = DBType.SqlServer;
+
+		// Common initialization
+		private void CommonConstruct()
+		{
+			_transactionDepth = 0;
+			EnableAutoSelect = true;
+			EnableNamedParams = true;
+			ForceDateTimesToUtc = true;
+
+            if (_providerName != null)
+				_factory = DbProviderFactories.GetFactory(_providerName);
+
+            string dbtype = (_factory == null ? _sharedConnection.GetType() : _factory.GetType()).Name;
+
+			if (dbtype.StartsWith(&quot;MySql&quot;)) _dbType = DBType.MySql;
+            else if (dbtype.StartsWith(&quot;SqlCe&quot;)) _dbType = DBType.SqlServerCE;
+			else if (dbtype.StartsWith(&quot;Npgsql&quot;)) _dbType = DBType.PostgreSQL;
+			else if (dbtype.StartsWith(&quot;Oracle&quot;)) _dbType = DBType.Oracle;
+            else if (dbtype.StartsWith(&quot;SQLite&quot;)) _dbType = DBType.SQLite;
+
+			if (_dbType == DBType.MySql &amp;&amp; _connectionString != null &amp;&amp; _connectionString.IndexOf(&quot;Allow User Variables=true&quot;) &gt;= 0)
+				_paramPrefix = &quot;?&quot;;
+			if (_dbType == DBType.Oracle)
+				_paramPrefix = &quot;:&quot;;
+
+            // by default use MSSQL default ReadCommitted level
+            //TODO change to RepeatableRead - but that is breaking
+		    _isolationLevel = IsolationLevel.ReadCommitted;
+		}
+
+		// Automatically close one open shared connection
+		public void Dispose()
+		{
+			// Automatically close one open connection reference
+			//  (Works with KeepConnectionAlive and manually opening a shared connection)
+			CloseSharedConnection();
+		}
+
+		// Set to true to keep the first opened connection alive until this object is disposed
+		public bool KeepConnectionAlive { get; set; }
+
+		// Open a connection (can be nested)
+		public void OpenSharedConnection()
+		{
+			if (_sharedConnectionDepth == 0)
+			{
+				_sharedConnection = _factory.CreateConnection();
+				_sharedConnection.ConnectionString = _connectionString;
+                _sharedConnection.OpenWithRetry();//Changed .Open() =&gt; .OpenWithRetry() extension method
+
+                // ensure we have the proper isolation level, as levels can leak in pools
+                // read http://stackoverflow.com/questions/9851415/sql-server-isolation-level-leaks-across-pooled-connections
+                // and http://stackoverflow.com/questions/641120/what-exec-sp-reset-connection-shown-in-sql-profiler-means
+                //
+                // NPoco has that code in OpenSharedConnectionImp (commented out?)
+                //using (var cmd = _sharedConnection.CreateCommand())
+                //{
+                //    cmd.CommandText = GetSqlForTransactionLevel(_isolationLevel);
+                //    cmd.CommandTimeout = CommandTimeout;
+                //    cmd.ExecuteNonQuery();
+                //}
+                //
+                // although MSDN documentation for SQL CE clearly states that the above method
+                // should work, it fails &amp; reports an error parsing the query on &#39;TRANSACTION&#39;,
+                // and Google is no help (others have faced the same issue... no solution). So,
+                // switching to another method that does work on all databases.
+                var tr = _sharedConnection.BeginTransaction(_isolationLevel);
+                tr.Commit();
+                tr.Dispose();
+
+                _sharedConnection = OnConnectionOpened(_sharedConnection);
+
+				if (KeepConnectionAlive)
+					_sharedConnectionDepth++;		// Make sure you call Dispose
+			}
+			_sharedConnectionDepth++;
+		}
+
+		// Close a previously opened connection
+		public void CloseSharedConnection()
+		{
+			if (_sharedConnectionDepth &gt; 0)
+			{
+				_sharedConnectionDepth--;
+				if (_sharedConnectionDepth == 0)
+				{
+					OnConnectionClosing(_sharedConnection);
+					_sharedConnection.Dispose();
+					_sharedConnection = null;
+				}
+			}
+		}
+
+		// Access to our shared connection
+		public IDbConnection Connection
+		{
+			get { return _sharedConnection; }
+		}
+
+		// Helper to create a transaction scope
+		public Transaction GetTransaction()
+		{
+            return GetTransaction(_isolationLevel);
+        }
+
+        public Transaction GetTransaction(IsolationLevel isolationLevel)
+        {
+            return new Transaction(this, isolationLevel);
+        }
+
+        public IsolationLevel CurrentTransactionIsolationLevel
+        {
+            get { return _transaction == null ? IsolationLevel.Unspecified : _transaction.IsolationLevel; }
+        }
+
+        // Use by derived repo generated by T4 templates
+		public virtual void OnBeginTransaction() { }
+		public virtual void OnEndTransaction() { }
+
+		// Start a new transaction, can be nested, every call must be
+		//	matched by a call to AbortTransaction or CompleteTransaction
+		// Use `using (var scope=db.Transaction) { scope.Complete(); }` to ensure correct semantics
+		public void BeginTransaction()
+		{
+            BeginTransaction(_isolationLevel);
+        }
+
+        public void BeginTransaction(IsolationLevel isolationLevel)
+        {
+            _transactionDepth++;
+
+			if (_transactionDepth == 1)
+			{
+				OpenSharedConnection();
+				_transaction = _sharedConnection.BeginTransaction(isolationLevel);
+				_transactionCancelled = false;
+				OnBeginTransaction();
+			}
+            else if (isolationLevel &gt; _transaction.IsolationLevel)
+                throw new Exception(&quot;Already in a transaction with a lower isolation level.&quot;);
+        }
+
+		// Internal helper to cleanup transaction stuff
+		void CleanupTransaction()
+		{
+			OnEndTransaction();
+
+			if (_transactionCancelled)
+				_transaction.Rollback();
+			else
+				_transaction.Commit();
+
+			_transaction.Dispose();
+			_transaction = null;
+
+			CloseSharedConnection();
+		}
+
+		// Abort the entire outer most transaction scope
+		public void AbortTransaction()
+		{
+			_transactionCancelled = true;
+            //TODO what shall we do if transactionDepth is already zero?
+			if ((--_transactionDepth) == 0)
+				CleanupTransaction();
+		}
+
+		// Complete the transaction
+		public void CompleteTransaction()
+		{
+            //TODO what shall we do if transactionDepth is already zero?
+            if ((--_transactionDepth) == 0)
+				CleanupTransaction();
+		}
+
+        // in NPoco this is in DatabaseType
+        private static string GetSqlForTransactionLevel(IsolationLevel isolationLevel)
+        {
+            switch (isolationLevel)
+            {
+                case IsolationLevel.ReadCommitted:
+                    return &quot;SET TRANSACTION ISOLATION LEVEL READ COMMITTED&quot;;
+                case IsolationLevel.ReadUncommitted:
+                    return &quot;SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED&quot;;
+                case IsolationLevel.RepeatableRead:
+                    return &quot;SET TRANSACTION ISOLATION LEVEL REPEATABLE READ&quot;;
+                case IsolationLevel.Serializable:
+                    return &quot;SET TRANSACTION ISOLATION LEVEL SERIALIZABLE&quot;;
+                case IsolationLevel.Snapshot:
+                    return &quot;SET TRANSACTION ISOLATION LEVEL SNAPSHOT&quot;;
+                default:
+                    return &quot;SET TRANSACTION ISOLATION LEVEL READ COMMITTED&quot;;
+            }
+        }
+
+        // Helper to handle named parameters from object properties
+		static Regex rxParams = new Regex(@&quot;(?&lt;!@)@\w+&quot;, RegexOptions.Compiled);
+		public static string ProcessParams(string _sql, object[] args_src, List&lt;object&gt; args_dest)
+		{
+			return rxParams.Replace(_sql, m =&gt;
+			{
+				string param = m.Value.Substring(1);
+
+				object arg_val;
+
+				int paramIndex;
+				if (int.TryParse(param, out paramIndex))
+				{
+					// Numbered parameter
+					if (paramIndex &lt; 0 || paramIndex &gt;= args_src.Length)
+						throw new ArgumentOutOfRangeException(string.Format(&quot;Parameter &#39;@{0}&#39; specified but only {1} parameters supplied (in `{2}`)&quot;, paramIndex, args_src.Length, _sql));
+					arg_val = args_src[paramIndex];
+				}
+				else
+				{
+					// Look for a property on one of the arguments with this name
+					bool found = false;
+					arg_val = null;
+					foreach (var o in args_src)
+					{
+						var pi = o.GetType().GetProperty(param);
+						if (pi != null)
+						{
+							arg_val = pi.GetValue(o, null);
+							found = true;
+							break;
+						}
+					}
+
+					if (!found)
+						throw new ArgumentException(string.Format(&quot;Parameter &#39;@{0}&#39; specified but none of the passed arguments have a property with this name (in &#39;{1}&#39;)&quot;, param, _sql));
+				}
+
+				// Expand collections to parameter lists
+				if ((arg_val as System.Collections.IEnumerable) != null &amp;&amp;
+					(arg_val as string) == null &amp;&amp;
+					(arg_val as byte[]) == null)
+				{
+					var sb = new StringBuilder();
+					foreach (var i in arg_val as System.Collections.IEnumerable)
+					{
+						sb.Append((sb.Length == 0 ? &quot;@&quot; : &quot;,@&quot;) + args_dest.Count.ToString());
+						args_dest.Add(i);
+					}
+					return sb.ToString();
+				}
+				else
+				{
+					args_dest.Add(arg_val);
+					return &quot;@&quot; + (args_dest.Count - 1).ToString();
+				}
+			}
+			);
+		}
+
+		// Add a parameter to a DB command
+		internal void AddParam(IDbCommand cmd, object item, string ParameterPrefix)
+		{
+			// Convert value to from poco type to db type
+			if (Database.Mapper != null &amp;&amp; item!=null)
+			{
+				var fn = Database.Mapper.GetToDbConverter(item.GetType());
+				if (fn!=null)
+					item = fn(item);
+			}
+
+			// Support passed in parameters
+			var idbParam = item as IDbDataParameter;
+			if (idbParam != null)
+			{
+				idbParam.ParameterName = string.Format(&quot;{0}{1}&quot;, ParameterPrefix, cmd.Parameters.Count);
+				cmd.Parameters.Add(idbParam);
+				return;
+			}
+
+			var p = cmd.CreateParameter();
+			p.ParameterName = string.Format(&quot;{0}{1}&quot;, ParameterPrefix, cmd.Parameters.Count);
+			if (item == null)
+			{
+				p.Value = DBNull.Value;
+			}
+			else
+			{
+				var t = item.GetType();
+				if (t.IsEnum)		// PostgreSQL .NET driver wont cast enum to int
+				{
+					p.Value = (int)item;
+				}
+				else if (t == typeof(Guid))
+				{
+					p.Value = item.ToString();
+					p.DbType = DbType.String;
+					p.Size = 40;
+				}
+				else if (t == typeof(string))
+				{
+                    // out of memory exception occurs if trying to save more than 4000 characters to SQL Server CE NText column.
+                    //Set before attempting to set Size, or Size will always max out at 4000
+                    if ((item as string).Length + 1 &gt; 4000 &amp;&amp; p.GetType().Name == &quot;SqlCeParameter&quot;)
+                        p.GetType().GetProperty(&quot;SqlDbType&quot;).SetValue(p, SqlDbType.NText, null);
+
+                    p.Size = (item as string).Length + 1;
+                    if(p.Size &lt; 4000)
+                        p.Size = Math.Max((item as string).Length + 1, 4000);		// Help query plan caching by using common size
+
+					p.Value = item;
+				}
+				else if (t == typeof(AnsiString))
+				{
+					// Thanks @DataChomp for pointing out the SQL Server indexing performance hit of using wrong string type on varchar
+					p.Size = Math.Max((item as AnsiString).Value.Length + 1, 4000);
+					p.Value = (item as AnsiString).Value;
+					p.DbType = DbType.AnsiString;
+				}
+				else if (t == typeof(bool) &amp;&amp; _dbType != DBType.PostgreSQL)
+				{
+					p.Value = ((bool)item) ? 1 : 0;
+				}
+				else if (item.GetType().Name == &quot;SqlGeography&quot;) //SqlGeography is a CLR Type
+				{
+					p.GetType().GetProperty(&quot;UdtTypeName&quot;).SetValue(p, &quot;geography&quot;, null); //geography is the equivalent SQL Server Type
+					p.Value = item;
+				}
+
+				else if (item.GetType().Name == &quot;SqlGeometry&quot;) //SqlGeometry is a CLR Type
+				{
+					p.GetType().GetProperty(&quot;UdtTypeName&quot;).SetValue(p, &quot;geometry&quot;, null); //geography is the equivalent SQL Server Type
+					p.Value = item;
+				}
+				else
+				{
+					p.Value = item;
+				}
+			}
+
+			cmd.Parameters.Add(p);
+		}
+
+		// Create a command
+		static Regex rxParamsPrefix = new Regex(@&quot;(?&lt;!@)@\w+&quot;, RegexOptions.Compiled);
+		public IDbCommand CreateCommand(IDbConnection connection, string sql, params object[] args)
+		{
+			// Perform named argument replacements
+			if (EnableNamedParams)
+			{
+				var new_args = new List&lt;object&gt;();
+				sql = ProcessParams(sql, args, new_args);
+				args = new_args.ToArray();
+			}
+
+			// Perform parameter prefix replacements
+			if (_paramPrefix != &quot;@&quot;)
+				sql = rxParamsPrefix.Replace(sql, m =&gt; _paramPrefix + m.Value.Substring(1));
+			sql = sql.Replace(&quot;@@&quot;, &quot;@&quot;);		   // &lt;- double @@ escapes a single @
+
+			// Create the command and add parameters
+			IDbCommand cmd = connection.CreateCommand();
+			cmd.Connection = connection;
+			cmd.CommandText = sql;
+			cmd.Transaction = _transaction;
+			foreach (var item in args)
+			{
+				AddParam(cmd, item, _paramPrefix);
+			}
+
+			if (_dbType == DBType.Oracle)
+			{
+				cmd.GetType().GetProperty(&quot;BindByName&quot;).SetValue(cmd, true, null);
+			}
+
+			if (!String.IsNullOrEmpty(sql))
+				DoPreExecute(cmd);
+
+			return cmd;
+		}
+
+		// Override this to log/capture exceptions
+		public virtual void OnException(Exception x)
+		{
+			System.Diagnostics.Debug.WriteLine(x.ToString());
+			System.Diagnostics.Debug.WriteLine(LastCommand);
+		}
+
+		// Override this to log commands, or modify command before execution
+		public virtual IDbConnection OnConnectionOpened(IDbConnection conn) { return conn; }
+		public virtual void OnConnectionClosing(IDbConnection conn) { }
+		public virtual void OnExecutingCommand(IDbCommand cmd) { }
+		public virtual void OnExecutedCommand(IDbCommand cmd) { }
+
+		// Execute a non-query command
+		public int Execute(string sql, params object[] args)
+		{
+			try
+			{
+				OpenSharedConnection();
+				try
+				{
+					using (var cmd = CreateCommand(_sharedConnection, sql, args))
+					{
+						var retv=cmd.ExecuteNonQueryWithRetry();
+						OnExecutedCommand(cmd);
+						return retv;
+					}
+				}
+				finally
+				{
+					CloseSharedConnection();
+				}
+			}
+			catch (Exception x)
+			{
+				OnException(x);
+				throw;
+			}
+		}
+
+		public int Execute(Sql sql)
+		{
+			return Execute(sql.SQL, sql.Arguments);
+		}
+
+		// Execute and cast a scalar property
+		public T ExecuteScalar&lt;T&gt;(string sql, params object[] args)
+		{
+			try
+			{
+				OpenSharedConnection();
+				try
+				{
+					using (var cmd = CreateCommand(_sharedConnection, sql, args))
+					{
+						object val = cmd.ExecuteScalarWithRetry();
+						OnExecutedCommand(cmd);
+
+                        if (val == null || val == DBNull.Value)
+                            return default(T);
+
+                        Type t = typeof(T);
+                        Type u = Nullable.GetUnderlyingType(t);
+
+                        return (T)Convert.ChangeType(val, u ?? t);
+					}
+				}
+				finally
+				{
+					CloseSharedConnection();
+				}
+			}
+			catch (Exception x)
+			{
+				OnException(x);
+				throw;
+			}
+		}
+
+		public T ExecuteScalar&lt;T&gt;(Sql sql)
+		{
+			return ExecuteScalar&lt;T&gt;(sql.SQL, sql.Arguments);
+		}
+
+		Regex rxSelect = new Regex(@&quot;\A\s*(SELECT|EXECUTE|CALL)\s&quot;, RegexOptions.Compiled | RegexOptions.Singleline | RegexOptions.IgnoreCase | RegexOptions.Multiline);
+		Regex rxFrom = new Regex(@&quot;\A\s*FROM\s&quot;, RegexOptions.Compiled | RegexOptions.Singleline | RegexOptions.IgnoreCase | RegexOptions.Multiline);
+		string AddSelectClause&lt;T&gt;(string sql)
+		{
+			if (sql.StartsWith(&quot;;&quot;))
+				return sql.Substring(1);
+
+			if (!rxSelect.IsMatch(sql))
+			{
+				var pd = PocoData.ForType(typeof(T));
+				var tableName = EscapeTableName(pd.TableInfo.TableName);
+				string cols = string.Join(&quot;, &quot;, (from c in pd.QueryColumns select tableName + &quot;.&quot; + EscapeSqlIdentifier(c)).ToArray());
+				if (!rxFrom.IsMatch(sql))
+					sql = string.Format(&quot;SELECT {0} FROM {1} {2}&quot;, cols, tableName, sql);
+				else
+					sql = string.Format(&quot;SELECT {0} {1}&quot;, cols, sql);
+			}
+			return sql;
+		}
+
+		public bool EnableAutoSelect { get; set; }
+		public bool EnableNamedParams { get; set; }
+		public bool ForceDateTimesToUtc { get; set; }
+
+		// Return a typed list of pocos
+		public List&lt;T&gt; Fetch&lt;T&gt;(string sql, params object[] args)
+		{
+			return Query&lt;T&gt;(sql, args).ToList();
+		}
+
+		public List&lt;T&gt; Fetch&lt;T&gt;(Sql sql)
+		{
+			return Fetch&lt;T&gt;(sql.SQL, sql.Arguments);
+		}
+
+		static Regex rxColumns = new Regex(@&quot;\A\s*SELECT\s+((?:\((?&gt;\((?&lt;depth&gt;)|\)(?&lt;-depth&gt;)|.?)*(?(depth)(?!))\)|.)*?)(?&lt;!,\s+)\bFROM\b&quot;, RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.Singleline | RegexOptions.Compiled);
+		static Regex rxOrderBy = new Regex(@&quot;\bORDER\s+BY\s+(?:\((?&gt;\((?&lt;depth&gt;)|\)(?&lt;-depth&gt;)|.?)*(?(depth)(?!))\)|[\w\(\)\.])+(?:\s+(?:ASC|DESC))?(?:\s*,\s*(?:\((?&gt;\((?&lt;depth&gt;)|\)(?&lt;-depth&gt;)|.?)*(?(depth)(?!))\)|[\w\(\)\.])+(?:\s+(?:ASC|DESC))?)*&quot;, RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.Singleline | RegexOptions.Compiled);
+		static Regex rxDistinct = new Regex(@&quot;\ADISTINCT\s&quot;, RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.Singleline | RegexOptions.Compiled);
+		public static bool SplitSqlForPaging(string sql, out string sqlCount, out string sqlSelectRemoved, out string sqlOrderBy)
+		{
+			sqlSelectRemoved = null;
+			sqlCount = null;
+			sqlOrderBy = null;
+
+			// Extract the columns from &quot;SELECT &lt;whatever&gt; FROM&quot;
+			var m = rxColumns.Match(sql);
+			if (!m.Success)
+				return false;
+
+			// Save column list and replace with COUNT(*)
+			Group g = m.Groups[1];
+			sqlSelectRemoved = sql.Substring(g.Index);
+
+			if (rxDistinct.IsMatch(sqlSelectRemoved))
+				sqlCount = sql.Substring(0, g.Index) + &quot;COUNT(&quot; + m.Groups[1].ToString().Trim() + &quot;) &quot; + sql.Substring(g.Index + g.Length);
+			else
+				sqlCount = sql.Substring(0, g.Index) + &quot;COUNT(*) &quot; + sql.Substring(g.Index + g.Length);
+
+
+			// Look for an &quot;ORDER BY &lt;whatever&gt;&quot; clause
+			m = rxOrderBy.Match(sqlCount);
+			if (!m.Success)
+			{
+				sqlOrderBy = null;
+			}
+			else
+			{
+				g = m.Groups[0];
+				sqlOrderBy = g.ToString();
+				sqlCount = sqlCount.Substring(0, g.Index) + sqlCount.Substring(g.Index + g.Length);
+			}
+
+			return true;
+		}
+
+	    /// &lt;summary&gt;
+	    /// NOTE: This is a custom mod of PetaPoco!! This builds the paging sql for different db providers
+	    /// &lt;/summary&gt;
+	    /// &lt;param name=&quot;sql&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;sqlSelectRemoved&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;sqlOrderBy&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;args&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;sqlPage&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;databaseType&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;skip&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;take&quot;&gt;&lt;/param&gt;
+	    internal virtual void BuildSqlDbSpecificPagingQuery(DBType databaseType, long skip, long take, string sql, string sqlSelectRemoved, string sqlOrderBy, ref object[] args, out string sqlPage)
+	    {
+            // this is overriden in UmbracoDatabase, and if running SqlServer &gt;=2012, the database type
+            // is switched from SqlServer to SqlServerCE in order to use the better paging syntax that
+            // SqlCE supports, and SqlServer &gt;=2012 too.
+            // so the first case is actually for SqlServer &lt;2012, and second case is CE *and* SqlServer &gt;=2012
+
+            if (databaseType == DBType.SqlServer || databaseType == DBType.Oracle)
+            {
+                sqlSelectRemoved = rxOrderBy.Replace(sqlSelectRemoved, &quot;&quot;);
+                if (rxDistinct.IsMatch(sqlSelectRemoved))
+                {
+                    sqlSelectRemoved = &quot;peta_inner.* FROM (SELECT &quot; + sqlSelectRemoved + &quot;) peta_inner&quot;;
+                }
+
+                // split to ensure that peta_rn is the last field to be selected, else Page&lt;int&gt; would fail
+                // the resulting sql is not perfect, NPoco has a much nicer way to do it, but it would require
+                // importing large parts of NPoco
+                var pos = sqlSelectRemoved.IndexOf(&quot;FROM&quot;);
+                var sqlColumns = sqlSelectRemoved.Substring(0, pos);
+                var sqlFrom = sqlSelectRemoved.Substring(pos);
+
+                sqlPage = string.Format(&quot;SELECT * FROM (SELECT {0}, ROW_NUMBER() OVER ({1}) peta_rn {2}) peta_paged WHERE peta_rn&gt;@{3} AND peta_rn&lt;=@{4}&quot;,
+                                        sqlColumns, sqlOrderBy ?? &quot;ORDER BY (SELECT NULL)&quot;, sqlFrom, args.Length, args.Length + 1);
+                args = args.Concat(new object[] { skip, skip + take }).ToArray();
+            }
+            else if (databaseType == DBType.SqlServerCE)
+            {
+                sqlPage = string.Format(&quot;{0}\nOFFSET @{1} ROWS FETCH NEXT @{2} ROWS ONLY&quot;, sql, args.Length, args.Length + 1);
+                args = args.Concat(new object[] { skip, take }).ToArray();
+            }
+            else
+            {
+                sqlPage = string.Format(&quot;{0}\nLIMIT @{1} OFFSET @{2}&quot;, sql, args.Length, args.Length + 1);
+                args = args.Concat(new object[] { take, skip }).ToArray();
+            }
+        }
+
+		public void BuildPageQueries&lt;T&gt;(long skip, long take, string sql, ref object[] args, out string sqlCount, out string sqlPage)
+		{
+			// Add auto select clause
+			if (EnableAutoSelect)
+				sql = AddSelectClause&lt;T&gt;(sql);
+
+			// Split the SQL into the bits we need
+			string sqlSelectRemoved, sqlOrderBy;
+			if (SplitSqlForPaging(sql, out sqlCount, out sqlSelectRemoved, out sqlOrderBy) == false)
+				throw new Exception(&quot;Unable to parse SQL statement for paged query&quot;);
+			if (_dbType == DBType.Oracle &amp;&amp; sqlSelectRemoved.StartsWith(&quot;*&quot;))
+                throw new Exception(&quot;Query must alias &#39;*&#39; when performing a paged query.\neg. select t.* from table t order by t.id&quot;);
+
+		    BuildSqlDbSpecificPagingQuery(_dbType, skip, take, sql, sqlSelectRemoved, sqlOrderBy, ref args, out sqlPage);
+		}
+
+		// Fetch a page
+		public Page&lt;T&gt; Page&lt;T&gt;(long page, long itemsPerPage, string sql, params object[] args)
+		{
+			string sqlCount, sqlPage;
+			BuildPageQueries&lt;T&gt;((page-1)*itemsPerPage, itemsPerPage, sql, ref args, out sqlCount, out sqlPage);
+
+			// Save the one-time command time out and use it for both queries
+			int saveTimeout = OneTimeCommandTimeout;
+
+			// Setup the paged result
+			var result = new Page&lt;T&gt;();
+			result.CurrentPage = page;
+			result.ItemsPerPage = itemsPerPage;
+			result.TotalItems = ExecuteScalar&lt;long&gt;(sqlCount, args);
+			result.TotalPages = result.TotalItems / itemsPerPage;
+			if ((result.TotalItems % itemsPerPage) != 0)
+				result.TotalPages++;
+
+			OneTimeCommandTimeout = saveTimeout;
+
+			// Get the records
+			result.Items = Fetch&lt;T&gt;(sqlPage, args);
+
+			// Done
+			return result;
+		}
+
+		public Page&lt;T&gt; Page&lt;T&gt;(long page, long itemsPerPage, Sql sql)
+		{
+			return Page&lt;T&gt;(page, itemsPerPage, sql.SQL, sql.Arguments);
+		}
+
+
+		public List&lt;T&gt; Fetch&lt;T&gt;(long page, long itemsPerPage, string sql, params object[] args)
+		{
+			return SkipTake&lt;T&gt;((page - 1) * itemsPerPage, itemsPerPage, sql, args);
+		}
+
+		public List&lt;T&gt; Fetch&lt;T&gt;(long page, long itemsPerPage, Sql sql)
+		{
+			return SkipTake&lt;T&gt;((page - 1) * itemsPerPage, itemsPerPage, sql.SQL, sql.Arguments);
+		}
+
+		public List&lt;T&gt; SkipTake&lt;T&gt;(long skip, long take, string sql, params object[] args)
+		{
+			string sqlCount, sqlPage;
+			BuildPageQueries&lt;T&gt;(skip, take, sql, ref args, out sqlCount, out sqlPage);
+			return Fetch&lt;T&gt;(sqlPage, args);
+		}
+
+		public List&lt;T&gt; SkipTake&lt;T&gt;(long skip, long take, Sql sql)
+		{
+			return SkipTake&lt;T&gt;(skip, take, sql.SQL, sql.Arguments);
+		}
+
+		// Return an enumerable collection of pocos
+		public IEnumerable&lt;T&gt; Query&lt;T&gt;(string sql, params object[] args)
+		{
+			if (EnableAutoSelect)
+				sql = AddSelectClause&lt;T&gt;(sql);
+
+			OpenSharedConnection();
+			try
+			{
+				using (var cmd = CreateCommand(_sharedConnection, sql, args))
+				{
+					IDataReader r;
+					var pd = PocoData.ForType(typeof(T));
+					try
+					{
+						r = cmd.ExecuteReaderWithRetry();
+						OnExecutedCommand(cmd);
+					}
+					catch (Exception x)
+					{
+						OnException(x);
+						throw;
+					}
+					var factory = pd.GetFactory(cmd.CommandText, _sharedConnection.ConnectionString, ForceDateTimesToUtc, 0, r.FieldCount, r) as Func&lt;IDataReader, T&gt;;
+					using (r)
+					{
+						while (true)
+						{
+							T poco;
+							try
+							{
+								if (!r.Read())
+									yield break;
+								poco = factory(r);
+							}
+							catch (Exception x)
+							{
+								OnException(x);
+								throw;
+							}
+
+							yield return poco;
+						}
+					}
+				}
+			}
+			finally
+			{
+				CloseSharedConnection();
+			}
+		}
+
+		// Multi Fetch
+		public List&lt;TRet&gt; Fetch&lt;T1, T2, TRet&gt;(Func&lt;T1, T2, TRet&gt; cb, string sql, params object[] args) { return Query&lt;T1, T2, TRet&gt;(cb, sql, args).ToList(); }
+		public List&lt;TRet&gt; Fetch&lt;T1, T2, T3, TRet&gt;(Func&lt;T1, T2, T3, TRet&gt; cb, string sql, params object[] args) { return Query&lt;T1, T2, T3, TRet&gt;(cb, sql, args).ToList(); }
+		public List&lt;TRet&gt; Fetch&lt;T1, T2, T3, T4, TRet&gt;(Func&lt;T1, T2, T3, T4, TRet&gt; cb, string sql, params object[] args) { return Query&lt;T1, T2, T3, T4, TRet&gt;(cb, sql, args).ToList(); }
+        public List&lt;TRet&gt; Fetch&lt;T1, T2, T3, T4, T5, TRet&gt;(Func&lt;T1, T2, T3, T4, T5, TRet&gt; cb, string sql, params object[] args) { return Query&lt;T1, T2, T3, T4, T5, TRet&gt;(cb, sql, args).ToList(); }
+
+		// Multi Query
+		public IEnumerable&lt;TRet&gt; Query&lt;T1, T2, TRet&gt;(Func&lt;T1, T2, TRet&gt; cb, string sql, params object[] args) { return Query&lt;TRet&gt;(new Type[] { typeof(T1), typeof(T2) }, cb, sql, args); }
+		public IEnumerable&lt;TRet&gt; Query&lt;T1, T2, T3, TRet&gt;(Func&lt;T1, T2, T3, TRet&gt; cb, string sql, params object[] args) { return Query&lt;TRet&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3)}, cb, sql, args); }
+		public IEnumerable&lt;TRet&gt; Query&lt;T1, T2, T3, T4, TRet&gt;(Func&lt;T1, T2, T3, T4, TRet&gt; cb, string sql, params object[] args) { return Query&lt;TRet&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4)}, cb, sql, args); }
+        public IEnumerable&lt;TRet&gt; Query&lt;T1, T2, T3, T4, T5, TRet&gt;(Func&lt;T1, T2, T3, T4, T5, TRet&gt; cb, string sql, params object[] args) { return Query&lt;TRet&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5) }, cb, sql, args); }
+
+		// Multi Fetch (SQL builder)
+		public List&lt;TRet&gt; Fetch&lt;T1, T2, TRet&gt;(Func&lt;T1, T2, TRet&gt; cb, Sql sql) { return Query&lt;T1, T2, TRet&gt;(cb, sql.SQL, sql.Arguments).ToList(); }
+		public List&lt;TRet&gt; Fetch&lt;T1, T2, T3, TRet&gt;(Func&lt;T1, T2, T3, TRet&gt; cb, Sql sql) { return Query&lt;T1, T2, T3, TRet&gt;(cb, sql.SQL, sql.Arguments).ToList(); }
+		public List&lt;TRet&gt; Fetch&lt;T1, T2, T3, T4, TRet&gt;(Func&lt;T1, T2, T3, T4, TRet&gt; cb, Sql sql) { return Query&lt;T1, T2, T3, T4, TRet&gt;(cb, sql.SQL, sql.Arguments).ToList(); }
+        public List&lt;TRet&gt; Fetch&lt;T1, T2, T3, T4, T5, TRet&gt;(Func&lt;T1, T2, T3, T4, T5, TRet&gt; cb, Sql sql) { return Query&lt;T1, T2, T3, T4, T5, TRet&gt;(cb, sql.SQL, sql.Arguments).ToList(); }
+
+		// Multi Query (SQL builder)
+		public IEnumerable&lt;TRet&gt; Query&lt;T1, T2, TRet&gt;(Func&lt;T1, T2, TRet&gt; cb, Sql sql) { return Query&lt;TRet&gt;(new Type[] { typeof(T1), typeof(T2) }, cb, sql.SQL, sql.Arguments); }
+		public IEnumerable&lt;TRet&gt; Query&lt;T1, T2, T3, TRet&gt;(Func&lt;T1, T2, T3, TRet&gt; cb, Sql sql) { return Query&lt;TRet&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3) }, cb, sql.SQL, sql.Arguments); }
+		public IEnumerable&lt;TRet&gt; Query&lt;T1, T2, T3, T4, TRet&gt;(Func&lt;T1, T2, T3, T4, TRet&gt; cb, Sql sql) { return Query&lt;TRet&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, cb, sql.SQL, sql.Arguments); }
+        public IEnumerable&lt;TRet&gt; Query&lt;T1, T2, T3, T4, T5, TRet&gt;(Func&lt;T1, T2, T3, T4, T5, TRet&gt; cb, Sql sql) { return Query&lt;TRet&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5) }, cb, sql.SQL, sql.Arguments); }
+
+		// Multi Fetch (Simple)
+		public List&lt;T1&gt; Fetch&lt;T1, T2&gt;(string sql, params object[] args) { return Query&lt;T1, T2&gt;(sql, args).ToList(); }
+		public List&lt;T1&gt; Fetch&lt;T1, T2, T3&gt;(string sql, params object[] args) { return Query&lt;T1, T2, T3&gt;(sql, args).ToList(); }
+		public List&lt;T1&gt; Fetch&lt;T1, T2, T3, T4&gt;(string sql, params object[] args) { return Query&lt;T1, T2, T3, T4&gt;(sql, args).ToList(); }
+        public List&lt;T1&gt; Fetch&lt;T1, T2, T3, T4, T5&gt;(string sql, params object[] args) { return Query&lt;T1, T2, T3, T4, T5&gt;(sql, args).ToList(); }
+
+		// Multi Query (Simple)
+		public IEnumerable&lt;T1&gt; Query&lt;T1, T2&gt;(string sql, params object[] args) { return Query&lt;T1&gt;(new Type[] { typeof(T1), typeof(T2) }, null, sql, args); }
+		public IEnumerable&lt;T1&gt; Query&lt;T1, T2, T3&gt;(string sql, params object[] args) { return Query&lt;T1&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3) }, null, sql, args); }
+		public IEnumerable&lt;T1&gt; Query&lt;T1, T2, T3, T4&gt;(string sql, params object[] args) { return Query&lt;T1&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, null, sql, args); }
+        public IEnumerable&lt;T1&gt; Query&lt;T1, T2, T3, T4, T5&gt;(string sql, params object[] args) { return Query&lt;T1&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5) }, null, sql, args); }
+
+		// Multi Fetch (Simple) (SQL builder)
+		public List&lt;T1&gt; Fetch&lt;T1, T2&gt;(Sql sql) { return Query&lt;T1, T2&gt;(sql.SQL, sql.Arguments).ToList(); }
+		public List&lt;T1&gt; Fetch&lt;T1, T2, T3&gt;(Sql sql) { return Query&lt;T1, T2, T3&gt;(sql.SQL, sql.Arguments).ToList(); }
+		public List&lt;T1&gt; Fetch&lt;T1, T2, T3, T4&gt;(Sql sql) { return Query&lt;T1, T2, T3, T4&gt;(sql.SQL, sql.Arguments).ToList(); }
+        public List&lt;T1&gt; Fetch&lt;T1, T2, T3, T4, T5&gt;(Sql sql) { return Query&lt;T1, T2, T3, T4, T5&gt;(sql.SQL, sql.Arguments).ToList(); }
+
+		// Multi Query (Simple) (SQL builder)
+		public IEnumerable&lt;T1&gt; Query&lt;T1, T2&gt;(Sql sql) { return Query&lt;T1&gt;(new Type[] { typeof(T1), typeof(T2) }, null, sql.SQL, sql.Arguments); }
+		public IEnumerable&lt;T1&gt; Query&lt;T1, T2, T3&gt;(Sql sql) { return Query&lt;T1&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3) }, null, sql.SQL, sql.Arguments); }
+		public IEnumerable&lt;T1&gt; Query&lt;T1, T2, T3, T4&gt;(Sql sql) { return Query&lt;T1&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4) }, null, sql.SQL, sql.Arguments); }
+        public IEnumerable&lt;T1&gt; Query&lt;T1, T2, T3, T4, T5&gt;(Sql sql) { return Query&lt;T1&gt;(new Type[] { typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5) }, null, sql.SQL, sql.Arguments); }
+
+		// Automagically guess the property relationships between various POCOs and create a delegate that will set them up
+		Delegate GetAutoMapper(Type[] types)
+		{
+			// Build a key
+			var kb = new StringBuilder();
+			foreach (var t in types)
+			{
+				kb.Append(t.ToString());
+				kb.Append(&quot;:&quot;);
+			}
+			var key = kb.ToString();
+
+			// Check cache
+			RWLock.EnterReadLock();
+			try
+			{
+				Delegate mapper;
+				if (AutoMappers.TryGetValue(key, out mapper))
+					return mapper;
+			}
+			finally
+			{
+				RWLock.ExitReadLock();
+			}
+
+			// Create it
+			RWLock.EnterWriteLock();
+			try
+			{
+				// Try again
+				Delegate mapper;
+				if (AutoMappers.TryGetValue(key, out mapper))
+					return mapper;
+
+				// Create a method
+				var m = new DynamicMethod(&quot;petapoco_automapper&quot;, types[0], types, true);
+				var il = m.GetILGenerator();
+
+				for (int i = 1; i &lt; types.Length; i++)
+				{
+					bool handled = false;
+					for (int j = i - 1; j &gt;= 0; j--)
+					{
+						// Find the property
+						var candidates = from p in types[j].GetProperties() where p.PropertyType == types[i] select p;
+						if (candidates.Count() == 0)
+							continue;
+						if (candidates.Count() &gt; 1)
+							throw new InvalidOperationException(string.Format(&quot;Can&#39;t auto join {0} as {1} has more than one property of type {0}&quot;, types[i], types[j]));
+
+						// Generate code
+						il.Emit(OpCodes.Ldarg_S, j);
+						il.Emit(OpCodes.Ldarg_S, i);
+						il.Emit(OpCodes.Callvirt, candidates.First().GetSetMethod(true));
+						handled = true;
+					}
+
+					if (!handled)
+						throw new InvalidOperationException(string.Format(&quot;Can&#39;t auto join {0}&quot;, types[i]));
+				}
+
+				il.Emit(OpCodes.Ldarg_0);
+				il.Emit(OpCodes.Ret);
+
+				// Cache it
+				var del = m.CreateDelegate(Expression.GetFuncType(types.Concat(types.Take(1)).ToArray()));
+				AutoMappers.Add(key, del);
+				return del;
+			}
+			finally
+			{
+				RWLock.ExitWriteLock();
+			}
+		}
+
+		// Find the split point in a result set for two different pocos and return the poco factory for the first
+		Delegate FindSplitPoint(Type typeThis, Type typeNext, string sql, IDataReader r, ref int pos)
+		{
+			// Last?
+			if (typeNext == null)
+				return PocoData.ForType(typeThis).GetFactory(sql, _sharedConnection.ConnectionString, ForceDateTimesToUtc, pos, r.FieldCount - pos, r);
+
+			// Get PocoData for the two types
+			PocoData pdThis = PocoData.ForType(typeThis);
+			PocoData pdNext = PocoData.ForType(typeNext);
+
+			// Find split point
+			int firstColumn = pos;
+			var usedColumns = new Dictionary&lt;string, bool&gt;();
+			for (; pos &lt; r.FieldCount; pos++)
+			{
+				// Split if field name has already been used, or if the field doesn&#39;t exist in current poco but does in the next
+				string fieldName = r.GetName(pos);
+				if (usedColumns.ContainsKey(fieldName) || (!pdThis.Columns.ContainsKey(fieldName) &amp;&amp; pdNext.Columns.ContainsKey(fieldName)))
+				{
+					return pdThis.GetFactory(sql, _sharedConnection.ConnectionString, ForceDateTimesToUtc, firstColumn, pos - firstColumn, r);
+				}
+				usedColumns.Add(fieldName, true);
+			}
+
+			throw new InvalidOperationException(string.Format(&quot;Couldn&#39;t find split point between {0} and {1}&quot;, typeThis, typeNext));
+		}
+
+
+		// Instance data used by the Multipoco factory delegate - essentially a list of the nested poco factories to call
+		public class MultiPocoFactory
+		{
+
+			public MultiPocoFactory(IEnumerable&lt;Delegate&gt; dels)
+			{
+				Delegates = new List&lt;Delegate&gt;(dels);
+			}
+			private List&lt;Delegate&gt; Delegates { get; set; }
+			private Delegate GetItem(int index) { return Delegates[index]; }
+
+			/// &lt;summary&gt;
+			/// Calls the delegate at the specified index and returns its values
+			/// &lt;/summary&gt;
+			/// &lt;param name=&quot;index&quot;&gt;&lt;/param&gt;
+			/// &lt;param name=&quot;reader&quot;&gt;&lt;/param&gt;
+			/// &lt;returns&gt;&lt;/returns&gt;
+			private object CallDelegate(int index, IDataReader reader)
+			{
+				var d = GetItem(index);
+				var output = d.DynamicInvoke(reader);
+				return output;
+			}
+
+			/// &lt;summary&gt;
+			/// Calls the callback delegate and passes in the output of all delegates as the parameters
+			/// &lt;/summary&gt;
+			/// &lt;typeparam name=&quot;TRet&quot;&gt;&lt;/typeparam&gt;
+			/// &lt;param name=&quot;callback&quot;&gt;&lt;/param&gt;
+			/// &lt;param name=&quot;dr&quot;&gt;&lt;/param&gt;
+			/// &lt;param name=&quot;count&quot;&gt;&lt;/param&gt;
+			/// &lt;returns&gt;&lt;/returns&gt;
+			public TRet CallCallback&lt;TRet&gt;(Delegate callback, IDataReader dr, int count)
+			{
+				var args = new List&lt;object&gt;();
+				for(var i = 0;i&lt;count;i++)
+				{
+					args.Add(CallDelegate(i, dr));
+				}
+				return (TRet)callback.DynamicInvoke(args.ToArray());
+			}
+		}
+
+		// Create a multi-poco factory
+		Func&lt;IDataReader, Delegate, TRet&gt; CreateMultiPocoFactory&lt;TRet&gt;(Type[] types, string sql, IDataReader r)
+		{
+			// Call each delegate
+			var dels = new List&lt;Delegate&gt;();
+			int pos = 0;
+			for (int i=0; i&lt;types.Length; i++)
+			{
+				// Add to list of delegates to call
+				var del = FindSplitPoint(types[i], i + 1 &lt; types.Length ? types[i + 1] : null, sql, r, ref pos);
+				dels.Add(del);
+			}
+
+			var mpFactory = new MultiPocoFactory(dels);
+			return (reader, arg3) =&gt; mpFactory.CallCallback&lt;TRet&gt;(arg3, reader, types.Length);
+		}
+
+		// Various cached stuff
+		static Dictionary&lt;string, object&gt; MultiPocoFactories = new Dictionary&lt;string, object&gt;();
+		static Dictionary&lt;string, Delegate&gt; AutoMappers = new Dictionary&lt;string, Delegate&gt;();
+		static System.Threading.ReaderWriterLockSlim RWLock = new System.Threading.ReaderWriterLockSlim();
+
+		// Get (or create) the multi-poco factory for a query
+		Func&lt;IDataReader, Delegate, TRet&gt; GetMultiPocoFactory&lt;TRet&gt;(Type[] types, string sql, IDataReader r)
+		{
+			// Build a key string  (this is crap, should address this at some point)
+			var kb = new StringBuilder();
+			kb.Append(typeof(TRet).ToString());
+			kb.Append(&quot;:&quot;);
+			foreach (var t in types)
+			{
+				kb.Append(&quot;:&quot;);
+				kb.Append(t.ToString());
+			}
+			kb.Append(&quot;:&quot;); kb.Append(_sharedConnection.ConnectionString);
+			kb.Append(&quot;:&quot;); kb.Append(ForceDateTimesToUtc);
+			kb.Append(&quot;:&quot;); kb.Append(sql);
+			string key = kb.ToString();
+
+			// Check cache
+			RWLock.EnterReadLock();
+			try
+			{
+				object oFactory;
+				if (MultiPocoFactories.TryGetValue(key, out oFactory))
+				{
+					//mpFactory = oFactory;
+					return (Func&lt;IDataReader, Delegate, TRet&gt;)oFactory;
+				}
+			}
+			finally
+			{
+				RWLock.ExitReadLock();
+			}
+
+			// Cache it
+			RWLock.EnterWriteLock();
+			try
+			{
+				// Check again
+				object oFactory; ;
+				if (MultiPocoFactories.TryGetValue(key, out oFactory))
+				{
+					return (Func&lt;IDataReader, Delegate, TRet&gt;)oFactory;
+				}
+
+				// Create the factory
+				var factory = CreateMultiPocoFactory&lt;TRet&gt;(types, sql, r);
+
+				MultiPocoFactories.Add(key, factory);
+				return factory;
+			}
+			finally
+			{
+				RWLock.ExitWriteLock();
+			}
+
+		}
+
+		// Actual implementation of the multi-poco query
+		public IEnumerable&lt;TRet&gt; Query&lt;TRet&gt;(Type[] types, Delegate cb, string sql, params object[] args)
+		{
+			OpenSharedConnection();
+			try
+			{
+				using (var cmd = CreateCommand(_sharedConnection, sql, args))
+				{
+					IDataReader r;
+					try
+					{
+						r = cmd.ExecuteReaderWithRetry();
+						OnExecutedCommand(cmd);
+					}
+					catch (Exception x)
+					{
+						OnException(x);
+						throw;
+					}
+					var factory = GetMultiPocoFactory&lt;TRet&gt;(types, sql, r);
+					if (cb == null)
+						cb = GetAutoMapper(types.ToArray());
+					bool bNeedTerminator=false;
+					using (r)
+					{
+						while (true)
+						{
+							TRet poco;
+							try
+							{
+								if (!r.Read())
+									break;
+								poco = factory(r, cb);
+							}
+							catch (Exception x)
+							{
+								OnException(x);
+								throw;
+							}
+
+							if (poco != null)
+								yield return poco;
+							else
+								bNeedTerminator = true;
+						}
+						if (bNeedTerminator)
+						{
+							var poco = (TRet)(cb as Delegate).DynamicInvoke(new object[types.Length]);
+							if (poco != null)
+								yield return poco;
+							else
+								yield break;
+						}
+					}
+				}
+			}
+			finally
+			{
+				CloseSharedConnection();
+			}
+		}
+
+
+		public IEnumerable&lt;T&gt; Query&lt;T&gt;(Sql sql)
+		{
+			return Query&lt;T&gt;(sql.SQL, sql.Arguments);
+		}
+
+		public bool Exists&lt;T&gt;(object primaryKey)
+		{
+			return FirstOrDefault&lt;T&gt;(string.Format(&quot;WHERE {0}=@0&quot;, EscapeSqlIdentifier(PocoData.ForType(typeof(T)).TableInfo.PrimaryKey)), primaryKey) != null;
+		}
+		public T Single&lt;T&gt;(object primaryKey)
+		{
+			return Single&lt;T&gt;(string.Format(&quot;WHERE {0}=@0&quot;, EscapeSqlIdentifier(PocoData.ForType(typeof(T)).TableInfo.PrimaryKey)), primaryKey);
+		}
+		public T SingleOrDefault&lt;T&gt;(object primaryKey)
+		{
+			return SingleOrDefault&lt;T&gt;(string.Format(&quot;WHERE {0}=@0&quot;, EscapeSqlIdentifier(PocoData.ForType(typeof(T)).TableInfo.PrimaryKey)), primaryKey);
+		}
+		public T Single&lt;T&gt;(string sql, params object[] args)
+		{
+			return Query&lt;T&gt;(sql, args).Single();
+		}
+		public T SingleOrDefault&lt;T&gt;(string sql, params object[] args)
+		{
+			return Query&lt;T&gt;(sql, args).SingleOrDefault();
+		}
+		public T First&lt;T&gt;(string sql, params object[] args)
+		{
+			return Query&lt;T&gt;(sql, args).First();
+		}
+		public T FirstOrDefault&lt;T&gt;(string sql, params object[] args)
+		{
+			return Query&lt;T&gt;(sql, args).FirstOrDefault();
+		}
+
+		public T Single&lt;T&gt;(Sql sql)
+		{
+			return Query&lt;T&gt;(sql).Single();
+		}
+		public T SingleOrDefault&lt;T&gt;(Sql sql)
+		{
+			return Query&lt;T&gt;(sql).SingleOrDefault();
+		}
+		public T First&lt;T&gt;(Sql sql)
+		{
+			return Query&lt;T&gt;(sql).First();
+		}
+		public T FirstOrDefault&lt;T&gt;(Sql sql)
+		{
+			return Query&lt;T&gt;(sql).FirstOrDefault();
+		}
+
+		public string EscapeTableName(string str)
+		{
+			// Assume table names with &quot;dot&quot;, or opening sq is already escaped
+			return str.IndexOf(&#39;.&#39;) &gt;= 0 ? str : EscapeSqlIdentifier(str);
+		}
+		public string EscapeSqlIdentifier(string str)
+		{
+			switch (_dbType)
+			{
+				case DBType.MySql:
+					return string.Format(&quot;`{0}`&quot;, str);
+
+				case DBType.PostgreSQL:
+				case DBType.Oracle:
+					return string.Format(&quot;\&quot;{0}\&quot;&quot;, str);
+
+				default:
+					return string.Format(&quot;[{0}]&quot;, str);
+			}
+		}
+
+		public object Insert(string tableName, string primaryKeyName, object poco)
+		{
+			return Insert(tableName, primaryKeyName, true, poco);
+		}
+
+		// Insert a poco into a table.  If the poco has a property with the same name
+		// as the primary key the id of the new record is assigned to it.  Either way,
+		// the new id is returned.
+		public object Insert(string tableName, string primaryKeyName, bool autoIncrement, object poco)
+		{
+			try
+			{
+				OpenSharedConnection();
+				try
+				{
+					using (var cmd = CreateCommand(_sharedConnection, &quot;&quot;))
+					{
+						var pd = PocoData.ForObject(poco, primaryKeyName);
+						var names = new List&lt;string&gt;();
+						var values = new List&lt;string&gt;();
+						var index = 0;
+						foreach (var i in pd.Columns)
+						{
+							// Don&#39;t insert result columns
+							if (i.Value.ResultColumn)
+								continue;
+
+							// Don&#39;t insert the primary key (except under oracle where we need bring in the next sequence value)
+							if (autoIncrement &amp;&amp; primaryKeyName != null &amp;&amp; string.Compare(i.Key, primaryKeyName, true)==0)
+							{
+								if (_dbType == DBType.Oracle &amp;&amp; !string.IsNullOrEmpty(pd.TableInfo.SequenceName))
+								{
+									names.Add(i.Key);
+									values.Add(string.Format(&quot;{0}.nextval&quot;, pd.TableInfo.SequenceName));
+								}
+								continue;
+							}
+
+							names.Add(EscapeSqlIdentifier(i.Key));
+							values.Add(string.Format(&quot;{0}{1}&quot;, _paramPrefix, index++));
+							AddParam(cmd, i.Value.GetValue(poco), _paramPrefix);
+						}
+
+						cmd.CommandText = string.Format(&quot;INSERT INTO {0} ({1}) VALUES ({2})&quot;,
+								EscapeTableName(tableName),
+								string.Join(&quot;,&quot;, names.ToArray()),
+								string.Join(&quot;,&quot;, values.ToArray())
+								);
+
+						if (!autoIncrement)
+						{
+							DoPreExecute(cmd);
+							cmd.ExecuteNonQueryWithRetry();
+							OnExecutedCommand(cmd);
+							return true;
+						}
+
+
+						object id;
+						switch (_dbType)
+						{
+							case DBType.SqlServerCE:
+								DoPreExecute(cmd);
+								cmd.ExecuteNonQueryWithRetry();
+								OnExecutedCommand(cmd);
+								id = ExecuteScalar&lt;object&gt;(&quot;SELECT @@@IDENTITY AS NewID;&quot;);
+								break;
+							case DBType.SqlServer:
+								cmd.CommandText += &quot;;\nSELECT SCOPE_IDENTITY() AS NewID;&quot;;
+								DoPreExecute(cmd);
+								id = cmd.ExecuteScalarWithRetry();
+								OnExecutedCommand(cmd);
+								break;
+							case DBType.PostgreSQL:
+								if (primaryKeyName != null)
+								{
+									cmd.CommandText += string.Format(&quot;returning {0} as NewID&quot;, EscapeSqlIdentifier(primaryKeyName));
+									DoPreExecute(cmd);
+									id = cmd.ExecuteScalarWithRetry();
+								}
+								else
+								{
+									id = -1;
+									DoPreExecute(cmd);
+									cmd.ExecuteNonQueryWithRetry();
+								}
+								OnExecutedCommand(cmd);
+								break;
+							case DBType.Oracle:
+								if (primaryKeyName != null)
+								{
+									cmd.CommandText += string.Format(&quot; returning {0} into :newid&quot;, EscapeSqlIdentifier(primaryKeyName));
+									var param = cmd.CreateParameter();
+									param.ParameterName = &quot;:newid&quot;;
+									param.Value = DBNull.Value;
+									param.Direction = ParameterDirection.ReturnValue;
+									param.DbType = DbType.Int64;
+									cmd.Parameters.Add(param);
+									DoPreExecute(cmd);
+									cmd.ExecuteNonQueryWithRetry();
+									id = param.Value;
+								}
+								else
+								{
+									id = -1;
+									DoPreExecute(cmd);
+									cmd.ExecuteNonQueryWithRetry();
+								}
+								OnExecutedCommand(cmd);
+								break;
+                            case DBType.SQLite:
+                                if (primaryKeyName != null)
+                                {
+                                    cmd.CommandText += &quot;;\nSELECT last_insert_rowid();&quot;;
+                                    DoPreExecute(cmd);
+                                    id = cmd.ExecuteScalarWithRetry();
+                                }
+                                else
+                                {
+                                    id = -1;
+                                    DoPreExecute(cmd);
+                                    cmd.ExecuteNonQueryWithRetry();
+                                }
+                                OnExecutedCommand(cmd);
+                                break;
+							default:
+								cmd.CommandText += &quot;;\nSELECT @@IDENTITY AS NewID;&quot;;
+								DoPreExecute(cmd);
+								id = cmd.ExecuteScalarWithRetry();
+								OnExecutedCommand(cmd);
+								break;
+						}
+
+
+						// Assign the ID back to the primary key property
+						if (primaryKeyName != null)
+						{
+							PocoColumn pc;
+							if (pd.Columns.TryGetValue(primaryKeyName, out pc))
+							{
+								pc.SetValue(poco, pc.ChangeType(id));
+							}
+						}
+
+						return id;
+					}
+				}
+				finally
+				{
+					CloseSharedConnection();
+				}
+			}
+			catch (Exception x)
+			{
+				OnException(x);
+				throw;
+			}
+		}
+
+		// Insert an annotated poco object
+		public object Insert(object poco)
+		{
+			var pd = PocoData.ForType(poco.GetType());
+			return Insert(pd.TableInfo.TableName, pd.TableInfo.PrimaryKey, pd.TableInfo.AutoIncrement, poco);
+		}
+
+		public int Update(string tableName, string primaryKeyName, object poco, object primaryKeyValue)
+		{
+			return Update(tableName, primaryKeyName, poco, primaryKeyValue, null);
+		}
+
+
+		// Update a record with values from a poco.  primary key value can be either supplied or read from the poco
+		public int Update(string tableName, string primaryKeyName, object poco, object primaryKeyValue, IEnumerable&lt;string&gt; columns)
+		{
+			try
+			{
+				OpenSharedConnection();
+				try
+				{
+					using (var cmd = CreateCommand(_sharedConnection, &quot;&quot;))
+					{
+						var sb = new StringBuilder();
+						var index = 0;
+						var pd = PocoData.ForObject(poco,primaryKeyName);
+						if (columns == null)
+						{
+							foreach (var i in pd.Columns)
+							{
+								// Don&#39;t update the primary key, but grab the value if we don&#39;t have it
+								if (string.Compare(i.Key, primaryKeyName, true) == 0)
+								{
+									if (primaryKeyValue == null)
+										primaryKeyValue = i.Value.GetValue(poco);
+									continue;
+								}
+
+								// Dont update result only columns
+								if (i.Value.ResultColumn)
+									continue;
+
+								// Build the sql
+								if (index &gt; 0)
+									sb.Append(&quot;, &quot;);
+								sb.AppendFormat(&quot;{0} = {1}{2}&quot;, EscapeSqlIdentifier(i.Key), _paramPrefix, index++);
+
+								// Store the parameter in the command
+								AddParam(cmd, i.Value.GetValue(poco), _paramPrefix);
+							}
+						}
+						else
+						{
+							foreach (var colname in columns)
+							{
+								var pc = pd.Columns[colname];
+
+								// Build the sql
+								if (index &gt; 0)
+									sb.Append(&quot;, &quot;);
+								sb.AppendFormat(&quot;{0} = {1}{2}&quot;, EscapeSqlIdentifier(colname), _paramPrefix, index++);
+
+								// Store the parameter in the command
+								AddParam(cmd, pc.GetValue(poco), _paramPrefix);
+							}
+
+							// Grab primary key value
+							if (primaryKeyValue == null)
+							{
+								var pc = pd.Columns[primaryKeyName];
+								primaryKeyValue = pc.GetValue(poco);
+							}
+
+						}
+
+						cmd.CommandText = string.Format(&quot;UPDATE {0} SET {1} WHERE {2} = {3}{4}&quot;,
+											EscapeTableName(tableName), sb.ToString(), EscapeSqlIdentifier(primaryKeyName), _paramPrefix, index++);
+						AddParam(cmd, primaryKeyValue, _paramPrefix);
+
+						DoPreExecute(cmd);
+
+						// Do it
+						var retv=cmd.ExecuteNonQueryWithRetry();
+						OnExecutedCommand(cmd);
+						return retv;
+					}
+				}
+				finally
+				{
+					CloseSharedConnection();
+				}
+			}
+			catch (Exception x)
+			{
+				OnException(x);
+				throw;
+			}
+		}
+
+		public int Update(string tableName, string primaryKeyName, object poco)
+		{
+			return Update(tableName, primaryKeyName, poco, null);
+		}
+
+		public int Update(string tableName, string primaryKeyName, object poco, IEnumerable&lt;string&gt; columns)
+		{
+			return Update(tableName, primaryKeyName, poco, null, columns);
+		}
+
+		public int Update(object poco, IEnumerable&lt;string&gt; columns)
+		{
+			return Update(poco, null, columns);
+		}
+
+		public int Update(object poco)
+		{
+			return Update(poco, null, null);
+		}
+
+		public int Update(object poco, object primaryKeyValue)
+		{
+			return Update(poco, primaryKeyValue, null);
+		}
+		public int Update(object poco, object primaryKeyValue, IEnumerable&lt;string&gt; columns)
+		{
+			var pd = PocoData.ForType(poco.GetType());
+			return Update(pd.TableInfo.TableName, pd.TableInfo.PrimaryKey, poco, primaryKeyValue, columns);
+		}
+
+		public int Update&lt;T&gt;(string sql, params object[] args)
+		{
+			var pd = PocoData.ForType(typeof(T));
+			return Execute(string.Format(&quot;UPDATE {0} {1}&quot;, EscapeTableName(pd.TableInfo.TableName), sql), args);
+		}
+
+		public int Update&lt;T&gt;(Sql sql)
+		{
+			var pd = PocoData.ForType(typeof(T));
+			return Execute(new Sql(string.Format(&quot;UPDATE {0}&quot;, EscapeTableName(pd.TableInfo.TableName))).Append(sql));
+		}
+
+		public int Delete(string tableName, string primaryKeyName, object poco)
+		{
+			return Delete(tableName, primaryKeyName, poco, null);
+		}
+
+		public int Delete(string tableName, string primaryKeyName, object poco, object primaryKeyValue)
+		{
+			// If primary key value not specified, pick it up from the object
+			if (primaryKeyValue == null)
+			{
+				var pd = PocoData.ForObject(poco,primaryKeyName);
+				PocoColumn pc;
+				if (pd.Columns.TryGetValue(primaryKeyName, out pc))
+				{
+					primaryKeyValue = pc.GetValue(poco);
+				}
+			}
+
+			// Do it
+			var sql = string.Format(&quot;DELETE FROM {0} WHERE {1}=@0&quot;, EscapeTableName(tableName), EscapeSqlIdentifier(primaryKeyName));
+			return Execute(sql, primaryKeyValue);
+		}
+
+		public int Delete(object poco)
+		{
+			var pd = PocoData.ForType(poco.GetType());
+			return Delete(pd.TableInfo.TableName, pd.TableInfo.PrimaryKey, poco);
+		}
+
+		public int Delete&lt;T&gt;(object pocoOrPrimaryKey)
+		{
+			if (pocoOrPrimaryKey.GetType() == typeof(T))
+				return Delete(pocoOrPrimaryKey);
+			var pd = PocoData.ForType(typeof(T));
+			return Delete(pd.TableInfo.TableName, pd.TableInfo.PrimaryKey, null, pocoOrPrimaryKey);
+		}
+
+		public int Delete&lt;T&gt;(string sql, params object[] args)
+		{
+			var pd = PocoData.ForType(typeof(T));
+			return Execute(string.Format(&quot;DELETE FROM {0} {1}&quot;, EscapeTableName(pd.TableInfo.TableName), sql), args);
+		}
+
+		public int Delete&lt;T&gt;(Sql sql)
+		{
+			var pd = PocoData.ForType(typeof(T));
+			return Execute(new Sql(string.Format(&quot;DELETE FROM {0}&quot;, EscapeTableName(pd.TableInfo.TableName))).Append(sql));
+		}
+
+		// Check if a poco represents a new record
+		public bool IsNew(string primaryKeyName, object poco)
+		{
+			var pd = PocoData.ForObject(poco, primaryKeyName);
+			object pk;
+			PocoColumn pc;
+			if (pd.Columns.TryGetValue(primaryKeyName, out pc))
+			{
+				pk = pc.GetValue(poco);
+			}
+#if !PETAPOCO_NO_DYNAMIC
+			else if (poco.GetType() == typeof(System.Dynamic.ExpandoObject))
+			{
+				return true;
+			}
+#endif
+			else
+			{
+				var pi = poco.GetType().GetProperty(primaryKeyName);
+				if (pi == null)
+					throw new ArgumentException(string.Format(&quot;The object doesn&#39;t have a property matching the primary key column name &#39;{0}&#39;&quot;, primaryKeyName));
+				pk = pi.GetValue(poco, null);
+			}
+
+			if (pk == null)
+				return true;
+
+			var type = pk.GetType();
+
+			if (type.IsValueType)
+			{
+				// Common primary key types
+				if (type == typeof(long))
+					return (long)pk == 0;
+				else if (type == typeof(ulong))
+					return (ulong)pk == 0;
+				else if (type == typeof(int))
+					return (int)pk == 0;
+				else if (type == typeof(uint))
+					return (uint)pk == 0;
+
+				// Create a default instance and compare
+				return pk == Activator.CreateInstance(pk.GetType());
+			}
+			else
+			{
+				return pk == null;
+			}
+		}
+
+		public bool IsNew(object poco)
+		{
+			var pd = PocoData.ForType(poco.GetType());
+			if (!pd.TableInfo.AutoIncrement)
+				throw new InvalidOperationException(&quot;IsNew() and Save() are only supported on tables with auto-increment/identity primary key columns&quot;);
+			return IsNew(pd.TableInfo.PrimaryKey, poco);
+		}
+
+		// Insert new record or Update existing record
+		public void Save(string tableName, string primaryKeyName, object poco)
+		{
+			if (IsNew(primaryKeyName, poco))
+			{
+				Insert(tableName, primaryKeyName, true, poco);
+			}
+			else
+			{
+				Update(tableName, primaryKeyName, poco);
+			}
+		}
+
+		public void Save(object poco)
+		{
+			var pd = PocoData.ForType(poco.GetType());
+			Save(pd.TableInfo.TableName, pd.TableInfo.PrimaryKey, poco);
+		}
+
+		public int CommandTimeout { get; set; }
+		public int OneTimeCommandTimeout { get; set; }
+
+		void DoPreExecute(IDbCommand cmd)
+		{
+			// Setup command timeout
+			if (OneTimeCommandTimeout != 0)
+			{
+				cmd.CommandTimeout = OneTimeCommandTimeout;
+				OneTimeCommandTimeout = 0;
+			}
+			else if (CommandTimeout!=0)
+			{
+				cmd.CommandTimeout = CommandTimeout;
+			}
+
+			// Call hook
+			OnExecutingCommand(cmd);
+
+			// Save it
+			_lastSql = cmd.CommandText;
+			_lastArgs = (from IDataParameter parameter in cmd.Parameters select parameter.Value).ToArray();
+		}
+
+		public string LastSQL { get { return _lastSql; } }
+		public object[] LastArgs { get { return _lastArgs; } }
+		public string LastCommand
+		{
+			get { return FormatCommand(_lastSql, _lastArgs); }
+		}
+
+		public string FormatCommand(IDbCommand cmd)
+		{
+			return FormatCommand(cmd.CommandText, (from IDataParameter parameter in cmd.Parameters select parameter.Value).ToArray());
+		}
+
+		public string FormatCommand(string sql, object[] args)
+		{
+			var sb = new StringBuilder();
+			if (sql == null)
+				return &quot;&quot;;
+			sb.Append(sql);
+			if (args != null &amp;&amp; args.Length &gt; 0)
+			{
+				sb.Append(&quot;\n&quot;);
+				for (int i = 0; i &lt; args.Length; i++)
+				{
+					sb.AppendFormat(&quot;\t -&gt; {0}{1} [{2}] = \&quot;{3}\&quot;\n&quot;, _paramPrefix, i, args[i].GetType().Name, args[i]);
+				}
+				sb.Remove(sb.Length - 1, 1);
+			}
+			return sb.ToString();
+		}
+
+
+		public static IMapper Mapper
+		{
+			get;
+			set;
+		}
+
+		public class PocoColumn
+		{
+			public string ColumnName;
+			public PropertyInfo PropertyInfo;
+			public bool ResultColumn;
+			public virtual void SetValue(object target, object val) { PropertyInfo.SetValue(target, val, null); }
+			public virtual object GetValue(object target) { return PropertyInfo.GetValue(target, null); }
+			public virtual object ChangeType(object val) { return Convert.ChangeType(val, PropertyInfo.PropertyType); }
+		}
+		public class ExpandoColumn : PocoColumn
+		{
+			public override void SetValue(object target, object val) { (target as IDictionary&lt;string, object&gt;)[ColumnName]=val; }
+			public override object GetValue(object target)
+			{
+				object val=null;
+				(target as IDictionary&lt;string, object&gt;).TryGetValue(ColumnName, out val);
+				return val;
+			}
+			public override object ChangeType(object val) { return val; }
+		}
+
+        /// &lt;summary&gt;
+        /// Container for a Memory cache object
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Better to have one memory cache instance than many so it&#39;s memory management can be handled more effectively
+        /// http://stackoverflow.com/questions/8463962/using-multiple-instances-of-memorycache
+        /// &lt;/remarks&gt;
+        internal class ManagedCache
+        {
+            public ObjectCache GetCache()
+            {
+                return ObjectCache;
+            }
+
+            static readonly ObjectCache ObjectCache = new MemoryCache(&quot;NPoco&quot;);
+
+        }
+
+        public class PocoData
+        {
+            //USE ONLY FOR TESTING
+            internal static bool UseLongKeys = false;
+            //USE ONLY FOR TESTING - default is one hr
+            internal static int SlidingExpirationSeconds = 3600;
+
+			public static PocoData ForObject(object o, string primaryKeyName)
+			{
+				var t = o.GetType();
+#if !PETAPOCO_NO_DYNAMIC
+				if (t == typeof(System.Dynamic.ExpandoObject))
+				{
+					var pd = new PocoData();
+					pd.TableInfo = new TableInfo();
+					pd.Columns = new Dictionary&lt;string, PocoColumn&gt;(StringComparer.OrdinalIgnoreCase);
+					pd.Columns.Add(primaryKeyName, new ExpandoColumn() { ColumnName = primaryKeyName });
+					pd.TableInfo.PrimaryKey = primaryKeyName;
+					pd.TableInfo.AutoIncrement = true;
+					foreach (var col in (o as IDictionary&lt;string, object&gt;).Keys)
+					{
+						if (col!=primaryKeyName)
+							pd.Columns.Add(col, new ExpandoColumn() { ColumnName = col });
+					}
+					return pd;
+				}
+				else
+#endif
+					return ForType(t);
+			}
+
+			public static PocoData ForType(Type t)
+			{
+#if !PETAPOCO_NO_DYNAMIC
+				if (t == typeof(System.Dynamic.ExpandoObject))
+					throw new InvalidOperationException(&quot;Can&#39;t use dynamic types with this method&quot;);
+#endif
+				// Check cache
+				InnerLock.EnterReadLock();
+				PocoData pd;
+				try
+				{
+					if (m_PocoDatas.TryGetValue(t, out pd))
+						return pd;
+				}
+				finally
+				{
+					InnerLock.ExitReadLock();
+				}
+
+
+				// Cache it
+				InnerLock.EnterWriteLock();
+				try
+				{
+					// Check again
+					if (m_PocoDatas.TryGetValue(t, out pd))
+						return pd;
+
+					// Create it
+					pd = new PocoData(t);
+
+					m_PocoDatas.Add(t, pd);
+				}
+				finally
+				{
+					InnerLock.ExitWriteLock();
+				}
+
+				return pd;
+			}
+
+			public PocoData()
+			{
+			}
+
+			public PocoData(Type t)
+			{
+				type = t;
+				TableInfo=new TableInfo();
+
+				// Get the table name
+				var a = t.GetCustomAttributes(typeof(TableNameAttribute), true);
+				TableInfo.TableName = a.Length == 0 ? t.Name : (a[0] as TableNameAttribute).Value;
+
+				// Get the primary key
+				a = t.GetCustomAttributes(typeof(PrimaryKeyAttribute), true);
+				TableInfo.PrimaryKey = a.Length == 0 ? &quot;ID&quot; : (a[0] as PrimaryKeyAttribute).Value;
+				TableInfo.SequenceName = a.Length == 0 ? null : (a[0] as PrimaryKeyAttribute).sequenceName;
+				TableInfo.AutoIncrement = a.Length == 0 ? false : (a[0] as PrimaryKeyAttribute).autoIncrement;
+
+				// Call column mapper
+				if (Database.Mapper != null)
+					Database.Mapper.GetTableInfo(t, TableInfo);
+
+				// Work out bound properties
+				bool ExplicitColumns = t.GetCustomAttributes(typeof(ExplicitColumnsAttribute), true).Length &gt; 0;
+				Columns = new Dictionary&lt;string, PocoColumn&gt;(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var pi in t.GetProperties())
+				{
+					// Work out if properties is to be included
+					var ColAttrs = pi.GetCustomAttributes(typeof(ColumnAttribute), true);
+					if (ExplicitColumns)
+					{
+						if (ColAttrs.Length == 0)
+							continue;
+					}
+					else
+					{
+						if (pi.GetCustomAttributes(typeof(IgnoreAttribute), true).Length != 0)
+							continue;
+					}
+
+					var pc = new PocoColumn();
+					pc.PropertyInfo = pi;
+
+					// Work out the DB column name
+					if (ColAttrs.Length &gt; 0)
+					{
+						var colattr = (ColumnAttribute)ColAttrs[0];
+						pc.ColumnName = colattr.Name;
+						if ((colattr as ResultColumnAttribute) != null)
+							pc.ResultColumn = true;
+					}
+					if (pc.ColumnName == null)
+					{
+						pc.ColumnName = pi.Name;
+						if (Database.Mapper != null &amp;&amp; !Database.Mapper.MapPropertyToColumn(t, pi, ref pc.ColumnName, ref pc.ResultColumn))
+							continue;
+					}
+
+					// Store it
+					Columns.Add(pc.ColumnName, pc);
+				}
+
+				// Build column list for automatic select
+				QueryColumns = (from c in Columns where !c.Value.ResultColumn select c.Key).ToArray();
+
+			}
+
+			static bool IsIntegralType(Type t)
+			{
+				var tc = Type.GetTypeCode(t);
+				return tc &gt;= TypeCode.SByte &amp;&amp; tc &lt;= TypeCode.UInt64;
+			}
+
+
+
+			// Create factory function that can convert a IDataReader record into a POCO
+			public Delegate GetFactory(string sql, string connString, bool ForceDateTimesToUtc, int firstColumn, int countColumns, IDataReader r)
+			{
+
+                //TODO: It would be nice to remove the irrelevant SQL parts - for a mapping operation anything after the SELECT clause isn&#39;t required.
+                // This would ensure less duplicate entries that get cached, currently both of these queries would be cached even though they are
+                // returning the same structured data:
+                // SELECT * FROM MyTable ORDER BY MyColumn
+                // SELECT * FROM MyTable ORDER BY MyColumn DESC
+
+			    string key;
+			    if (UseLongKeys)
+			    {
+                    key = string.Format(&quot;{0}:{1}:{2}:{3}:{4}&quot;, sql, connString, ForceDateTimesToUtc, firstColumn, countColumns);
+			    }
+			    else
+			    {
+                    //Create a hashed key, we don&#39;t want to store so much string data in memory
+                    var combiner = new HashCodeCombiner();
+                    combiner.AddCaseInsensitiveString(sql);
+                    combiner.AddCaseInsensitiveString(connString);
+                    combiner.AddObject(ForceDateTimesToUtc);
+                    combiner.AddInt(firstColumn);
+                    combiner.AddInt(countColumns);
+                    key = combiner.GetCombinedHashCode();
+			    }
+
+
+			    var objectCache = _managedCache.GetCache();
+
+			    Func&lt;Delegate&gt; factory = () =&gt;
+			    {
+                    // Create the method
+                    var m = new DynamicMethod(&quot;petapoco_factory_&quot; + objectCache.GetCount(), type, new Type[] { typeof(IDataReader) }, true);
+                    var il = m.GetILGenerator();
+
+#if !PETAPOCO_NO_DYNAMIC
+                    if (type == typeof(object))
+                    {
+                        // var poco=new T()
+                        il.Emit(OpCodes.Newobj, typeof(System.Dynamic.ExpandoObject).GetConstructor(Type.EmptyTypes));			// obj
+
+                        MethodInfo fnAdd = typeof(IDictionary&lt;string, object&gt;).GetMethod(&quot;Add&quot;);
+
+                        // Enumerate all fields generating a set assignment for the column
+                        for (int i = firstColumn; i &lt; firstColumn + countColumns; i++)
+                        {
+                            var srcType = r.GetFieldType(i);
+
+                            il.Emit(OpCodes.Dup);						// obj, obj
+                            il.Emit(OpCodes.Ldstr, r.GetName(i));		// obj, obj, fieldname
+
+                            // Get the converter
+                            Func&lt;object, object&gt; converter = null;
+                            if (Database.Mapper != null)
+                                converter = Database.Mapper.GetFromDbConverter(null, srcType);
+                            if (ForceDateTimesToUtc &amp;&amp; converter == null &amp;&amp; srcType == typeof(DateTime))
+                                converter = delegate(object src) { return new DateTime(((DateTime)src).Ticks, DateTimeKind.Utc); };
+
+                            // Setup stack for call to converter
+                            AddConverterToStack(il, converter);
+
+                            // r[i]
+                            il.Emit(OpCodes.Ldarg_0);					// obj, obj, fieldname, converter?,    rdr
+                            il.Emit(OpCodes.Ldc_I4, i);					// obj, obj, fieldname, converter?,  rdr,i
+                            il.Emit(OpCodes.Callvirt, fnGetValue);		// obj, obj, fieldname, converter?,  value
+
+                            // Convert DBNull to null
+                            il.Emit(OpCodes.Dup);						// obj, obj, fieldname, converter?,  value, value
+                            il.Emit(OpCodes.Isinst, typeof(DBNull));	// obj, obj, fieldname, converter?,  value, (value or null)
+                            var lblNotNull = il.DefineLabel();
+                            il.Emit(OpCodes.Brfalse_S, lblNotNull);		// obj, obj, fieldname, converter?,  value
+                            il.Emit(OpCodes.Pop);						// obj, obj, fieldname, converter?
+                            if (converter != null)
+                                il.Emit(OpCodes.Pop);					// obj, obj, fieldname,
+                            il.Emit(OpCodes.Ldnull);					// obj, obj, fieldname, null
+                            if (converter != null)
+                            {
+                                var lblReady = il.DefineLabel();
+                                il.Emit(OpCodes.Br_S, lblReady);
+                                il.MarkLabel(lblNotNull);
+                                il.Emit(OpCodes.Callvirt, fnInvoke);
+                                il.MarkLabel(lblReady);
+                            }
+                            else
+                            {
+                                il.MarkLabel(lblNotNull);
+                            }
+
+                            il.Emit(OpCodes.Callvirt, fnAdd);
+                        }
+                    }
+                    else
+#endif
+                        if (type.IsValueType || type == typeof(string) || type == typeof(byte[]))
+                        {
+                            // Do we need to install a converter?
+                            var srcType = r.GetFieldType(0);
+                            var converter = GetConverter(ForceDateTimesToUtc, null, srcType, type);
+
+                            // &quot;if (!rdr.IsDBNull(i))&quot;
+                            il.Emit(OpCodes.Ldarg_0);										// rdr
+                            il.Emit(OpCodes.Ldc_I4_0);										// rdr,0
+                            il.Emit(OpCodes.Callvirt, fnIsDBNull);							// bool
+                            var lblCont = il.DefineLabel();
+                            il.Emit(OpCodes.Brfalse_S, lblCont);
+                            il.Emit(OpCodes.Ldnull);										// null
+                            var lblFin = il.DefineLabel();
+                            il.Emit(OpCodes.Br_S, lblFin);
+
+                            il.MarkLabel(lblCont);
+
+                            // Setup stack for call to converter
+                            AddConverterToStack(il, converter);
+
+                            il.Emit(OpCodes.Ldarg_0);										// rdr
+                            il.Emit(OpCodes.Ldc_I4_0);										// rdr,0
+                            il.Emit(OpCodes.Callvirt, fnGetValue);							// value
+
+                            // Call the converter
+                            if (converter != null)
+                                il.Emit(OpCodes.Callvirt, fnInvoke);
+
+                            il.MarkLabel(lblFin);
+                            il.Emit(OpCodes.Unbox_Any, type);								// value converted
+                        }
+                        else
+                        {
+                            // var poco=new T()
+                            il.Emit(OpCodes.Newobj, type.GetConstructor(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[0], null));
+
+                            // Enumerate all fields generating a set assignment for the column
+                            for (int i = firstColumn; i &lt; firstColumn + countColumns; i++)
+                            {
+                                // Get the PocoColumn for this db column, ignore if not known
+                                PocoColumn pc;
+                                if (!Columns.TryGetValue(r.GetName(i), out pc))
+                                    continue;
+
+                                // Get the source type for this column
+                                var srcType = r.GetFieldType(i);
+                                var dstType = pc.PropertyInfo.PropertyType;
+
+                                // &quot;if (!rdr.IsDBNull(i))&quot;
+                                il.Emit(OpCodes.Ldarg_0);										// poco,rdr
+                                il.Emit(OpCodes.Ldc_I4, i);										// poco,rdr,i
+                                il.Emit(OpCodes.Callvirt, fnIsDBNull);							// poco,bool
+                                var lblNext = il.DefineLabel();
+                                il.Emit(OpCodes.Brtrue_S, lblNext);								// poco
+
+                                il.Emit(OpCodes.Dup);											// poco,poco
+
+                                // Do we need to install a converter?
+                                var converter = GetConverter(ForceDateTimesToUtc, pc, srcType, dstType);
+
+                                // Fast
+                                bool Handled = false;
+                                if (converter == null)
+                                {
+                                    var valuegetter = typeof(IDataRecord).GetMethod(&quot;Get&quot; + srcType.Name, new Type[] { typeof(int) });
+                                    if (valuegetter != null
+                                            &amp;&amp; valuegetter.ReturnType == srcType
+                                            &amp;&amp; (valuegetter.ReturnType == dstType || valuegetter.ReturnType == Nullable.GetUnderlyingType(dstType)))
+                                    {
+                                        il.Emit(OpCodes.Ldarg_0);										// *,rdr
+                                        il.Emit(OpCodes.Ldc_I4, i);										// *,rdr,i
+                                        il.Emit(OpCodes.Callvirt, valuegetter);							// *,value
+
+                                        // Convert to Nullable
+                                        if (Nullable.GetUnderlyingType(dstType) != null)
+                                        {
+                                            il.Emit(OpCodes.Newobj, dstType.GetConstructor(new Type[] { Nullable.GetUnderlyingType(dstType) }));
+                                        }
+
+                                        il.Emit(OpCodes.Callvirt, pc.PropertyInfo.GetSetMethod(true));		// poco
+                                        Handled = true;
+                                    }
+                                }
+
+                                // Not so fast
+                                if (!Handled)
+                                {
+                                    // Setup stack for call to converter
+                                    AddConverterToStack(il, converter);
+
+                                    // &quot;value = rdr.GetValue(i)&quot;
+                                    il.Emit(OpCodes.Ldarg_0);										// *,rdr
+                                    il.Emit(OpCodes.Ldc_I4, i);										// *,rdr,i
+                                    il.Emit(OpCodes.Callvirt, fnGetValue);							// *,value
+
+                                    // Call the converter
+                                    if (converter != null)
+                                        il.Emit(OpCodes.Callvirt, fnInvoke);
+
+                                    // Assign it
+                                    il.Emit(OpCodes.Unbox_Any, pc.PropertyInfo.PropertyType);		// poco,poco,value
+                                    il.Emit(OpCodes.Callvirt, pc.PropertyInfo.GetSetMethod(true));		// poco
+                                }
+
+                                il.MarkLabel(lblNext);
+                            }
+
+                            var fnOnLoaded = RecurseInheritedTypes&lt;MethodInfo&gt;(type, (x) =&gt; x.GetMethod(&quot;OnLoaded&quot;, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, new Type[0], null));
+                            if (fnOnLoaded != null)
+                            {
+                                il.Emit(OpCodes.Dup);
+                                il.Emit(OpCodes.Callvirt, fnOnLoaded);
+                            }
+                        }
+
+                    il.Emit(OpCodes.Ret);
+
+                    // return it
+                    var del = m.CreateDelegate(Expression.GetFuncType(typeof(IDataReader), type));
+
+                    return del;
+			    };
+
+                //lazy usage of AddOrGetExisting ref: http://stackoverflow.com/questions/10559279/how-to-deal-with-costly-building-operations-using-memorycache/15894928#15894928
+                var newValue = new Lazy&lt;Delegate&gt;(factory);
+                // the line belows returns existing item or adds the new value if it doesn&#39;t exist
+                var value = (Lazy&lt;Delegate&gt;)objectCache.AddOrGetExisting(key, newValue, new CacheItemPolicy
+                {
+                    //sliding expiration of 1 hr, if the same key isn&#39;t used in this
+                    // timeframe it will be removed from the cache
+                    SlidingExpiration = new TimeSpan(0, 0, SlidingExpirationSeconds)
+                });
+                return (value ?? newValue).Value; // Lazy&lt;T&gt; handles the locking itself
+
+			}
+
+			private static void AddConverterToStack(ILGenerator il, Func&lt;object, object&gt; converter)
+			{
+				if (converter != null)
+				{
+					// Add the converter
+					int converterIndex = m_Converters.Count;
+					m_Converters.Add(converter);
+
+					// Generate IL to push the converter onto the stack
+					il.Emit(OpCodes.Ldsfld, fldConverters);
+					il.Emit(OpCodes.Ldc_I4, converterIndex);
+					il.Emit(OpCodes.Callvirt, fnListGetItem);					// Converter
+				}
+			}
+
+			private static Func&lt;object, object&gt; GetConverter(bool forceDateTimesToUtc, PocoColumn pc, Type srcType, Type dstType)
+			{
+				Func&lt;object, object&gt; converter = null;
+
+				// Get converter from the mapper
+				if (Database.Mapper != null)
+				{
+					if (pc != null)
+					{
+						converter = Database.Mapper.GetFromDbConverter(pc.PropertyInfo, srcType);
+					}
+					else
+					{
+						var m2 = Database.Mapper as IMapper2;
+						if (m2 != null)
+						{
+							converter = m2.GetFromDbConverter(dstType, srcType);
+						}
+					}
+				}
+
+				// Standard DateTime-&gt;Utc mapper
+				if (forceDateTimesToUtc &amp;&amp; converter == null &amp;&amp; srcType == typeof(DateTime) &amp;&amp; (dstType == typeof(DateTime) || dstType == typeof(DateTime?)))
+				{
+					converter = delegate(object src) { return new DateTime(((DateTime)src).Ticks, DateTimeKind.Utc); };
+				}
+
+				// Forced type conversion including integral types -&gt; enum
+				if (converter == null)
+				{
+					if (dstType.IsEnum &amp;&amp; IsIntegralType(srcType))
+					{
+						if (srcType != typeof(int))
+						{
+							converter = delegate(object src) { return Convert.ChangeType(src, typeof(int), null); };
+						}
+					}
+					else if (!dstType.IsAssignableFrom(srcType))
+					{
+						converter = delegate(object src) { return Convert.ChangeType(src, dstType, null); };
+					}
+				}
+				return converter;
+			}
+
+
+			static T RecurseInheritedTypes&lt;T&gt;(Type t, Func&lt;Type, T&gt; cb)
+			{
+				while (t != null)
+				{
+					T info = cb(t);
+					if (info != null)
+						return info;
+					t = t.BaseType;
+				}
+				return default(T);
+			}
+
+            ManagedCache _managedCache = new ManagedCache();
+			static Dictionary&lt;Type, PocoData&gt; m_PocoDatas = new Dictionary&lt;Type, PocoData&gt;();
+			static List&lt;Func&lt;object, object&gt;&gt; m_Converters = new List&lt;Func&lt;object, object&gt;&gt;();
+			static MethodInfo fnGetValue = typeof(IDataRecord).GetMethod(&quot;GetValue&quot;, new Type[] { typeof(int) });
+			static MethodInfo fnIsDBNull = typeof(IDataRecord).GetMethod(&quot;IsDBNull&quot;);
+			static FieldInfo fldConverters = typeof(PocoData).GetField(&quot;m_Converters&quot;, BindingFlags.Static | BindingFlags.GetField | BindingFlags.NonPublic);
+			static MethodInfo fnListGetItem = typeof(List&lt;Func&lt;object, object&gt;&gt;).GetProperty(&quot;Item&quot;).GetGetMethod();
+			static MethodInfo fnInvoke = typeof(Func&lt;object, object&gt;).GetMethod(&quot;Invoke&quot;);
+			public Type type;
+			public string[] QueryColumns { get; private set; }
+			public TableInfo TableInfo { get; private set; }
+			public Dictionary&lt;string, PocoColumn&gt; Columns { get; private set; }
+            static System.Threading.ReaderWriterLockSlim InnerLock = new System.Threading.ReaderWriterLockSlim();
+
+            /// &lt;summary&gt;
+            /// Returns a report of the current cache being utilized by PetaPoco
+            /// &lt;/summary&gt;
+            /// &lt;returns&gt;&lt;/returns&gt;
+		    public static string PrintDebugCacheReport(out double totalBytes, out IEnumerable&lt;string&gt; allKeys)
+            {
+                var managedCache = new ManagedCache();
+
+                var sb = new StringBuilder();
+                sb.AppendLine(&quot;m_PocoDatas:&quot;);
+                foreach (var pocoData in m_PocoDatas)
+                {
+                    sb.AppendFormat(&quot;\t{0}\n&quot;, pocoData.Key);
+                    sb.AppendFormat(&quot;\t\tTable:{0} - Col count:{1}\n&quot;, pocoData.Value.TableInfo.TableName, pocoData.Value.QueryColumns.Length);
+                }
+
+                var cache = managedCache.GetCache();
+                allKeys = cache.Select(x =&gt; x.Key).ToArray();
+
+                sb.AppendFormat(&quot;\tTotal Poco data count:{0}\n&quot;, allKeys.Count());
+
+                var keys = string.Join(&quot;&quot;, cache.Select(x =&gt; x.Key));
+                //Bytes in .Net are stored as utf-16 = unicode little endian
+                totalBytes = Encoding.Unicode.GetByteCount(keys);
+
+                sb.AppendFormat(&quot;\tTotal byte for keys:{0}\n&quot;, totalBytes);
+
+                sb.AppendLine(&quot;\tAll Poco cache items:&quot;);
+
+                foreach (var item in cache)
+                {
+                    sb.AppendFormat(&quot;\t\t Key -&gt; {0}\n&quot;, item.Key);
+                    sb.AppendFormat(&quot;\t\t Value -&gt; {0}\n&quot;, item.Value);
+                }
+
+                sb.AppendLine(&quot;-------------------END REPORT------------------------&quot;);
+                return sb.ToString();
+            }
+		}
+
+
+		// Member variables
+	    readonly string _connectionString;
+	    readonly string _providerName;
+		DbProviderFactory _factory;
+		IDbConnection _sharedConnection;
+		IDbTransaction _transaction;
+		int _sharedConnectionDepth;
+		int _transactionDepth;
+		bool _transactionCancelled;
+		string _lastSql;
+		object[] _lastArgs;
+		string _paramPrefix = &quot;@&quot;;
+	    IsolationLevel _isolationLevel;
+	}
+
+	// Transaction object helps maintain transaction depth counts
+	public class Transaction : IDisposable
+	{
+        public Transaction(Database db, IsolationLevel isolationLevel)
+        {
+            _db = db;
+            _db.BeginTransaction(isolationLevel);
+        }
+
+		public virtual void Complete()
+		{
+			_db.CompleteTransaction();
+			_db = null;
+		}
+
+		public void Dispose()
+		{
+            //TODO prevent multiple calls to Dispose
+			if (_db != null)
+				_db.AbortTransaction();
+		}
+
+		Database _db;
+	}
+
+	// Simple helper class for building SQL statments
+	public class Sql
+	{
+		public Sql()
+		{
+		}
+
+		public Sql(string sql, params object[] args)
+		{
+			_sql = sql;
+			_args = args;
+		}
+
+		public static Sql Builder
+		{
+			get { return new Sql(); }
+		}
+
+		string _sql;
+		object[] _args;
+		Sql _rhs;
+		string _sqlFinal;
+		object[] _argsFinal;
+
+		private void Build()
+		{
+			// already built?
+			if (_sqlFinal != null)
+				return;
+
+			// Build it
+			var sb = new StringBuilder();
+			var args = new List&lt;object&gt;();
+			Build(sb, args, null);
+			_sqlFinal = sb.ToString();
+			_argsFinal = args.ToArray();
+		}
+
+		public string SQL
+		{
+			get
+			{
+				Build();
+				return _sqlFinal;
+			}
+		}
+
+		public object[] Arguments
+		{
+			get
+			{
+				Build();
+				return _argsFinal;
+			}
+		}
+
+		public Sql Append(Sql sql)
+		{
+			if (_rhs != null)
+				_rhs.Append(sql);
+			else
+				_rhs = sql;
+
+			_sqlFinal = null;
+			return this;
+		}
+
+		public Sql Append(string sql, params object[] args)
+		{
+			return Append(new Sql(sql, args));
+		}
+
+		static bool Is(Sql sql, string sqltype)
+		{
+			return sql != null &amp;&amp; sql._sql != null &amp;&amp; sql._sql.StartsWith(sqltype, StringComparison.InvariantCultureIgnoreCase);
+		}
+
+		private void Build(StringBuilder sb, List&lt;object&gt; args, Sql lhs)
+		{
+			if (!String.IsNullOrEmpty(_sql))
+			{
+				// Add SQL to the string
+				if (sb.Length &gt; 0)
+				{
+					sb.Append(&quot;\n&quot;);
+				}
+
+				var sql = Database.ProcessParams(_sql, _args, args);
+
+				if (Is(lhs, &quot;WHERE &quot;) &amp;&amp; Is(this, &quot;WHERE &quot;))
+					sql = &quot;AND &quot; + sql.Substring(6);
+				if (Is(lhs, &quot;ORDER BY &quot;) &amp;&amp; Is(this, &quot;ORDER BY &quot;))
+					sql = &quot;, &quot; + sql.Substring(9);
+
+				sb.Append(sql);
+			}
+
+			// Now do rhs
+			if (_rhs != null)
+				_rhs.Build(sb, args, this);
+		}
+
+		public Sql Where(string sql, params object[] args)
+		{
+			return Append(new Sql(&quot;WHERE (&quot; + sql + &quot;)&quot;, args));
+		}
+
+		public Sql OrderBy(params object[] columns)
+		{
+			return Append(new Sql(&quot;ORDER BY &quot; + String.Join(&quot;, &quot;, (from x in columns select x.ToString()).ToArray())));
+		}
+
+		public Sql Select(params object[] columns)
+		{
+			return Append(new Sql(&quot;SELECT &quot; + String.Join(&quot;, &quot;, (from x in columns select x.ToString()).ToArray())));
+		}
+
+		public Sql From(params object[] tables)
+		{
+			return Append(new Sql(&quot;FROM &quot; + String.Join(&quot;, &quot;, (from x in tables select x.ToString()).ToArray())));
+		}
+
+		public Sql GroupBy(params object[] columns)
+		{
+			return Append(new Sql(&quot;GROUP BY &quot; + String.Join(&quot;, &quot;, (from x in columns select x.ToString()).ToArray())));
+		}
+
+		private SqlJoinClause Join(string JoinType, string table)
+		{
+			return new SqlJoinClause(Append(new Sql(JoinType + table)));
+		}
+
+		public SqlJoinClause InnerJoin(string table) { return Join(&quot;INNER JOIN &quot;, table); }
+		public SqlJoinClause LeftJoin(string table) { return Join(&quot;LEFT JOIN &quot;, table); }
+        public SqlJoinClause LeftOuterJoin(string table) { return Join(&quot;LEFT OUTER JOIN &quot;, table); }
+        public SqlJoinClause RightJoin(string table) { return Join(&quot;RIGHT JOIN &quot;, table); }
+
+		public class SqlJoinClause
+		{
+			private readonly Sql _sql;
+
+			public SqlJoinClause(Sql sql)
+			{
+				_sql = sql;
+			}
+
+			public Sql On(string onClause, params object[] args)
+			{
+				return _sql.Append(&quot;ON &quot; + onClause, args);
+			}
+		}
+	}
+
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[45,3,45,27,1],[45,28,45,29,1],[45,30,45,31,1],[46,3,46,38,1],[46,39,46,40,1],[46,41,46,53,1],[46,54,46,55,1],[47,24,47,28,1],[47,29,47,33,1],[54,3,54,33,1],[54,34,54,35,1],[54,36,54,37,1],[55,47,55,57,1],[55,58,55,59,1],[55,60,55,61,1],[62,3,62,46,1],[63,3,63,4,1],[64,4,64,22,1],[65,3,65,4,1],[66,25,66,29,1],[66,30,66,42,1],[73,3,73,48,1],[74,3,74,4,1],[75,4,75,23,1],[76,4,76,25,1],[77,3,77,4,1],[79,25,79,29,1],[79,30,79,42,1],[80,32,80,36,1],[80,37,80,41,0],[81,31,81,35,1],[81,36,81,40,1],[87,3,87,29,0],[87,30,87,31,0],[87,32,87,33,0],[93,29,93,33,0],[93,34,93,38,1],[94,28,94,32,1],[94,33,94,37,1],[95,28,95,32,1],[95,33,95,37,1],[96,30,96,34,0],[96,35,96,39,1],[97,26,97,30,1],[97,31,97,35,1],[98,27,98,31,0],[98,32,98,36,0],[104,3,104,32,0],[105,3,105,4,0],[106,4,106,16,0],[107,3,107,4,0],[108,25,108,29,0],[108,30,108,42,0],[114,29,114,33,1],[114,34,114,38,1],[115,30,115,34,1],[115,35,115,39,1],[116,31,116,35,1],[116,36,116,40,1],[117,32,117,36,0],[117,37,117,41,1],[138,3,138,44,1],[139,3,139,4,1],[140,4,140,35,1],[141,4,141,52,1],[142,4,142,31,1],[143,4,143,22,1],[144,3,144,4,1],[146,3,146,64,1],[147,3,147,4,1],[148,4,148,41,1],[149,4,149,33,1],[150,4,150,22,1],[151,3,151,4,1],[153,3,153,71,0],[154,3,154,4,0],[155,4,155,41,0],[156,4,156,24,0],[157,4,157,22,0],[158,3,158,4,0],[160,3,160,47,1],[161,3,161,4,1],[163,4,163,35,1],[164,5,164,75,0],[167,4,167,61,1],[168,4,168,77,1],[169,4,169,5,1],[170,5,170,106,1],[171,6,171,95,1],[172,4,172,5,1],[174,4,174,5,0],[175,5,175,120,0],[179,4,179,102,1],[180,4,180,33,1],[181,4,181,22,1],[182,3,182,4,1],[193,3,193,37,1],[193,3,193,37,0],[193,3,193,37,1],[193,3,193,37,1],[197,3,197,4,1],[198,4,198,26,1],[199,4,199,28,1],[200,4,200,29,1],[201,4,201,31,1],[203,13,203,39,1],[204,5,204,62,1],[206,13,206,104,1],[208,4,208,35,1],[208,36,208,59,0],[209,18,209,49,1],[209,50,209,79,1],[210,9,210,41,1],[210,42,210,70,0],[211,9,211,41,1],[211,42,211,66,0],[212,18,212,50,1],[212,51,212,75,0],[214,4,214,124,1],[215,5,215,24,0],[216,4,216,33,1],[217,5,217,24,0],[221,7,221,54,1],[222,3,222,4,1],[226,3,226,4,1],[229,4,229,28,1],[230,3,230,4,1],[233,37,233,41,1],[233,42,233,46,0],[237,3,237,4,1],[238,4,238,36,1],[239,4,239,5,1],[240,5,240,53,1],[241,5,241,60,1],[242,17,242,51,1],[260,17,260,78,1],[261,17,261,29,1],[262,17,262,30,1],[264,17,264,75,1],[266,5,266,29,1],[267,6,267,31,0],[268,4,268,5,1],[269,4,269,29,1],[270,3,270,4,1],[274,3,274,4,1],[275,4,275,35,1],[276,4,276,5,1],[277,5,277,30,1],[278,5,278,37,1],[279,5,279,6,1],[280,6,280,45,1],[281,6,281,34,1],[282,6,282,31,1],[283,5,283,6,1],[284,4,284,5,1],[285,3,285,4,1],[290,8,290,9,1],[290,10,290,35,1],[290,36,290,37,1],[295,3,295,4,1],[296,13,296,52,1],[297,9,297,10,1],[300,9,300,10,1],[301,13,301,58,1],[302,9,302,10,1],[306,17,306,18,0],[306,19,306,106,0],[306,107,306,108,0],[310,44,310,45,1],[310,46,310,47,1],[311,42,311,43,1],[311,44,311,45,1],[317,3,317,4,0],[318,13,318,47,0],[319,9,319,10,0],[322,9,322,10,1],[323,13,323,33,1],[325,4,325,31,1],[326,4,326,5,1],[327,5,327,28,1],[328,5,328,71,1],[329,5,329,35,1],[330,5,330,26,1],[331,4,331,5,1],[332,18,332,67,1],[333,17,333,95,0],[334,9,334,10,1],[338,3,338,4,1],[339,4,339,23,1],[341,4,341,30,1],[342,5,342,29,1],[344,5,344,27,1],[346,4,346,27,1],[347,4,347,24,1],[349,4,349,28,1],[350,3,350,4,1],[354,3,354,4,1],[355,4,355,33,1],[357,4,357,35,1],[358,5,358,26,1],[359,3,359,4,1],[363,3,363,4,1],[365,13,365,44,1],[366,5,366,26,1],[367,3,367,4,1],[371,9,371,10,0],[372,13,372,36,0],[375,21,375,77,0],[377,21,377,79,0],[379,21,379,78,0],[381,21,381,75,0],[383,21,383,71,0],[385,21,385,77,0],[387,9,387,10,0],[390,3,390,75,1],[392,3,392,4,1],[393,4,394,4,1],[394,4,394,5,1],[394,5,395,5,1],[395,5,395,41,1],[395,41,400,5,1],[400,5,400,45,1],[400,45,401,5,1],[401,5,401,6,1],[401,6,403,6,1],[403,6,403,58,1],[403,58,404,7,1],[404,7,404,169,0],[404,169,405,6,1],[405,6,405,37,1],[405,37,406,5,1],[406,5,406,6,1],[406,6,408,5,1],[408,5,408,6,1],[408,6,410,6,1],[410,6,410,25,1],[410,25,411,6,1],[411,6,411,21,1],[411,21,412,6,1],[412,6,412,13,1],[412,13,412,15,1],[412,15,412,20,1],[412,20,412,21,1],[412,21,412,23,1],[412,23,412,24,1],[412,24,412,32,1],[412,32,413,6,1],[413,6,413,7,1],[413,7,414,7,1],[414,7,414,47,1],[414,47,415,7,1],[415,7,415,22,1],[415,22,416,7,1],[416,7,416,8,1],[416,8,417,8,1],[417,8,417,39,1],[417,39,418,8,1],[418,8,418,21,1],[418,21,419,8,1],[419,8,419,14,1],[419,14,421,6,1],[421,6,421,7,0],[421,7,423,6,1],[423,6,423,17,1],[423,17,424,7,1],[424,7,424,168,0],[424,168,425,5,1],[425,5,425,6,1],[425,6,428,5,1],[428,5,430,34,1],[430,34,431,5,1],[431,5,431,6,1],[431,6,432,6,1],[432,6,432,35,1],[432,35,433,6,1],[433,6,433,13,1],[433,13,433,15,1],[433,15,433,20,1],[433,20,433,21,1],[433,21,433,23,1],[433,23,433,24,1],[433,24,433,65,1],[433,65,434,6,1],[434,6,434,7,1],[434,7,435,7,1],[435,7,435,77,1],[435,77,436,7,1],[436,7,436,24,1],[436,24,437,6,1],[437,6,437,7,1],[437,7,438,6,1],[438,6,438,27,1],[438,27,441,5,1],[441,5,441,6,1],[441,6,442,6,1],[442,6,442,29,1],[442,29,443,6,1],[443,6,443,52,1],[443,52,445,4,1],[445,4,445,5,1],[445,5,446,6,1],[393,4,446,6,1],[447,3,447,4,1],[451,3,451,4,1],[453,4,453,46,1],[454,4,454,5,1],[455,5,455,63,1],[456,5,456,18,1],[457,6,457,22,1],[458,4,458,5,1],[461,4,461,44,1],[462,4,462,25,1],[463,4,463,5,0],[464,5,464,93,0],[465,5,465,34,0],[466,5,466,12,0],[469,4,469,34,1],[470,4,470,85,1],[471,4,471,21,1],[472,4,472,5,1],[473,5,473,28,1],[474,4,474,5,1],[476,4,476,5,1],[477,5,477,28,1],[478,5,478,18,1],[479,5,479,6,0],[480,6,480,26,0],[481,5,481,6,0],[482,10,482,32,1],[483,5,483,6,1],[484,6,484,32,1],[485,6,485,31,1],[486,6,486,18,1],[487,5,487,6,1],[488,10,488,34,1],[489,5,489,6,1],[492,21,492,100,1],[493,25,493,97,1],[495,21,495,58,1],[496,21,496,38,1],[497,25,497,78,1],[499,6,499,21,1],[500,5,500,6,1],[501,10,501,38,1],[502,5,502,6,0],[504,6,504,69,0],[505,6,505,43,0],[506,6,506,35,0],[507,5,507,6,0],[508,10,508,64,1],[509,5,509,6,1],[510,6,510,37,1],[511,5,511,6,1],[512,10,512,52,1],[513,5,513,6,0],[514,6,514,76,0],[515,6,515,21,0],[516,5,516,6,0],[518,10,518,51,1],[519,5,519,6,0],[520,6,520,75,0],[521,6,521,21,0],[522,5,522,6,0],[524,5,524,6,1],[525,6,525,21,1],[526,5,526,6,1],[527,4,527,5,1],[529,4,529,26,1],[530,3,530,4,1],[533,3,533,81,1],[535,3,535,4,1],[537,4,537,26,1],[538,4,538,5,1],[539,5,539,39,1],[540,5,540,46,1],[541,5,541,31,1],[542,4,542,5,1],[545,4,545,28,1],[546,5,546,44,0],[546,44,546,79,0],[546,79,546,81,0],[546,5,546,81,0],[547,4,547,33,1],[550,4,550,48,1],[551,4,551,32,1],[552,4,552,26,1],[553,4,553,35,1],[554,4,554,11,1],[554,13,554,21,1],[554,22,554,24,1],[554,25,554,29,1],[555,4,555,5,1],[556,5,556,39,1],[557,4,557,5,1],[559,4,559,33,1],[560,4,560,5,0],[561,5,561,71,0],[562,4,562,5,0],[564,4,564,35,1],[565,5,565,23,1],[567,4,567,15,1],[568,3,568,4,1],[572,3,572,4,1],[573,4,573,53,1],[574,4,574,52,1],[575,3,575,4,1],[578,71,578,72,1],[578,73,578,85,1],[578,86,578,87,1],[579,63,579,64,1],[579,65,579,66,1],[580,58,580,59,1],[580,60,580,61,1],[581,57,581,58,1],[581,59,581,60,1],[585,3,585,4,1],[587,4,587,5,1],[588,5,588,28,1],[590,5,590,6,1],[591,13,591,66,1],[592,6,592,7,1],[593,7,593,47,1],[594,7,594,30,1],[595,7,595,19,1],[599,5,599,6,1],[600,6,600,30,1],[601,5,601,6,1],[603,4,603,23,0],[604,4,604,5,0],[605,5,605,20,0],[606,5,606,11,0],[608,3,608,4,1],[611,3,611,4,1],[612,4,612,43,1],[613,3,613,4,1],[617,3,617,4,1],[619,4,619,5,1],[620,5,620,28,1],[622,5,622,6,1],[623,13,623,66,1],[624,6,624,7,1],[625,7,625,49,1],[626,7,626,30,1],[628,25,628,64,1],[629,29,629,47,1],[631,25,631,44,1],[632,25,632,64,1],[634,25,634,67,1],[638,5,638,6,1],[639,6,639,30,1],[640,5,640,6,1],[642,4,642,23,0],[643,4,643,5,0],[644,5,644,20,0],[645,5,645,11,0],[647,3,647,4,1],[650,3,650,4,1],[651,4,651,52,1],[652,3,652,4,1],[654,3,654,163,1],[654,3,654,163,0],[654,3,654,163,1],[654,3,654,163,1],[655,3,655,144,1],[655,3,655,144,1],[655,3,655,144,1],[655,3,655,144,0],[657,3,657,4,1],[658,4,658,28,1],[659,5,659,29,0],[661,4,661,31,1],[662,4,662,5,1],[663,5,663,42,1],[664,5,664,61,1],[665,5,665,71,1],[665,71,665,111,1],[665,111,665,124,1],[665,5,665,124,1],[666,5,666,30,1],[667,6,667,75,1],[669,6,669,55,1],[670,4,670,5,1],[671,4,671,15,1],[672,3,672,4,1],[674,34,674,38,1],[674,39,674,43,1],[675,35,675,39,1],[675,40,675,44,1],[676,37,676,41,1],[676,42,676,46,1],[680,3,680,4,1],[681,4,681,40,1],[682,3,682,4,1],[685,3,685,4,1],[686,4,686,44,1],[687,3,687,4,1],[689,3,689,236,1],[690,3,690,346,1],[691,3,691,156,1],[693,3,693,4,1],[694,4,694,28,1],[695,4,695,20,1],[696,4,696,22,1],[699,4,699,33,1],[700,4,700,19,1],[701,5,701,18,0],[704,4,704,26,1],[705,4,705,46,1],[707,4,707,45,1],[708,5,708,128,0],[710,5,710,92,1],[714,4,714,34,1],[715,4,715,19,1],[716,4,716,5,0],[717,5,717,23,0],[718,4,718,5,0],[720,4,720,5,1],[721,5,721,21,1],[722,5,722,31,1],[723,5,723,88,1],[724,4,724,5,1],[726,4,726,16,1],[727,3,727,4,1],[741,6,741,7,1],[747,13,747,83,1],[748,13,748,14,0],[749,17,749,76,0],[750,17,750,58,0],[751,17,751,18,0],[752,21,752,105,0],[753,17,753,18,0],[758,17,758,60,0],[759,17,759,69,0],[760,17,760,63,0],[762,17,763,132,0],[764,17,764,82,0],[765,13,765,14,0],[766,18,766,57,1],[767,13,767,14,1],[768,17,768,127,1],[769,17,769,75,1],[770,13,770,14,1],[772,13,772,14,0],[773,17,773,107,0],[774,17,774,75,0],[775,13,775,14,0],[776,9,776,10,1],[779,3,779,4,1],[781,4,781,25,1],[782,5,782,35,1],[786,4,786,92,1],[787,5,787,74,0],[788,4,788,69,1],[789,17,789,135,0],[791,7,791,116,1],[792,3,792,4,1],[796,3,796,4,1],[798,4,798,103,1],[801,4,801,44,1],[804,4,804,31,1],[805,4,805,30,1],[806,4,806,39,1],[807,4,807,60,1],[808,4,808,57,1],[809,4,809,48,1],[810,5,810,25,1],[812,4,812,40,1],[815,4,815,43,1],[818,4,818,18,1],[819,3,819,4,1],[822,3,822,4,1],[823,4,823,63,1],[824,3,824,4,1],[828,3,828,4,0],[829,4,829,75,0],[830,3,830,4,0],[833,3,833,4,0],[834,4,834,88,0],[835,3,835,4,0],[838,3,838,4,0],[840,4,840,78,0],[841,4,841,35,0],[842,3,842,4,0],[845,3,845,4,0],[846,4,846,59,0],[847,3,847,4,0],[902,98,902,99,0],[902,100,902,151,0],[902,152,902,153,0],[903,106,903,107,0],[903,108,903,163,0],[903,164,903,165,0],[904,114,904,115,0],[904,116,904,175,0],[904,176,904,177,0],[905,128,905,129,0],[905,130,905,193,0],[905,194,905,195,0],[908,105,908,106,1],[908,107,908,180,1],[908,181,908,182,1],[909,113,909,114,1],[909,115,909,199,1],[909,200,909,201,1],[910,121,910,122,0],[910,123,910,219,0],[910,220,910,221,0],[911,135,911,136,0],[911,137,911,246,0],[911,247,911,248,0],[914,73,914,74,1],[914,75,914,139,1],[914,140,914,141,1],[915,81,915,82,1],[915,83,915,151,1],[915,152,915,153,1],[916,89,916,90,0],[916,91,916,163,0],[916,164,916,165,0],[917,103,917,104,0],[917,105,917,181,0],[917,182,917,183,0],[920,80,920,81,0],[920,82,920,168,0],[920,169,920,170,0],[921,88,921,89,0],[921,90,921,188,0],[921,189,921,190,0],[922,96,922,97,0],[922,98,922,208,0],[922,209,922,210,0],[923,110,923,111,0],[923,112,923,234,0],[923,235,923,236,0],[926,67,926,68,0],[926,69,926,110,0],[926,111,926,112,0],[927,71,927,72,0],[927,73,927,118,0],[927,119,927,120,0],[928,75,928,76,0],[928,77,928,126,0],[928,127,928,128,0],[929,85,929,86,0],[929,87,929,140,0],[929,141,929,142,0],[932,74,932,75,1],[932,76,932,149,1],[932,150,932,151,1],[933,78,933,79,1],[933,80,933,165,1],[933,166,933,167,1],[934,82,934,83,1],[934,84,934,181,1],[934,182,934,183,1],[935,92,935,93,1],[935,94,935,203,1],[935,204,935,205,1],[938,42,938,43,1],[938,44,938,98,1],[938,99,938,100,1],[939,46,939,47,1],[939,48,939,106,1],[939,107,939,108,1],[940,50,940,51,1],[940,52,940,114,1],[940,115,940,116,1],[941,60,941,61,1],[941,62,941,128,1],[941,129,941,130,1],[944,49,944,50,0],[944,51,944,137,0],[944,138,944,139,0],[945,53,945,54,0],[945,55,945,153,0],[945,154,945,155,0],[946,57,946,58,0],[946,59,946,169,0],[946,170,946,171,0],[947,67,947,68,0],[947,69,947,191,0],[947,192,947,193,0],[951,3,951,4,1],[953,4,953,33,1],[954,4,954,11,1],[954,13,954,18,1],[954,19,954,21,1],[954,22,954,27,1],[955,4,955,5,1],[956,5,956,29,1],[957,5,957,20,1],[958,4,958,5,1],[959,4,959,28,1],[962,4,962,27,1],[964,4,964,5,1],[966,5,966,50,1],[967,6,967,20,1],[968,4,968,5,1],[970,4,970,5,1],[971,5,971,27,1],[972,4,972,5,1],[975,4,975,28,1],[977,4,977,5,1],[980,5,980,50,1],[981,6,981,20,0],[984,5,984,77,1],[985,5,985,33,1],[987,10,987,19,1],[987,21,987,37,1],[987,39,987,42,1],[988,5,988,6,1],[989,6,989,27,1],[990,11,990,24,1],[990,26,990,32,1],[990,34,990,37,1],[991,6,991,7,1],[993,7,993,65,1],[993,65,993,91,1],[993,91,993,101,1],[993,7,993,101,1],[994,7,994,35,1],[995,8,995,17,1],[996,7,996,34,1],[997,8,997,148,0],[1000,7,1000,35,1],[1001,7,1001,35,1],[1002,7,1002,72,1],[1003,7,1003,22,1],[1004,6,1004,7,1],[1006,6,1006,19,1],[1007,7,1007,91,0],[1008,5,1008,6,1],[1010,5,1010,30,1],[1011,5,1011,26,1],[1014,5,1014,95,1],[1015,5,1015,31,1],[1016,5,1016,16,1],[1019,4,1019,5,1],[1020,5,1020,28,1],[1021,4,1021,5,1],[1022,3,1022,4,1],[1026,3,1026,4,1],[1028,4,1028,25,1],[1029,5,1029,140,1],[1032,4,1032,49,1],[1033,4,1033,49,1],[1036,4,1036,26,1],[1037,4,1037,53,1],[1038,11,1038,29,1],[1038,31,1038,36,1],[1039,4,1039,5,1],[1041,5,1041,39,1],[1042,5,1042,129,1],[1043,5,1043,6,1],[1044,6,1044,128,1],[1046,5,1046,38,1],[1047,4,1047,5,1],[1049,4,1049,124,0],[1050,3,1050,4,1],[1057,4,1057,55,1],[1058,4,1058,5,1],[1059,5,1059,42,1],[1060,4,1060,5,1],[1061,39,1061,43,1],[1061,44,1061,48,1],[1062,40,1062,41,1],[1062,42,1062,66,1],[1062,67,1062,68,1],[1071,4,1071,5,1],[1072,5,1072,28,1],[1073,5,1073,42,1],[1074,5,1074,19,1],[1075,4,1075,5,1],[1086,4,1086,5,1],[1087,5,1087,35,1],[1088,9,1088,18,1],[1088,19,1088,26,1],[1088,27,1088,30,1],[1089,5,1089,6,1],[1090,6,1090,36,1],[1091,5,1091,6,1],[1092,5,1092,57,1],[1093,4,1093,5,1],[1098,3,1098,4,1],[1100,4,1100,36,1],[1101,4,1101,16,1],[1102,9,1102,16,1],[1102,18,1102,32,1],[1102,34,1102,37,1],[1103,4,1103,5,1],[1105,5,1105,101,1],[1106,5,1106,19,1],[1107,4,1107,5,1],[1109,4,1109,47,1],[1110,4,1110,29,1],[1110,29,1110,85,1],[1110,85,1110,86,1],[1110,4,1110,86,1],[1111,3,1111,4,1],[1114,3,1114,91,1],[1115,3,1115,88,1],[1116,3,1116,101,1],[1120,3,1120,4,1],[1122,4,1122,33,1],[1123,4,1123,39,1],[1124,4,1124,19,1],[1125,4,1125,11,1],[1125,13,1125,18,1],[1125,19,1125,21,1],[1125,22,1125,27,1],[1126,4,1126,5,1],[1127,5,1127,20,1],[1128,5,1128,29,1],[1129,4,1129,5,1],[1130,4,1130,19,1],[1130,20,1130,66,1],[1131,4,1131,19,1],[1131,20,1131,51,1],[1132,4,1132,19,1],[1132,20,1132,35,1],[1133,4,1133,31,1],[1136,4,1136,27,1],[1138,4,1138,5,1],[1140,5,1140,59,1],[1141,5,1141,6,1],[1143,6,1143,57,1],[1145,4,1145,5,1],[1147,4,1147,5,1],[1148,5,1148,27,1],[1149,4,1149,5,1],[1152,4,1152,28,1],[1154,4,1154,5,1],[1156,22,1156,23,1],[1157,5,1157,59,1],[1158,5,1158,6,0],[1159,6,1159,57,0],[1163,5,1163,63,1],[1165,5,1165,42,1],[1166,5,1166,20,1],[1169,4,1169,5,1],[1170,5,1170,28,1],[1171,4,1171,5,1],[1173,3,1173,4,1],[1239,3,1239,4,1],[1240,4,1240,44,1],[1241,3,1241,4,1],[1244,3,1244,4,1],[1245,4,1245,151,1],[1246,3,1246,4,1],[1248,3,1248,4,0],[1249,4,1249,135,0],[1250,3,1250,4,0],[1252,3,1252,4,0],[1253,4,1253,144,0],[1254,3,1254,4,0],[1256,3,1256,4,0],[1257,4,1257,40,0],[1258,3,1258,4,0],[1260,3,1260,4,1],[1261,4,1261,49,1],[1262,3,1262,4,1],[1264,3,1264,4,1],[1265,4,1265,39,1],[1266,3,1266,4,1],[1268,3,1268,4,1],[1269,4,1269,48,1],[1270,3,1270,4,1],[1273,3,1273,4,0],[1274,4,1274,34,0],[1275,3,1275,4,0],[1277,3,1277,4,0],[1278,4,1278,43,0],[1279,3,1279,4,0],[1281,3,1281,4,0],[1282,4,1282,33,0],[1283,3,1283,4,0],[1285,3,1285,4,1],[1286,4,1286,42,1],[1287,3,1287,4,1],[1290,3,1290,4,1],[1292,4,1292,66,1],[1293,3,1293,4,1],[1295,3,1295,4,1],[1296,4,1296,20,1],[1299,6,1299,41,0],[1303,6,1303,43,0],[1306,6,1306,41,1],[1308,3,1308,4,1],[1311,3,1311,4,0],[1312,4,1312,57,0],[1313,3,1313,4,0],[1319,3,1319,4,1],[1321,4,1321,5,1],[1322,5,1322,28,1],[1324,5,1324,6,1],[1325,13,1325,59,1],[1326,6,1326,7,1],[1327,7,1327,57,1],[1328,7,1328,38,1],[1329,7,1329,39,1],[1330,7,1330,21,1],[1331,7,1331,14,1],[1331,16,1331,21,1],[1331,22,1331,24,1],[1331,25,1331,35,1],[1332,7,1332,8,1],[1334,8,1334,33,1],[1335,9,1335,18,1],[1338,8,1338,102,1],[1339,8,1339,9,1],[1340,9,1340,90,1],[1341,9,1341,10,0],[1342,10,1342,27,0],[1343,10,1343,78,0],[1344,9,1344,10,0],[1345,9,1345,18,1],[1348,8,1348,46,1],[1349,8,1349,67,1],[1350,8,1350,60,1],[1351,7,1351,8,1],[1353,7,1357,11,1],[1359,7,1359,26,1],[1360,7,1360,8,1],[1361,8,1361,26,1],[1362,8,1362,39,1],[1363,8,1363,31,1],[1364,8,1364,20,1],[1369,7,1369,23,1],[1372,9,1372,27,1],[1373,9,1373,40,1],[1374,9,1374,32,1],[1375,9,1375,68,1],[1376,9,1376,15,1],[1378,9,1378,67,0],[1379,9,1379,27,0],[1380,9,1380,43,0],[1381,9,1381,32,0],[1382,9,1382,15,0],[1384,9,1384,36,0],[1385,9,1385,10,0],[1386,10,1386,106,0],[1387,10,1387,28,0],[1388,10,1388,44,0],[1389,9,1389,10,0],[1391,9,1391,10,0],[1392,10,1392,18,0],[1393,10,1393,28,0],[1394,10,1394,41,0],[1395,9,1395,10,0],[1396,9,1396,32,0],[1397,9,1397,15,0],[1399,9,1399,36,0],[1400,9,1400,10,0],[1401,10,1401,110,0],[1402,10,1402,44,0],[1403,10,1403,41,0],[1404,10,1404,37,0],[1405,10,1405,59,0],[1406,10,1406,38,0],[1407,10,1407,36,0],[1408,10,1408,28,0],[1409,10,1409,41,0],[1410,10,1410,27,0],[1411,9,1411,10,0],[1413,9,1413,10,0],[1414,10,1414,18,0],[1415,10,1415,28,0],[1416,10,1416,41,0],[1417,9,1417,10,0],[1418,9,1418,32,0],[1419,9,1419,15,0],[1421,33,1421,60,0],[1422,33,1422,34,0],[1423,37,1423,89,0],[1424,37,1424,55,0],[1425,37,1425,71,0],[1426,33,1426,34,0],[1428,33,1428,34,0],[1429,37,1429,45,0],[1430,37,1430,55,0],[1431,37,1431,68,0],[1432,33,1432,34,0],[1433,33,1433,56,0],[1434,33,1434,39,0],[1436,9,1436,61,0],[1437,9,1437,27,0],[1438,9,1438,43,0],[1439,9,1439,32,0],[1440,9,1440,15,0],[1445,7,1445,34,1],[1446,7,1446,8,1],[1448,8,1448,59,1],[1449,8,1449,9,1],[1450,9,1450,46,1],[1451,8,1451,9,1],[1452,7,1452,8,1],[1454,7,1454,17,1],[1458,5,1458,6,1],[1459,6,1459,30,1],[1460,5,1460,6,1],[1462,4,1462,23,1],[1463,4,1463,5,1],[1464,5,1464,20,1],[1465,5,1465,11,1],[1467,3,1467,4,1],[1471,3,1471,4,1],[1472,4,1472,46,1],[1473,4,1473,101,1],[1474,3,1474,4,1],[1477,3,1477,4,0],[1478,4,1478,74,0],[1479,3,1479,4,0],[1484,3,1484,4,1],[1486,4,1486,5,1],[1487,5,1487,28,1],[1489,5,1489,6,1],[1490,13,1490,59,1],[1491,6,1491,7,1],[1492,7,1492,36,1],[1493,7,1493,21,1],[1494,7,1494,56,1],[1495,7,1495,27,1],[1496,7,1496,8,1],[1497,8,1497,15,1],[1497,17,1497,22,1],[1497,23,1497,25,1],[1497,26,1497,36,1],[1498,8,1498,9,1],[1500,9,1500,62,1],[1501,9,1501,10,1],[1502,10,1502,38,1],[1503,11,1503,52,1],[1504,10,1504,19,1],[1508,9,1508,34,1],[1509,10,1509,19,1],[1512,9,1512,23,1],[1513,10,1513,26,1],[1514,9,1514,92,1],[1517,9,1517,61,1],[1518,8,1518,9,1],[1519,7,1519,8,1],[1521,7,1521,8,1],[1522,8,1522,15,1],[1522,17,1522,28,1],[1522,29,1522,31,1],[1522,32,1522,39,1],[1523,8,1523,9,1],[1524,9,1524,38,1],[1527,9,1527,23,1],[1528,10,1528,26,1],[1529,9,1529,94,1],[1532,9,1532,56,1],[1533,8,1533,9,1],[1536,8,1536,36,1],[1537,8,1537,9,1],[1538,9,1538,45,1],[1539,9,1539,45,1],[1540,8,1540,9,1],[1542,7,1542,8,1],[1544,7,1545,115,1],[1546,7,1546,52,1],[1548,7,1548,25,1],[1551,7,1551,47,1],[1552,7,1552,30,1],[1553,7,1553,19,1],[1557,5,1557,6,1],[1558,6,1558,30,1],[1559,5,1559,6,1],[1561,4,1561,23,1],[1562,4,1562,5,1],[1563,5,1563,20,1],[1564,5,1564,11,1],[1566,3,1566,4,1],[1569,3,1569,4,1],[1570,4,1570,57,1],[1571,3,1571,4,1],[1574,3,1574,4,1],[1575,4,1575,66,1],[1576,3,1576,4,1],[1579,3,1579,4,1],[1580,4,1580,39,1],[1581,3,1581,4,1],[1584,3,1584,4,1],[1585,4,1585,36,1],[1586,3,1586,4,1],[1589,3,1589,4,0],[1590,4,1590,47,0],[1591,3,1591,4,0],[1593,3,1593,4,1],[1594,4,1594,46,1],[1595,4,1595,99,1],[1596,3,1596,4,1],[1599,3,1599,4,1],[1600,4,1600,41,1],[1601,4,1601,104,1],[1602,3,1602,4,1],[1605,3,1605,4,0],[1606,4,1606,41,0],[1607,4,1607,110,0],[1608,3,1608,4,0],[1611,3,1611,4,1],[1612,4,1612,57,1],[1613,3,1613,4,1],[1616,3,1616,4,1],[1618,4,1618,32,1],[1619,4,1619,5,1],[1620,5,1620,54,1],[1622,5,1622,56,1],[1623,5,1623,6,1],[1624,6,1624,42,1],[1625,5,1625,6,1],[1626,4,1626,5,1],[1629,4,1629,125,1],[1630,4,1630,41,1],[1631,3,1631,4,1],[1634,3,1634,4,1],[1635,4,1635,46,1],[1636,4,1636,73,1],[1637,3,1637,4,1],[1640,3,1640,4,0],[1641,4,1641,48,0],[1642,5,1642,37,0],[1643,4,1643,41,0],[1644,4,1644,91,0],[1645,3,1645,4,0],[1648,3,1648,4,1],[1649,4,1649,41,1],[1650,4,1650,109,1],[1651,3,1651,4,1],[1654,3,1654,4,0],[1655,4,1655,41,0],[1656,4,1656,115,0],[1657,3,1657,4,0],[1661,3,1661,4,1],[1662,4,1662,54,1],[1665,4,1665,55,1],[1666,4,1666,5,1],[1667,5,1667,28,1],[1668,4,1668,5,1],[1670,9,1670,68,0],[1671,4,1671,5,0],[1672,5,1672,17,0],[1676,4,1676,5,0],[1677,5,1677,57,0],[1678,5,1678,20,0],[1679,6,1679,146,0],[1680,5,1680,34,0],[1681,4,1681,5,0],[1683,4,1683,19,1],[1684,5,1684,17,0],[1686,4,1686,28,1],[1688,4,1688,25,1],[1689,4,1689,5,1],[1691,5,1691,30,1],[1692,6,1692,27,0],[1693,10,1693,36,1],[1694,6,1694,28,0],[1695,10,1695,34,1],[1696,6,1696,26,1],[1697,10,1697,35,0],[1698,6,1698,27,0],[1701,5,1701,57,0],[1704,4,1704,5,0],[1705,5,1705,23,0],[1707,3,1707,4,1],[1710,3,1710,4,1],[1711,4,1711,46,1],[1712,4,1712,36,1],[1713,5,1713,141,0],[1714,4,1714,48,1],[1715,3,1715,4,1],[1719,3,1719,4,1],[1720,4,1720,36,1],[1721,4,1721,5,0],[1722,5,1722,51,0],[1723,4,1723,5,0],[1725,4,1725,5,1],[1726,5,1726,45,1],[1727,4,1727,5,1],[1728,3,1728,4,1],[1731,3,1731,4,1],[1732,4,1732,46,1],[1733,4,1733,64,1],[1734,3,1734,4,1],[1736,31,1736,35,1],[1736,36,1736,40,0],[1737,38,1737,42,1],[1737,43,1737,47,1],[1740,3,1740,4,1],[1742,4,1742,35,1],[1743,4,1743,5,0],[1744,5,1744,48,0],[1745,5,1745,31,0],[1746,4,1746,5,0],[1747,9,1747,31,1],[1748,4,1748,5,0],[1749,5,1749,41,0],[1750,4,1750,5,0],[1753,4,1753,28,1],[1756,4,1756,31,1],[1757,4,1757,72,1],[1757,72,1757,87,1],[1757,87,1757,99,1],[1757,4,1757,99,1],[1758,3,1758,4,1],[1760,31,1760,32,0],[1760,33,1760,49,0],[1760,50,1760,51,0],[1761,34,1761,35,0],[1761,36,1761,53,0],[1761,54,1761,55,0],[1764,8,1764,9,1],[1764,10,1764,52,1],[1764,53,1764,54,1],[1768,3,1768,4,0],[1769,4,1769,98,0],[1769,98,1769,113,0],[1769,113,1769,126,0],[1769,4,1769,126,0],[1770,3,1770,4,0],[1773,3,1773,4,1],[1774,4,1774,33,1],[1775,4,1775,20,1],[1776,5,1776,15,0],[1777,4,1777,19,1],[1778,4,1778,40,1],[1779,4,1779,5,1],[1780,5,1780,21,1],[1781,10,1781,19,1],[1781,21,1781,36,1],[1781,38,1781,41,1],[1782,5,1782,6,1],[1783,6,1783,106,1],[1784,5,1784,6,1],[1785,5,1785,33,1],[1786,4,1786,5,1],[1787,4,1787,25,1],[1788,3,1788,4,1],[1793,4,1793,8,1],[1794,4,1794,8,1],[1802,60,1802,61,1],[1802,62,1802,103,1],[1802,104,1802,105,1],[1803,50,1803,51,1],[1803,52,1803,95,1],[1803,96,1803,97,1],[1804,49,1804,50,1],[1804,51,1804,109,1],[1804,110,1804,111,1],[1808,61,1808,62,0],[1808,63,1808,119,0],[1808,120,1808,121,0],[1810,4,1810,5,1],[1811,5,1811,21,1],[1812,5,1812,78,1],[1813,5,1813,16,1],[1814,4,1814,5,1],[1815,50,1815,51,0],[1815,52,1815,63,0],[1815,64,1815,65,0],[1828,13,1828,14,1],[1829,17,1829,36,1],[1830,13,1830,14,1],[1832,13,1832,80,1],[1839,13,1839,54,1],[1841,13,1841,65,1],[1844,4,1844,5,1],[1845,5,1845,25,1],[1847,5,1847,51,1],[1848,5,1848,6,1],[1849,6,1849,30,1],[1850,6,1850,37,1],[1851,6,1851,88,1],[1852,6,1852,90,1],[1853,6,1853,47,1],[1854,6,1854,40,1],[1855,6,1855,13,1],[1855,15,1855,22,1],[1855,23,1855,25,1],[1855,26,1855,65,1],[1856,6,1856,7,1],[1857,7,1857,31,1],[1858,8,1858,70,1],[1859,6,1859,7,1],[1860,6,1860,16,1],[1864,6,1864,24,1],[1865,4,1865,5,1],[1868,4,1868,5,1],[1870,5,1870,51,1],[1871,6,1871,86,0],[1874,5,1874,31,1],[1877,5,1877,6,1],[1878,6,1878,45,1],[1879,7,1879,17,1],[1880,5,1880,6,1],[1882,5,1882,6,1],[1883,6,1883,31,1],[1884,5,1884,6,1],[1888,5,1888,32,1],[1890,5,1890,6,1],[1892,6,1892,45,1],[1893,7,1893,17,0],[1896,6,1896,27,1],[1898,6,1898,29,1],[1899,5,1899,6,1],[1901,5,1901,6,1],[1902,6,1902,32,1],[1903,5,1903,6,1],[1905,5,1905,15,1],[1906,4,1906,5,1],[1908,4,1908,21,1],[1909,4,1909,5,1],[1910,4,1910,5,1],[1912,4,1912,27,1],[1913,4,1913,5,1],[1914,5,1914,14,1],[1915,5,1915,31,1],[1918,5,1918,69,1],[1919,5,1919,87,1],[1922,5,1922,66,1],[1923,5,1923,87,1],[1924,5,1924,96,1],[1925,5,1925,99,1],[1928,5,1928,33,1],[1929,6,1929,49,1],[1932,5,1932,101,1],[1933,5,1933,84,1],[1935,17,1935,24,1],[1935,26,1935,32,1],[1935,33,1935,35,1],[1935,36,1935,53,1],[1936,5,1936,6,1],[1938,6,1938,75,1],[1939,6,1939,26,1],[1940,6,1940,7,1],[1941,7,1941,32,1],[1942,8,1942,17,1],[1943,6,1943,7,1],[1945,6,1945,7,1],[1946,7,1946,77,1],[1947,8,1947,17,0],[1948,6,1948,7,1],[1950,6,1950,32,1],[1951,6,1951,27,1],[1954,6,1954,30,1],[1955,6,1955,7,1],[1956,7,1956,50,1],[1957,7,1957,36,1],[1958,7,1958,54,1],[1959,8,1959,31,1],[1960,6,1960,7,1],[1961,6,1961,32,1],[1962,6,1962,7,1],[1963,7,1963,31,1],[1964,7,1964,122,1],[1965,8,1965,17,0],[1966,6,1966,7,1],[1969,6,1969,37,1],[1970,5,1970,6,1],[1973,5,1973,45,1],[1973,45,1973,66,1],[1973,66,1973,74,1],[1973,74,1973,79,1],[1973,79,1973,91,1],[1973,5,1973,91,1],[1975,4,1975,5,1],[1978,4,1978,5,0],[1979,5,1979,34,0],[1980,5,1980,58,0],[1981,4,1981,5,0],[1987,4,1987,5,1],[1996,8,1996,24,1],[1997,8,1997,9,0],[1998,21,1998,129,0],[1999,8,1999,9,0],[2001,8,2001,9,1],[2003,21,2003,59,1],[2004,21,2004,60,1],[2005,21,2005,67,1],[2006,21,2006,61,1],[2007,21,2007,50,1],[2008,21,2008,51,1],[2009,21,2009,58,1],[2010,8,2010,9,1],[2013,8,2013,51,1],[2015,8,2042,66,1],[2042,66,2042,67,1],[2042,67,2042,68,1],[2042,68,2042,129,1],[2042,129,2042,130,1],[2042,130,2042,131,1],[2042,131,2142,10,1],[2015,8,2142,10,1],[2204,17,2204,60,1],[2206,17,2211,20,1],[2212,17,2212,50,1],[2214,4,2214,5,1],[2217,4,2217,5,1],[2218,5,2218,27,1],[2219,5,2219,6,1],[2221,6,2221,46,1],[2222,6,2222,34,1],[2225,6,2225,45,1],[2226,6,2226,46,1],[2227,6,2227,47,1],[2228,5,2228,6,1],[2229,4,2229,5,1],[2232,4,2232,5,1],[2233,5,2233,43,1],[2236,5,2236,33,1],[2237,5,2237,6,1],[2238,6,2238,21,1],[2239,6,2239,7,1],[2240,7,2240,80,1],[2241,6,2241,7,1],[2243,6,2243,7,1],[2244,7,2244,44,1],[2245,7,2245,22,1],[2246,7,2246,8,0],[2247,8,2247,60,0],[2248,7,2248,8,0],[2249,6,2249,7,1],[2250,5,2250,6,1],[2253,5,2253,146,1],[2254,5,2254,6,1],[2255,6,2255,39,1],[2255,39,2255,40,1],[2255,40,2255,41,1],[2255,41,2255,102,1],[2255,102,2255,103,1],[2255,103,2255,104,1],[2255,104,2255,105,1],[2255,6,2255,105,1],[2256,5,2256,6,1],[2259,5,2259,27,1],[2260,5,2260,6,1],[2261,6,2261,52,1],[2262,6,2262,7,0],[2263,7,2263,34,0],[2264,7,2264,8,0],[2265,8,2265,41,0],[2265,41,2265,42,0],[2265,42,2265,43,0],[2265,43,2265,93,0],[2265,93,2265,94,0],[2265,94,2265,95,0],[2265,95,2265,96,0],[2265,8,2265,96,0],[2266,7,2266,8,0],[2267,6,2267,7,0],[2268,11,2268,50,1],[2269,6,2269,7,1],[2270,7,2270,40,1],[2270,40,2270,41,1],[2270,41,2270,42,1],[2270,42,2270,88,1],[2270,88,2270,89,1],[2270,89,2270,90,1],[2270,90,2270,91,1],[2270,7,2270,91,1],[2271,6,2271,7,1],[2272,5,2272,6,1],[2273,5,2273,22,1],[2274,4,2274,5,1],[2278,4,2278,5,1],[2279,5,2279,22,1],[2280,5,2280,6,1],[2281,6,2281,21,1],[2282,6,2282,23,1],[2283,7,2283,19,0],[2284,6,2284,21,1],[2285,5,2285,6,1],[2286,5,2286,23,1],[2287,4,2287,5,1],[2289,13,2289,61,1],[2289,13,2289,61,1],[2290,4,2290,85,1],[2291,4,2291,86,1],[2292,4,2292,105,1],[2293,4,2293,77,1],[2294,4,2294,149,1],[2295,4,2295,108,1],[2296,4,2296,82,1],[2298,35,2298,39,1],[2298,40,2298,52,1],[2299,33,2299,37,1],[2299,38,2299,50,1],[2300,52,2300,56,1],[2300,57,2300,69,1],[2301,13,2301,114,1],[2308,13,2308,14,0],[2309,17,2309,55,0],[2311,17,2311,46,0],[2312,17,2312,47,0],[2313,17,2313,24,0],[2313,26,2313,38,0],[2313,39,2313,41,0],[2313,42,2313,53,0],[2314,17,2314,18,0],[2315,21,2315,62,0],[2316,21,2316,144,0],[2317,17,2317,18,0],[2319,17,2319,53,0],[2320,17,2320,45,0],[2320,45,2320,50,0],[2320,50,2320,62,0],[2320,17,2320,62,0],[2322,17,2322,83,0],[2324,17,2324,62,0],[2324,62,2324,67,0],[2324,67,2324,70,0],[2324,17,2324,70,0],[2326,17,2326,66,0],[2328,17,2328,76,0],[2330,17,2330,58,0],[2332,17,2332,24,0],[2332,26,2332,34,0],[2332,35,2332,37,0],[2332,38,2332,43,0],[2333,17,2333,18,0],[2334,21,2334,68,0],[2335,21,2335,72,0],[2336,17,2336,18,0],[2338,17,2338,88,0],[2339,17,2339,38,0],[2340,13,2340,14,0],[2355,3,2355,29,1],[2355,3,2355,29,1],[2355,3,2355,29,0],[2355,3,2355,29,1],[2362,9,2362,71,1],[2363,9,2363,10,1],[2364,13,2364,22,1],[2365,13,2365,50,1],[2366,9,2366,10,1],[2369,3,2369,4,1],[2370,4,2370,30,1],[2371,4,2371,15,1],[2372,3,2372,4,1],[2375,3,2375,4,1],[2377,4,2377,20,1],[2378,5,2378,28,1],[2379,3,2379,4,1],[2387,3,2387,15,1],[2388,3,2388,4,1],[2389,3,2389,4,1],[2391,3,2391,47,1],[2392,3,2392,4,1],[2393,4,2393,15,1],[2394,4,2394,17,1],[2395,3,2395,4,1],[2399,8,2399,9,0],[2399,10,2399,27,0],[2399,28,2399,29,0],[2409,3,2409,4,1],[2411,4,2411,26,1],[2412,5,2412,12,1],[2415,4,2415,33,1],[2416,4,2416,34,1],[2417,4,2417,26,1],[2418,4,2418,30,1],[2419,4,2419,32,1],[2420,3,2420,4,1],[2425,4,2425,5,1],[2426,5,2426,13,1],[2427,5,2427,22,1],[2428,4,2428,5,1],[2434,4,2434,5,1],[2435,5,2435,13,1],[2436,5,2436,23,1],[2437,4,2437,5,1],[2441,3,2441,4,1],[2442,4,2442,21,1],[2443,5,2443,22,1],[2445,5,2445,16,1],[2447,4,2447,21,1],[2448,4,2448,16,1],[2449,3,2449,4,1],[2452,3,2452,4,1],[2453,4,2453,38,1],[2454,3,2454,4,1],[2457,3,2457,4,1],[2458,4,2458,120,1],[2459,3,2459,4,1],[2462,3,2462,4,1],[2463,4,2463,36,1],[2464,4,2464,5,1],[2466,5,2466,23,1],[2467,5,2467,6,1],[2468,6,2468,22,1],[2469,5,2469,6,1],[2471,5,2471,57,1],[2473,5,2473,49,1],[2474,6,2474,38,1],[2475,5,2475,55,1],[2476,6,2476,36,1],[2478,5,2478,20,1],[2479,4,2479,5,1],[2482,4,2482,21,1],[2483,5,2483,32,1],[2484,3,2484,4,1],[2487,3,2487,4,1],[2488,4,2488,56,1],[2489,3,2489,4,1],[2492,3,2492,4,1],[2493,4,2493,84,1],[2493,84,2493,96,1],[2493,96,2493,111,1],[2493,4,2493,111,1],[2494,3,2494,4,1],[2497,3,2497,4,1],[2498,4,2498,82,1],[2498,82,2498,94,1],[2498,94,2498,109,1],[2498,4,2498,109,1],[2499,3,2499,4,1],[2502,3,2502,4,1],[2503,4,2503,79,1],[2503,79,2503,91,1],[2503,91,2503,106,1],[2503,4,2503,106,1],[2504,3,2504,4,1],[2507,3,2507,4,1],[2508,4,2508,84,1],[2508,84,2508,96,1],[2508,96,2508,111,1],[2508,4,2508,111,1],[2509,3,2509,4,1],[2512,3,2512,4,1],[2513,4,2513,64,1],[2514,3,2514,4,1],[2516,48,2516,49,1],[2516,50,2516,84,1],[2516,85,2516,86,1],[2517,47,2517,48,1],[2517,49,2517,82,1],[2517,83,2517,84,1],[2518,58,2518,59,0],[2518,60,2518,99,0],[2518,100,2518,101,0],[2519,54,2519,55,1],[2519,56,2519,90,1],[2519,91,2519,92,1],[2525,4,2525,33,1],[2526,4,2526,5,1],[2527,5,2527,16,1],[2528,4,2528,5,1],[2531,4,2531,5,1],[2532,5,2532,48,1],[2533,4,2533,5,1]]);
+    </script>
+  </body>
+</html>

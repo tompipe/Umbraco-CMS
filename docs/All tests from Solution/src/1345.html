@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Editors\MediaTypeController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System.Collections.Generic;
+using System.Linq;
+using AutoMapper;
+using Umbraco.Core.Models;
+using Umbraco.Web.Models.ContentEditing;
+using Umbraco.Web.Mvc;
+using Umbraco.Web.WebApi.Filters;
+using Constants = Umbraco.Core.Constants;
+using System.Web.Http;
+using System.Net;
+using System.Net.Http;
+using Umbraco.Web.WebApi;
+using Umbraco.Core.Services;
+using Umbraco.Core.Models.EntityBase;
+using System;
+using System.ComponentModel;
+using System.Web.Http.Controllers;
+using Umbraco.Core;
+
+namespace Umbraco.Web.Editors
+{
+    //TODO:  We&#39;ll need to be careful about the security on this controller, when we start implementing
+    // methods to modify content types we&#39;ll need to enforce security on the individual methods, we
+    // cannot put security on the whole controller because things like GetAllowedChildren are required for content editing.
+
+    /// &lt;summary&gt;
+    /// An API controller used for dealing with content types
+    /// &lt;/summary&gt;
+    [PluginController(&quot;UmbracoApi&quot;)]
+    [UmbracoTreeAuthorize(Constants.Trees.MediaTypes)]
+    [EnableOverrideAuthorization]
+    [MediaTypeControllerControllerConfigurationAttribute]
+    public class MediaTypeController : ContentTypeControllerBase
+    {
+        /// &lt;summary&gt;
+        /// Configures this controller with a custom action selector
+        /// &lt;/summary&gt;
+        private class MediaTypeControllerControllerConfigurationAttribute : Attribute, IControllerConfiguration
+        {
+            public void Initialize(HttpControllerSettings controllerSettings, HttpControllerDescriptor controllerDescriptor)
+            {
+                controllerSettings.Services.Replace(typeof(IHttpActionSelector), new ParameterSwapControllerActionSelector(
+                    new ParameterSwapControllerActionSelector.ParameterSwapInfo(&quot;GetAllowedChildren&quot;, &quot;contentId&quot;, typeof(int), typeof(Guid), typeof(string))));
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        public MediaTypeController()
+            : this(UmbracoContext.Current)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbracoContext&quot;&gt;&lt;/param&gt;
+        public MediaTypeController(UmbracoContext umbracoContext)
+            : base(umbracoContext)
+        {
+
+        }
+
+        public int GetCount()
+        {
+            return Services.ContentTypeService.CountContentTypes();
+        }
+
+        [UmbracoTreeAuthorize(Constants.Trees.MediaTypes, Constants.Trees.Media)]
+        public MediaTypeDisplay GetById(int id)
+        {
+            var ct = Services.ContentTypeService.GetMediaType(id);
+            if (ct == null)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+
+            var dto = Mapper.Map&lt;IMediaType, MediaTypeDisplay&gt;(ct);
+            return dto;
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes a document type wth a given ID
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpDelete]
+        [HttpPost]
+        public HttpResponseMessage DeleteById(int id)
+        {
+            var foundType = Services.ContentTypeService.GetMediaType(id);
+            if (foundType == null)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+
+            Services.ContentTypeService.Delete(foundType, Security.CurrentUser.Id);
+            return Request.CreateResponse(HttpStatusCode.OK);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the avilable compositions for this content type
+        /// This has been wrapped in a dto instead of simple parameters to support having multiple parameters in post request body
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;filter.contentTypeId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;filter.ContentTypes&quot;&gt;
+        /// This is normally an empty list but if additional content type aliases are passed in, any content types containing those aliases will be filtered out
+        /// along with any content types that have matching property types that are included in the filtered content types
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;filter.PropertyTypes&quot;&gt;
+        /// This is normally an empty list but if additional property type aliases are passed in, any content types that have these aliases will be filtered out.
+        /// This is required because in the case of creating/modifying a content type because new property types being added to it are not yet persisted so cannot
+        /// be looked up via the db, they need to be passed in.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;filter&quot;&gt;
+        /// Filter applied when resolving compositions&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpPost]
+        public HttpResponseMessage GetAvailableCompositeMediaTypes(GetAvailableCompositionsFilter filter)
+        {
+            var result = PerformGetAvailableCompositeContentTypes(filter.ContentTypeId, UmbracoObjectTypes.MediaType, filter.FilterContentTypes, filter.FilterPropertyTypes)
+                .Select(x =&gt; new
+                {
+                    contentType = x.Item1,
+                    allowed = x.Item2
+                });
+            return Request.CreateResponse(result);
+        }
+
+        public MediaTypeDisplay GetEmpty(int parentId)
+        {
+            var ct = new MediaType(parentId) {Icon = &quot;icon-picture&quot;};
+
+            var dto = Mapper.Map&lt;IMediaType, MediaTypeDisplay&gt;(ct);
+            return dto;
+        }
+
+
+        /// &lt;summary&gt;
+        /// Returns all member types
+        /// &lt;/summary&gt;
+        public IEnumerable&lt;ContentTypeBasic&gt; GetAll()
+        {
+
+            return Services.ContentTypeService.GetAllMediaTypes()
+                               .Select(Mapper.Map&lt;IMediaType, ContentTypeBasic&gt;);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes a document type container wth a given ID
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpDelete]
+        [HttpPost]
+        public HttpResponseMessage DeleteContainer(int id)
+        {
+            Services.ContentTypeService.DeleteMediaTypeContainer(id, Security.CurrentUser.Id);
+
+            return Request.CreateResponse(HttpStatusCode.OK);
+        }
+
+        public HttpResponseMessage PostCreateContainer(int parentId, string name)
+        {
+            var result = Services.ContentTypeService.CreateMediaTypeContainer(parentId, name, Security.CurrentUser.Id);
+
+            return result
+                ? Request.CreateResponse(HttpStatusCode.OK, result.Result) //return the id
+                : Request.CreateNotificationValidationErrorResponse(result.Exception.Message);
+        }
+
+        public MediaTypeDisplay PostSave(MediaTypeSave contentTypeSave)
+        {
+            var savedCt = PerformPostSave&lt;IMediaType, MediaTypeDisplay, MediaTypeSave, PropertyTypeBasic&gt;(
+                contentTypeSave:        contentTypeSave,
+                getContentType:         i =&gt; Services.ContentTypeService.GetMediaType(i),
+                saveContentType:        type =&gt; Services.ContentTypeService.Save(type));
+
+            var display = Mapper.Map&lt;MediaTypeDisplay&gt;(savedCt);
+
+            display.AddSuccessNotification(
+                            Services.TextService.Localize(&quot;speechBubbles/mediaTypeSavedHeader&quot;),
+                            string.Empty);
+
+            return display;
+        }
+
+
+        /// &lt;summary&gt;
+        /// Returns the allowed child content type objects for the content item id passed in - based on an INT id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentId&quot;&gt;&lt;/param&gt;
+        [UmbracoTreeAuthorize(Constants.Trees.MediaTypes, Constants.Trees.Media)]
+        public IEnumerable&lt;ContentTypeBasic&gt; GetAllowedChildren(int contentId)
+        {
+            if (contentId == Constants.System.RecycleBinContent)
+                return Enumerable.Empty&lt;ContentTypeBasic&gt;();
+
+            IEnumerable&lt;IMediaType&gt; types;
+            if (contentId == Constants.System.Root)
+            {
+                types = Services.ContentTypeService.GetAllMediaTypes().ToList();
+
+                //if no allowed root types are set, just return everything
+                if (types.Any(x =&gt; x.AllowedAsRoot))
+                    types = types.Where(x =&gt; x.AllowedAsRoot);
+            }
+            else
+            {
+                var contentItem = Services.MediaService.GetById(contentId);
+                if (contentItem == null)
+                {
+                    return Enumerable.Empty&lt;ContentTypeBasic&gt;();
+                }
+
+                var ids = contentItem.ContentType.AllowedContentTypes.Select(x =&gt; x.Id.Value).ToArray();
+
+                if (ids.Any() == false) return Enumerable.Empty&lt;ContentTypeBasic&gt;();
+
+                types = Services.ContentTypeService.GetAllMediaTypes(ids).ToList();
+            }
+
+            var basics = types.Select(Mapper.Map&lt;IMediaType, ContentTypeBasic&gt;).ToList();
+
+            foreach (var basic in basics)
+            {
+                basic.Name = TranslateItem(basic.Name);
+                basic.Description = TranslateItem(basic.Description);
+            }
+
+            return basics;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the allowed child content type objects for the content item id passed in - based on a GUID id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentId&quot;&gt;&lt;/param&gt;
+        [UmbracoTreeAuthorize(Constants.Trees.MediaTypes, Constants.Trees.Media)]
+        public IEnumerable&lt;ContentTypeBasic&gt; GetAllowedChildren(Guid contentId)
+        {
+            var entity = ApplicationContext.Services.EntityService.GetByKey(contentId);
+            if (entity != null)
+            {
+                return GetAllowedChildren(entity.Id);
+            }
+
+            throw new HttpResponseException(HttpStatusCode.NotFound);
+        }
+        
+        [Obsolete(&quot;Do not use this method, use either the overload with INT or GUID instead, this will be removed in future versions&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        [UmbracoTreeAuthorize(Constants.Trees.MediaTypes, Constants.Trees.Media)]        
+        public IEnumerable&lt;ContentTypeBasic&gt; GetAllowedChildren(string contentId)
+        {
+            foreach (var type in new[] { typeof(int), typeof(Guid) })
+            {
+                var parsed = contentId.TryConvertTo(type);
+                if (parsed)
+                {
+                    //oooh magic! will auto select the right overload
+                    return GetAllowedChildren((dynamic)parsed.Result);
+                }                    
+            }
+
+            throw new HttpResponseException(HttpStatusCode.NotFound);
+        }
+
+        /// &lt;summary&gt;
+        /// Move the media type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;move&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public HttpResponseMessage PostMove(MoveOrCopy move)
+        {
+            return PerformMove(
+                move,
+                getContentType: i =&gt; Services.ContentTypeService.GetMediaType(i),
+                doMove: (type, i) =&gt; Services.ContentTypeService.MoveMediaType(type, i));
+        }
+
+        /// &lt;summary&gt;
+        /// Copy the media type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;copy&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public HttpResponseMessage PostCopy(MoveOrCopy copy)
+        {
+            return PerformCopy(
+                copy,
+                getContentType: i =&gt; Services.ContentTypeService.GetMediaType(i),
+                doCopy: (type, i) =&gt; Services.ContentTypeService.CopyMediaType(type, i));
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[41,13,41,14,0],[42,17,43,161,0],[44,13,44,14,0],[51,15,51,43,0],[52,9,52,10,0],[53,9,53,10,0],[60,15,60,35,0],[61,9,61,10,0],[63,9,63,10,0],[66,9,66,10,0],[67,13,67,68,0],[68,9,68,10,0],[72,9,72,10,0],[73,13,73,67,0],[74,13,74,28,0],[75,13,75,14,0],[76,17,76,74,0],[79,13,79,68,0],[80,13,80,24,0],[81,9,81,10,0],[91,9,91,10,0],[92,13,92,74,0],[93,13,93,35,0],[94,13,94,14,0],[95,17,95,74,0],[98,13,98,84,0],[99,13,99,62,0],[100,9,100,10,0],[121,9,121,10,0],[122,13,123,30,0],[123,30,127,18,0],[127,18,127,20,0],[122,13,127,20,0],[128,13,128,51,0],[129,9,129,10,0],[132,9,132,10,0],[133,13,133,70,0],[135,13,135,68,0],[136,13,136,24,0],[137,9,137,10,0],[144,9,144,10,0],[146,13,147,82,0],[148,9,148,10,0],[158,9,158,10,0],[159,13,159,95,0],[161,13,161,62,0],[162,9,162,10,0],[165,9,165,10,0],[166,13,166,120,0],[168,13,170,95,0],[171,9,171,10,0],[174,9,174,10,0],[175,13,177,46,0],[177,46,177,89,0],[177,89,178,49,0],[178,49,178,87,0],[178,87,178,89,0],[175,13,178,89,0],[180,13,180,65,0],[182,13,184,43,0],[186,13,186,28,0],[187,9,187,10,0],[196,9,196,10,0],[197,13,197,65,0],[198,17,198,61,0],[201,13,201,52,0],[202,13,202,14,0],[203,17,203,81,0],[206,17,206,36,0],[206,36,206,51,0],[206,51,206,53,0],[206,17,206,53,0],[207,21,207,46,0],[207,46,207,61,0],[207,61,207,63,0],[207,21,207,63,0],[208,13,208,14,0],[210,13,210,14,0],[211,17,211,76,0],[212,17,212,41,0],[213,17,213,18,0],[214,21,214,65,0],[217,17,217,83,0],[217,83,217,93,0],[217,93,217,105,0],[217,17,217,105,0],[219,17,219,40,0],[219,41,219,85,0],[221,17,221,84,0],[222,13,222,14,0],[224,13,224,90,0],[226,13,226,20,0],[226,22,226,31,0],[226,32,226,34,0],[226,35,226,41,0],[227,13,227,14,0],[228,17,228,56,0],[229,17,229,70,0],[230,13,230,14,0],[232,13,232,27,0],[233,9,233,10,0],[241,9,241,10,0],[242,13,242,88,0],[243,13,243,32,0],[244,13,244,14,0],[245,17,245,54,0],[248,13,248,70,0],[249,9,249,10,0],[255,9,255,10,0],[256,13,256,20,0],[256,22,256,30,0],[256,31,256,33,0],[256,34,256,69,0],[257,13,257,14,0],[258,17,258,59,0],[259,17,259,28,0],[260,17,260,18,0],[262,21,262,71,0],[264,13,264,14,0],[266,13,266,70,0],[267,9,267,10,0],[275,9,275,10,0],[276,13,278,38,0],[278,38,278,81,0],[278,81,279,38,0],[279,38,279,88,0],[279,88,279,90,0],[276,13,279,90,0],[280,9,280,10,0],[288,9,288,10,0],[289,13,291,38,0],[291,38,291,81,0],[291,81,292,38,0],[292,38,292,88,0],[292,88,292,90,0],[289,13,292,90,0],[293,9,293,10,0]]);
+    </script>
+  </body>
+</html>

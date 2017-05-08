@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\channels\UmbracoMetaWeblogAPI.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Drawing;
+using System.IO;
+using System.Web;
+using CookComputing.Blogger;
+using CookComputing.MetaWeblog;
+using CookComputing.XmlRpc;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using umbraco.BusinessLogic;
+using umbraco.cms.businesslogic;
+using umbraco.cms.businesslogic.datatype;
+using umbraco.cms.businesslogic.media;
+using umbraco.cms.businesslogic.property;
+using umbraco.cms.businesslogic.propertytype;
+using umbraco.cms.businesslogic.web;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Security;
+using umbraco.presentation.channels.businesslogic;
+using Post = CookComputing.MetaWeblog.Post;
+
+using System.Collections.Generic;
+using System.Web.Security;
+using Umbraco.Core.IO;
+using Umbraco.Core;
+
+namespace umbraco.presentation.channels
+{
+    public abstract class UmbracoMetaWeblogAPI : XmlRpcService, IMetaWeblog
+    {
+        internal readonly MediaFileSystem _fs;
+
+        protected UmbracoMetaWeblogAPI()
+        {
+            _fs = FileSystemProviderManager.Current.GetFileSystemProvider&lt;MediaFileSystem&gt;();
+        }
+
+        [XmlRpcMethod(&quot;blogger.deletePost&quot;,
+            Description = &quot;Deletes a post.&quot;)]
+        [return: XmlRpcReturnValue(Description = &quot;Always returns true.&quot;)]
+        public bool deletePost(
+            string appKey,
+            string postid,
+            string username,
+            string password,
+            [XmlRpcParameter(
+                Description = &quot;Where applicable, this specifies whether the blog &quot;
+                              + &quot;should be republished after the post has been deleted.&quot;)] bool publish)
+        {
+            if (ValidateUser(username, password))
+            {
+                Channel userChannel = new Channel(username);
+                new Document(int.Parse(postid))
+                    .delete();
+                return true;
+            }
+            return false;
+        }
+
+        public object editPost(
+            string postid,
+            string username,
+            string password,
+            Post post,
+            bool publish)
+        {
+            if (ValidateUser(username, password))
+            {
+                Channel userChannel = new Channel(username);
+                Document doc = new Document(Convert.ToInt32(postid));
+
+
+                doc.Text = HttpContext.Current.Server.HtmlDecode(post.title);
+
+                // Excerpt
+                if (userChannel.FieldExcerptAlias != null &amp;&amp; userChannel.FieldExcerptAlias != &quot;&quot;)
+                    doc.getProperty(userChannel.FieldExcerptAlias).Value = RemoveLeftUrl(post.mt_excerpt);
+
+                
+                if (UmbracoConfig.For.UmbracoSettings().Content.TidyEditorContent)
+                    doc.getProperty(userChannel.FieldDescriptionAlias).Value = library.Tidy(RemoveLeftUrl(post.description), false);
+                else
+                    doc.getProperty(userChannel.FieldDescriptionAlias).Value = RemoveLeftUrl(post.description);
+
+                UpdateCategories(doc, post, userChannel);
+
+
+                if (publish)
+                {
+                    doc.SaveAndPublish(new User(username));
+                }
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        private static void UpdateCategories(Document doc, Post post, Channel userChannel)
+        {
+            if (userChannel.FieldCategoriesAlias != null &amp;&amp; userChannel.FieldCategoriesAlias != &quot;&quot;)
+            {
+                ContentType blogPostType = ContentType.GetByAlias(userChannel.DocumentTypeAlias);
+                PropertyType categoryType = blogPostType.getPropertyType(userChannel.FieldCategoriesAlias);
+
+                String[] categories = post.categories;
+                string categoryValue = &quot;&quot;;
+                interfaces.IUseTags tags = UseTags(categoryType);
+                if (tags != null)
+                {
+                    tags.RemoveTagsFromNode(doc.Id);
+                    for (int i = 0; i &lt; categories.Length; i++)
+                    {
+                        tags.AddTagToNode(doc.Id, categories[i]);
+                    }
+                    //If the IUseTags provider manually set the property value to something on the IData interface then we should persist this
+                    //code commented as for some reason, even though the IUseTags control is setting IData.Value it is null here
+                    //could be a cache issue, or maybe it&#39;s a different instance of the IData or something, rather odd
+                    //doc.getProperty(userChannel.FieldCategoriesAlias).Value = categoryType.DataTypeDefinition.DataType.Data.Value;
+
+                    //Instead, set the document property to CSV of the tags - this WILL break custom editors for tags which don&#39;t adhere to the
+                    //pseudo standard that the .Value of the property contains CSV tags. 
+                    doc.getProperty(userChannel.FieldCategoriesAlias).Value = string.Join(&quot;,&quot;, categories);
+                }
+                else
+                {
+                    for (int i = 0; i &lt; categories.Length; i++)
+                    {
+                        PreValue pv = new PreValue(categoryType.DataTypeDefinition.Id, categories[i]);
+                        categoryValue += pv.Id + &quot;,&quot;;
+                    }
+                    if (categoryValue.Length &gt; 0)
+                        categoryValue = categoryValue.Substring(0, categoryValue.Length - 1);
+
+                    doc.getProperty(userChannel.FieldCategoriesAlias).Value = categoryValue;
+                }
+            }
+        }
+
+        public CategoryInfo[] getCategories(
+            string blogid,
+            string username,
+            string password)
+        {
+            if (ValidateUser(username, password))
+            {
+                Channel userChannel = new Channel(username);
+                if (userChannel.FieldCategoriesAlias != null &amp;&amp; userChannel.FieldCategoriesAlias != &quot;&quot;)
+                {
+                    // Find the propertytype via the document type
+                    ContentType blogPostType = ContentType.GetByAlias(userChannel.DocumentTypeAlias);
+                    PropertyType categoryType = blogPostType.getPropertyType(userChannel.FieldCategoriesAlias);
+
+                    // check if the datatype uses tags or prevalues
+                    CategoryInfo[] returnedCategories = null;
+                    interfaces.IUseTags tags = UseTags(categoryType);
+                    if (tags != null)
+                    {
+                        List&lt;interfaces.ITag&gt; alltags = tags.GetAllTags();
+                        if (alltags != null)
+                        {
+                            returnedCategories = new CategoryInfo[alltags.Count];
+                            int counter = 0;
+                            foreach (interfaces.ITag t in alltags)
+                            {
+                                CategoryInfo ci = new CategoryInfo();
+                                ci.title = t.TagCaption;
+                                ci.categoryid = t.Id.ToString();
+                                ci.description = &quot;&quot;;
+                                ci.rssUrl = &quot;&quot;;
+                                ci.htmlUrl = &quot;&quot;;
+                                returnedCategories[counter] = ci;
+                                counter++;
+                            }
+                        }
+                        else
+                        {
+                            returnedCategories = new CategoryInfo[0];
+                        }
+                    }
+                    else
+                    {
+                        SortedList categories = PreValues.GetPreValues(categoryType.DataTypeDefinition.Id);
+                        returnedCategories = new CategoryInfo[categories.Count];
+                        IDictionaryEnumerator ide = categories.GetEnumerator();
+                        int counter = 0;
+                        while (ide.MoveNext())
+                        {
+                            PreValue category = (PreValue)ide.Value;
+                            CategoryInfo ci = new CategoryInfo();
+                            ci.title = category.Value;
+                            ci.categoryid = category.Id.ToString();
+                            ci.description = &quot;&quot;;
+                            ci.rssUrl = &quot;&quot;;
+                            ci.htmlUrl = &quot;&quot;;
+                            returnedCategories[counter] = ci;
+                            counter++;
+                        }
+                    }
+
+                    return returnedCategories;
+                }
+            }
+
+            throw new ArgumentException(&quot;Categories doesn&#39;t work for this channel, they might not have been activated. Contact your umbraco administrator.&quot;);
+        }
+
+        public static interfaces.IUseTags UseTags(PropertyType categoryType)
+        {
+            if (typeof(interfaces.IUseTags).IsAssignableFrom(categoryType.DataTypeDefinition.DataType.DataEditor.GetType()))
+            {
+                interfaces.IUseTags tags = (interfaces.IUseTags)categoryType.DataTypeDefinition.DataType.DataEditor as interfaces.IUseTags;
+                return tags;
+            }
+            return null;
+        }
+
+        public Post getPost(
+            string postid,
+            string username,
+            string password)
+        {
+            if (ValidateUser(username, password))
+            {
+                Channel userChannel = new Channel(username);
+                Document d = new Document(int.Parse(postid));
+                Post p = new Post();
+                p.title = d.Text;
+                p.description = d.getProperty(userChannel.FieldDescriptionAlias).Value.ToString();
+
+                // Excerpt
+                if (userChannel.FieldExcerptAlias != null &amp;&amp; userChannel.FieldExcerptAlias != &quot;&quot;)
+                    p.mt_excerpt = d.getProperty(userChannel.FieldExcerptAlias).Value.ToString();
+
+                // Categories
+                if (userChannel.FieldCategoriesAlias != null &amp;&amp; userChannel.FieldCategoriesAlias != &quot;&quot; &amp;&amp;
+                    d.getProperty(userChannel.FieldCategoriesAlias) != null &amp;&amp;
+                    d.getProperty(userChannel.FieldCategoriesAlias).Value != null &amp;&amp;
+                    d.getProperty(userChannel.FieldCategoriesAlias).Value.ToString() != &quot;&quot;)
+                {
+                    String categories = d.getProperty(userChannel.FieldCategoriesAlias).Value.ToString();
+                    char[] splitter = { &#39;,&#39; };
+                    String[] categoryIds = categories.Split(splitter);
+                    p.categories = categoryIds;
+                }
+
+                p.postid = postid;
+                p.permalink = library.NiceUrl(d.Id);
+                p.dateCreated = d.CreateDateTime;
+                p.link = p.permalink;
+                return p;
+            }
+            else
+                throw new ArgumentException(string.Format(&quot;Error retriving post with id: &#39;{0}&#39;&quot;, postid));
+        }
+
+        public Post[] getRecentPosts(
+            string blogid,
+            string username,
+            string password,
+            int numberOfPosts)
+        {
+            if (ValidateUser(username, password))
+            {
+                ArrayList blogPosts = new ArrayList();
+                ArrayList blogPostsObjects = new ArrayList();
+
+                User u = new User(username);
+                Channel userChannel = new Channel(u.Id);
+
+
+                Document rootDoc;
+                if (userChannel.StartNode &gt; 0)
+                    rootDoc = new Document(userChannel.StartNode);
+                else
+                {
+                    if (u.StartNodeId == -1)
+                    {
+                        rootDoc = Document.GetRootDocuments()[0];
+                    }
+                    else
+                    {
+                        rootDoc = new Document(u.StartNodeId);
+                    }
+                }
+
+                //store children array here because iterating over an Array object is very inneficient.
+                var c = rootDoc.Children;
+                foreach (Document d in c)
+                {
+                    int count = 0;
+                    blogPosts.AddRange(
+                        findBlogPosts(userChannel, d, u.Name, ref count, numberOfPosts, userChannel.FullTree));
+                }
+
+                blogPosts.Sort(new DocumentSortOrderComparer());
+
+                foreach (Object o in blogPosts)
+                {
+                    Document d = (Document)o;
+                    Post p = new Post();
+                    p.dateCreated = d.CreateDateTime;
+                    p.userid = username;
+                    p.title = d.Text;
+                    p.permalink = library.NiceUrl(d.Id);
+                    p.description = d.getProperty(userChannel.FieldDescriptionAlias).Value.ToString();
+                    p.link = library.NiceUrl(d.Id);
+                    p.postid = d.Id.ToString();
+
+                    if (userChannel.FieldCategoriesAlias != null &amp;&amp; userChannel.FieldCategoriesAlias != &quot;&quot; &amp;&amp;
+                        d.getProperty(userChannel.FieldCategoriesAlias) != null &amp;&amp;
+                        d.getProperty(userChannel.FieldCategoriesAlias).Value != null &amp;&amp;
+                        d.getProperty(userChannel.FieldCategoriesAlias).Value.ToString() != &quot;&quot;)
+                    {
+                        String categories = d.getProperty(userChannel.FieldCategoriesAlias).Value.ToString();
+                        char[] splitter = { &#39;,&#39; };
+                        String[] categoryIds = categories.Split(splitter);
+                        p.categories = categoryIds;
+                    }
+
+                    // Excerpt
+                    if (userChannel.FieldExcerptAlias != null &amp;&amp; userChannel.FieldExcerptAlias != &quot;&quot;)
+                        p.mt_excerpt = d.getProperty(userChannel.FieldExcerptAlias).Value.ToString();
+
+
+                    blogPostsObjects.Add(p);
+                }
+
+
+                return (Post[])blogPostsObjects.ToArray(typeof(Post));
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        protected ArrayList findBlogPosts(Channel userChannel, Document d, String userName, ref int count, int max,
+                                          bool fullTree)
+        {
+            ArrayList list = new ArrayList();
+
+            ContentType ct = d.ContentType;
+
+            if (ct.Alias.Equals(userChannel.DocumentTypeAlias) &amp;
+                (count &lt; max))
+            {
+                list.Add(d);
+                count = count + 1;
+            }
+
+            if (d.Children != null &amp;&amp; d.Children.Length &gt; 0 &amp;&amp; fullTree)
+            {
+                //store children array here because iterating over an Array object is very inneficient.
+                var c = d.Children;
+                foreach (Document child in c)
+                {
+                    if (count &lt; max)
+                    {
+                        list.AddRange(findBlogPosts(userChannel, child, userName, ref count, max, true));
+                    }
+                }
+            }
+            return list;
+        }
+
+        public string newPost(
+            string blogid,
+            string username,
+            string password,
+            Post post,
+            bool publish)
+        {
+            if (ValidateUser(username, password))
+            {
+                Channel userChannel = new Channel(username);
+                User u = new User(username);
+                Document doc =
+                    Document.MakeNew(HttpContext.Current.Server.HtmlDecode(post.title),
+                                     DocumentType.GetByAlias(userChannel.DocumentTypeAlias), u,
+                                     userChannel.StartNode);
+
+
+                // Excerpt
+                if (userChannel.FieldExcerptAlias != null &amp;&amp; userChannel.FieldExcerptAlias != &quot;&quot;)
+                    doc.getProperty(userChannel.FieldExcerptAlias).Value = RemoveLeftUrl(post.mt_excerpt);
+
+
+                // Description
+                if (UmbracoConfig.For.UmbracoSettings().Content.TidyEditorContent)
+                    doc.getProperty(userChannel.FieldDescriptionAlias).Value = library.Tidy(RemoveLeftUrl(post.description), false);
+                else
+                    doc.getProperty(userChannel.FieldDescriptionAlias).Value = RemoveLeftUrl(post.description);
+
+                // Categories
+                UpdateCategories(doc, post, userChannel);
+
+                // check release date
+                if (post.dateCreated.Year &gt; 0001)
+                {
+                    publish = false;
+                    doc.ReleaseDate = post.dateCreated;
+                }
+
+                if (publish)
+                {
+                    doc.SaveAndPublish(new User(username));
+                }
+                return doc.Id.ToString();
+            }
+            else
+                throw new ArgumentException(&quot;Error creating post&quot;);
+        }
+
+        protected MediaObjectInfo newMediaObjectLogicForWord(
+            string blogid,
+            string username,
+            string password,
+            FileData file)
+        {
+            UrlData ud = newMediaObjectLogic(blogid, username, password, file);
+            MediaObjectInfo moi = new MediaObjectInfo();
+            moi.url = ud.url;
+            return moi;
+        }
+        protected UrlData newMediaObjectLogic(
+            string blogid,
+            string username,
+            string password,
+            FileData file)
+        {
+            if (ValidateUser(username, password))
+            {
+                User u = new User(username);
+                Channel userChannel = new Channel(username);
+                UrlData fileUrl = new UrlData();
+                if (userChannel.ImageSupport)
+                {
+                    Media rootNode;
+                    if (userChannel.MediaFolder &gt; 0)
+                        rootNode = new Media(userChannel.MediaFolder);
+                    else
+                        rootNode = new Media(u.StartMediaId);
+
+                    // Create new media
+                    Media m = Media.MakeNew(file.name, MediaType.GetByAlias(userChannel.MediaTypeAlias), u, rootNode.Id);
+
+                    Property fileObject = m.getProperty(userChannel.MediaTypeFileProperty);
+                    
+                    var filename = file.name.Replace(&quot;/&quot;, &quot;_&quot;);
+                    var relativeFilePath = _fs.GetRelativePath(fileObject.Id, filename);
+
+                    fileObject.Value = _fs.GetUrl(relativeFilePath);
+                    fileUrl.url = fileObject.Value.ToString();
+
+                    if (!fileUrl.url.StartsWith(&quot;http&quot;))
+                    {
+                        var protocol = GlobalSettings.UseSSL ? &quot;https&quot; : &quot;http&quot;;
+                        fileUrl.url = protocol + &quot;://&quot; + HttpContext.Current.Request.ServerVariables[&quot;SERVER_NAME&quot;] + fileUrl.url;
+                    }
+
+                    _fs.AddFile(relativeFilePath, new MemoryStream(file.bits));
+
+                    // Try updating standard file values
+                    try
+                    {
+                        string orgExt = &quot;&quot;;
+                        // Size
+                        if (m.getProperty(Constants.Conventions.Media.Bytes) != null)
+                            m.getProperty(Constants.Conventions.Media.Bytes).Value = file.bits.Length;
+                        // Extension
+                        if (m.getProperty(Constants.Conventions.Media.Extension) != null)
+                        {
+                            orgExt =
+                                ((string)
+                                 file.name.Substring(file.name.LastIndexOf(&quot;.&quot;) + 1,
+                                                     file.name.Length - file.name.LastIndexOf(&quot;.&quot;) - 1));
+                            m.getProperty(Constants.Conventions.Media.Extension).Value = orgExt.ToLower();
+                        }
+                        // Width and Height
+                        // Check if image and then get sizes, make thumb and update database
+                        if (m.getProperty(Constants.Conventions.Media.Width) != null &amp;&amp; m.getProperty(Constants.Conventions.Media.Height) != null &amp;&amp;
+                            &quot;,jpeg,jpg,gif,bmp,png,tiff,tif,&quot;.IndexOf(&quot;,&quot; + orgExt.ToLower() + &quot;,&quot;) &gt; 0)
+                        {
+                            int fileWidth;
+                            int fileHeight;
+
+                            using (var stream = _fs.OpenFile(relativeFilePath))
+                            {
+                                Image image = Image.FromStream(stream);
+                                fileWidth = image.Width;
+                                fileHeight = image.Height;
+                                stream.Close();
+                                try
+                                {
+                                    m.getProperty(Constants.Conventions.Media.Width).Value = fileWidth.ToString();
+                                    m.getProperty(Constants.Conventions.Media.Height).Value = fileHeight.ToString();
+                                }
+                                catch (Exception ex)
+                                {
+                                    LogHelper.Error&lt;UmbracoMetaWeblogAPI&gt;(&quot;An error occurred reading the media stream&quot;, ex);
+                                }    
+                            }
+
+                            
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogHelper.Error&lt;UmbracoMetaWeblogAPI&gt;(&quot;An error occurred in newMediaObjectLogic&quot;, ex);
+                    }
+
+                    return fileUrl;
+                }
+                else
+                    throw new ArgumentException(
+                        &quot;Image Support is turned off in this channel. Modify channel settings in umbraco to enable image support.&quot;);
+            }
+            return new UrlData();
+        }
+
+        private static bool ValidateUser(string username, string password)
+        {
+            var provider = MembershipProviderExtensions.GetUsersMembershipProvider();
+
+            return provider.ValidateUser(username, password);
+        }
+
+        [XmlRpcMethod(&quot;blogger.getUsersBlogs&quot;,
+            Description = &quot;Returns information on all the blogs a given user &quot;
+                          + &quot;is a member.&quot;)]
+        public BlogInfo[] getUsersBlogs(
+            string appKey,
+            string username,
+            string password)
+        {
+            if (ValidateUser(username, password))
+            {
+                BlogInfo[] blogs = new BlogInfo[1];
+                User u = new User(username);
+                Channel userChannel = new Channel(u.Id);
+                Document rootDoc;
+                if (userChannel.StartNode &gt; 0)
+                    rootDoc = new Document(userChannel.StartNode);
+                else
+                    rootDoc = new Document(u.StartNodeId);
+
+                BlogInfo bInfo = new BlogInfo();
+                bInfo.blogName = userChannel.Name;
+                bInfo.blogid = rootDoc.Id.ToString();
+                bInfo.url = library.NiceUrlWithDomain(rootDoc.Id, true);
+                blogs[0] = bInfo;
+
+                return blogs;
+            }
+
+            throw new ArgumentException(string.Format(&quot;No data found for user with username: &#39;{0}&#39;&quot;, username));
+        }
+
+        private static string RemoveLeftUrl(string text)
+        {
+            return
+                text.Replace(HttpContext.Current.Request.Url.GetLeftPart(UriPartial.Authority), &quot;&quot;);
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[34,9,34,41,0],[35,9,35,10,0],[36,13,36,94,0],[37,9,37,10,0],[50,9,50,10,0],[51,13,51,50,0],[52,13,52,14,0],[53,17,53,61,0],[54,17,55,31,0],[56,17,56,29,0],[58,13,58,26,0],[59,9,59,10,0],[67,9,67,10,0],[68,13,68,50,0],[69,13,69,14,0],[70,17,70,61,0],[71,17,71,70,0],[74,17,74,78,0],[77,17,77,98,0],[78,21,78,107,0],[81,17,81,83,0],[82,21,82,133,0],[84,21,84,112,0],[86,17,86,58,0],[89,17,89,29,0],[90,17,90,18,0],[91,21,91,60,0],[92,17,92,18,0],[93,17,93,29,0],[96,13,96,14,0],[97,17,97,30,0],[99,9,99,10,0],[102,9,102,10,0],[103,13,103,100,0],[104,13,104,14,0],[105,17,105,98,0],[106,17,106,108,0],[108,17,108,55,0],[109,17,109,43,0],[110,17,110,66,0],[111,17,111,34,0],[112,17,112,18,0],[113,21,113,53,0],[114,26,114,35,0],[114,37,114,58,0],[114,60,114,63,0],[115,21,115,22,0],[116,25,116,66,0],[117,21,117,22,0],[125,21,125,108,0],[126,17,126,18,0],[128,17,128,18,0],[129,26,129,35,0],[129,37,129,58,0],[129,60,129,63,0],[130,21,130,22,0],[131,25,131,103,0],[132,25,132,54,0],[133,21,133,22,0],[134,21,134,50,0],[135,25,135,94,0],[137,21,137,93,0],[138,17,138,18,0],[139,13,139,14,0],[140,9,140,10,0],[146,9,146,10,0],[147,13,147,50,0],[148,13,148,14,0],[149,17,149,61,0],[150,17,150,104,0],[151,17,151,18,0],[153,21,153,102,0],[154,21,154,112,0],[157,21,157,62,0],[158,21,158,70,0],[159,21,159,38,0],[160,21,160,22,0],[161,25,161,75,0],[162,25,162,45,0],[163,25,163,26,0],[164,29,164,82,0],[165,29,165,45,0],[166,29,166,36,0],[166,38,166,55,0],[166,56,166,58,0],[166,59,166,66,0],[167,29,167,30,0],[168,33,168,70,0],[169,33,169,57,0],[170,33,170,65,0],[171,33,171,53,0],[172,33,172,48,0],[173,33,173,49,0],[174,33,174,66,0],[175,33,175,43,0],[176,29,176,30,0],[177,25,177,26,0],[179,25,179,26,0],[180,29,180,70,0],[181,25,181,26,0],[182,21,182,22,0],[184,21,184,22,0],[185,25,185,108,0],[186,25,186,81,0],[187,25,187,80,0],[188,25,188,41,0],[189,25,189,47,0],[190,25,190,26,0],[191,29,191,69,0],[192,29,192,66,0],[193,29,193,55,0],[194,29,194,68,0],[195,29,195,49,0],[196,29,196,44,0],[197,29,197,45,0],[198,29,198,62,0],[199,29,199,39,0],[200,25,200,26,0],[201,21,201,22,0],[203,21,203,47,0],[205,13,205,14,0],[207,13,207,158,0],[208,9,208,10,0],[211,9,211,10,0],[212,13,212,125,0],[213,13,213,14,0],[214,17,214,140,0],[215,17,215,29,0],[217,13,217,25,0],[218,9,218,10,0],[224,9,224,10,0],[225,13,225,50,0],[226,13,226,14,0],[227,17,227,61,0],[228,17,228,62,0],[229,17,229,37,0],[230,17,230,34,0],[231,17,231,99,0],[234,17,234,98,0],[235,21,235,98,0],[238,17,241,92,0],[242,17,242,18,0],[243,21,243,106,0],[244,21,244,47,0],[245,21,245,71,0],[246,21,246,48,0],[247,17,247,18,0],[249,17,249,35,0],[250,17,250,53,0],[251,17,251,50,0],[252,17,252,38,0],[253,17,253,26,0],[256,17,256,107,0],[257,9,257,10,0],[264,9,264,10,0],[265,13,265,50,0],[266,13,266,14,0],[267,17,267,55,0],[268,17,268,62,0],[270,17,270,45,0],[271,17,271,57,0],[275,17,275,47,0],[276,21,276,67,0],[278,17,278,18,0],[279,21,279,45,0],[280,21,280,22,0],[281,25,281,66,0],[282,21,282,22,0],[284,21,284,22,0],[285,25,285,63,0],[286,21,286,22,0],[287,17,287,18,0],[290,17,290,42,0],[291,17,291,24,0],[291,26,291,36,0],[291,37,291,39,0],[291,40,291,41,0],[292,17,292,18,0],[293,21,293,35,0],[294,21,295,112,0],[296,17,296,18,0],[298,17,298,65,0],[300,17,300,24,0],[300,26,300,34,0],[300,35,300,37,0],[300,38,300,47,0],[301,17,301,18,0],[302,21,302,46,0],[303,21,303,41,0],[304,21,304,54,0],[305,21,305,41,0],[306,21,306,38,0],[307,21,307,57,0],[308,21,308,103,0],[309,21,309,52,0],[310,21,310,48,0],[312,21,315,96,0],[316,21,316,22,0],[317,25,317,110,0],[318,25,318,51,0],[319,25,319,75,0],[320,25,320,52,0],[321,21,321,22,0],[324,21,324,102,0],[325,25,325,102,0],[328,21,328,45,0],[329,17,329,18,0],[332,17,332,71,0],[335,13,335,14,0],[336,17,336,29,0],[338,9,338,10,0],[342,9,342,10,0],[343,13,343,46,0],[345,13,345,44,0],[347,13,348,31,0],[349,13,349,14,0],[350,17,350,29,0],[351,17,351,35,0],[352,13,352,14,0],[354,13,354,73,0],[355,13,355,14,0],[357,17,357,36,0],[358,17,358,24,0],[358,26,358,40,0],[358,41,358,43,0],[358,44,358,45,0],[359,17,359,18,0],[360,21,360,37,0],[361,21,361,22,0],[362,25,362,106,0],[363,21,363,22,0],[364,17,364,18,0],[365,13,365,14,0],[366,13,366,25,0],[367,9,367,10,0],[375,9,375,10,0],[376,13,376,50,0],[377,13,377,14,0],[378,17,378,61,0],[379,17,379,45,0],[380,17,383,61,0],[387,17,387,98,0],[388,21,388,107,0],[392,17,392,83,0],[393,21,393,133,0],[395,21,395,112,0],[398,17,398,58,0],[401,17,401,50,0],[402,17,402,18,0],[403,21,403,37,0],[404,21,404,56,0],[405,17,405,18,0],[407,17,407,29,0],[408,17,408,18,0],[409,21,409,60,0],[410,17,410,18,0],[411,17,411,42,0],[414,17,414,68,0],[415,9,415,10,0],[422,9,422,10,0],[423,13,423,80,0],[424,13,424,57,0],[425,13,425,30,0],[426,13,426,24,0],[427,9,427,10,0],[433,9,433,10,0],[434,13,434,50,0],[435,13,435,14,0],[436,17,436,45,0],[437,17,437,61,0],[438,17,438,49,0],[439,17,439,46,0],[440,17,440,18,0],[442,21,442,53,0],[443,25,443,71,0],[445,25,445,62,0],[448,21,448,122,0],[450,21,450,92,0],[452,21,452,64,0],[453,21,453,89,0],[455,21,455,69,0],[456,21,456,63,0],[458,21,458,57,0],[459,21,459,22,0],[460,25,460,81,0],[461,25,461,131,0],[462,21,462,22,0],[464,21,464,80,0],[468,21,468,22,0],[469,25,469,44,0],[471,25,471,86,0],[472,29,472,103,0],[474,25,474,90,0],[475,25,475,26,0],[476,29,479,106,0],[480,29,480,107,0],[481,25,481,26,0],[484,25,485,105,0],[486,25,486,26,0],[490,36,490,79,0],[491,29,491,30,0],[492,33,492,72,0],[493,33,493,57,0],[494,33,494,59,0],[495,33,495,48,0],[497,33,497,34,0],[498,37,498,115,0],[499,37,499,117,0],[500,33,500,34,0],[501,33,501,53,0],[502,33,502,34,0],[503,37,503,125,0],[504,33,504,34,0],[505,29,505,30,0],[508,25,508,26,0],[509,21,509,22,0],[510,21,510,41,0],[511,21,511,22,0],[512,25,512,111,0],[513,21,513,22,0],[515,21,515,36,0],[518,21,519,133,0],[521,13,521,34,0],[522,9,522,10,0],[525,9,525,10,0],[526,13,526,86,0],[528,13,528,62,0],[529,9,529,10,0],[538,9,538,10,0],[539,13,539,50,0],[540,13,540,14,0],[541,17,541,52,0],[542,17,542,45,0],[543,17,543,57,0],[545,17,545,47,0],[546,21,546,67,0],[548,21,548,59,0],[550,17,550,49,0],[551,17,551,51,0],[552,17,552,54,0],[553,17,553,73,0],[554,17,554,34,0],[556,17,556,30,0],[559,13,559,113,0],[560,9,560,10,0],[563,9,563,10,0],[564,13,565,101,0],[566,9,566,10,0]]);
+    </script>
+  </body>
+</html>

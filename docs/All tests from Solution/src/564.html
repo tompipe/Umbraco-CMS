@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\plugins\tinymce3\GzipCompressor.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+/*
+ * $Id: GzipCompressor.cs 439 2007-11-26 13:26:10Z spocke $
+ *
+ * @author Moxiecode
+ * @copyright Copyright � 2004-2007, Moxiecode Systems AB, All rights reserved.
+ */
+
+using System;
+using System.Web;
+using System.Collections;
+using System.IO;
+using System.IO.Compression;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace umbraco.presentation.plugins.tinymce3
+{
+    /// &lt;summary&gt;
+	/// Description of GzipCompressor.
+	/// &lt;/summary&gt;
+	public class GzipCompressor {
+		#region private
+		private bool diskCache, noCompression;
+		private string cachePath;
+		private ArrayList items;
+		#endregion
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		public GzipCompressor() {
+			this.items = new ArrayList();
+		}
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		public bool NoCompression {
+			get { return noCompression; }
+			set { noCompression = value; }
+		}
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		public bool DiskCache {
+			get { return diskCache; }
+			set { diskCache = value; }
+		}
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		public string CachePath {
+			get { return cachePath; }
+			set { cachePath = value; }
+		}
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;path&quot;&gt;&lt;/param&gt;
+		public void AddFile(string path) {
+			//System.Web.HttpContext.Current.Response.Write(path + &quot;\n&quot;);
+			if (File.Exists(path))
+				this.items.Add(new CompressItem(CompressItemType.File, path));
+			else
+				throw new Exception(&quot;File could not be found \&quot;&quot; + path + &quot;\&quot;, unable to add it for Gzip compression.&quot;);
+		}
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;data&quot;&gt;&lt;/param&gt;
+		public void AddData(string data) {
+			this.items.Add(new CompressItem(CompressItemType.Chunk, data));
+		}
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;to_stream&quot;&gt;&lt;/param&gt;
+		public void Compress(Stream to_stream) {
+			GZipStream gzipStream = null;
+			string key = &quot;&quot;;
+			byte[] bytes;
+
+			// Build cache key
+			foreach (CompressItem item in this.items) {
+				if (item.Type == CompressItemType.File)
+					key += item.Data;
+			}
+
+			key = MD5(key);
+			if (this.NoCompression) {
+				this.SendPlainText(key, to_stream);
+				return;
+			}
+
+			// Check for cached file on disk, stream that one if it was found
+			if (this.DiskCache &amp;&amp; File.Exists(Path.Combine(this.CachePath, key + &quot;.gz&quot;))) {
+				this.StreamFromTo(File.OpenRead(Path.Combine(this.CachePath, key + &quot;.gz&quot;)), to_stream, 4096, CloseMode.InStream);
+				return;
+			}
+
+			try {
+				// Build new gzipped stream
+				if (this.DiskCache) {
+						gzipStream = new GZipStream(File.OpenWrite(Path.Combine(this.CachePath, key + &quot;.gz&quot;)), CompressionMode.Compress);
+
+						// Compress all files into memory
+						foreach (CompressItem item in this.items) {
+							// Add file
+							if (item.Type == CompressItemType.File)
+								StreamFromTo(File.OpenRead(item.Data), gzipStream, 4096, CloseMode.InStream);
+
+							// Add chunk
+							if (item.Type == CompressItemType.Chunk) {
+								bytes = Encoding.ASCII.GetBytes(item.Data.ToCharArray());
+								gzipStream.Write(bytes, 0, bytes.Length);
+							}
+						}
+
+						// Close gzip stream
+						gzipStream.Close();
+						gzipStream = null;
+
+						// Send cached file to user
+						this.StreamFromTo(File.OpenRead(Path.Combine(this.CachePath, key + &quot;.gz&quot;)), to_stream, 4096, CloseMode.InStream);
+				} else {
+					gzipStream = new GZipStream(to_stream, CompressionMode.Compress);
+
+					// Compress all files into output stream
+					foreach (CompressItem item in this.items) {
+						// Add file
+						if (item.Type == CompressItemType.File)
+							StreamFromTo(File.OpenRead(item.Data), gzipStream, 4096, CloseMode.InStream);
+
+						// Add chunk
+						if (item.Type == CompressItemType.Chunk) {
+							bytes = Encoding.ASCII.GetBytes(item.Data.ToCharArray());
+							gzipStream.Write(bytes, 0, bytes.Length);
+						}
+					}
+				}
+			} finally {
+				if (gzipStream != null)
+					gzipStream.Close();
+			}
+		}
+
+		#region private
+
+		private void SendPlainText(string key, Stream to_stream) {
+			Stream fileStream = null;
+			byte[] bytes;
+
+			// Check for cached file on disk, stream that one if it was found
+			if (this.DiskCache &amp;&amp; File.Exists(Path.Combine(this.CachePath, key + &quot;.js&quot;))) {
+				this.StreamFromTo(File.OpenRead(Path.Combine(this.CachePath, key + &quot;.js&quot;)), to_stream, 4096, CloseMode.InStream);
+				return;
+			}
+
+			// Build new plain text stream
+			if (this.DiskCache) {
+				try {
+					fileStream = File.OpenWrite(Path.Combine(this.CachePath, key + &quot;.js&quot;));
+
+					// Compress all files into memory
+					foreach (CompressItem item in this.items) {
+						// Add file
+						if (item.Type == CompressItemType.File)
+							StreamFromTo(File.OpenRead(item.Data), fileStream, 4096, CloseMode.InStream);
+
+						// Add chunk
+						if (item.Type == CompressItemType.Chunk) {
+							bytes = Encoding.ASCII.GetBytes(item.Data.ToCharArray());
+							fileStream.Write(bytes, 0, bytes.Length);
+						}
+					}
+
+					// Close file stream
+					fileStream.Close();
+					fileStream = null;
+				} finally {
+					// Close file stream
+					if (fileStream != null)
+						fileStream.Close();
+				}
+
+				// Send cached file to user
+				this.StreamFromTo(File.OpenRead(Path.Combine(this.CachePath, key + &quot;.js&quot;)), to_stream, 4096, CloseMode.InStream);
+			} else {
+				// Concat all files into output stream
+				foreach (CompressItem item in this.items) {
+					// Add file
+					if (item.Type == CompressItemType.File)
+						StreamFromTo(File.OpenRead(item.Data), to_stream, 4096, CloseMode.InStream);
+
+					// Add chunk
+					if (item.Type == CompressItemType.Chunk) {
+						bytes = Encoding.ASCII.GetBytes(item.Data.ToCharArray());
+						to_stream.Write(bytes, 0, bytes.Length);
+					}
+				}
+			}
+		}
+
+		private void StreamFromTo(Stream in_stream, Stream out_stream, int buff_size, CloseMode mode) {
+			byte[] buff = new byte[buff_size];
+			int len;
+
+			try {
+				while ((len = in_stream.Read(buff, 0, buff_size)) &gt; 0) {
+					out_stream.Write(buff, 0, len);
+					out_stream.Flush();
+				}
+			} finally {
+				if (in_stream != null &amp;&amp; (mode == CloseMode.Both || mode == CloseMode.InStream))
+					in_stream.Close();
+
+				if (out_stream != null &amp;&amp; (mode == CloseMode.Both || mode == CloseMode.OutStream))
+					out_stream.Close();
+			}
+		}
+
+		private string MD5(string str) {
+			MD5 md5 = new MD5CryptoServiceProvider();
+			byte[] result = md5.ComputeHash(Encoding.ASCII.GetBytes(str));
+			str = BitConverter.ToString(result);
+
+			return str.Replace(&quot;-&quot;, &quot;&quot;);
+		}
+
+		#endregion
+	}
+
+	enum CloseMode {
+		None, InStream, OutStream, Both
+	}
+
+	enum CompressItemType {
+		File, Chunk
+	}
+
+	class CompressItem {
+		private string data;
+		private CompressItemType type;
+
+		public CompressItem(CompressItemType type, string data) {
+			this.type = type;
+			this.data = data;
+		}
+
+		public string Data {
+			get { return data; }
+			set { data = value; }
+		}
+
+		public CompressItemType Type {
+			get { return type; }
+		}
+	}
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[31,3,31,26,0],[31,27,31,28,0],[32,4,32,33,0],[33,3,33,4,0],[39,8,39,9,0],[39,10,39,31,0],[39,32,39,33,0],[40,8,40,9,0],[40,10,40,32,0],[40,33,40,34,0],[47,8,47,9,0],[47,10,47,27,0],[47,28,47,29,0],[48,8,48,9,0],[48,10,48,28,0],[48,29,48,30,0],[55,8,55,9,0],[55,10,55,27,0],[55,28,55,29,0],[56,8,56,9,0],[56,10,56,28,0],[56,29,56,30,0],[63,36,63,37,0],[65,4,65,26,0],[66,5,66,67,0],[68,5,68,109,0],[69,3,69,4,0],[75,36,75,37,0],[76,4,76,67,0],[77,3,77,4,0],[83,42,83,43,0],[84,4,84,33,0],[85,4,85,20,0],[89,4,89,11,0],[89,13,89,30,0],[89,31,89,33,0],[89,34,89,44,0],[89,46,89,47,0],[90,5,90,44,0],[91,6,91,23,0],[92,4,92,5,0],[94,4,94,19,0],[95,4,95,27,0],[95,28,95,29,0],[96,5,96,40,0],[97,5,97,12,0],[101,4,101,81,0],[101,82,101,83,0],[102,5,102,118,0],[103,5,103,12,0],[106,8,106,9,0],[108,5,108,24,0],[108,25,108,26,0],[109,7,109,120,0],[112,7,112,14,0],[112,16,112,33,0],[112,34,112,36,0],[112,37,112,47,0],[112,49,112,50,0],[114,8,114,47,0],[115,9,115,86,0],[118,8,118,48,0],[118,49,118,50,0],[119,9,119,66,0],[120,9,120,50,0],[121,8,121,9,0],[122,7,122,8,0],[125,7,125,26,0],[126,7,126,25,0],[129,7,129,120,0],[130,5,130,6,0],[130,12,130,13,0],[131,6,131,71,0],[134,6,134,13,0],[134,15,134,32,0],[134,33,134,35,0],[134,36,134,46,0],[134,48,134,49,0],[136,7,136,46,0],[137,8,137,85,0],[140,7,140,47,0],[140,48,140,49,0],[141,8,141,65,0],[142,8,142,49,0],[143,7,143,8,0],[144,6,144,7,0],[145,5,145,6,0],[146,4,146,5,0],[146,14,146,15,0],[147,5,147,28,0],[148,6,148,25,0],[149,4,149,5,0],[150,3,150,4,0],[154,60,154,61,0],[155,4,155,29,0],[159,4,159,81,0],[159,82,159,83,0],[160,5,160,118,0],[161,5,161,12,0],[165,4,165,23,0],[165,24,165,25,0],[166,9,166,10,0],[167,6,167,77,0],[170,6,170,13,0],[170,15,170,32,0],[170,33,170,35,0],[170,36,170,46,0],[170,48,170,49,0],[172,7,172,46,0],[173,8,173,85,0],[176,7,176,47,0],[176,48,176,49,0],[177,8,177,65,0],[178,8,178,49,0],[179,7,179,8,0],[180,6,180,7,0],[183,6,183,25,0],[184,6,184,24,0],[185,5,185,6,0],[185,15,185,16,0],[187,6,187,29,0],[188,7,188,26,0],[189,5,189,6,0],[192,5,192,118,0],[193,4,193,5,0],[193,11,193,12,0],[195,5,195,12,0],[195,14,195,31,0],[195,32,195,34,0],[195,35,195,45,0],[195,47,195,48,0],[197,6,197,45,0],[198,7,198,83,0],[201,6,201,46,0],[201,47,201,48,0],[202,7,202,64,0],[203,7,203,47,0],[204,6,204,7,0],[205,5,205,6,0],[206,4,206,5,0],[207,3,207,4,0],[209,97,209,98,0],[210,4,210,38,0],[213,8,213,9,0],[214,5,214,59,0],[214,60,214,61,0],[215,6,215,37,0],[216,6,216,25,0],[217,5,217,6,0],[218,4,218,5,0],[218,14,218,15,0],[219,5,219,85,0],[220,6,220,24,0],[222,5,222,87,0],[223,6,223,25,0],[224,4,224,5,0],[225,3,225,4,0],[227,34,227,35,0],[228,4,228,45,0],[229,4,229,66,0],[230,4,230,40,0],[232,4,232,32,0],[233,3,233,4,0],[250,3,250,58,0],[250,59,250,60,0],[251,4,251,21,0],[252,4,252,21,0],[253,3,253,4,0],[256,8,256,9,0],[256,10,256,22,0],[256,23,256,24,0],[257,8,257,9,0],[257,10,257,23,0],[257,24,257,25,0],[261,8,261,9,0],[261,10,261,22,0],[261,23,261,24,0]]);
+    </script>
+  </body>
+</html>

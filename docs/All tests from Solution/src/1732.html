@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\VersionableRepositoryBase.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Data.SqlTypes;
+using System.Diagnostics;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Editors;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Core.Services;
+using Umbraco.Core.Dynamics;
+using Umbraco.Core.IO;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    internal abstract class VersionableRepositoryBase&lt;TId, TEntity&gt; : PetaPocoRepositoryBase&lt;TId, TEntity&gt;
+        where TEntity : class, IAggregateRoot
+    {
+        private readonly IContentSection _contentSection;
+
+        /// &lt;summary&gt;
+        /// This is used for unit tests ONLY
+        /// &lt;/summary&gt;
+        internal static bool ThrowOnWarning = false;
+
+        protected VersionableRepositoryBase(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax, IContentSection contentSection)
+            : base(work, cache, logger, sqlSyntax)
+        {
+            _contentSection = contentSection;
+        }
+
+        #region IRepositoryVersionable Implementation
+
+        /// &lt;summary&gt;
+        /// Gets a list of all versions for an &lt;see cref=&quot;TEntity&quot;/&gt; ordered so latest is first
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;TEntity&quot;/&gt; to retrieve versions from&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of the same &lt;see cref=&quot;TEntity&quot;/&gt; object with different versions&lt;/returns&gt;
+        public virtual IEnumerable&lt;TEntity&gt; GetAllVersions(int id)
+        {
+            var sql = new Sql();
+            sql.Select(&quot;*&quot;)
+                .From&lt;ContentVersionDto&gt;(SqlSyntax)
+                .InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                .On&lt;ContentVersionDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;ContentDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId)
+                .Where&lt;NodeDto&gt;(x =&gt; x.NodeId == id)
+                .OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate, SqlSyntax);
+
+            var dtos = Database.Fetch&lt;ContentVersionDto, ContentDto, NodeDto&gt;(sql);
+            foreach (var dto in dtos)
+            {
+                yield return GetByVersion(dto.VersionId);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a list of all version Ids for the given content item ordered so latest is first
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;maxRows&quot;&gt;The maximum number of rows to return&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual IEnumerable&lt;Guid&gt; GetVersionIds(int id, int maxRows)
+        {
+            var sql = new Sql();
+            sql.Select(&quot;cmsDocument.versionId&quot;)
+                .From&lt;DocumentDto&gt;(SqlSyntax)
+                .InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                .On&lt;DocumentDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;ContentDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId)
+                .Where&lt;NodeDto&gt;(x =&gt; x.NodeId == id)
+                .OrderByDescending&lt;DocumentDto&gt;(x =&gt; x.UpdateDate, SqlSyntax);
+
+            return Database.Fetch&lt;Guid&gt;(SqlSyntax.SelectTop(sql, maxRows));
+        }
+
+        public virtual void DeleteVersion(Guid versionId)
+        {
+            var dto = Database.FirstOrDefault&lt;ContentVersionDto&gt;(&quot;WHERE versionId = @VersionId&quot;, new { VersionId = versionId });
+            if (dto == null) return;
+
+            //Ensure that the lastest version is not deleted
+            var latestVersionDto = Database.FirstOrDefault&lt;ContentVersionDto&gt;(&quot;WHERE ContentId = @Id ORDER BY VersionDate DESC&quot;, new { Id = dto.NodeId });
+            if (latestVersionDto.VersionId == dto.VersionId)
+                return;
+
+            using (var transaction = Database.GetTransaction())
+            {
+                PerformDeleteVersion(dto.NodeId, versionId);
+
+                transaction.Complete();
+            }
+        }
+
+        public virtual void DeleteVersions(int id, DateTime versionDate)
+        {
+            //Ensure that the latest version is not part of the versions being deleted
+            var latestVersionDto = Database.FirstOrDefault&lt;ContentVersionDto&gt;(&quot;WHERE ContentId = @Id ORDER BY VersionDate DESC&quot;, new { Id = id });
+            var list =
+                Database.Fetch&lt;ContentVersionDto&gt;(
+                    &quot;WHERE versionId &lt;&gt; @VersionId AND (ContentId = @Id AND VersionDate &lt; @VersionDate)&quot;,
+                    new { VersionId = latestVersionDto.VersionId, Id = id, VersionDate = versionDate });
+            if (list.Any() == false) return;
+
+            using (var transaction = Database.GetTransaction())
+            {
+                foreach (var dto in list)
+                {
+                    PerformDeleteVersion(id, dto.VersionId);
+                }
+
+                transaction.Complete();
+            }
+        }
+
+        public abstract TEntity GetByVersion(Guid versionId);
+
+        /// &lt;summary&gt;
+        /// Protected method to execute the delete statements for removing a single version for a TEntity item.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;TEntity&quot;/&gt; to delete a version from&lt;/param&gt;
+        /// &lt;param name=&quot;versionId&quot;&gt;Guid id of the version to delete&lt;/param&gt;
+        protected abstract void PerformDeleteVersion(int id, Guid versionId);
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Gets paged document descendants as XML by path
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;path&quot;&gt;Path starts with&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Page number&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Page size&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total records the query would return without paging&lt;/param&gt;
+        /// &lt;returns&gt;A paged enumerable of XML entries of content items&lt;/returns&gt;
+        public virtual IEnumerable&lt;XElement&gt; GetPagedXmlEntriesByPath(string path, long pageIndex, int pageSize, string[] orderBy, out long totalRecords)
+        {
+            var query = new Sql().Select(string.Format(&quot;umbracoNode.id, cmsContentXml.{0}&quot;, SqlSyntax.GetQuotedColumnName(&quot;xml&quot;)))
+                .From(&quot;umbracoNode&quot;)
+                .InnerJoin(&quot;cmsContentXml&quot;).On(&quot;cmsContentXml.nodeId = umbracoNode.id&quot;);
+
+            if (path == &quot;-1&quot;)
+            {
+                query.Where(&quot;umbracoNode.nodeObjectType = @type&quot;, new { type = NodeObjectTypeId });
+            }
+            else
+            {
+                query.Where(string.Format(&quot;umbracoNode.{0} LIKE (@0)&quot;, SqlSyntax.GetQuotedColumnName(&quot;path&quot;)), path.EnsureEndsWith(&quot;,%&quot;));
+            }
+
+            //each order by param needs to be in a bracket! see: https://github.com/toptensoftware/PetaPoco/issues/177
+            query.OrderBy(orderBy == null
+                ? &quot;(umbracoNode.id)&quot;
+                : string.Join(&quot;,&quot;, orderBy.Select(x =&gt; string.Format(&quot;({0})&quot;, SqlSyntax.GetQuotedColumnName(x)))));
+
+            var pagedResult = Database.Page&lt;ContentXmlDto&gt;(pageIndex + 1, pageSize, query);
+            totalRecords = pagedResult.TotalItems;
+            return pagedResult.Items.Select(dto =&gt; XElement.Parse(dto.Xml));
+        }
+
+        public int CountDescendants(int parentId, string contentTypeAlias = null)
+        {
+            var pathMatch = parentId == -1
+                ? &quot;-1,&quot;
+                : &quot;,&quot; + parentId + &quot;,&quot;;
+            var sql = new Sql();
+            if (contentTypeAlias.IsNullOrWhiteSpace())
+            {
+                sql.Select(&quot;COUNT(*)&quot;)
+                    .From&lt;NodeDto&gt;()
+                    .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId)
+                    .Where&lt;NodeDto&gt;(x =&gt; x.Path.Contains(pathMatch));
+            }
+            else
+            {
+                sql.Select(&quot;COUNT(*)&quot;)
+                    .From&lt;NodeDto&gt;()
+                    .InnerJoin&lt;ContentDto&gt;()
+                    .On&lt;NodeDto, ContentDto&gt;(left =&gt; left.NodeId, right =&gt; right.NodeId)
+                    .InnerJoin&lt;ContentTypeDto&gt;()
+                    .On&lt;ContentTypeDto, ContentDto&gt;(left =&gt; left.NodeId, right =&gt; right.ContentTypeId)
+                    .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId)
+                    .Where&lt;NodeDto&gt;(x =&gt; x.Path.Contains(pathMatch))
+                    .Where&lt;ContentTypeDto&gt;(x =&gt; x.Alias == contentTypeAlias);
+            }
+
+            return Database.ExecuteScalar&lt;int&gt;(sql);
+        }
+
+        public int CountChildren(int parentId, string contentTypeAlias = null)
+        {
+            var sql = new Sql();
+            if (contentTypeAlias.IsNullOrWhiteSpace())
+            {
+                sql.Select(&quot;COUNT(*)&quot;)
+                    .From&lt;NodeDto&gt;()
+                    .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId)
+                    .Where&lt;NodeDto&gt;(x =&gt; x.ParentId == parentId);
+            }
+            else
+            {
+                sql.Select(&quot;COUNT(*)&quot;)
+                    .From&lt;NodeDto&gt;()
+                    .InnerJoin&lt;ContentDto&gt;()
+                    .On&lt;NodeDto, ContentDto&gt;(left =&gt; left.NodeId, right =&gt; right.NodeId)
+                    .InnerJoin&lt;ContentTypeDto&gt;()
+                    .On&lt;ContentTypeDto, ContentDto&gt;(left =&gt; left.NodeId, right =&gt; right.ContentTypeId)
+                    .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId)
+                    .Where&lt;NodeDto&gt;(x =&gt; x.ParentId == parentId)
+                    .Where&lt;ContentTypeDto&gt;(x =&gt; x.Alias == contentTypeAlias);
+            }
+
+            return Database.ExecuteScalar&lt;int&gt;(sql);
+        }
+
+        /// &lt;summary&gt;
+        /// Get the total count of entities
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentTypeAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public int Count(string contentTypeAlias = null)
+        {
+            var sql = new Sql();
+            if (contentTypeAlias.IsNullOrWhiteSpace())
+            {
+                sql.Select(&quot;COUNT(*)&quot;)
+                    .From&lt;NodeDto&gt;()
+                    .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId);
+            }
+            else
+            {
+                sql.Select(&quot;COUNT(*)&quot;)
+                    .From&lt;NodeDto&gt;()
+                    .InnerJoin&lt;ContentDto&gt;()
+                    .On&lt;NodeDto, ContentDto&gt;(left =&gt; left.NodeId, right =&gt; right.NodeId)
+                    .InnerJoin&lt;ContentTypeDto&gt;()
+                    .On&lt;ContentTypeDto, ContentDto&gt;(left =&gt; left.NodeId, right =&gt; right.ContentTypeId)
+                    .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId)
+                    .Where&lt;ContentTypeDto&gt;(x =&gt; x.Alias == contentTypeAlias);
+            }
+
+            return Database.ExecuteScalar&lt;int&gt;(sql);
+        }
+
+        /// &lt;summary&gt;
+        /// This removes associated tags from the entity - used generally when an entity is recycled
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;tagRepo&quot;&gt;&lt;/param&gt;
+        protected void ClearEntityTags(IContentBase entity, ITagRepository tagRepo)
+        {
+            tagRepo.ClearTagsFromEntity(entity.Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Updates the tag repository with any tag enabled properties and their values
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;tagRepo&quot;&gt;&lt;/param&gt;
+        protected void UpdatePropertyTags(IContentBase entity, ITagRepository tagRepo)
+        {
+            foreach (var tagProp in entity.Properties.Where(x =&gt; x.TagSupport.Enable))
+            {
+                if (tagProp.TagSupport.Behavior == PropertyTagBehavior.Remove)
+                {
+                    //remove the specific tags
+                    tagRepo.RemoveTagsFromProperty(
+                        entity.Id,
+                        tagProp.PropertyTypeId,
+                        tagProp.TagSupport.Tags.Select(x =&gt; new Tag { Text = x.Item1, Group = x.Item2 }));
+                }
+                else
+                {
+                    //assign the tags
+                    tagRepo.AssignTagsToProperty(
+                        entity.Id,
+                        tagProp.PropertyTypeId,
+                        tagProp.TagSupport.Tags.Select(x =&gt; new Tag { Text = x.Item1, Group = x.Item2 }),
+                        tagProp.TagSupport.Behavior == PropertyTagBehavior.Replace);
+                }
+            }
+        }
+
+        private Sql GetFilteredSqlForPagedResults(Sql sql, Func&lt;Tuple&lt;string, object[]&gt;&gt; defaultFilter = null)
+        {
+            Sql filteredSql;
+
+            // Apply filter
+            if (defaultFilter != null)
+            {
+                var filterResult = defaultFilter();
+
+                //NOTE: this is certainly strange - NPoco handles this much better but we need to re-create the sql
+                // instance a couple of times to get the parameter order correct, for some reason the first
+                // time the arguments don&#39;t show up correctly but the SQL argument parameter names are actually updated
+                // accordingly - so we re-create it again. In v8 we don&#39;t need to do this and it&#39;s already taken care of.
+
+                filteredSql = new Sql(sql.SQL, sql.Arguments);
+                var args = filteredSql.Arguments.Concat(filterResult.Item2).ToArray();
+                filteredSql = new Sql(
+                    string.Format(&quot;{0} {1}&quot;, filteredSql.SQL, filterResult.Item1),
+                    args);
+                filteredSql = new Sql(filteredSql.SQL, args);
+            }
+            else
+            {
+                //copy to var so that the original isn&#39;t changed
+                filteredSql = new Sql(sql.SQL, sql.Arguments);
+            }
+            return filteredSql;
+        }
+
+        private Sql GetSortedSqlForPagedResults(Sql sql, Direction orderDirection, string orderBy, bool orderBySystemField, Tuple&lt;string, string&gt; nodeIdSelect)
+        {
+
+            //copy to var so that the original isn&#39;t changed
+            var sortedSql = new Sql(sql.SQL, sql.Arguments);
+
+            if (orderBySystemField)
+            {
+                // Apply order according to parameters
+                if (string.IsNullOrEmpty(orderBy) == false)
+                {
+                    var orderByParams = new[] { GetDatabaseFieldNameForOrderBy(orderBy) };
+                    if (orderDirection == Direction.Ascending)
+                    {
+                        sortedSql.OrderBy(orderByParams);
+                    }
+                    else
+                    {
+                        sortedSql.OrderByDescending(orderByParams);
+                    }
+                }
+            }
+            else
+            {
+                // Sorting by a custom field, so set-up sub-query for ORDER BY clause to pull through value
+                // from most recent content version for the given order by field
+                var sortedInt = string.Format(SqlSyntax.ConvertIntegerToOrderableString, &quot;dataInt&quot;);
+                var sortedDate = string.Format(SqlSyntax.ConvertDateToOrderableString, &quot;dataDate&quot;);
+                var sortedString = string.Format(&quot;COALESCE({0},&#39;&#39;)&quot;, &quot;dataNvarchar&quot;);
+                var sortedDecimal = string.Format(SqlSyntax.ConvertDecimalToOrderableString, &quot;dataDecimal&quot;);
+
+                //these are defaults that will be used in the query - they can be overridden for non-versioned entities or document entities
+                var versionQuery = &quot; AND cpd.versionId = cd.versionId&quot;;
+                var newestQuery = string.Empty;
+
+                //cmsDocument needs to filter by the &#39;newest&#39; parameter in the query
+                if (nodeIdSelect.Item1 == &quot;cmsDocument&quot;)
+                    newestQuery = &quot; AND cd.newest = 1&quot;;
+
+                //members do not use versions so clear the versionQuery string
+                if (nodeIdSelect.Item1 == &quot;cmsMember&quot;)
+                    versionQuery = string.Empty;
+
+                //needs to be an outer join since there&#39;s no guarantee that any of the nodes have values for this property
+                var outerJoinTempTable = string.Format(@&quot;LEFT OUTER JOIN (
+                                SELECT CASE
+                                    WHEN dataInt Is Not Null THEN {0}
+                                    WHEN dataDecimal Is Not Null THEN {1}
+                                    WHEN dataDate Is Not Null THEN {2}
+                                    ELSE {3}
+                                END AS CustomPropVal,
+                                cd.{4} AS CustomPropValContentId
+                                FROM {5} cd
+                                INNER JOIN cmsPropertyData cpd ON cpd.contentNodeId = cd.{4}{6}
+                                INNER JOIN cmsPropertyType cpt ON cpt.Id = cpd.propertytypeId
+                                WHERE cpt.Alias = @{7}{8}) AS CustomPropData
+                                ON CustomPropData.CustomPropValContentId = umbracoNode.id
+                &quot;, sortedInt, sortedDecimal, sortedDate, sortedString, nodeIdSelect.Item2, nodeIdSelect.Item1, versionQuery, sortedSql.Arguments.Length, newestQuery);
+
+                //insert this just above the last WHERE
+                string newSql = sortedSql.SQL.Insert(sortedSql.SQL.LastIndexOf(&quot;WHERE&quot;), outerJoinTempTable);
+
+                var newArgs = sortedSql.Arguments.ToList();
+                newArgs.Add(orderBy);
+
+                sortedSql = new Sql(newSql, newArgs.ToArray());
+
+                if (orderDirection == Direction.Descending)
+                {
+                    sortedSql.OrderByDescending(&quot;CustomPropData.CustomPropVal&quot;);
+                }
+                else
+                {
+                    sortedSql.OrderBy(&quot;CustomPropData.CustomPropVal&quot;);
+                }
+            }
+
+            if (orderBySystemField &amp;&amp; orderBy != &quot;umbracoNode.id&quot;)
+            {
+                //no matter what we always MUST order the result also by umbracoNode.id to ensure that all records being ordered by are unique.
+                // if we do not do this then we end up with issues where we are ordering by a field that has duplicate values (i.e. the &#39;text&#39; column
+                // is empty for many nodes)
+                // see: http://issues.umbraco.org/issue/U4-8831
+                sortedSql.OrderBy(&quot;umbracoNode.id&quot;);
+            }
+
+            return sortedSql;
+
+        }
+
+        /// &lt;summary&gt;
+        /// A helper method for inheritors to get the paged results by query in a way that minimizes queries
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TDto&quot;&gt;The type of the d.&lt;/typeparam&gt;
+        /// &lt;param name=&quot;query&quot;&gt;The query.&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Index of the page.&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Size of the page.&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;The total records.&lt;/param&gt;
+        /// &lt;param name=&quot;nodeIdSelect&quot;&gt;The tablename + column name for the SELECT statement fragment to return the node id from the query&lt;/param&gt;
+        /// &lt;param name=&quot;defaultFilter&quot;&gt;A callback to create the default filter to be applied if there is one&lt;/param&gt;
+        /// &lt;param name=&quot;processQuery&quot;&gt;A callback to process the query result&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;The order by column&lt;/param&gt;
+        /// &lt;param name=&quot;orderDirection&quot;&gt;The order direction.&lt;/param&gt;
+        /// &lt;param name=&quot;orderBySystemField&quot;&gt;Flag to indicate when ordering by system field&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;exception cref=&quot;System.ArgumentNullException&quot;&gt;orderBy&lt;/exception&gt;
+        protected IEnumerable&lt;TEntity&gt; GetPagedResultsByQuery&lt;TDto&gt;(IQuery&lt;TEntity&gt; query, long pageIndex, int pageSize, out long totalRecords,
+            Tuple&lt;string, string&gt; nodeIdSelect,
+            Func&lt;Sql, PagingSqlQuery&lt;TDto&gt;, IEnumerable&lt;TEntity&gt;&gt; processQuery,
+            string orderBy,
+            Direction orderDirection,
+            bool orderBySystemField,
+            Func&lt;Tuple&lt;string, object[]&gt;&gt; defaultFilter = null)
+        {
+            if (orderBy == null) throw new ArgumentNullException(&quot;orderBy&quot;);
+
+            // Get base query for returning IDs
+            var sqlBaseIds = GetBaseQuery(BaseQueryType.Ids);
+            // Get base query for returning all data
+            var sqlBaseFull = GetBaseQuery(BaseQueryType.FullMultiple);
+
+            if (query == null) query = new Query&lt;TEntity&gt;();
+            var translatorIds = new SqlTranslator&lt;TEntity&gt;(sqlBaseIds, query);
+            var sqlQueryIds = translatorIds.Translate();
+            var translatorFull = new SqlTranslator&lt;TEntity&gt;(sqlBaseFull, query);
+            var sqlQueryFull = translatorFull.Translate();
+
+            //get sorted and filtered sql
+            var sqlNodeIdsWithSort = GetSortedSqlForPagedResults(
+                GetFilteredSqlForPagedResults(sqlQueryIds, defaultFilter),
+                orderDirection, orderBy, orderBySystemField, nodeIdSelect);
+
+            // Get page of results and total count
+            IEnumerable&lt;TEntity&gt; result;
+            var pagedResult = Database.Page&lt;TDto&gt;(pageIndex + 1, pageSize, sqlNodeIdsWithSort);
+            totalRecords = Convert.ToInt32(pagedResult.TotalItems);
+
+            //NOTE: We need to check the actual items returned, not the &#39;totalRecords&#39;, that is because if you request a page number
+            // that doesn&#39;t actually have any data on it, the totalRecords will still indicate there are records but there are none in
+            // the pageResult, then the GetAll will actually return ALL records in the db.
+            if (pagedResult.Items.Any())
+            {
+                //Create the inner paged query that was used above to get the paged result, we&#39;ll use that as the inner sub query
+                var args = sqlNodeIdsWithSort.Arguments;
+                string sqlStringCount, sqlStringPage;
+                Database.BuildPageQueries&lt;TDto&gt;(pageIndex * pageSize, pageSize, sqlNodeIdsWithSort.SQL, ref args, out sqlStringCount, out sqlStringPage);
+
+                //We need to make this FULL query an inner join on the paged ID query
+                var splitQuery = sqlQueryFull.SQL.Split(new[] { &quot;WHERE &quot; }, StringSplitOptions.None);
+                var fullQueryWithPagedInnerJoin = new Sql(splitQuery[0])
+                    .Append(&quot;INNER JOIN (&quot;)
+                    //join the paged query with the paged query arguments
+                    .Append(sqlStringPage, args)
+                    .Append(&quot;) temp &quot;)
+                    .Append(string.Format(&quot;ON {0}.{1} = temp.{1}&quot;, nodeIdSelect.Item1, nodeIdSelect.Item2))
+                    //add the original where clause back with the original arguments
+                    .Where(splitQuery[1], sqlQueryIds.Arguments);
+
+                //get sorted and filtered sql
+                var fullQuery = GetSortedSqlForPagedResults(
+                    GetFilteredSqlForPagedResults(fullQueryWithPagedInnerJoin, defaultFilter),
+                    orderDirection, orderBy, orderBySystemField, nodeIdSelect);
+                
+                return processQuery(fullQuery, new PagingSqlQuery&lt;TDto&gt;(Database, sqlNodeIdsWithSort, pageIndex, pageSize));
+            }
+            else
+            {
+                result = Enumerable.Empty&lt;TEntity&gt;();
+            }
+
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the property collection for a non-paged query
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sql&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;documentDefs&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected IDictionary&lt;Guid, PropertyCollection&gt; GetPropertyCollection(
+            Sql sql,
+            IReadOnlyCollection&lt;DocumentDefinition&gt; documentDefs)
+        {
+            return GetPropertyCollection(new PagingSqlQuery(sql), documentDefs);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the property collection for a query
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pagingSqlQuery&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;documentDefs&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected IDictionary&lt;Guid, PropertyCollection&gt; GetPropertyCollection(
+            PagingSqlQuery pagingSqlQuery,
+            IReadOnlyCollection&lt;DocumentDefinition&gt; documentDefs)
+        {
+            if (documentDefs.Count == 0) return new Dictionary&lt;Guid, PropertyCollection&gt;();
+
+            //initialize to the query passed in
+            var docSql = pagingSqlQuery.PrePagedSql;
+
+            //we need to parse the original SQL statement and reduce the columns to just cmsContent.nodeId, cmsContentVersion.VersionId so that we can use
+            // the statement to go get the property data for all of the items by using an inner join
+            var parsedOriginalSql = &quot;SELECT {0} &quot; + docSql.SQL.Substring(docSql.SQL.IndexOf(&quot;FROM&quot;, StringComparison.Ordinal));
+            
+            if (pagingSqlQuery.HasPaging)
+            {
+                //if this is a paged query, build the paged query with the custom column substitution, then re-assign
+                docSql = pagingSqlQuery.BuildPagedQuery(&quot;{0}&quot;);
+                parsedOriginalSql = docSql.SQL;
+            }
+            else if (parsedOriginalSql.InvariantContains(&quot;ORDER BY &quot;))
+            {
+                //now remove everything from an Orderby clause and beyond if this is unpaged data
+                parsedOriginalSql = parsedOriginalSql.Substring(0, parsedOriginalSql.LastIndexOf(&quot;ORDER BY &quot;, StringComparison.Ordinal));
+            }
+
+            //This retrieves all pre-values for all data types that are referenced for all property types
+            // that exist in the data set.
+            //Benchmarks show that eagerly loading these so that we can lazily read the property data
+            // below (with the use of Query intead of Fetch) go about 30% faster, so we&#39;ll eagerly load
+            // this now since we cannot execute another reader inside of reading the property data.
+            var preValsSql = new Sql(@&quot;SELECT a.id, a.value, a.sortorder, a.alias, a.datatypeNodeId
+FROM cmsDataTypePreValues a
+WHERE EXISTS(
+    SELECT DISTINCT b.id as preValIdInner
+    FROM cmsDataTypePreValues b
+	INNER JOIN cmsPropertyType
+	ON b.datatypeNodeId = cmsPropertyType.dataTypeId
+    INNER JOIN 
+	    (&quot; + string.Format(parsedOriginalSql, &quot;cmsContent.contentType&quot;) + @&quot;) as docData
+    ON cmsPropertyType.contentTypeId = docData.contentType
+    WHERE a.id = b.id)&quot;, docSql.Arguments);
+
+            var allPreValues = Database.Fetch&lt;DataTypePreValueDto&gt;(preValsSql);
+
+            //It&#39;s Important with the sort order here! We require this to be sorted by node id,
+            // this is required because this data set can be huge depending on the page size. Due
+            // to it&#39;s size we need to be smart about iterating over the property values to build
+            // the document. Before we used to use Linq to get the property data for a given content node
+            // and perform a Distinct() call. This kills performance because that would mean if we had 7000 nodes
+            // and on each iteration we will perform a lookup on potentially 100,000 property rows against the node
+            // id which turns out to be a crazy amount of iterations. Instead we know it&#39;s sorted by this value we&#39;ll
+            // keep an index stored of the rows being read so we never have to re-iterate the entire data set
+            // on each document iteration.
+            var propSql = new Sql(@&quot;SELECT cmsPropertyData.*
+FROM cmsPropertyData
+INNER JOIN cmsPropertyType
+ON cmsPropertyData.propertytypeid = cmsPropertyType.id
+INNER JOIN 
+	(&quot; + string.Format(parsedOriginalSql, &quot;cmsContent.nodeId, cmsContentVersion.VersionId&quot;) + @&quot;) as docData
+ON cmsPropertyData.versionId = docData.VersionId AND cmsPropertyData.contentNodeId = docData.nodeId
+ORDER BY contentNodeId, versionId, propertytypeid
+&quot;, docSql.Arguments);
+            
+            //This does NOT fetch all data into memory in a list, this will read
+            // over the records as a data reader, this is much better for performance and memory,
+            // but it means that during the reading of this data set, nothing else can be read
+            // from SQL server otherwise we&#39;ll get an exception.
+            var allPropertyData = Database.Query&lt;PropertyDataDto&gt;(propSql);
+
+            var result = new Dictionary&lt;Guid, PropertyCollection&gt;();
+            var propertiesWithTagSupport = new Dictionary&lt;string, SupportTagsAttribute&gt;();
+            //used to track the resolved composition property types per content type so we don&#39;t have to re-resolve (ToArray) the list every time
+            var resolvedCompositionProperties = new Dictionary&lt;int, PropertyType[]&gt;();
+
+            //keep track of the current property data item being enumerated
+            var propertyDataSetEnumerator = allPropertyData.GetEnumerator();
+            var hasCurrent = false; // initially there is no enumerator.Current
+
+            var comparer = new DocumentDefinitionComparer(SqlSyntax);
+
+            try
+            {
+                //This must be sorted by node id because this is how we are sorting the query to lookup property types above,
+                // which allows us to more efficiently iterate over the large data set of property values
+                foreach (var def in documentDefs.OrderBy(x =&gt; x.Id).ThenBy(x =&gt; x.Version, comparer))
+                {
+                    // get the resolved properties from our local cache, or resolve them and put them in cache
+                    PropertyType[] compositionProperties;
+                    if (resolvedCompositionProperties.ContainsKey(def.Composition.Id))
+                    {
+                        compositionProperties = resolvedCompositionProperties[def.Composition.Id];
+                    }
+                    else
+                    {
+                        compositionProperties = def.Composition.CompositionPropertyTypes.ToArray();
+                        resolvedCompositionProperties[def.Composition.Id] = compositionProperties;
+                    }
+
+                    // assemble the dtos for this def
+                    // use the available enumerator.Current if any else move to next
+                    var propertyDataDtos = new List&lt;PropertyDataDto&gt;();
+                    while (hasCurrent || propertyDataSetEnumerator.MoveNext())
+                    {
+                        //Not checking null on VersionId because it can never be null - no idea why it&#39;s set to nullable
+                        // ReSharper disable once PossibleInvalidOperationException
+                        if (propertyDataSetEnumerator.Current.VersionId.Value == def.Version)
+                        {
+                            hasCurrent = false; // enumerator.Current is not available
+                            propertyDataDtos.Add(propertyDataSetEnumerator.Current);
+                        }
+                        else
+                        {
+                            hasCurrent = true;  // enumerator.Current is available for another def
+                            break;              // no more propertyDataDto for this def
+                        }
+                    }
+
+                    var properties = PropertyFactory.BuildEntity(propertyDataDtos, compositionProperties, def.CreateDate, def.VersionDate).ToArray();
+
+                    foreach (var property in properties)
+                    {
+                        //NOTE: The benchmarks run with and without the following code show very little change so this is not a perf bottleneck
+                        var editor = PropertyEditorResolver.Current.GetByAlias(property.PropertyType.PropertyEditorAlias);
+
+                        var tagSupport = propertiesWithTagSupport.ContainsKey(property.PropertyType.PropertyEditorAlias)
+                            ? propertiesWithTagSupport[property.PropertyType.PropertyEditorAlias]
+                            : TagExtractor.GetAttribute(editor);
+
+                        if (tagSupport != null)
+                        {
+                            //add to local cache so we don&#39;t need to reflect next time for this property editor alias
+                            propertiesWithTagSupport[property.PropertyType.PropertyEditorAlias] = tagSupport;
+
+                            //this property has tags, so we need to extract them and for that we need the prevals which we&#39;ve already looked up
+                            var preValData = allPreValues.Where(x =&gt; x.DataTypeNodeId == property.PropertyType.DataTypeDefinitionId)
+                                .Distinct()
+                                .ToArray();
+
+                            var asDictionary = preValData.ToDictionary(x =&gt; x.Alias, x =&gt; new PreValue(x.Id, x.Value, x.SortOrder));
+
+                            var preVals = new PreValueCollection(asDictionary);
+
+                            var contentPropData = new ContentPropertyData(property.Value,
+                                preVals,
+                                new Dictionary&lt;string, object&gt;());
+
+                            TagExtractor.SetPropertyTags(property, contentPropData, property.Value, tagSupport);
+                        }
+                    }
+
+                    if (result.ContainsKey(def.Version))
+                    {
+                        var msg = string.Format(&quot;The query returned multiple property sets for document definition {0}, {1}, {2}&quot;, def.Id, def.Version, def.Composition.Name);
+                        if (ThrowOnWarning)
+                        {
+                            throw new InvalidOperationException(msg);
+                        }
+                        else
+                        {
+                            Logger.Warn&lt;VersionableRepositoryBase&lt;TId, TEntity&gt;&gt;(msg);
+                        }
+                    }
+                    result[def.Version] = new PropertyCollection(properties);
+                }
+            }
+            finally
+            {
+                propertyDataSetEnumerator.Dispose();
+            }
+
+            return result;
+
+        }
+        
+        protected virtual string GetDatabaseFieldNameForOrderBy(string orderBy)
+        {
+            // Translate the passed order by field (which were originally defined for in-memory object sorting
+            // of ContentItemBasic instances) to the database field names.
+            switch (orderBy.ToUpperInvariant())
+            {
+                case &quot;UPDATEDATE&quot;:
+                    return &quot;cmsContentVersion.VersionDate&quot;;
+                case &quot;NAME&quot;:
+                    return &quot;umbracoNode.text&quot;;
+                case &quot;PUBLISHED&quot;:
+                case &quot;OWNER&quot;:
+                    return &quot;cmsDocument.published&quot;;
+                    //TODO: This isn&#39;t going to work very nicely because it&#39;s going to order by ID, not by letter
+                    return &quot;umbracoNode.nodeUser&quot;;
+                // Members only
+                case &quot;USERNAME&quot;:
+                    return &quot;cmsMember.LoginName&quot;;
+                default:
+                    //ensure invalid SQL cannot be submitted
+                    return Regex.Replace(orderBy, @&quot;[^\w\.,`\[\]@-]&quot;, &quot;&quot;);
+            }
+        }
+
+        protected virtual string GetEntityPropertyNameForOrderBy(string orderBy)
+        {
+            // Translate the passed order by field (which were originally defined for in-memory object sorting
+            // of ContentItemBasic instances) to the IMedia property names.
+            switch (orderBy.ToUpperInvariant())
+            {
+                case &quot;OWNER&quot;:
+                    //TODO: This isn&#39;t going to work very nicely because it&#39;s going to order by ID, not by letter
+                    return &quot;CreatorId&quot;;
+                case &quot;UPDATER&quot;:
+                    //TODO: This isn&#39;t going to work very nicely because it&#39;s going to order by ID, not by letter
+                    return &quot;WriterId&quot;;
+                case &quot;VERSIONDATE&quot;:
+                    return &quot;UpdateDate&quot;;
+                default:
+                    //ensure invalid SQL cannot be submitted
+                    return Regex.Replace(orderBy, @&quot;[^\w\.,`\[\]@-]&quot;, &quot;&quot;);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes all media files passed in.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;files&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual bool DeleteMediaFiles(IEnumerable&lt;string&gt; files)
+        {
+            //ensure duplicates are removed
+            files = files.Distinct();
+
+            var allsuccess = true;
+
+            var fs = FileSystemProviderManager.Current.GetFileSystemProvider&lt;MediaFileSystem&gt;();
+            Parallel.ForEach(files, file =&gt;
+            {
+                try
+                {
+                    if (file.IsNullOrWhiteSpace()) return;
+
+                    var relativeFilePath = fs.GetRelativePath(file);
+                    if (fs.FileExists(relativeFilePath) == false) return;
+
+                    var parentDirectory = System.IO.Path.GetDirectoryName(relativeFilePath);
+
+                    // don&#39;t want to delete the media folder if not using directories.
+                    if (_contentSection.UploadAllowDirectories &amp;&amp; parentDirectory != fs.GetRelativePath(&quot;/&quot;))
+                    {
+                        //issue U4-771: if there is a parent directory the recursive parameter should be true
+                        fs.DeleteDirectory(parentDirectory, String.IsNullOrEmpty(parentDirectory) == false);
+                    }
+                    else
+                    {
+                        fs.DeleteFile(file, true);
+                    }
+                }
+                catch (Exception e)
+                {
+                    Logger.Error&lt;VersionableRepositoryBase&lt;TId, TEntity&gt;&gt;(&quot;An error occurred while deleting file attached to nodes: &quot; + file, e);
+                    allsuccess = false;
+                }
+            });
+
+            return allsuccess;
+        }
+
+        /// &lt;summary&gt;
+        /// For Paging, repositories must support returning different query for the query type specified
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;queryType&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected abstract Sql GetBaseQuery(BaseQueryType queryType);
+
+        internal class DocumentDefinitionCollection : KeyedCollection&lt;ValueType, DocumentDefinition&gt;
+        {
+            private readonly bool _includeAllVersions;
+
+            /// &lt;summary&gt;
+            /// Constructor specifying if all versions should be allowed, in that case the key for the collection becomes the versionId (GUID)
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;includeAllVersions&quot;&gt;&lt;/param&gt;
+            public DocumentDefinitionCollection(bool includeAllVersions = false)
+            {
+                _includeAllVersions = includeAllVersions;
+            }
+
+            protected override ValueType GetKeyForItem(DocumentDefinition item)
+            {
+                return _includeAllVersions ? (ValueType)item.Version : item.Id;
+            }
+
+            /// &lt;summary&gt;
+            /// if this key already exists if it does then we need to check
+            /// if the existing item is &#39;older&#39; than the new item and if that is the case we&#39;ll replace the older one
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;item&quot;&gt;&lt;/param&gt;
+            /// &lt;returns&gt;&lt;/returns&gt;
+            public bool AddOrUpdate(DocumentDefinition item)
+            {
+                //if we are including all versions then just add, we aren&#39;t checking for latest
+                if (_includeAllVersions)
+                {
+                    base.Add(item);
+                    return true;
+                }
+
+                if (Dictionary == null)
+                {
+                    base.Add(item);
+                    return true;
+                }
+
+                var key = GetKeyForItem(item);
+                DocumentDefinition found;
+                if (TryGetValue(key, out found))
+                {
+                    //it already exists and it&#39;s older so we need to replace it
+                    if (item.VersionId &gt; found.VersionId)
+                    {
+                        var currIndex = Items.IndexOf(found);
+                        if (currIndex == -1)
+                            throw new IndexOutOfRangeException(&quot;Could not find the item in the list: &quot; + found.Version);
+
+                        //replace the current one with the newer one
+                        SetItem(currIndex, item);
+                        return true;
+                    }
+                    //could not add or update
+                    return false;
+                }
+                
+                base.Add(item);
+                return true;
+            }
+          
+            public bool TryGetValue(ValueType key, out DocumentDefinition val)
+            {
+                if (Dictionary == null)
+                {
+                    val = null;
+                    return false;
+                }
+                return Dictionary.TryGetValue(key, out val);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// A custom comparer required for sorting entities by GUIDs to match how the sorting of GUIDs works on SQL server
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// MySql sorts GUIDs as a string, MSSQL sorts based on byte sections, this comparer will allow sorting GUIDs to be the same as how SQL server does
+        /// &lt;/remarks&gt;
+        private class DocumentDefinitionComparer : IComparer&lt;Guid&gt;
+        {
+            private readonly ISqlSyntaxProvider _sqlSyntax;
+
+            public DocumentDefinitionComparer(ISqlSyntaxProvider sqlSyntax)
+            {
+                _sqlSyntax = sqlSyntax;
+            }
+
+            public int Compare(Guid x, Guid y)
+            {
+                //MySql sorts on GUIDs as strings (i.e. normal)
+                if (_sqlSyntax is MySqlSyntaxProvider)
+                {
+                    return x.CompareTo(y);
+                }
+
+                //MSSQL doesn&#39;t it sorts them on byte sections!
+                return new SqlGuid(x).CompareTo(new SqlGuid(y));
+            }
+        }
+
+        internal class DocumentDefinition
+        {
+            /// &lt;summary&gt;
+            /// Initializes a new instance of the &lt;see cref=&quot;T:System.Object&quot;/&gt; class.
+            /// &lt;/summary&gt;
+            public DocumentDefinition(DocumentDto dto, IContentTypeComposition composition)
+            {
+                DocumentDto = dto;
+                ContentVersionDto = dto.ContentVersionDto;
+                Composition = composition;
+            }
+
+            public DocumentDefinition(ContentVersionDto dto, IContentTypeComposition composition)
+            {
+                ContentVersionDto = dto;
+                Composition = composition;
+            }
+
+            public DocumentDto DocumentDto { get; private set; }
+            public ContentVersionDto ContentVersionDto { get; private set; }
+
+            public int Id
+            {
+                get { return ContentVersionDto.NodeId; }
+            }
+            
+            public Guid Version
+            {
+                get { return DocumentDto != null ? DocumentDto.VersionId : ContentVersionDto.VersionId; }
+            }
+
+            /// &lt;summary&gt;
+            /// This is used to determien which version is the most recent
+            /// &lt;/summary&gt;
+            public int VersionId
+            {
+                get { return ContentVersionDto.Id; }
+            }
+
+            public DateTime VersionDate
+            {
+                get { return ContentVersionDto.VersionDate; }
+            }
+
+            public DateTime CreateDate
+            {
+                get { return ContentVersionDto.ContentDto.NodeDto.CreateDate; }
+            }
+
+            public IContentTypeComposition Composition { get; set; }            
+
+            
+        }
+
+        /// &lt;summary&gt;
+        /// An object representing a query that may contain paging information
+        /// &lt;/summary&gt;
+        internal class PagingSqlQuery
+        {
+            public Sql PrePagedSql { get; private set; }
+
+            public PagingSqlQuery(Sql prePagedSql)
+            {
+                PrePagedSql = prePagedSql;
+            }
+
+            public virtual bool HasPaging
+            {
+                get { return false; }
+            }
+
+            public virtual Sql BuildPagedQuery(string selectColumns)
+            {
+                throw new InvalidOperationException(&quot;This query has no paging information&quot;);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// An object representing a query that contains paging information
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        internal class PagingSqlQuery&lt;T&gt; : PagingSqlQuery
+        {
+            private readonly Database _db;
+            private readonly long _pageIndex;
+            private readonly int _pageSize;
+
+            public PagingSqlQuery(Database db, Sql prePagedSql, long pageIndex, int pageSize) : base(prePagedSql)
+            {
+                _db = db;
+                _pageIndex = pageIndex;
+                _pageSize = pageSize;                
+            }
+
+            public override bool HasPaging
+            {
+                get { return _pageSize &gt; 0; }
+            }
+
+            /// &lt;summary&gt;
+            /// Creates a paged query based on the original query and subtitutes the selectColumns specified
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;selectColumns&quot;&gt;&lt;/param&gt;
+            /// &lt;returns&gt;&lt;/returns&gt;
+            public override Sql BuildPagedQuery(string selectColumns)
+            {
+                if (HasPaging == false) throw new InvalidOperationException(&quot;This query has no paging information&quot;);
+
+                var resultSql = string.Format(&quot;SELECT {0} {1}&quot;, selectColumns, PrePagedSql.SQL.Substring(PrePagedSql.SQL.IndexOf(&quot;FROM&quot;, StringComparison.Ordinal)));
+
+                //this query is meant to be paged so we need to generate the paging syntax
+                //Create the inner paged query that was used above to get the paged result, we&#39;ll use that as the inner sub query
+                var args = PrePagedSql.Arguments;
+                string sqlStringCount, sqlStringPage;
+                _db.BuildPageQueries&lt;T&gt;(_pageIndex * _pageSize, _pageSize, resultSql, ref args, out sqlStringCount, out sqlStringPage);
+
+                return new Sql(sqlStringPage, args);
+            }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[39,9,39,53,1],[42,15,42,51,1],[43,9,43,10,1],[44,13,44,46,1],[45,9,45,10,1],[81,9,81,10,1],[82,13,82,33,1],[83,13,91,79,1],[93,13,93,76,1],[94,9,94,10,1],[97,9,97,10,0],[98,13,98,129,0],[99,13,99,29,0],[99,30,99,37,0],[102,13,102,155,0],[103,13,103,61,0],[104,17,104,24,0],[106,20,106,63,0],[107,13,107,14,0],[108,17,108,61,0],[110,17,110,40,0],[111,13,111,14,0],[112,9,112,10,0],[115,9,115,10,0],[117,13,117,147,0],[118,13,121,105,0],[122,13,122,37,0],[122,38,122,45,0],[124,20,124,63,0],[125,13,125,14,0],[126,17,126,24,0],[126,26,126,33,0],[126,34,126,36,0],[126,37,126,41,0],[127,17,127,18,0],[128,21,128,61,0],[129,17,129,18,0],[131,17,131,40,0],[132,13,132,14,0],[133,9,133,10,0],[156,9,156,10,0],[157,13,159,89,0],[161,13,161,30,0],[162,13,162,14,0],[163,17,163,100,0],[164,13,164,14,0],[166,13,166,14,0],[167,17,167,139,0],[168,13,168,14,0],[171,13,173,56,0],[173,56,173,112,0],[173,112,173,116,0],[171,13,173,116,0],[175,13,175,92,0],[176,13,176,51,0],[177,13,177,52,0],[177,52,177,75,0],[177,75,177,77,0],[177,13,177,77,0],[178,9,178,10,0],[181,9,181,10,1],[182,13,184,40,1],[185,13,185,33,1],[186,13,186,55,1],[187,13,187,14,1],[188,17,191,70,1],[192,13,192,14,1],[194,13,194,14,0],[195,17,203,78,0],[204,13,204,14,0],[206,13,206,53,1],[207,9,207,10,1],[210,9,210,10,1],[211,13,211,33,1],[212,13,212,55,1],[213,13,213,14,1],[214,17,217,66,1],[218,13,218,14,1],[220,13,220,14,0],[221,17,229,78,0],[230,13,230,14,0],[232,13,232,53,1],[233,9,233,10,1],[241,9,241,10,1],[242,13,242,33,1],[243,13,243,55,1],[244,13,244,14,1],[245,17,247,80,1],[248,13,248,14,1],[250,13,250,14,1],[251,17,258,78,1],[259,13,259,14,1],[261,13,261,53,1],[262,9,262,10,1],[270,9,270,10,1],[271,13,271,52,1],[272,9,272,10,1],[280,9,280,10,1],[281,13,281,20,1],[281,22,281,33,1],[281,34,281,36,1],[281,37,281,66,1],[281,66,281,85,1],[281,85,281,86,1],[281,37,281,86,1],[282,13,282,14,1],[283,17,283,79,1],[284,17,284,18,1],[286,21,289,61,1],[289,61,289,104,1],[289,104,289,107,1],[286,21,289,107,1],[290,17,290,18,1],[292,17,292,18,1],[294,21,297,61,1],[297,61,297,104,1],[297,104,298,85,1],[294,21,298,85,1],[299,17,299,18,1],[300,13,300,14,1],[301,9,301,10,1],[304,9,304,10,1],[308,13,308,39,1],[309,13,309,14,1],[310,17,310,52,1],[317,17,317,63,1],[318,17,318,87,1],[319,17,321,27,1],[322,17,322,62,1],[323,13,323,14,1],[325,13,325,14,1],[327,17,327,63,1],[328,13,328,14,1],[329,13,329,32,1],[330,9,330,10,1],[333,9,333,10,1],[336,13,336,61,1],[338,13,338,36,1],[339,13,339,14,1],[341,17,341,60,1],[342,17,342,18,1],[343,21,343,91,1],[344,21,344,63,1],[345,21,345,22,1],[346,25,346,58,1],[347,21,347,22,1],[349,21,349,22,1],[350,25,350,68,1],[351,21,351,22,1],[352,17,352,18,1],[353,13,353,14,1],[355,13,355,14,1],[358,17,358,101,1],[359,17,359,100,1],[360,17,360,86,1],[361,17,361,109,1],[364,17,364,72,1],[365,17,365,48,1],[368,17,368,57,1],[369,21,369,56,1],[372,17,372,55,1],[373,21,373,49,0],[376,17,389,167,1],[392,17,392,110,1],[394,17,394,60,1],[395,17,395,38,1],[397,17,397,64,1],[399,17,399,60,1],[400,17,400,18,0],[401,21,401,81,0],[402,17,402,18,0],[404,17,404,18,1],[405,21,405,71,1],[406,17,406,18,1],[407,13,407,14,1],[409,13,409,67,1],[410,13,410,14,1],[415,17,415,53,1],[416,13,416,14,1],[418,13,418,30,1],[420,9,420,10,1],[445,9,445,10,1],[446,13,446,33,1],[446,34,446,77,0],[449,13,449,62,1],[451,13,451,72,1],[453,13,453,31,1],[453,32,453,61,1],[454,13,454,79,1],[455,13,455,57,1],[456,13,456,81,1],[457,13,457,59,1],[460,13,462,76,1],[466,13,466,96,1],[467,13,467,68,1],[472,13,472,41,1],[473,13,473,14,1],[475,17,475,57,1],[477,17,477,154,1],[480,17,480,102,1],[481,17,488,66,1],[491,17,493,80,1],[495,17,495,125,1],[498,13,498,14,0],[499,17,499,54,0],[500,13,500,14,0],[502,13,502,27,0],[503,9,503,10,1],[514,9,514,10,1],[515,13,515,81,1],[516,9,516,10,1],[527,9,527,10,1],[528,13,528,41,1],[528,42,528,92,1],[531,13,531,53,1],[535,13,535,128,1],[537,13,537,42,1],[538,13,538,14,1],[540,17,540,64,1],[541,17,541,48,1],[542,13,542,14,1],[543,18,543,71,1],[544,13,544,14,1],[546,17,546,138,1],[547,13,547,14,1],[554,13,564,44,1],[566,13,566,80,1],[577,13,585,22,1],[591,13,591,76,1],[593,13,593,69,1],[594,13,594,91,1],[596,13,596,87,1],[599,13,599,77,1],[600,13,600,36,1],[602,13,602,70,1],[605,13,605,14,1],[608,17,608,24,1],[608,26,608,33,1],[608,34,608,36,1],[608,37,608,63,1],[608,63,608,67,1],[608,67,608,81,1],[608,81,608,90,1],[608,90,608,101,1],[608,37,608,101,1],[609,17,609,18,1],[612,21,612,87,1],[613,21,613,22,1],[614,25,614,99,1],[615,21,615,22,1],[617,21,617,22,1],[618,25,618,100,1],[619,25,619,99,1],[620,21,620,22,1],[624,21,624,72,1],[625,21,625,79,1],[626,21,626,22,1],[629,25,629,94,1],[630,25,630,26,1],[631,29,631,48,1],[632,29,632,85,1],[633,25,633,26,1],[635,25,635,26,1],[636,29,636,47,1],[637,29,637,35,1],[639,21,639,22,1],[641,21,641,150,1],[643,21,643,28,1],[643,30,643,42,1],[643,43,643,45,1],[643,46,643,56,1],[644,21,644,22,1],[646,25,646,123,1],[648,25,650,65,1],[652,25,652,48,1],[653,25,653,26,1],[655,29,655,110,1],[658,29,658,70,1],[658,70,658,132,1],[658,132,660,44,1],[658,29,660,44,1],[662,29,662,77,1],[662,77,662,84,1],[662,84,662,91,1],[662,91,662,131,1],[662,131,662,133,1],[662,29,662,133,1],[664,29,664,80,1],[666,29,668,67,1],[670,29,670,113,1],[671,25,671,26,1],[672,21,672,22,1],[674,21,674,57,1],[675,21,675,22,0],[676,25,676,175,0],[677,25,677,44,0],[678,25,678,26,0],[679,29,679,70,0],[682,25,682,26,0],[683,29,683,87,0],[684,25,684,26,0],[685,21,685,22,0],[686,21,686,78,1],[687,17,687,18,1],[688,13,688,14,1],[690,13,690,14,1],[691,17,691,53,1],[692,13,692,14,1],[694,13,694,27,1],[696,9,696,10,1],[699,9,699,10,1],[702,13,702,48,1],[705,21,705,60,0],[707,21,707,47,1],[710,21,710,52,0],[715,21,715,50,0],[718,21,718,75,1],[720,9,720,10,1],[723,9,723,10,0],[726,13,726,48,0],[730,21,730,40,0],[733,21,733,39,0],[735,21,735,41,0],[738,21,738,75,0],[740,9,740,10,0],[748,9,748,10,1],[750,13,750,38,1],[752,13,752,35,1],[754,13,754,97,1],[755,13,756,13,1],[756,13,756,14,0],[756,14,758,17,1],[758,17,758,18,0],[758,18,759,21,1],[759,21,759,51,0],[759,51,759,52,1],[759,52,759,59,0],[759,59,761,21,1],[761,21,761,69,0],[761,69,762,21,1],[762,21,762,66,0],[762,66,762,67,1],[762,67,762,74,0],[762,74,764,21,1],[764,21,764,93,0],[764,93,767,21,1],[767,21,767,110,0],[767,110,768,21,1],[768,21,768,22,0],[768,22,770,25,1],[770,25,770,109,0],[770,109,771,21,1],[771,21,771,22,0],[771,22,773,21,1],[773,21,773,22,0],[773,22,774,25,1],[774,25,774,51,0],[774,51,775,21,1],[775,21,775,22,0],[775,22,776,17,1],[776,17,776,18,0],[776,18,777,17,1],[777,17,777,36,0],[777,36,778,17,1],[778,17,778,18,0],[778,18,779,21,1],[779,21,779,146,0],[779,146,780,21,1],[780,21,780,40,0],[780,40,781,17,1],[781,17,781,18,0],[781,18,782,13,1],[782,13,782,14,0],[782,14,782,16,1],[755,13,782,16,1],[784,13,784,31,1],[785,9,785,10,1],[802,13,802,81,1],[803,13,803,14,1],[804,17,804,58,1],[805,13,805,14,1],[808,13,808,14,1],[809,17,809,80,1],[810,13,810,14,1],[819,13,819,14,1],[821,17,821,41,1],[822,17,822,18,1],[823,21,823,36,1],[824,21,824,33,1],[827,17,827,40,1],[828,17,828,18,1],[829,21,829,36,1],[830,21,830,33,1],[833,17,833,47,1],[835,17,835,49,1],[836,17,836,18,1],[838,21,838,58,1],[839,21,839,22,0],[840,25,840,62,0],[841,25,841,45,0],[842,29,842,121,0],[845,25,845,50,0],[846,25,846,37,0],[849,21,849,34,1],[852,17,852,32,1],[853,17,853,29,1],[854,13,854,14,1],[857,13,857,14,1],[858,17,858,40,1],[859,17,859,18,0],[860,21,860,32,0],[861,21,861,34,0],[863,17,863,61,1],[864,13,864,14,1],[877,13,877,76,1],[878,13,878,14,1],[879,17,879,40,1],[880,13,880,14,1],[883,13,883,14,1],[885,17,885,55,1],[886,17,886,18,0],[887,21,887,43,0],[891,17,891,65,1],[892,13,892,14,1],[900,13,900,92,1],[901,13,901,14,1],[902,17,902,35,1],[903,17,903,59,1],[904,17,904,43,1],[905,13,905,14,1],[907,13,907,98,1],[908,13,908,14,1],[909,17,909,41,1],[910,17,910,43,1],[911,13,911,14,1],[913,46,913,50,1],[913,51,913,63,1],[914,58,914,62,1],[914,63,914,75,1],[918,21,918,22,1],[918,23,918,55,1],[918,56,918,57,1],[923,21,923,22,1],[923,23,923,104,1],[923,105,923,106,1],[931,21,931,22,1],[931,23,931,51,1],[931,52,931,53,1],[936,21,936,22,1],[936,23,936,60,1],[936,61,936,62,1],[941,21,941,22,1],[941,23,941,78,1],[941,79,941,80,1],[944,58,944,62,1],[944,63,944,67,1],[954,38,954,42,1],[954,43,954,55,1],[956,13,956,51,1],[957,13,957,14,1],[958,17,958,43,1],[959,13,959,14,1],[963,21,963,22,1],[963,23,963,36,1],[963,37,963,38,1],[967,13,967,14,0],[968,17,968,93,0],[982,97,982,114,1],[983,13,983,14,1],[984,17,984,26,1],[985,17,985,40,1],[986,17,986,38,1],[987,13,987,14,1],[991,21,991,22,1],[991,23,991,44,1],[991,45,991,46,1],[1000,13,1000,14,1],[1001,17,1001,40,1],[1001,41,1001,117,0],[1003,17,1003,166,1],[1007,17,1007,50,1],[1009,17,1009,136,1],[1011,17,1011,53,1],[1012,13,1012,14,1]]);
+    </script>
+  </body>
+</html>

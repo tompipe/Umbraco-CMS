@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\DomainRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence.FaultHandling;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    //TODO: We need to get a readonly ISO code for the domain assigned
+
+    internal class DomainRepository : PetaPocoRepositoryBase&lt;int, IDomain&gt;, IDomainRepository
+    {
+        public DomainRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax)
+            : base(work, cache, logger, sqlSyntax)
+        {           
+        }
+
+        private FullDataSetRepositoryCachePolicyFactory&lt;IDomain, int&gt; _cachePolicyFactory;
+        protected override IRepositoryCachePolicyFactory&lt;IDomain, int&gt; CachePolicyFactory
+        {
+            get
+            {
+                //Use a FullDataSet cache policy - this will cache the entire GetAll result in a single collection
+                return _cachePolicyFactory ?? (_cachePolicyFactory = new FullDataSetRepositoryCachePolicyFactory&lt;IDomain, int&gt;(
+                    RuntimeCache, GetEntityId, () =&gt; PerformGetAll(), false));
+            }
+        }
+
+        protected override IDomain PerformGet(int id)
+        {
+            //use the underlying GetAll which will force cache all domains
+            return GetAll().FirstOrDefault(x =&gt; x.Id == id);
+        }
+
+        protected override IEnumerable&lt;IDomain&gt; PerformGetAll(params int[] ids)
+        {
+            var sql = GetBaseQuery(false).Where(&quot;umbracoDomains.id &gt; 0&quot;);
+            if (ids.Any())
+            {
+                sql.Where(&quot;umbracoDomains.id in (@ids)&quot;, new { ids = ids });
+            }
+
+            return Database.Fetch&lt;DomainDto&gt;(sql).Select(ConvertFromDto);
+        }
+
+        protected override IEnumerable&lt;IDomain&gt; PerformGetByQuery(IQuery&lt;IDomain&gt; query)
+        {
+            throw new NotSupportedException(&quot;This repository does not support this method&quot;);
+        }
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+            if (isCount)
+            {
+                sql.Select(&quot;COUNT(*)&quot;).From&lt;DomainDto&gt;(SqlSyntax);
+            }
+            else
+            {
+                sql.Select(&quot;umbracoDomains.*, umbracoLanguage.languageISOCode&quot;)
+                    .From&lt;DomainDto&gt;(SqlSyntax)
+                    .LeftJoin&lt;LanguageDto&gt;(SqlSyntax)
+                    .On&lt;DomainDto, LanguageDto&gt;(SqlSyntax, dto =&gt; dto.DefaultLanguage, dto =&gt; dto.Id);
+            }
+            
+            return sql;
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoDomains.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            var list = new List&lt;string&gt;
+                {
+                    &quot;DELETE FROM umbracoDomains WHERE id = @Id&quot;
+                };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { throw new NotImplementedException(); }
+        }
+
+        protected override void PersistNewItem(IDomain entity)
+        {
+            var exists = Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM umbracoDomains WHERE domainName = @domainName&quot;, new { domainName = entity.DomainName });
+            if (exists &gt; 0) throw new DuplicateNameException(string.Format(&quot;The domain name {0} is already assigned&quot;, entity.DomainName));
+
+            if (entity.RootContentId.HasValue)
+            {
+                var contentExists = Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM cmsContent WHERE nodeId = @id&quot;, new { id = entity.RootContentId.Value });
+                if (contentExists == 0) throw new NullReferenceException(&quot;No content exists with id &quot; + entity.RootContentId.Value);
+            }
+
+            if (entity.LanguageId.HasValue)
+            {
+                var languageExists = Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM umbracoLanguage WHERE id = @id&quot;, new { id = entity.LanguageId.Value });
+                if (languageExists == 0) throw new NullReferenceException(&quot;No language exists with id &quot; + entity.LanguageId.Value);
+            }
+
+            ((UmbracoDomain)entity).AddingEntity();
+
+            var factory = new DomainModelFactory();
+            var dto = factory.BuildDto(entity);
+
+            var id = Convert.ToInt32(Database.Insert(dto));
+            entity.Id = id;
+
+            //if the language changed, we need to resolve the ISO code!
+            if (entity.LanguageId.HasValue)
+            {
+                ((UmbracoDomain)entity).LanguageIsoCode = Database.ExecuteScalar&lt;string&gt;(&quot;SELECT languageISOCode FROM umbracoLanguage WHERE id=@langId&quot;, new { langId = entity.LanguageId });
+            }
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(IDomain entity)
+        {
+            ((UmbracoDomain)entity).UpdatingEntity();
+
+            var exists = Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM umbracoDomains WHERE domainName = @domainName AND umbracoDomains.id &lt;&gt; @id&quot;, 
+                new { domainName = entity.DomainName, id = entity.Id });
+            //ensure there is no other domain with the same name on another entity
+            if (exists &gt; 0) throw new DuplicateNameException(string.Format(&quot;The domain name {0} is already assigned&quot;, entity.DomainName));
+
+            if (entity.RootContentId.HasValue)
+            {
+                var contentExists = Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM cmsContent WHERE nodeId = @id&quot;, new { id = entity.RootContentId.Value });
+                if (contentExists == 0) throw new NullReferenceException(&quot;No content exists with id &quot; + entity.RootContentId.Value);
+            }
+
+            if (entity.LanguageId.HasValue)
+            {
+                var languageExists = Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM umbracoLanguage WHERE id = @id&quot;, new { id = entity.LanguageId.Value });
+                if (languageExists == 0) throw new NullReferenceException(&quot;No language exists with id &quot; + entity.LanguageId.Value);
+            }
+
+            var factory = new DomainModelFactory();
+            var dto = factory.BuildDto(entity);
+
+            Database.Update(dto);
+
+            //if the language changed, we need to resolve the ISO code!
+            if (entity.WasPropertyDirty(&quot;LanguageId&quot;))
+            {
+                ((UmbracoDomain)entity).LanguageIsoCode = Database.ExecuteScalar&lt;string&gt;(&quot;SELECT languageISOCode FROM umbracoLanguage WHERE id=@langId&quot;, new {langId = entity.LanguageId});
+            }
+
+            entity.ResetDirtyProperties();
+        }
+
+        public IDomain GetByName(string domainName)
+        {
+            return GetAll().FirstOrDefault(x =&gt; x.DomainName.InvariantEquals(domainName));
+        }
+
+        public bool Exists(string domainName)
+        {
+            return GetAll().Any(x =&gt; x.DomainName.InvariantEquals(domainName));
+        }
+
+        public IEnumerable&lt;IDomain&gt; GetAll(bool includeWildcards)
+        {
+            return GetAll().Where(x =&gt; includeWildcards || x.IsWildcard == false);
+        }
+
+        public IEnumerable&lt;IDomain&gt; GetAssignedDomains(int contentId, bool includeWildcards)
+        {
+            return GetAll()
+                .Where(x =&gt; x.RootContentId == contentId)
+                .Where(x =&gt; includeWildcards || x.IsWildcard == false);
+        }
+
+        private IDomain ConvertFromDto(DomainDto dto)
+        {
+            var factory = new DomainModelFactory();
+            var entity = factory.BuildEntity(dto);
+            return entity;
+        }      
+
+        internal class DomainModelFactory
+        {
+           
+            public IDomain BuildEntity(DomainDto dto)
+            {
+                var domain = new UmbracoDomain(dto.DomainName, dto.IsoCode)
+                {
+                    Id = dto.Id,
+                    LanguageId = dto.DefaultLanguage,
+                    RootContentId = dto.RootStructureId
+                };
+                //on initial construction we don&#39;t want to have dirty properties tracked
+                // http://issues.umbraco.org/issue/U4-1946
+                domain.ResetDirtyProperties(false);
+                return domain;
+            }
+
+            public DomainDto BuildDto(IDomain entity)
+            {
+                var dto = new DomainDto { DefaultLanguage = entity.LanguageId, DomainName = entity.DomainName, Id = entity.Id, RootStructureId = entity.RootContentId };
+                return dto;
+            }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,15,22,51,1],[23,9,23,10,1],[24,9,24,10,1],[30,13,30,14,1],[32,17,33,54,1],[33,54,33,69,1],[33,69,33,79,1],[32,17,33,79,1],[34,13,34,14,1],[38,9,38,10,0],[40,13,40,49,0],[40,49,40,59,0],[40,59,40,61,0],[40,13,40,61,0],[41,9,41,10,0],[44,9,44,10,1],[45,13,45,74,1],[46,13,46,27,1],[47,13,47,14,0],[48,17,48,77,0],[49,13,49,14,0],[51,13,51,74,1],[52,9,52,10,1],[55,9,55,10,0],[56,13,56,93,0],[60,9,60,10,1],[61,13,61,33,1],[62,13,62,25,1],[63,13,63,14,0],[64,17,64,67,0],[65,13,65,14,0],[67,13,67,14,1],[68,17,71,103,1],[72,13,72,14,1],[74,13,74,24,1],[75,9,75,10,1],[78,9,78,10,0],[79,13,79,46,0],[80,9,80,10,0],[83,9,83,10,1],[84,13,87,19,1],[88,13,88,25,1],[89,9,89,10,1],[93,17,93,18,0],[93,19,93,55,0],[97,9,97,10,1],[98,13,98,164,1],[99,13,99,28,1],[99,29,99,139,1],[101,13,101,47,1],[102,13,102,14,1],[103,17,103,160,1],[104,17,104,40,1],[104,41,104,133,0],[105,13,105,14,1],[107,13,107,44,1],[108,13,108,14,1],[109,17,109,159,1],[110,17,110,41,1],[110,42,110,132,0],[111,13,111,14,1],[113,13,113,52,1],[115,13,115,52,1],[116,13,116,48,1],[118,13,118,60,1],[119,13,119,28,1],[122,13,122,44,1],[123,13,123,14,1],[124,17,124,190,1],[125,13,125,14,1],[127,13,127,43,1],[128,9,128,10,1],[131,9,131,10,1],[132,13,132,54,1],[134,13,135,73,1],[137,13,137,28,1],[137,29,137,139,0],[139,13,139,47,1],[140,13,140,14,1],[141,17,141,160,1],[142,17,142,40,1],[142,41,142,133,0],[143,13,143,14,1],[145,13,145,44,1],[146,13,146,14,1],[147,17,147,159,1],[148,17,148,41,1],[148,42,148,132,0],[149,13,149,14,1],[151,13,151,52,1],[152,13,152,48,1],[154,13,154,34,1],[157,13,157,55,1],[158,13,158,14,0],[159,17,159,188,0],[160,13,160,14,0],[162,13,162,43,1],[163,9,163,10,1],[166,9,166,10,1],[167,13,167,49,1],[167,49,167,89,1],[167,89,167,91,1],[167,13,167,91,1],[168,9,168,10,1],[171,9,171,10,1],[172,13,172,38,1],[172,38,172,78,1],[172,78,172,80,1],[172,13,172,80,1],[173,9,173,10,1],[176,9,176,10,1],[177,13,177,40,1],[177,40,177,81,1],[177,81,177,83,1],[177,13,177,83,1],[178,9,178,10,1],[181,9,181,10,1],[182,13,183,29,1],[183,29,183,57,1],[183,57,184,29,1],[184,29,184,70,1],[184,70,184,72,1],[182,13,184,72,1],[185,9,185,10,1],[188,9,188,10,1],[189,13,189,52,1],[190,13,190,51,1],[191,13,191,27,1],[192,9,192,10,1],[198,13,198,14,1],[199,17,204,19,1],[207,17,207,52,1],[208,17,208,31,1],[209,13,209,14,1],[212,13,212,14,1],[213,17,213,169,1],[214,17,214,28,1],[215,13,215,14,1]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\XmlHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
+using System.Xml.XPath;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+
+namespace Umbraco.Core
+{
+    /// &lt;summary&gt;
+	/// The XmlHelper class contains general helper methods for working with xml in umbraco.
+    /// &lt;/summary&gt;
+    public class XmlHelper
+    {
+        /// &lt;summary&gt;
+        /// Creates or sets an attribute on the XmlNode if an Attributes collection is available
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xml&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;n&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;&lt;/param&gt;
+        public static void SetAttribute(XmlDocument xml, XmlNode n, string name, string value)
+        {
+            if (xml == null) throw new ArgumentNullException(&quot;xml&quot;);
+            if (n == null) throw new ArgumentNullException(&quot;n&quot;);
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException(&quot;Value cannot be null or whitespace.&quot;, &quot;name&quot;);
+
+            if (n.Attributes == null)
+            {
+                return;
+            }
+            if (n.Attributes[name] == null)
+            {
+                var a = xml.CreateAttribute(name);
+                a.Value = value;
+                n.Attributes.Append(a);
+            }
+            else
+            {
+                n.Attributes[name].Value = value;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether a specified string contains only xml whitespace characters.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;s&quot;&gt;The string.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;c&gt;true&lt;/c&gt; if the string contains only xml whitespace characters.&lt;/returns&gt;
+        /// &lt;remarks&gt;As per XML 1.1 specs, space, \t, \r and \n.&lt;/remarks&gt;
+        public static bool IsXmlWhitespace(string s)
+        {
+            // as per xml 1.1 specs - anything else is significant whitespace
+            s = s.Trim(&#39; &#39;, &#39;\t&#39;, &#39;\r&#39;, &#39;\n&#39;);
+            return s.Length == 0;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new &lt;c&gt;XPathDocument&lt;/c&gt; from an xml string.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xml&quot;&gt;The xml string.&lt;/param&gt;
+        /// &lt;returns&gt;An &lt;c&gt;XPathDocument&lt;/c&gt; created from the xml string.&lt;/returns&gt;
+        public static XPathDocument CreateXPathDocument(string xml)
+        {
+            return new XPathDocument(new XmlTextReader(new StringReader(xml)));
+        }
+
+        /// &lt;summary&gt;
+        /// Tries to create a new &lt;c&gt;XPathDocument&lt;/c&gt; from an xml string.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xml&quot;&gt;The xml string.&lt;/param&gt;
+        /// &lt;param name=&quot;doc&quot;&gt;The XPath document.&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether it has been possible to create the document.&lt;/returns&gt;
+        public static bool TryCreateXPathDocument(string xml, out XPathDocument doc)
+        {
+            try
+            {
+                doc = CreateXPathDocument(xml);
+                return true;
+            }
+            catch (Exception)
+            {
+                doc = null;
+                return false;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Tries to create a new &lt;c&gt;XPathDocument&lt;/c&gt; from a property value.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The value of the property.&lt;/param&gt;
+        /// &lt;param name=&quot;doc&quot;&gt;The XPath document.&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether it has been possible to create the document.&lt;/returns&gt;
+        /// &lt;remarks&gt;The value can be anything... Performance-wise, this is bad.&lt;/remarks&gt;
+        public static bool TryCreateXPathDocumentFromPropertyValue(object value, out XPathDocument doc)
+        {
+            // DynamicNode.ConvertPropertyValueByDataType first cleans the value by calling
+            // XmlHelper.StripDashesInElementOrAttributeName - this is because the XML is
+            // to be returned as a DynamicXml and element names such as &quot;value-item&quot; are
+            // invalid and must be converted to &quot;valueitem&quot;. But we don&#39;t have that sort of
+            // problem here - and we don&#39;t need to bother with dashes nor dots, etc.
+
+            doc = null;
+            var xml = value as string;
+            if (xml == null) return false; // no a string
+            if (CouldItBeXml(xml) == false) return false; // string does not look like it&#39;s xml
+            if (IsXmlWhitespace(xml)) return false; // string is whitespace, xml-wise
+            if (TryCreateXPathDocument(xml, out doc) == false) return false; // string can&#39;t be parsed into xml
+
+            var nav = doc.CreateNavigator();
+            if (nav.MoveToFirstChild())
+            {
+                var name = nav.LocalName; // must not match an excluded tag
+                if (UmbracoConfig.For.UmbracoSettings().Scripting.NotDynamicXmlDocumentElements.All(x =&gt; x.Element.InvariantEquals(name) == false)) return true;
+            }
+
+            doc = null;
+            return false;
+        }
+
+        /// &lt;summary&gt;
+        /// Tries to create a new &lt;c&gt;XElement&lt;/c&gt; from a property value.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The value of the property.&lt;/param&gt;
+        /// &lt;param name=&quot;elt&quot;&gt;The Xml element.&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether it has been possible to create the element.&lt;/returns&gt;
+        /// &lt;remarks&gt;The value can be anything... Performance-wise, this is bad.&lt;/remarks&gt;
+        public static bool TryCreateXElementFromPropertyValue(object value, out XElement elt)
+        {
+            // see note above in TryCreateXPathDocumentFromPropertyValue...
+
+            elt = null;
+            var xml = value as string;
+            if (xml == null) return false; // not a string
+            if (CouldItBeXml(xml) == false) return false; // string does not look like it&#39;s xml
+            if (IsXmlWhitespace(xml)) return false; // string is whitespace, xml-wise
+
+            try
+            {
+                elt = XElement.Parse(xml, LoadOptions.None);
+            }
+            catch
+            {
+                elt = null;
+                return false; // string can&#39;t be parsed into xml
+            }
+
+            var name = elt.Name.LocalName; // must not match an excluded tag
+            if (UmbracoConfig.For.UmbracoSettings().Scripting.NotDynamicXmlDocumentElements.All(x =&gt; x.Element.InvariantEquals(name) == false)) return true;
+
+            elt = null;
+            return false;
+        }
+
+        /// &lt;summary&gt;
+        /// Sorts the children of a parentNode.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parentNode&quot;&gt;The parent node.&lt;/param&gt;
+        /// &lt;param name=&quot;childNodesXPath&quot;&gt;An XPath expression to select children of &lt;paramref name=&quot;parentNode&quot;/&gt; to sort.&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;A function returning the value to order the nodes by.&lt;/param&gt;
+        internal static void SortNodes(
+            XmlNode parentNode,
+            string childNodesXPath,
+            Func&lt;XmlNode, int&gt; orderBy)
+        {
+            var sortedChildNodes = parentNode.SelectNodes(childNodesXPath).Cast&lt;XmlNode&gt;()
+                .OrderBy(orderBy)
+                .ToArray();
+
+            // append child nodes to last position, in sort-order
+            // so all child nodes will go after the property nodes
+            foreach (var node in sortedChildNodes)
+                parentNode.AppendChild(node); // moves the node to the last position
+        }
+
+        /// &lt;summary&gt;
+        /// Sorts the children of a parentNode if needed.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parentNode&quot;&gt;The parent node.&lt;/param&gt;
+        /// &lt;param name=&quot;childNodesXPath&quot;&gt;An XPath expression to select children of &lt;paramref name=&quot;parentNode&quot;/&gt; to sort.&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;A function returning the value to order the nodes by.&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether sorting was needed.&lt;/returns&gt;
+        /// &lt;remarks&gt;same as SortNodes but will do nothing if nodes are already sorted - should improve performances.&lt;/remarks&gt;
+        internal static bool SortNodesIfNeeded(
+            XmlNode parentNode,
+            string childNodesXPath,
+            Func&lt;XmlNode, int&gt; orderBy)
+        {
+            // ensure orderBy runs only once per node
+            // checks whether nodes are already ordered
+            // and actually sorts only if needed
+
+            var childNodesAndOrder = parentNode.SelectNodes(childNodesXPath).Cast&lt;XmlNode&gt;()
+                .Select(x =&gt; Tuple.Create(x, orderBy(x))).ToArray();
+
+            var a = 0;
+            foreach (var x in childNodesAndOrder)
+            {
+                if (a &gt; x.Item2)
+                {
+                    a = -1;
+                    break;
+                }
+                a = x.Item2;
+            }
+
+            if (a &gt;= 0)
+	            return false;
+
+            // append child nodes to last position, in sort-order
+            // so all child nodes will go after the property nodes
+            foreach (var x in childNodesAndOrder.OrderBy(x =&gt; x.Item2))
+                parentNode.AppendChild(x.Item1); // moves the node to the last position
+
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Sorts a single child node of a parentNode.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parentNode&quot;&gt;The parent node.&lt;/param&gt;
+        /// &lt;param name=&quot;childNodesXPath&quot;&gt;An XPath expression to select children of &lt;paramref name=&quot;parentNode&quot;/&gt; to sort.&lt;/param&gt;
+        /// &lt;param name=&quot;node&quot;&gt;The child node to sort.&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;A function returning the value to order the nodes by.&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether sorting was needed.&lt;/returns&gt;
+        /// &lt;remarks&gt;Assuming all nodes but &lt;paramref name=&quot;node&quot;/&gt; are sorted, this will move the node to
+        /// the right position without moving all the nodes (as SortNodes would do) - should improve perfs.&lt;/remarks&gt;
+        internal static bool SortNode(
+            XmlNode parentNode,
+            string childNodesXPath,
+            XmlNode node,
+            Func&lt;XmlNode, int&gt; orderBy)
+	    {
+            var nodeSortOrder = orderBy(node);
+            var childNodesAndOrder = parentNode.SelectNodes(childNodesXPath).Cast&lt;XmlNode&gt;()
+                .Select(x =&gt; Tuple.Create(x, orderBy(x))).ToArray();
+
+            // only one node = node is in the right place already, obviously
+            if (childNodesAndOrder.Length == 1) return false;
+
+            // find the first node with a sortOrder &gt; node.sortOrder
+            var i = 0;
+            while (i &lt; childNodesAndOrder.Length &amp;&amp; childNodesAndOrder[i].Item2 &lt;= nodeSortOrder)
+               i++;
+
+            // if one was found
+            if (i &lt; childNodesAndOrder.Length)
+            {
+                // and node is just before, we&#39;re done already
+                // else we need to move it right before the node that was found
+                if (i == 0 || childNodesAndOrder[i - 1].Item1 != node)
+                {
+                    parentNode.InsertBefore(node, childNodesAndOrder[i].Item1);
+                    return true;
+                }
+            }
+            else // i == childNodesAndOrder.Length &amp;&amp; childNodesAndOrder.Length &gt; 1
+            {
+                // and node is the last one, we&#39;re done already
+                // else we need to append it as the last one
+                // (and i &gt; 1, see above)
+                if (childNodesAndOrder[i - 1].Item1 != node)
+                {
+                    parentNode.AppendChild(node);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // used by DynamicNode only, see note in TryCreateXPathDocumentFromPropertyValue
+        public static string StripDashesInElementOrAttributeNames(string xml)
+        {
+            using (var outputms = new MemoryStream())
+            {
+                using (TextWriter outputtw = new StreamWriter(outputms))
+                {
+                    using (var ms = new MemoryStream())
+                    {
+                        using (var tw = new StreamWriter(ms))
+                        {
+                            tw.Write(xml);
+                            tw.Flush();
+                            ms.Position = 0;
+                            using (var tr = new StreamReader(ms))
+                            {
+                                bool IsInsideElement = false, IsInsideQuotes = false;
+                                int ic = 0;
+                                while ((ic = tr.Read()) != -1)
+                                {
+                                    if (ic == (int)&#39;&lt;&#39; &amp;&amp; !IsInsideQuotes)
+                                    {
+                                        if (tr.Peek() != (int)&#39;!&#39;)
+                                        {
+                                            IsInsideElement = true;
+                                        }
+                                    }
+                                    if (ic == (int)&#39;&gt;&#39; &amp;&amp; !IsInsideQuotes)
+                                    {
+                                        IsInsideElement = false;
+                                    }
+                                    if (ic == (int)&#39;&quot;&#39;)
+                                    {
+                                        IsInsideQuotes = !IsInsideQuotes;
+                                    }
+                                    if (!IsInsideElement || ic != (int)&#39;-&#39; || IsInsideQuotes)
+                                    {
+                                        outputtw.Write((char)ic);
+                                    }
+                                }
+
+                            }
+                        }
+                    }
+                    outputtw.Flush();
+                    outputms.Position = 0;
+                    using (TextReader outputtr = new StreamReader(outputms))
+                    {
+                        return outputtr.ReadToEnd();
+                    }
+                }
+            }
+        }
+
+
+		/// &lt;summary&gt;
+        /// Imports a XML node from text.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;text&quot;&gt;The text.&lt;/param&gt;
+        /// &lt;param name=&quot;xmlDoc&quot;&gt;The XML doc.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+		public static XmlNode ImportXmlNodeFromText(string text, ref XmlDocument xmlDoc)
+        {
+            xmlDoc.LoadXml(text);
+            return xmlDoc.FirstChild;
+        }
+
+        /// &lt;summary&gt;
+        /// Opens a file as a XmlDocument.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;filePath&quot;&gt;The relative file path. ei. /config/umbraco.config&lt;/param&gt;
+        /// &lt;returns&gt;Returns a XmlDocument class&lt;/returns&gt;
+        public static XmlDocument OpenAsXmlDocument(string filePath)
+        {
+
+        	var reader = new XmlTextReader(IOHelper.MapPath(filePath)) {WhitespaceHandling = WhitespaceHandling.All};
+
+        	var xmlDoc = new XmlDocument();
+            //Load the file into the XmlDocument
+            xmlDoc.Load(reader);
+            //Close off the connection to the file.
+            reader.Close();
+
+            return xmlDoc;
+        }
+
+        /// &lt;summary&gt;
+        /// creates a XmlAttribute with the specified name and value
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xd&quot;&gt;The xmldocument.&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;The name of the attribute.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The value of the attribute.&lt;/param&gt;
+        /// &lt;returns&gt;a XmlAttribute&lt;/returns&gt;
+        public static XmlAttribute AddAttribute(XmlDocument xd, string name, string value)
+        {
+            if (xd == null) throw new ArgumentNullException(&quot;xd&quot;);
+            if (string.IsNullOrEmpty(name)) throw new ArgumentException(&quot;Value cannot be null or empty.&quot;, &quot;name&quot;);
+
+            var temp = xd.CreateAttribute(name);
+            temp.Value = value;
+            return temp;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a text XmlNode with the specified name and value
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xd&quot;&gt;The xmldocument.&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;The node name.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The node value.&lt;/param&gt;
+        /// &lt;returns&gt;a XmlNode&lt;/returns&gt;
+        public static XmlNode AddTextNode(XmlDocument xd, string name, string value)
+        {
+            if (xd == null) throw new ArgumentNullException(&quot;xd&quot;);
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException(&quot;Value cannot be null or whitespace.&quot;, &quot;name&quot;);
+
+            var temp = xd.CreateNode(XmlNodeType.Element, name, &quot;&quot;);
+            temp.AppendChild(xd.CreateTextNode(value));
+            return temp;
+        }
+
+        /// &lt;summary&gt;
+        /// Sets or Creates a text XmlNode with the specified name and value
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xd&quot;&gt;The xmldocument.&lt;/param&gt;
+        /// &lt;param name=&quot;parent&quot;&gt;The node to set or create the child text node on&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;The node name.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The node value.&lt;/param&gt;
+        /// &lt;returns&gt;a XmlNode&lt;/returns&gt;
+        public static XmlNode SetTextNode(XmlDocument xd, XmlNode parent, string name, string value)
+        {
+            if (xd == null) throw new ArgumentNullException(&quot;xd&quot;);
+            if (parent == null) throw new ArgumentNullException(&quot;parent&quot;);
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException(&quot;Value cannot be null or whitespace.&quot;, &quot;name&quot;);
+
+            var child = parent.SelectSingleNode(name);
+            if (child != null)
+            {
+                child.InnerText = value;
+                return child;
+            }
+            return AddTextNode(xd, name, value);
+        }
+
+        /// &lt;summary&gt;
+        /// Sets or creates an Xml node from its inner Xml.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xd&quot;&gt;The xmldocument.&lt;/param&gt;
+        /// &lt;param name=&quot;parent&quot;&gt;The node to set or create the child text node on&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;The node name.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The node inner Xml.&lt;/param&gt;
+        /// &lt;returns&gt;a XmlNode&lt;/returns&gt;
+        public static XmlNode SetInnerXmlNode(XmlDocument xd, XmlNode parent, string name, string value)
+        {
+            if (xd == null) throw new ArgumentNullException(&quot;xd&quot;);
+            if (parent == null) throw new ArgumentNullException(&quot;parent&quot;);
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException(&quot;Value cannot be null or whitespace.&quot;, &quot;name&quot;);
+
+            var child = parent.SelectSingleNode(name) ?? xd.CreateNode(XmlNodeType.Element, name, &quot;&quot;);
+            child.InnerXml = value;
+            return child;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a cdata XmlNode with the specified name and value
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xd&quot;&gt;The xmldocument.&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;The node name.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The node value.&lt;/param&gt;
+        /// &lt;returns&gt;A XmlNode&lt;/returns&gt;
+		public static XmlNode AddCDataNode(XmlDocument xd, string name, string value)
+        {
+            if (xd == null) throw new ArgumentNullException(&quot;xd&quot;);
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException(&quot;Value cannot be null or whitespace.&quot;, &quot;name&quot;);
+
+            var temp = xd.CreateNode(XmlNodeType.Element, name, &quot;&quot;);
+            temp.AppendChild(xd.CreateCDataSection(value));
+            return temp;
+        }
+
+        /// &lt;summary&gt;
+        /// Sets or Creates a cdata XmlNode with the specified name and value
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xd&quot;&gt;The xmldocument.&lt;/param&gt;
+        /// &lt;param name=&quot;parent&quot;&gt;The node to set or create the child text node on&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;The node name.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The node value.&lt;/param&gt;
+        /// &lt;returns&gt;a XmlNode&lt;/returns&gt;
+        public static XmlNode SetCDataNode(XmlDocument xd, XmlNode parent, string name, string value)
+        {
+            if (xd == null) throw new ArgumentNullException(&quot;xd&quot;);
+            if (parent == null) throw new ArgumentNullException(&quot;parent&quot;);
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException(&quot;Value cannot be null or whitespace.&quot;, &quot;name&quot;);
+
+            var child = parent.SelectSingleNode(name);
+            if (child != null)
+            {
+                child.InnerXml = &quot;&lt;![CDATA[&quot; + value + &quot;]]&gt;&quot;; ;
+                return child;
+            }
+            return AddCDataNode(xd, name, value);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of a XmlNode
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;n&quot;&gt;The XmlNode.&lt;/param&gt;
+        /// &lt;returns&gt;the value as a string&lt;/returns&gt;
+		public static string GetNodeValue(XmlNode n)
+        {
+            var value = string.Empty;
+            if (n == null || n.FirstChild == null)
+                return value;
+            value = n.FirstChild.Value ?? n.InnerXml;
+            return value.Replace(&quot;&lt;!--CDATAOPENTAG--&gt;&quot;, &quot;&lt;![CDATA[&quot;).Replace(&quot;&lt;!--CDATACLOSETAG--&gt;&quot;, &quot;]]&gt;&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Determines whether the specified string appears to be XML.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xml&quot;&gt;The XML string.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// 	&lt;c&gt;true&lt;/c&gt; if the specified string appears to be XML; otherwise, &lt;c&gt;false&lt;/c&gt;.
+        /// &lt;/returns&gt;
+		public static bool CouldItBeXml(string xml)
+        {
+            if (string.IsNullOrEmpty(xml)) return false;
+
+            xml = xml.Trim();
+            return xml.StartsWith(&quot;&lt;&quot;) &amp;&amp; xml.EndsWith(&quot;&gt;&quot;) &amp;&amp; xml.Contains(&#39;/&#39;);
+        }
+
+        /// &lt;summary&gt;
+        /// Splits the specified delimited string into an XML document.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;data&quot;&gt;The data.&lt;/param&gt;
+        /// &lt;param name=&quot;separator&quot;&gt;The separator.&lt;/param&gt;
+        /// &lt;param name=&quot;rootName&quot;&gt;Name of the root.&lt;/param&gt;
+        /// &lt;param name=&quot;elementName&quot;&gt;Name of the element.&lt;/param&gt;
+        /// &lt;returns&gt;Returns an &lt;c&gt;System.Xml.XmlDocument&lt;/c&gt; representation of the delimited string data.&lt;/returns&gt;
+		public static XmlDocument Split(string data, string[] separator, string rootName, string elementName)
+        {
+            return Split(new XmlDocument(), data, separator, rootName, elementName);
+        }
+
+        /// &lt;summary&gt;
+        /// Splits the specified delimited string into an XML document.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xml&quot;&gt;The XML document.&lt;/param&gt;
+        /// &lt;param name=&quot;data&quot;&gt;The delimited string data.&lt;/param&gt;
+        /// &lt;param name=&quot;separator&quot;&gt;The separator.&lt;/param&gt;
+        /// &lt;param name=&quot;rootName&quot;&gt;Name of the root node.&lt;/param&gt;
+        /// &lt;param name=&quot;elementName&quot;&gt;Name of the element node.&lt;/param&gt;
+        /// &lt;returns&gt;Returns an &lt;c&gt;System.Xml.XmlDocument&lt;/c&gt; representation of the delimited string data.&lt;/returns&gt;
+		public static XmlDocument Split(XmlDocument xml, string data, string[] separator, string rootName, string elementName)
+        {
+            // load new XML document.
+            xml.LoadXml(string.Concat(&quot;&lt;&quot;, rootName, &quot;/&gt;&quot;));
+
+            // get the data-value, check it isn&#39;t empty.
+            if (!string.IsNullOrEmpty(data))
+            {
+                // explode the values into an array
+                var values = data.Split(separator, StringSplitOptions.None);
+
+                // loop through the array items.
+                foreach (string value in values)
+                {
+                    // add each value to the XML document.
+                    var xn = XmlHelper.AddTextNode(xml, elementName, value);
+                    xml.DocumentElement.AppendChild(xn);
+                }
+            }
+
+            // return the XML node.
+            return xml;
+        }
+
+		/// &lt;summary&gt;
+		/// Return a dictionary of attributes found for a string based tag
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;tag&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		public static Dictionary&lt;string, string&gt; GetAttributesFromElement(string tag)
+		{
+			var m =
+				Regex.Matches(tag, &quot;(?&lt;attributeName&gt;\\S*)=\&quot;(?&lt;attributeValue&gt;[^\&quot;]*)\&quot;&quot;,
+							  RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+			// fix for issue 14862: return lowercase attributes for case insensitive matching
+			var d = m.Cast&lt;Match&gt;().ToDictionary(attributeSet =&gt; attributeSet.Groups[&quot;attributeName&quot;].Value.ToString().ToLower(), attributeSet =&gt; attributeSet.Groups[&quot;attributeValue&quot;].Value.ToString());
+			return d;
+		}
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[28,9,28,10,0],[29,13,29,29,0],[29,30,29,69,0],[30,13,30,27,0],[30,28,30,65,0],[31,13,31,49,0],[31,50,31,125,0],[33,13,33,38,0],[34,13,34,14,0],[35,17,35,24,0],[37,13,37,44,0],[38,13,38,14,0],[39,17,39,51,0],[40,17,40,33,0],[41,17,41,40,0],[42,13,42,14,0],[44,13,44,14,0],[45,17,45,50,0],[46,13,46,14,0],[47,9,47,10,0],[56,9,56,10,1],[58,13,58,47,1],[59,13,59,34,1],[60,9,60,10,1],[68,9,68,10,1],[69,13,69,80,1],[70,9,70,10,1],[79,9,79,10,1],[81,13,81,14,1],[82,17,82,48,1],[83,17,83,29,1],[85,13,85,30,0],[86,13,86,14,0],[87,17,87,28,0],[88,17,88,30,0],[90,9,90,10,1],[100,9,100,10,1],[107,13,107,24,1],[108,13,108,39,1],[109,13,109,29,1],[109,30,109,43,0],[110,13,110,44,1],[110,45,110,58,1],[111,13,111,38,1],[111,39,111,52,0],[112,13,112,63,1],[112,64,112,77,0],[114,13,114,45,1],[115,13,115,40,1],[116,13,116,14,1],[117,17,117,42,1],[118,17,118,106,1],[118,106,118,146,1],[118,146,118,148,1],[118,17,118,148,1],[118,149,118,161,1],[119,13,119,14,0],[121,13,121,24,0],[122,13,122,26,0],[123,9,123,10,1],[133,9,133,10,1],[136,13,136,24,1],[137,13,137,39,1],[138,13,138,29,1],[138,30,138,43,0],[139,13,139,44,1],[139,45,139,58,1],[140,13,140,38,1],[140,39,140,52,0],[143,13,143,14,1],[144,17,144,61,1],[145,13,145,14,1],[146,13,146,18,0],[147,13,147,14,0],[148,17,148,28,0],[149,17,149,30,0],[152,13,152,43,1],[153,13,153,102,1],[153,102,153,142,1],[153,142,153,144,1],[153,13,153,144,1],[153,145,153,157,0],[155,13,155,24,1],[156,13,156,26,1],[157,9,157,10,1],[169,9,169,10,1],[170,13,172,28,1],[176,13,176,20,1],[176,22,176,30,1],[176,31,176,33,1],[176,34,176,50,1],[177,17,177,46,1],[178,9,178,10,1],[192,9,192,10,0],[197,13,198,30,0],[198,30,198,57,0],[198,57,198,69,0],[197,13,198,69,0],[200,13,200,23,0],[201,13,201,20,0],[201,22,201,27,0],[201,28,201,30,0],[201,31,201,49,0],[202,13,202,14,0],[203,17,203,33,0],[204,17,204,18,0],[205,21,205,28,0],[206,21,206,27,0],[208,17,208,29,0],[209,13,209,14,0],[211,13,211,24,0],[212,14,212,27,0],[216,13,216,20,0],[216,22,216,27,0],[216,28,216,30,0],[216,31,216,63,0],[216,63,216,70,0],[216,70,216,71,0],[216,31,216,71,0],[217,17,217,49,0],[219,13,219,25,0],[220,9,220,10,0],[237,6,237,7,0],[238,13,238,47,0],[239,13,240,30,0],[240,30,240,57,0],[240,57,240,69,0],[239,13,240,69,0],[243,13,243,48,0],[243,49,243,62,0],[246,13,246,23,0],[247,13,247,98,0],[248,16,248,20,0],[251,13,251,47,0],[252,13,252,14,0],[255,17,255,71,0],[256,17,256,18,0],[257,21,257,80,0],[258,21,258,33,0],[260,13,260,14,0],[262,13,262,14,0],[266,17,266,61,0],[267,17,267,18,0],[268,21,268,50,0],[269,21,269,33,0],[271,13,271,14,0],[272,13,272,26,0],[273,9,273,10,0],[277,9,277,10,1],[278,20,278,53,1],[279,13,279,14,1],[280,24,280,72,1],[281,17,281,18,1],[282,28,282,55,1],[283,21,283,22,1],[284,32,284,61,1],[285,25,285,26,1],[286,29,286,43,1],[287,29,287,40,1],[288,29,288,45,1],[289,36,289,65,1],[290,29,290,30,1],[291,33,291,61,1],[291,63,291,85,1],[292,33,292,44,1],[293,33,293,63,1],[294,33,294,34,1],[295,37,295,75,1],[296,37,296,38,1],[297,41,297,67,1],[298,41,298,42,1],[299,45,299,68,1],[300,41,300,42,1],[301,37,301,38,1],[302,37,302,75,1],[303,37,303,38,1],[304,41,304,65,1],[305,37,305,38,1],[306,37,306,56,1],[307,37,307,38,1],[308,41,308,74,1],[309,37,309,38,1],[310,37,310,94,1],[311,37,311,38,1],[312,41,312,66,1],[313,37,313,38,1],[314,33,314,34,1],[316,29,316,30,1],[317,25,317,26,1],[318,21,318,22,1],[319,21,319,38,1],[320,21,320,43,1],[321,28,321,76,1],[322,21,322,22,1],[323,25,323,53,1],[327,9,327,10,1],[337,9,337,10,0],[338,13,338,34,0],[339,13,339,38,0],[340,9,340,10,0],[348,9,348,10,0],[350,10,350,115,0],[352,10,352,41,0],[354,13,354,33,0],[356,13,356,28,0],[358,13,358,27,0],[359,9,359,10,0],[369,9,369,10,0],[370,13,370,28,0],[370,29,370,67,0],[371,13,371,44,0],[371,45,371,115,0],[373,13,373,49,0],[374,13,374,32,0],[375,13,375,25,0],[376,9,376,10,0],[386,9,386,10,0],[387,13,387,28,0],[387,29,387,67,0],[388,13,388,49,0],[388,50,388,125,0],[390,13,390,69,0],[391,13,391,56,0],[392,13,392,25,0],[393,9,393,10,0],[404,9,404,10,0],[405,13,405,28,0],[405,29,405,67,0],[406,13,406,32,0],[406,33,406,75,0],[407,13,407,49,0],[407,50,407,125,0],[409,13,409,55,0],[410,13,410,31,0],[411,13,411,14,0],[412,17,412,41,0],[413,17,413,30,0],[415,13,415,49,0],[416,9,416,10,0],[427,9,427,10,0],[428,13,428,28,0],[428,29,428,67,0],[429,13,429,32,0],[429,33,429,75,0],[430,13,430,49,0],[430,50,430,125,0],[432,13,432,103,0],[433,13,433,36,0],[434,13,434,26,0],[435,9,435,10,0],[445,9,445,10,0],[446,13,446,28,0],[446,29,446,67,0],[447,13,447,49,0],[447,50,447,125,0],[449,13,449,69,0],[450,13,450,60,0],[451,13,451,25,0],[452,9,452,10,0],[463,9,463,10,0],[464,13,464,28,0],[464,29,464,67,0],[465,13,465,32,0],[465,33,465,75,0],[466,13,466,49,0],[466,50,466,125,0],[468,13,468,55,0],[469,13,469,31,0],[470,13,470,14,0],[471,17,471,62,0],[471,63,471,64,0],[472,17,472,30,0],[474,13,474,50,0],[475,9,475,10,0],[483,9,483,10,1],[484,13,484,38,1],[485,13,485,51,1],[486,17,486,30,0],[487,13,487,54,1],[488,13,488,109,1],[489,9,489,10,1],[499,9,499,10,1],[500,13,500,43,1],[500,44,500,57,0],[502,13,502,30,1],[503,13,503,82,1],[504,9,504,10,1],[515,9,515,10,0],[516,13,516,85,0],[517,9,517,10,0],[529,9,529,10,0],[531,13,531,61,0],[534,13,534,45,0],[535,13,535,14,0],[537,17,537,77,0],[540,17,540,24,0],[540,26,540,38,0],[540,39,540,41,0],[540,42,540,48,0],[541,17,541,18,0],[543,21,543,77,0],[544,21,544,57,0],[545,17,545,18,0],[546,13,546,14,0],[549,13,549,24,0],[550,9,550,10,0],[558,3,558,4,0],[559,4,561,74,0],[563,4,563,57,0],[563,57,563,120,0],[563,120,563,138,0],[563,138,563,192,0],[563,192,563,194,0],[563,4,563,194,0],[564,4,564,13,0],[565,3,565,4,0]]);
+    </script>
+  </body>
+</html>

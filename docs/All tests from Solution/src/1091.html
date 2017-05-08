@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Mvc\RenderRouteHandler.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Linq;
+using System.Text;
+using System.Web;
+using System.Web.Compilation;
+using System.Web.Mvc;
+using System.Web.Routing;
+using System.Web.SessionState;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Models;
+using Umbraco.Web.Models;
+using Umbraco.Web.Routing;
+using umbraco.cms.businesslogic.template;
+using System.Collections.Generic;
+
+namespace Umbraco.Web.Mvc
+{
+    public class RenderRouteHandler : IRouteHandler
+    {
+        // Define reserved dictionary keys for controller, action and area specified in route additional values data
+        private static class ReservedAdditionalKeys
+        {
+            internal const string Controller = &quot;c&quot;;
+            internal const string Action = &quot;a&quot;;
+            internal const string Area = &quot;ar&quot;;
+        }
+
+        public RenderRouteHandler(IControllerFactory controllerFactory)
+        {
+            if (controllerFactory == null) throw new ArgumentNullException(&quot;controllerFactory&quot;);
+            _controllerFactory = controllerFactory;
+        }
+
+        /// &lt;summary&gt;
+        /// Contructor generally used for unit testing
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;controllerFactory&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;umbracoContext&quot;&gt;&lt;/param&gt;
+        internal RenderRouteHandler(IControllerFactory controllerFactory, UmbracoContext umbracoContext)
+        {
+            if (controllerFactory == null) throw new ArgumentNullException(&quot;controllerFactory&quot;);
+            if (umbracoContext == null) throw new ArgumentNullException(&quot;umbracoContext&quot;);
+            _controllerFactory = controllerFactory;
+            _umbracoContext = umbracoContext;
+        }
+
+        private readonly IControllerFactory _controllerFactory;
+        private readonly UmbracoContext _umbracoContext;
+
+        /// &lt;summary&gt;
+        /// Returns the current UmbracoContext
+        /// &lt;/summary&gt;
+        public UmbracoContext UmbracoContext
+        {
+            get { return _umbracoContext ?? UmbracoContext.Current; }
+        }
+
+        #region IRouteHandler Members
+
+        /// &lt;summary&gt;
+        /// Assigns the correct controller based on the Umbraco request and returns a standard MvcHandler to prcess the response,
+        /// this also stores the render model into the data tokens for the current RouteData.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;requestContext&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IHttpHandler GetHttpHandler(RequestContext requestContext)
+        {
+            if (UmbracoContext == null)
+            {
+                throw new NullReferenceException(&quot;There is not current UmbracoContext, it must be initialized before the RenderRouteHandler executes&quot;);
+            }
+            var docRequest = UmbracoContext.PublishedContentRequest;
+            if (docRequest == null)
+            {
+                throw new NullReferenceException(&quot;There is not current PublishedContentRequest, it must be initialized before the RenderRouteHandler executes&quot;);
+            }
+
+            SetupRouteDataForRequest(
+                new RenderModel(docRequest.PublishedContent, docRequest.Culture),
+                requestContext,
+                docRequest);
+
+            return GetHandlerForRoute(requestContext, docRequest);
+
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Ensures that all of the correct DataTokens are added to the route values which are all required for rendering front-end umbraco views
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;renderModel&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;requestContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;docRequest&quot;&gt;&lt;/param&gt;
+        internal void SetupRouteDataForRequest(RenderModel renderModel, RequestContext requestContext, PublishedContentRequest docRequest)
+        {
+            //put essential data into the data tokens, the &#39;umbraco&#39; key is required to be there for the view engine
+            requestContext.RouteData.DataTokens.Add(Core.Constants.Web.UmbracoDataToken, renderModel); //required for the RenderModelBinder and view engine
+            requestContext.RouteData.DataTokens.Add(Core.Constants.Web.PublishedDocumentRequestDataToken, docRequest); //required for RenderMvcController
+            requestContext.RouteData.DataTokens.Add(Core.Constants.Web.UmbracoContextDataToken, UmbracoContext); //required for UmbracoTemplatePage
+        }
+
+        private void UpdateRouteDataForRequest(RenderModel renderModel, RequestContext requestContext)
+        {
+            if (renderModel == null) throw new ArgumentNullException(&quot;renderModel&quot;);
+            if (requestContext == null) throw new ArgumentNullException(&quot;requestContext&quot;);
+
+            requestContext.RouteData.DataTokens[Core.Constants.Web.UmbracoDataToken] = renderModel;
+            // the rest should not change -- it&#39;s only the published content that has changed
+        }
+
+        /// &lt;summary&gt;
+        /// Checks the request and query strings to see if it matches the definition of having a Surface controller
+        /// posted/get value, if so, then we return a PostedDataProxyInfo object with the correct information.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;requestContext&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static PostedDataProxyInfo GetFormInfo(RequestContext requestContext)
+        {
+            if (requestContext == null) throw new ArgumentNullException(&quot;requestContext&quot;);
+
+            //if it is a POST/GET then a value must be in the request
+            if (requestContext.HttpContext.Request.QueryString[&quot;ufprt&quot;].IsNullOrWhiteSpace()
+                &amp;&amp; requestContext.HttpContext.Request.Form[&quot;ufprt&quot;].IsNullOrWhiteSpace())
+            {
+                return null;
+            }
+
+            string encodedVal;
+
+            switch (requestContext.HttpContext.Request.RequestType)
+            {
+                case &quot;POST&quot;:
+                    //get the value from the request.
+                    //this field will contain an encrypted version of the surface route vals.
+                    encodedVal = requestContext.HttpContext.Request.Form[&quot;ufprt&quot;];
+                    break;
+                case &quot;GET&quot;:
+                    //this field will contain an encrypted version of the surface route vals.
+                    encodedVal = requestContext.HttpContext.Request.QueryString[&quot;ufprt&quot;];
+                    break;
+                default:
+                    return null;
+            }
+
+
+            string decryptedString;
+            try
+            {
+                decryptedString = encodedVal.DecryptWithMachineKey();
+            }
+            catch (FormatException)
+            {
+                LogHelper.Warn&lt;RenderRouteHandler&gt;(&quot;A value was detected in the ufprt parameter but Umbraco could not decrypt the string&quot;);
+                return null;
+            }
+
+            var parsedQueryString = HttpUtility.ParseQueryString(decryptedString);
+            var decodedParts = new Dictionary&lt;string, string&gt;();
+
+            foreach (var key in parsedQueryString.AllKeys)
+            {
+                decodedParts[key] = parsedQueryString[key];
+            }
+
+            //validate all required keys exist
+
+            //the controller
+            if (decodedParts.All(x =&gt; x.Key != ReservedAdditionalKeys.Controller))
+                return null;
+            //the action
+            if (decodedParts.All(x =&gt; x.Key != ReservedAdditionalKeys.Action))
+                return null;
+            //the area
+            if (decodedParts.All(x =&gt; x.Key != ReservedAdditionalKeys.Area))
+                return null;
+
+            foreach (var item in decodedParts.Where(x =&gt; new[] { 
+			    ReservedAdditionalKeys.Controller, 
+			    ReservedAdditionalKeys.Action, 
+			    ReservedAdditionalKeys.Area }.Contains(x.Key) == false))
+            {
+                // Populate route with additional values which aren&#39;t reserved values so they eventually to action parameters
+                requestContext.RouteData.Values[item.Key] = item.Value;
+            }
+
+            //return the proxy info without the surface id... could be a local controller.
+            return new PostedDataProxyInfo
+            {
+                ControllerName = HttpUtility.UrlDecode(decodedParts.Single(x =&gt; x.Key == ReservedAdditionalKeys.Controller).Value),
+                ActionName = HttpUtility.UrlDecode(decodedParts.Single(x =&gt; x.Key == ReservedAdditionalKeys.Action).Value),
+                Area = HttpUtility.UrlDecode(decodedParts.Single(x =&gt; x.Key == ReservedAdditionalKeys.Area).Value),
+            };
+        }
+
+        /// &lt;summary&gt;
+        /// Handles a posted form to an Umbraco Url and ensures the correct controller is routed to and that
+        /// the right DataTokens are set.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;requestContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;postedInfo&quot;&gt;&lt;/param&gt;
+        internal static IHttpHandler HandlePostedValues(RequestContext requestContext, PostedDataProxyInfo postedInfo)
+        {
+            if (requestContext == null) throw new ArgumentNullException(&quot;requestContext&quot;);
+            if (postedInfo == null) throw new ArgumentNullException(&quot;postedInfo&quot;);
+
+            //set the standard route values/tokens
+            requestContext.RouteData.Values[&quot;controller&quot;] = postedInfo.ControllerName;
+            requestContext.RouteData.Values[&quot;action&quot;] = postedInfo.ActionName;
+
+            IHttpHandler handler;
+
+            //get the route from the defined routes
+            using (RouteTable.Routes.GetReadLock())
+            {
+                Route surfaceRoute;
+                if (postedInfo.Area.IsNullOrWhiteSpace())
+                {
+                    //find the controller in the route table without an area
+                    var surfaceRoutes = RouteTable.Routes.OfType&lt;Route&gt;()
+                                                  .Where(x =&gt; x.Defaults != null &amp;&amp;
+                                                              x.Defaults.ContainsKey(&quot;controller&quot;) &amp;&amp;
+                                                              x.Defaults[&quot;controller&quot;].ToString().InvariantEquals(postedInfo.ControllerName) &amp;&amp;
+                                                              x.DataTokens.ContainsKey(&quot;area&quot;) == false).ToList();
+
+                    // If more than one route is found, find one with a matching action
+                    if (surfaceRoutes.Count() &gt; 1)
+                    {
+                        surfaceRoute = surfaceRoutes.FirstOrDefault(x =&gt;
+                            x.Defaults[&quot;action&quot;] != null &amp;&amp;
+                            x.Defaults[&quot;action&quot;].ToString().InvariantEquals(postedInfo.ActionName));
+                    }
+                    else
+                    {
+                        surfaceRoute = surfaceRoutes.SingleOrDefault();
+                    }
+
+                }
+                else
+                {
+                    //find the controller in the route table with the specified area
+                    surfaceRoute = RouteTable.Routes.OfType&lt;Route&gt;()
+                                             .SingleOrDefault(x =&gt; x.Defaults != null &amp;&amp;
+                                                                   x.Defaults.ContainsKey(&quot;controller&quot;) &amp;&amp;
+                                                                   x.Defaults[&quot;controller&quot;].ToString().InvariantEquals(postedInfo.ControllerName) &amp;&amp;
+                                                                   x.DataTokens.ContainsKey(&quot;area&quot;) &amp;&amp;
+                                                                   x.DataTokens[&quot;area&quot;].ToString().InvariantEquals(postedInfo.Area));
+                }
+
+                if (surfaceRoute == null)
+                    throw new InvalidOperationException(&quot;Could not find a Surface controller route in the RouteTable for controller name &quot; + postedInfo.ControllerName);
+
+                //set the area if one is there.
+                if (surfaceRoute.DataTokens.ContainsKey(&quot;area&quot;))
+                {
+                    requestContext.RouteData.DataTokens[&quot;area&quot;] = surfaceRoute.DataTokens[&quot;area&quot;];
+                }
+
+                //set the &#39;Namespaces&#39; token so the controller factory knows where to look to construct it
+                if (surfaceRoute.DataTokens.ContainsKey(&quot;Namespaces&quot;))
+                {
+                    requestContext.RouteData.DataTokens[&quot;Namespaces&quot;] = surfaceRoute.DataTokens[&quot;Namespaces&quot;];
+                }
+                handler = surfaceRoute.RouteHandler.GetHttpHandler(requestContext);
+
+            }
+
+            return handler;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a RouteDefinition object based on the current renderModel
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;requestContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;publishedContentRequest&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal virtual RouteDefinition GetUmbracoRouteDefinition(RequestContext requestContext, PublishedContentRequest publishedContentRequest)
+        {
+            if (requestContext == null) throw new ArgumentNullException(&quot;requestContext&quot;);
+            if (publishedContentRequest == null) throw new ArgumentNullException(&quot;publishedContentRequest&quot;);
+
+            var defaultControllerType = DefaultRenderMvcControllerResolver.Current.GetDefaultControllerType();
+            var defaultControllerName = ControllerExtensions.GetControllerName(defaultControllerType);
+            //creates the default route definition which maps to the &#39;UmbracoController&#39; controller
+            var def = new RouteDefinition
+                {
+                    ControllerName = defaultControllerName,
+                    ControllerType = defaultControllerType,
+                    PublishedContentRequest = publishedContentRequest,
+                    ActionName = ((Route)requestContext.RouteData.Route).Defaults[&quot;action&quot;].ToString(),
+                    HasHijackedRoute = false
+                };
+
+            //check that a template is defined), if it doesn&#39;t and there is a hijacked route it will just route
+            // to the index Action
+            if (publishedContentRequest.HasTemplate)
+            {
+                //the template Alias should always be already saved with a safe name.
+                //if there are hyphens in the name and there is a hijacked route, then the Action will need to be attributed
+                // with the action name attribute.
+                var templateName = publishedContentRequest.TemplateAlias.Split(&#39;.&#39;)[0].ToSafeAlias();
+                def.ActionName = templateName;
+            }
+
+            //check if there&#39;s a custom controller assigned, base on the document type alias.
+            var controllerType = _controllerFactory.GetControllerTypeInternal(requestContext, publishedContentRequest.PublishedContent.DocumentTypeAlias);
+
+            //check if that controller exists
+            if (controllerType != null)
+            {
+                //ensure the controller is of type IRenderMvcController and ControllerBase
+                if (TypeHelper.IsTypeAssignableFrom&lt;IRenderController&gt;(controllerType)
+                    &amp;&amp; TypeHelper.IsTypeAssignableFrom&lt;ControllerBase&gt;(controllerType))
+                {
+                    //set the controller and name to the custom one
+                    def.ControllerType = controllerType;
+                    def.ControllerName = ControllerExtensions.GetControllerName(controllerType);
+                    if (def.ControllerName != defaultControllerName)
+                    {
+                        def.HasHijackedRoute = true;
+                    }
+                }
+                else
+                {
+                    LogHelper.Warn&lt;RenderRouteHandler&gt;(
+                        &quot;The current Document Type {0} matches a locally declared controller of type {1}. Custom Controllers for Umbraco routing must implement &#39;{2}&#39; and inherit from &#39;{3}&#39;.&quot;,
+                        () =&gt; publishedContentRequest.PublishedContent.DocumentTypeAlias,
+                        () =&gt; controllerType.FullName,
+                        () =&gt; typeof(IRenderController).FullName,
+                        () =&gt; typeof(ControllerBase).FullName);
+
+                    //we cannot route to this custom controller since it is not of the correct type so we&#39;ll continue with the defaults
+                    // that have already been set above.
+                }
+            }
+
+            //store the route definition
+            requestContext.RouteData.DataTokens[Umbraco.Core.Constants.Web.UmbracoRouteDefinitionDataToken] = def;
+
+            return def;
+        }
+
+        internal IHttpHandler GetHandlerOnMissingTemplate(PublishedContentRequest pcr)
+        {
+            if (pcr == null) throw new ArgumentNullException(&quot;pcr&quot;);
+
+            // missing template, so we&#39;re in a 404 here
+            // so the content, if any, is a custom 404 page of some sort
+
+            if (!pcr.HasPublishedContent)
+                // means the builder could not find a proper document to handle 404
+                return new PublishedContentNotFoundHandler();
+
+            if (!pcr.HasTemplate)
+                // means the engine could find a proper document, but the document has no template
+                // at that point there isn&#39;t much we can do and there is no point returning
+                // to Mvc since Mvc can&#39;t do much
+                return new PublishedContentNotFoundHandler(&quot;In addition, no template exists to render the custom 404.&quot;);
+
+            // so we have a template, so we should have a rendering engine
+            if (pcr.RenderingEngine == RenderingEngine.WebForms) // back to webforms ?                
+                return GetWebFormsHandler();
+            
+            if (pcr.RenderingEngine != RenderingEngine.Mvc) // else ?
+                return new PublishedContentNotFoundHandler(&quot;In addition, no rendering engine exists to render the custom 404.&quot;);
+
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// this will determine the controller and set the values in the route data
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;requestContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;publishedContentRequest&quot;&gt;&lt;/param&gt;
+        internal IHttpHandler GetHandlerForRoute(RequestContext requestContext, PublishedContentRequest publishedContentRequest)
+        {
+            if (requestContext == null) throw new ArgumentNullException(&quot;requestContext&quot;);
+            if (publishedContentRequest == null) throw new ArgumentNullException(&quot;publishedContentRequest&quot;);
+
+            var routeDef = GetUmbracoRouteDefinition(requestContext, publishedContentRequest);
+
+            //Need to check for a special case if there is form data being posted back to an Umbraco URL
+            var postedInfo = GetFormInfo(requestContext);
+            if (postedInfo != null)
+            {
+                return HandlePostedValues(requestContext, postedInfo);
+            }
+
+            //Now we can check if we are supposed to render WebForms when the route has not been hijacked
+            if (publishedContentRequest.RenderingEngine == RenderingEngine.WebForms 
+                &amp;&amp; publishedContentRequest.HasTemplate 
+                &amp;&amp; routeDef.HasHijackedRoute == false)
+            {
+                return GetWebFormsHandler();
+            }
+
+            //here we need to check if there is no hijacked route and no template assigned, if this is the case
+            //we want to return a blank page, but we&#39;ll leave that up to the NoTemplateHandler.
+            if (!publishedContentRequest.HasTemplate &amp;&amp; !routeDef.HasHijackedRoute)
+            {
+                publishedContentRequest.UpdateOnMissingTemplate(); // will go 404
+
+                // HandleHttpResponseStatus returns a value indicating that the request should
+                // not be processed any further, eg because it has been redirect. then, exit.
+                if (UmbracoModule.HandleHttpResponseStatus(requestContext.HttpContext, publishedContentRequest))
+                    return null;
+
+                var handler = GetHandlerOnMissingTemplate(publishedContentRequest);
+
+                // if it&#39;s not null it can be either the PublishedContentNotFoundHandler (no document was
+                // found to handle 404, or document with no template was found) or the WebForms handler 
+                // (a document was found and its template is WebForms)
+
+                // if it&#39;s null it means that a document was found and its template is Mvc
+
+                // if we have a handler, return now
+                if (handler != null)
+                    return handler;
+
+                // else we are running Mvc
+                // update the route data - because the PublishedContent has changed
+                UpdateRouteDataForRequest(
+                    new RenderModel(publishedContentRequest.PublishedContent, publishedContentRequest.Culture),
+                    requestContext);
+                // update the route definition
+                routeDef = GetUmbracoRouteDefinition(requestContext, publishedContentRequest);
+            }
+
+            //no post values, just route to the controller/action requried (local)
+
+            requestContext.RouteData.Values[&quot;controller&quot;] = routeDef.ControllerName;
+            if (!string.IsNullOrWhiteSpace(routeDef.ActionName))
+            {
+                requestContext.RouteData.Values[&quot;action&quot;] = routeDef.ActionName;
+            }
+
+            // Set the session state requirements
+            requestContext.HttpContext.SetSessionStateBehavior(GetSessionStateBehavior(requestContext, routeDef.ControllerName));
+
+            // reset the friendly path so in the controllers and anything occuring after this point in time,
+            //the URL is reset back to the original request.
+            requestContext.HttpContext.RewritePath(UmbracoContext.OriginalRequestUrl.PathAndQuery);
+
+            return new UmbracoMvcHandler(requestContext);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the handler for webforms requests
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static IHttpHandler GetWebFormsHandler()
+        {
+            return (global::umbraco.UmbracoDefault)BuildManager.CreateInstanceFromVirtualPath(&quot;~/default.aspx&quot;, typeof(global::umbraco.UmbracoDefault));
+        }
+
+        private SessionStateBehavior GetSessionStateBehavior(RequestContext requestContext, string controllerName)
+        {
+            return _controllerFactory.GetControllerSessionBehavior(requestContext, controllerName);
+        }
+
+        
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[30,9,30,72,1],[31,9,31,10,1],[32,13,32,43,1],[32,44,32,97,0],[33,13,33,52,1],[34,9,34,10,1],[41,9,41,105,1],[42,9,42,10,1],[43,13,43,43,1],[43,44,43,97,0],[44,13,44,40,1],[44,41,44,91,0],[45,13,45,52,1],[46,13,46,46,1],[47,9,47,10,1],[57,17,57,18,1],[57,19,57,68,1],[57,69,57,70,1],[69,9,69,10,0],[70,13,70,40,0],[71,13,71,14,0],[72,17,72,152,0],[74,13,74,69,0],[75,13,75,36,0],[76,13,76,14,0],[77,17,77,161,0],[80,13,83,29,0],[85,13,85,67,0],[87,9,87,10,0],[98,9,98,10,0],[100,13,100,103,0],[101,13,101,119,0],[102,13,102,113,0],[103,9,103,10,0],[106,9,106,10,0],[107,13,107,37,0],[107,38,107,85,0],[108,13,108,40,0],[108,41,108,91,0],[110,13,110,100,0],[112,9,112,10,0],[121,9,121,10,1],[122,13,122,40,1],[122,41,122,91,0],[125,13,126,90,1],[127,13,127,14,1],[128,17,128,29,1],[133,13,133,68,0],[138,21,138,83,0],[139,21,139,27,0],[142,21,142,90,0],[143,21,143,27,0],[145,21,145,33,0],[151,13,151,14,0],[152,17,152,70,0],[153,13,153,14,0],[154,13,154,36,0],[155,13,155,14,0],[156,17,156,140,0],[157,17,157,29,0],[160,13,160,83,0],[161,13,161,65,0],[163,13,163,20,0],[163,22,163,29,0],[163,30,163,32,0],[163,33,163,58,0],[164,13,164,14,0],[165,17,165,60,0],[166,13,166,14,0],[171,13,171,39,0],[171,39,171,81,0],[171,81,171,83,0],[171,13,171,83,0],[172,17,172,29,0],[174,13,174,39,0],[174,39,174,77,0],[174,77,174,79,0],[174,13,174,79,0],[175,17,175,29,0],[177,13,177,39,0],[177,39,177,75,0],[177,75,177,77,0],[177,13,177,77,0],[178,17,178,29,0],[180,13,180,20,0],[180,22,180,30,0],[180,31,180,33,0],[180,34,180,58,0],[180,58,183,62,0],[183,62,183,63,0],[180,34,183,63,0],[184,13,184,14,0],[186,17,186,72,0],[187,13,187,14,0],[190,13,192,81,0],[192,81,192,123,0],[192,123,193,77,0],[193,77,193,115,0],[193,115,194,71,0],[194,71,194,107,0],[194,107,195,15,0],[190,13,195,15,0],[196,9,196,10,1],[205,9,205,10,0],[206,13,206,40,0],[206,41,206,91,0],[207,13,207,36,0],[207,37,207,83,0],[210,13,210,87,0],[211,13,211,79,0],[216,13,216,52,0],[217,13,217,14,0],[219,17,219,58,0],[220,17,220,18,0],[222,21,223,63,0],[223,63,226,104,0],[226,104,226,115,0],[222,21,226,115,0],[229,21,229,51,0],[230,21,230,22,0],[231,25,232,29,0],[232,29,233,99,0],[233,99,233,101,0],[231,25,233,101,0],[234,21,234,22,0],[236,21,236,22,0],[237,25,237,72,0],[238,21,238,22,0],[240,17,240,18,0],[242,17,242,18,0],[244,21,245,68,0],[245,68,249,132,0],[249,132,249,134,0],[244,21,249,134,0],[250,17,250,18,0],[252,17,252,42,0],[253,21,253,169,0],[256,17,256,65,0],[257,17,257,18,0],[258,21,258,99,0],[259,17,259,18,0],[262,17,262,71,0],[263,17,263,18,0],[264,21,264,111,0],[265,17,265,18,0],[266,17,266,84,0],[268,13,268,14,0],[270,13,270,28,0],[271,9,271,10,0],[280,9,280,10,1],[281,13,281,40,1],[281,41,281,91,0],[282,13,282,49,1],[282,50,282,109,0],[284,13,284,111,1],[285,13,285,103,1],[287,13,294,19,1],[298,13,298,53,1],[299,13,299,14,1],[303,17,303,102,1],[304,17,304,47,1],[305,13,305,14,1],[308,13,308,155,1],[311,13,311,40,1],[312,13,312,14,1],[314,17,315,88,1],[316,17,316,18,1],[318,21,318,57,1],[319,21,319,97,1],[320,21,320,69,1],[321,21,321,22,1],[322,25,322,53,1],[323,21,323,22,1],[324,17,324,18,1],[326,17,326,18,0],[327,21,329,31,0],[329,31,329,89,0],[329,89,330,31,0],[330,31,330,54,0],[330,54,331,31,0],[331,31,331,65,0],[331,65,332,31,0],[332,31,332,62,0],[332,62,332,64,0],[327,21,332,64,0],[336,17,336,18,0],[337,13,337,14,1],[340,13,340,115,1],[342,13,342,24,1],[343,9,343,10,1],[346,9,346,10,0],[347,13,347,29,0],[347,30,347,69,0],[352,13,352,42,0],[354,17,354,62,0],[356,13,356,34,0],[360,17,360,121,0],[363,13,363,65,0],[364,17,364,45,0],[366,13,366,60,0],[367,17,367,129,0],[369,13,369,25,0],[370,9,370,10,0],[378,9,378,10,1],[379,13,379,40,1],[379,41,379,91,0],[380,13,380,49,1],[380,50,380,109,0],[382,13,382,95,1],[385,13,385,58,1],[386,13,386,36,1],[387,13,387,14,0],[388,17,388,71,0],[392,13,394,55,1],[395,13,395,14,0],[396,17,396,45,0],[401,13,401,84,1],[402,13,402,14,0],[403,17,403,67,0],[407,17,407,113,0],[408,21,408,33,0],[410,17,410,84,0],[419,17,419,37,0],[420,21,420,36,0],[424,17,426,37,0],[428,17,428,95,0],[429,13,429,14,0],[433,13,433,85,1],[434,13,434,65,1],[435,13,435,14,1],[436,17,436,81,1],[437,13,437,14,1],[440,13,440,130,1],[444,13,444,100,1],[446,13,446,58,1],[447,9,447,10,1],[454,9,454,10,0],[455,13,455,153,0],[456,9,456,10,0],[459,9,459,10,1],[460,13,460,100,1],[461,9,461,10,1]]);
+    </script>
+  </body>
+</html>

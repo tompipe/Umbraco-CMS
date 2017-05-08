@@ -1,0 +1,907 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Scheduling\BackgroundTaskRunnerTests.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using NUnit.Framework;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Web.Scheduling;
+
+namespace Umbraco.Tests.Scheduling
+{
+    [TestFixture]
+    [Timeout(30000)]
+    public class BackgroundTaskRunnerTests
+    {
+        ILogger _logger; 
+
+        [TestFixtureSetUp]
+        public void InitializeFixture()
+        {
+            _logger = new DebugDiagnosticsLogger();
+        }
+
+        [Test]
+        public async void ShutdownWhenRunningWithWait()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                var stopped = false;
+                runner.Stopped += (sender, args) =&gt; { stopped = true; };
+
+                Assert.IsFalse(runner.IsRunning); // because AutoStart is false
+                runner.Add(new MyTask(5000));
+                Assert.IsTrue(runner.IsRunning); // is running the task
+
+                runner.Shutdown(false, true); // -force +wait
+
+                // all this before we await because +wait
+                Assert.IsTrue(runner.IsCompleted); // shutdown completes the runner
+                Assert.IsFalse(runner.IsRunning); // no more running tasks
+                Assert.IsTrue(stopped);
+
+                await runner.StoppedAwaitable; // runner stops, within test&#39;s timeout
+            }
+        }
+
+        [Test]
+        public async void ShutdownWhenRunningWithoutWait()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                var stopped = false;
+                runner.Stopped += (sender, args) =&gt; { stopped = true; };
+
+                Assert.IsFalse(runner.IsRunning); // because AutoStart is false
+                runner.Add(new MyTask(5000));
+                Assert.IsTrue(runner.IsRunning); // is running the task
+
+                runner.Shutdown(false, false); // -force +wait
+
+                // all this before we await because -wait
+                Assert.IsTrue(runner.IsCompleted); // shutdown completes the runner
+                Assert.IsTrue(runner.IsRunning); // still running the task
+                Assert.IsFalse(stopped);
+
+                await runner.StoppedAwaitable; // runner stops, within test&#39;s timeout
+
+                // and then...
+                Assert.IsFalse(runner.IsRunning); // no more running tasks
+                Assert.IsTrue(stopped);
+            }
+        }
+
+        [Test]
+        public async void ShutdownCompletesTheRunner()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                Assert.IsFalse(runner.IsRunning); // because AutoStart is false
+
+                // shutdown -force =&gt; run all queued tasks
+                runner.Shutdown(false, false); // -force -wait
+                await runner.StoppedAwaitable; // runner stops, within test&#39;s timeout
+
+                Assert.IsFalse(runner.IsRunning); // still not running anything
+                Assert.IsTrue(runner.IsCompleted); // shutdown completes the runner
+
+                // cannot add tasks to it anymore
+                Assert.IsFalse(runner.TryAdd(new MyTask()));
+                Assert.Throws&lt;InvalidOperationException&gt;(() =&gt;
+                {
+                    runner.Add(new MyTask());
+                });
+            } 
+        }
+
+        [Test]
+        public async void ShutdownFlushesTheQueue()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                MyTask t;
+
+                Assert.IsFalse(runner.IsRunning); // because AutoStart is false
+                runner.Add(new MyTask(5000));
+                runner.Add(new MyTask());
+                runner.Add(t = new MyTask());
+                Assert.IsTrue(runner.IsRunning); // is running tasks
+
+                // shutdown -force =&gt; run all queued tasks
+                runner.Shutdown(false, false); // -force -wait
+                Assert.IsTrue(runner.IsRunning); // is running tasks
+                await runner.StoppedAwaitable; // runner stops, within test&#39;s timeout
+
+                Assert.AreNotEqual(DateTime.MinValue, t.Ended); // t has run
+            }
+        }
+
+        [Test]
+        public async void ShutdownForceTruncatesTheQueue()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                MyTask t;
+
+                Assert.IsFalse(runner.IsRunning); // because AutoStart is false
+                runner.Add(new MyTask(5000));
+                runner.Add(new MyTask());
+                runner.Add(t = new MyTask());
+                Assert.IsTrue(runner.IsRunning); // is running tasks
+
+                // shutdown +force =&gt; tries to cancel the current task, ignores queued tasks
+                runner.Shutdown(true, false); // +force -wait
+                Assert.IsTrue(runner.IsRunning); // is running that long task it cannot cancel
+                await runner.StoppedAwaitable; // runner stops, within test&#39;s timeout
+
+                Assert.AreEqual(DateTime.MinValue, t.Ended); // t has *not* run
+            }
+        }
+
+        [Test]
+        public async void ShutdownThenForce()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+
+                Assert.IsFalse(runner.IsRunning); // because AutoStart is false
+                runner.Add(new MyTask(5000));
+                runner.Add(new MyTask());
+                runner.Add(new MyTask());
+                Assert.IsTrue(runner.IsRunning); // is running tasks
+
+                // shutdown -force =&gt; run all queued tasks
+                runner.Shutdown(false, false); // -force -wait
+
+                Assert.IsTrue(runner.IsCompleted); // shutdown completes the runner
+                Assert.IsTrue(runner.IsRunning); // still running a task
+                Thread.Sleep(3000);
+                Assert.IsTrue(runner.IsRunning); // still running a task
+
+                // shutdown +force =&gt; tries to cancel the current task, ignores queued tasks
+                runner.Shutdown(true, false); // +force -wait
+                await runner.StoppedAwaitable; // runner stops, within test&#39;s timeout
+            }
+        }
+
+
+        [Test]
+        public async void HostingStopNonImmediate()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                MyTask t;
+
+                var stopped = false;
+                runner.Stopped += (sender, args) =&gt; { stopped = true; };
+                var terminating = false;
+                runner.Terminating += (sender, args) =&gt; { terminating = true; };
+                var terminated = false;
+                runner.Terminated += (sender, args) =&gt; { terminated = true; };
+
+                Assert.IsFalse(runner.IsRunning); // because AutoStart is false
+                runner.Add(new MyTask(5000));
+                runner.Add(new MyTask());
+                runner.Add(t = new MyTask());
+                Assert.IsTrue(runner.IsRunning); // is running the task
+
+                runner.Stop(false); // -immediate = -force, -wait
+                Assert.IsTrue(terminating); // has raised that event
+                Assert.IsFalse(terminated); // but not terminated yet
+
+                // all this before we await because -wait
+                Assert.IsTrue(runner.IsCompleted); // shutdown completes the runner
+                Assert.IsTrue(runner.IsRunning); // still running the task
+
+                await runner.StoppedAwaitable; // runner stops, within test&#39;s timeout
+                Assert.IsFalse(runner.IsRunning);
+                Assert.IsTrue(stopped);
+
+                await runner.TerminatedAwaitable; // runner terminates, within test&#39;s timeout
+                Assert.IsTrue(terminated); // has raised that event
+
+                Assert.AreNotEqual(DateTime.MinValue, t.Ended); // t has run
+            }
+        }
+
+        [Test]
+        public async void HostingStopImmediate()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                MyTask t;
+
+                var stopped = false;
+                runner.Stopped += (sender, args) =&gt; { stopped = true; };
+                var terminating = false;
+                runner.Terminating += (sender, args) =&gt; { terminating = true; };
+                var terminated = false;
+                runner.Terminated += (sender, args) =&gt; { terminated = true; };
+
+                Assert.IsFalse(runner.IsRunning); // because AutoStart is false
+                runner.Add(new MyTask(5000));
+                runner.Add(new MyTask());
+                runner.Add(t = new MyTask());
+                Assert.IsTrue(runner.IsRunning); // is running the task
+
+                runner.Stop(true); // +immediate = +force, +wait
+                Assert.IsTrue(terminating); // has raised that event
+                Assert.IsTrue(terminated); // and that event
+                Assert.IsTrue(stopped); // and that one
+
+                // and all this before we await because +wait
+                Assert.IsTrue(runner.IsCompleted); // shutdown completes the runner
+                Assert.IsFalse(runner.IsRunning); // done running
+
+                await runner.StoppedAwaitable; // runner stops, within test&#39;s timeout
+                await runner.TerminatedAwaitable; // runner terminates, within test&#39;s timeout
+
+                Assert.AreEqual(DateTime.MinValue, t.Ended); // t has *not* run
+            }
+        }
+
+        
+        [Test]
+        public void Create_IsNotRunning()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                Assert.IsFalse(runner.IsRunning);
+            }
+        }
+
+        
+        [Test]
+        public async void Create_AutoStart_IsRunning()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions
+            {
+                AutoStart = true
+            }, _logger))
+            {
+                Assert.IsTrue(runner.IsRunning); // because AutoStart is true
+                await runner.StoppedAwaitable; // runner stops, within test&#39;s timeout
+            }
+        }
+
+        [Test]
+        public void Create_AutoStartAndKeepAlive_IsRunning()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions { AutoStart = true, KeepAlive = true }, _logger))
+            {
+                Assert.IsTrue(runner.IsRunning); // because AutoStart is true
+                Thread.Sleep(800); // for long
+                Assert.IsTrue(runner.IsRunning);
+                // dispose will stop it
+            }
+        }
+
+        [Test]
+        public async void Dispose_IsRunning()
+        {
+            BackgroundTaskRunner&lt;IBackgroundTask&gt; runner;
+            using (runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions { AutoStart = true, KeepAlive = true }, _logger))
+            {
+                Assert.IsTrue(runner.IsRunning);
+                // dispose will stop it
+            }
+
+            await runner.StoppedAwaitable; // runner stops, within test&#39;s timeout
+            //await runner.TerminatedAwaitable; // NO! see note below
+            Assert.Throws&lt;InvalidOperationException&gt;(() =&gt; runner.Add(new MyTask()));
+
+            // but do NOT await on TerminatedAwaitable - disposing just shuts the runner down
+            // so that we don&#39;t have a runaway task in tests, etc - but it does NOT terminate
+            // the runner - it really is NOT a nice way to end a runner - it&#39;s there for tests
+        }
+      
+        [Test]
+        public void Startup_KeepAlive_IsRunning()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions { KeepAlive = true }, _logger))
+            {
+                Assert.IsFalse(runner.IsRunning);
+                runner.StartUp();
+                Assert.IsTrue(runner.IsRunning);
+                // dispose will stop it
+            }
+        }
+
+        [Test]
+        public async void Create_AddTask_IsRunning()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;BaseTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                var waitHandle = new ManualResetEvent(false);
+                runner.TaskCompleted += (sender, args) =&gt;
+                {
+                    waitHandle.Set();
+                };
+                runner.Add(new MyTask());
+                Assert.IsTrue(runner.IsRunning);
+                waitHandle.WaitOne();
+                await runner.StoppedAwaitable; //since we are not being kept alive, it will quit
+                Assert.IsFalse(runner.IsRunning);
+            }
+        }
+
+        [Test]
+        public void Create_KeepAliveAndAddTask_IsRunning()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;BaseTask&gt;(new BackgroundTaskRunnerOptions { KeepAlive = true }, _logger))
+            {
+                var waitHandle = new ManualResetEvent(false);
+                runner.TaskCompleted += (sender, args) =&gt;
+                {
+                    Assert.IsTrue(sender.IsRunning);
+                    waitHandle.Set();
+                };
+                runner.Add(new MyTask());
+                waitHandle.WaitOne();
+                Thread.Sleep(1000); // we are waiting a second just to prove that it&#39;s still running and hasn&#39;t been shut off
+                Assert.IsTrue(runner.IsRunning);
+            }
+        }
+
+        [Test]
+        public async void WaitOnRunner_OneTask()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;BaseTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                var task = new MyTask();
+                Assert.IsTrue(task.Ended == default(DateTime));
+                runner.Add(task);
+                await runner.CurrentThreadingTask;   // wait for the Task operation to complete
+                Assert.IsTrue(task.Ended != default(DateTime)); // task is done
+                await runner.StoppedAwaitable;               // wait for the entire runner operation to complete
+            }
+        }
+
+        
+        [Test]
+        public async void WaitOnRunner_Tasks()
+        {
+            var tasks = new List&lt;BaseTask&gt;();
+            for (var i = 0; i &lt; 10; i++)
+                tasks.Add(new MyTask());
+
+            using (var runner = new BackgroundTaskRunner&lt;BaseTask&gt;(new BackgroundTaskRunnerOptions { KeepAlive = false, LongRunning = true, PreserveRunningTask = true }, _logger))
+            {
+                tasks.ForEach(runner.Add);
+
+                await runner.StoppedAwaitable; // wait for the entire runner operation to complete
+
+                // check that tasks are done
+                Assert.IsTrue(tasks.All(x =&gt; x.Ended != default(DateTime)));
+
+                Assert.AreEqual(TaskStatus.RanToCompletion, runner.CurrentThreadingTask.Status);
+                Assert.IsFalse(runner.IsRunning);
+                Assert.IsFalse(runner.IsDisposed);
+            }
+        }
+
+        [Test]
+        public async void WaitOnTask()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;BaseTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                var task = new MyTask();
+                var waitHandle = new ManualResetEvent(false);
+                runner.TaskCompleted += (sender, t) =&gt; waitHandle.Set();
+                Assert.IsTrue(task.Ended == default(DateTime));
+                runner.Add(task);
+                waitHandle.WaitOne(); // wait &#39;til task is done
+                Assert.IsTrue(task.Ended != default(DateTime)); // task is done
+                await runner.StoppedAwaitable; // wait for the entire runner operation to complete
+            }
+        }
+
+        [Test]
+        public async void WaitOnTasks()
+        {
+            var tasks = new Dictionary&lt;BaseTask, ManualResetEvent&gt;();
+            for (var i = 0; i &lt; 10; i++)
+                tasks.Add(new MyTask(), new ManualResetEvent(false));
+
+            using (var runner = new BackgroundTaskRunner&lt;BaseTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                runner.TaskCompleted += (sender, task) =&gt; tasks[task.Task].Set();
+                foreach (var t in tasks) runner.Add(t.Key);
+
+                // wait &#39;til tasks are done, check that tasks are done
+                WaitHandle.WaitAll(tasks.Values.Select(x =&gt; (WaitHandle)x).ToArray());
+                Assert.IsTrue(tasks.All(x =&gt; x.Key.Ended != default(DateTime)));
+
+                await runner.StoppedAwaitable; // wait for the entire runner operation to complete
+            }
+        }
+
+        [Test]
+        public void Tasks_Can_Keep_Being_Added_And_Will_Execute()
+        {
+            Func&lt;Dictionary&lt;BaseTask, ManualResetEvent&gt;&gt; getTasks = () =&gt;
+            {
+                var newTasks = new Dictionary&lt;BaseTask, ManualResetEvent&gt;();
+                for (var i = 0; i &lt; 10; i++)
+                {
+                    newTasks.Add(new MyTask(), new ManualResetEvent(false));
+                }
+                return newTasks;
+            };
+
+            IDictionary&lt;BaseTask, ManualResetEvent&gt; tasks = getTasks();
+
+            BackgroundTaskRunner&lt;BaseTask&gt; tManager;
+            using (tManager = new BackgroundTaskRunner&lt;BaseTask&gt;(new BackgroundTaskRunnerOptions { LongRunning = true, KeepAlive = true }, _logger))
+            {
+                tManager.TaskCompleted += (sender, task) =&gt; tasks[task.Task].Set();
+
+                //execute first batch
+                tasks.ForEach(t =&gt; tManager.Add(t.Key));
+
+                //wait for all ITasks to complete
+                WaitHandle.WaitAll(tasks.Values.Select(x =&gt; (WaitHandle)x).ToArray());
+
+                foreach (var task in tasks)
+                {
+                    Assert.IsTrue(task.Key.Ended != default(DateTime));
+                }
+
+                //execute another batch after a bit
+                Thread.Sleep(2000);
+
+                tasks = getTasks();
+                tasks.ForEach(t =&gt; tManager.Add(t.Key));
+
+                //wait for all ITasks to complete
+                WaitHandle.WaitAll(tasks.Values.Select(x =&gt; (WaitHandle)x).ToArray());
+
+                foreach (var task in tasks)
+                {
+                    Assert.IsTrue(task.Key.Ended != default(DateTime));
+                }
+            }
+        }
+
+        [Test]
+        public async void Non_Persistent_Runner_Will_Start_New_Threads_When_Required()
+        {
+            Func&lt;List&lt;BaseTask&gt;&gt; getTasks = () =&gt;
+            {
+                var newTasks = new List&lt;BaseTask&gt;();
+                for (var i = 0; i &lt; 10; i++)
+                {
+                    newTasks.Add(new MyTask());
+                }
+                return newTasks;
+            };
+
+            List&lt;BaseTask&gt; tasks = getTasks();
+
+            using (var tManager = new BackgroundTaskRunner&lt;BaseTask&gt;(new BackgroundTaskRunnerOptions { LongRunning = true, PreserveRunningTask = true }, _logger))
+            {
+                tasks.ForEach(tManager.Add);
+
+                //wait till the thread is done
+                await tManager.CurrentThreadingTask;
+
+                Assert.AreEqual(TaskStatus.RanToCompletion, tManager.CurrentThreadingTask.Status);
+                Assert.IsFalse(tManager.IsRunning);
+                Assert.IsFalse(tManager.IsDisposed);
+
+                foreach (var task in tasks)
+                {
+                    Assert.IsTrue(task.Ended != default(DateTime));
+                }
+
+                //create more tasks
+                tasks = getTasks();
+
+                //add more tasks
+                tasks.ForEach(tManager.Add);
+
+                //wait till the thread is done
+                await tManager.CurrentThreadingTask;
+      
+                foreach (var task in tasks)
+                {
+                    Assert.IsTrue(task.Ended != default(DateTime));
+                }
+
+                Assert.AreEqual(TaskStatus.RanToCompletion, tManager.CurrentThreadingTask.Status);
+                Assert.IsFalse(tManager.IsRunning);
+                Assert.IsFalse(tManager.IsDisposed);
+            }
+        }
+
+        
+        [Test]
+        public void RecurringTaskTest()
+        {
+            var runCount = 0;
+            var waitHandle = new ManualResetEvent(false);
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                runner.TaskCompleted += (sender, args) =&gt;
+                {
+                    runCount++;
+                    if (runCount &gt; 3)
+                        waitHandle.Set();
+                };
+
+                var task = new MyRecurringTask(runner, 200, 500);
+                
+                runner.Add(task);
+
+                Assert.IsTrue(runner.IsRunning); // waiting on delay
+                Assert.AreEqual(0, runCount);
+
+                waitHandle.WaitOne();
+
+                Assert.GreaterOrEqual(runCount, 4);
+
+                // stops recurring
+                runner.Shutdown(false, true);
+
+                // check that task has been disposed (timer has been killed, etc)
+                Assert.IsTrue(task.IsDisposed);
+            }
+        }
+
+        [Test]
+        public async void DelayedTaskRuns()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                var task = new MyDelayedTask(200, false);
+                runner.Add(task);
+                Assert.IsTrue(runner.IsRunning);
+                Thread.Sleep(5000);
+                Assert.IsTrue(runner.IsRunning); // still waiting for the task to release
+                Assert.IsFalse(task.HasRun);
+                task.Release();
+                await runner.CurrentThreadingTask; //wait for current task to complete
+                Assert.IsTrue(task.HasRun);
+                await runner.StoppedAwaitable; // wait for the entire runner operation to complete
+            }
+        }
+
+        [Test]
+        public async void DelayedTaskStops()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                var task = new MyDelayedTask(200, true);
+                runner.Add(task);
+                Assert.IsTrue(runner.IsRunning);
+                Thread.Sleep(5000);
+                Assert.IsTrue(runner.IsRunning); // still waiting for the task to release               
+                Assert.IsFalse(task.HasRun);
+                runner.Shutdown(false, false);
+                await runner.StoppedAwaitable; // wait for the entire runner operation to complete
+                Assert.IsTrue(task.HasRun);
+            }
+        }
+
+        
+        [Test]
+        public void DelayedRecurring()
+        {
+            var runCount = 0;
+            var waitHandle = new ManualResetEvent(false);
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                runner.TaskCompleted += (sender, args) =&gt;
+                {
+                    runCount++;
+                    if (runCount &gt; 3)
+                        waitHandle.Set();
+
+                };
+
+                var task = new MyDelayedRecurringTask(runner, 2000, 1000);
+                runner.Add(task);
+                Assert.IsTrue(runner.IsRunning); // waiting on delay
+                Assert.AreEqual(0, runCount);
+
+                waitHandle.WaitOne();
+                Assert.GreaterOrEqual(runCount, 4);
+                Assert.IsTrue(task.HasRun);
+
+                // stops recurring
+                runner.Shutdown(false, false);
+            }
+        }
+
+        [Test]
+        public async void FailingTaskSync()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                var exceptions = new ConcurrentQueue&lt;Exception&gt;();
+                runner.TaskError += (sender, args) =&gt; exceptions.Enqueue(args.Exception);
+
+                var task = new MyFailingTask(false, true, false); // -async, +running, -disposing
+                runner.Add(task);
+                Assert.IsTrue(runner.IsRunning);
+                await runner.StoppedAwaitable; // wait for the entire runner operation to complete
+
+                Assert.AreEqual(1, exceptions.Count); // traced and reported
+            }
+        }
+
+        [Test]
+        public async void FailingTaskDisposing()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                var exceptions = new ConcurrentQueue&lt;Exception&gt;();
+                runner.TaskError += (sender, args) =&gt; exceptions.Enqueue(args.Exception);
+
+                var task = new MyFailingTask(false, false, true); // -async, -running, +disposing
+                runner.Add(task);
+                Assert.IsTrue(runner.IsRunning);
+                await runner.StoppedAwaitable; // wait for the entire runner operation to complete
+
+                Assert.AreEqual(1, exceptions.Count); // traced and reported
+            }
+        }
+
+        [Test]
+        public async void FailingTaskAsync()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                var exceptions = new ConcurrentQueue&lt;Exception&gt;();
+                runner.TaskError += (sender, args) =&gt; exceptions.Enqueue(args.Exception);
+
+                var task = new MyFailingTask(true, true, false); // +async, +running, -disposing
+                runner.Add(task);
+                Assert.IsTrue(runner.IsRunning);
+                await runner.StoppedAwaitable; // wait for the entire runner operation to complete
+
+                Assert.AreEqual(1, exceptions.Count); // traced and reported
+            }
+        }
+
+        [Test]
+        public async void FailingTaskDisposingAsync()
+        {
+            using (var runner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(new BackgroundTaskRunnerOptions(), _logger))
+            {
+                var exceptions = new ConcurrentQueue&lt;Exception&gt;();
+                runner.TaskError += (sender, args) =&gt; exceptions.Enqueue(args.Exception);
+
+                var task = new MyFailingTask(false, false, true); // -async, -running, +disposing
+                runner.Add(task);
+                Assert.IsTrue(runner.IsRunning);
+                await runner.StoppedAwaitable; // wait for the entire runner operation to complete
+
+                Assert.AreEqual(1, exceptions.Count); // traced and reported
+            }
+        }
+
+        private class MyFailingTask : IBackgroundTask
+        {
+            private readonly bool _isAsync;
+            private readonly bool _running;
+            private readonly bool _disposing;
+
+            public MyFailingTask(bool isAsync, bool running, bool disposing)
+            {
+                _isAsync = isAsync;
+                _running = running;
+                _disposing = disposing;
+            }
+
+            public void Run()
+            {
+                Thread.Sleep(1000);
+                if (_running)
+                    throw new Exception(&quot;Task has thrown.&quot;);
+            }
+
+            public async Task RunAsync(CancellationToken token)
+            {
+                await Task.Delay(1000);
+                if (_running)
+                    throw new Exception(&quot;Task has thrown.&quot;);
+            }
+
+            public bool IsAsync
+            {
+                get { return _isAsync; }
+            }
+
+            public void Dispose()
+            {
+                if (_disposing)
+                    throw new Exception(&quot;Task has thrown.&quot;);
+            }
+        }
+
+        private class MyDelayedRecurringTask : RecurringTaskBase
+        {
+            public bool HasRun { get; private set; }
+
+            public MyDelayedRecurringTask(IBackgroundTaskRunner&lt;RecurringTaskBase&gt; runner, int delayMilliseconds, int periodMilliseconds)
+                : base(runner, delayMilliseconds, periodMilliseconds)
+            { }
+
+            public override bool IsAsync
+            {
+                get { return false; }
+            }
+
+            public override bool PerformRun()
+            {
+                HasRun = true;
+                return true; // repeat
+            }
+
+            public override Task&lt;bool&gt; PerformRunAsync(CancellationToken token)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override bool RunsOnShutdown { get { return true; } }
+        }
+
+        private class MyDelayedTask : ILatchedBackgroundTask
+        {
+            private readonly int _runMilliseconds;
+            private readonly ManualResetEventSlim _gate;
+
+            public bool HasRun { get; private set; }
+
+            public MyDelayedTask(int runMilliseconds, bool runsOnShutdown)
+            {
+                _runMilliseconds = runMilliseconds;
+                _gate = new ManualResetEventSlim(false);
+                RunsOnShutdown = runsOnShutdown;
+            }
+
+            public WaitHandle Latch
+            {
+                get { return _gate.WaitHandle; }
+            }
+
+            public bool IsLatched
+            {
+                get { return _gate.IsSet == false; }
+            }
+
+            public bool RunsOnShutdown { get; private set; }
+
+            public void Run()
+            {
+                Thread.Sleep(_runMilliseconds);
+                HasRun = true;
+            }
+
+            public void Release()
+            {
+                _gate.Set();
+            }
+
+            public Task RunAsync(CancellationToken token)
+            {
+                throw new NotImplementedException();
+            }
+
+            public bool IsAsync
+            {
+                get { return false; }
+            }
+
+            public void Dispose()
+            { }
+        }
+
+        private class MyRecurringTask : RecurringTaskBase
+        {
+            private readonly int _runMilliseconds;
+
+            public MyRecurringTask(IBackgroundTaskRunner&lt;RecurringTaskBase&gt; runner, int runMilliseconds, int periodMilliseconds)
+                : base(runner, 0, periodMilliseconds)
+            {
+                _runMilliseconds = runMilliseconds;
+            }
+
+            public override bool PerformRun()
+            {                
+                Thread.Sleep(_runMilliseconds);
+                return true; // repeat
+            }
+
+            public override Task&lt;bool&gt; PerformRunAsync(CancellationToken token)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override bool IsAsync
+            {
+                get { return false; }
+            }
+
+            public override bool RunsOnShutdown { get { return false; } }
+        }
+
+        private class MyTask : BaseTask
+        {
+            private readonly int _milliseconds;
+
+            public MyTask()
+                : this(500)
+            { }
+
+            public MyTask(int milliseconds)
+            {
+                _milliseconds = milliseconds;
+            }
+
+            public override void PerformRun()
+            {
+                Thread.Sleep(_milliseconds);
+            }
+        }
+
+        public abstract class BaseTask : IBackgroundTask
+        {
+            public bool WasCancelled { get; set; }
+
+            public Guid UniqueId { get; protected set; }
+
+            public abstract void PerformRun();
+
+            public void Run()
+            {
+                PerformRun();
+                Ended = DateTime.Now;
+            }
+
+            public Task RunAsync(CancellationToken token)
+            {
+                throw new NotImplementedException();
+                //return Task.Delay(500); 
+            }
+
+            public bool IsAsync
+            {
+                get { return false; }
+            }
+
+            public virtual void Cancel()
+            {
+                WasCancelled = true;
+            }
+
+            public DateTime Queued { get; set; }
+            public DateTime Started { get; set; }
+            public DateTime Ended { get; set; }
+
+            public virtual void Dispose()
+            { }
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[23,9,23,10,1],[24,13,24,52,1],[25,9,25,10,1],[29,9,29,10,1],[30,20,30,118,1],[31,13,31,14,1],[32,17,32,37,1],[33,17,33,53,1],[33,53,33,54,1],[33,54,33,55,1],[33,55,33,70,1],[33,70,33,71,1],[33,71,33,72,1],[33,72,33,73,1],[33,17,33,73,1],[35,17,35,50,1],[36,17,36,46,1],[37,17,37,49,1],[39,17,39,46,1],[42,17,42,51,1],[43,17,43,50,1],[44,17,44,40,1],[46,17,46,47,1],[47,13,47,14,1],[48,9,48,10,1],[52,9,52,10,1],[53,20,53,118,1],[54,13,54,14,1],[55,17,55,37,1],[56,17,56,53,1],[56,53,56,54,1],[56,54,56,55,1],[56,55,56,70,1],[56,70,56,71,1],[56,71,56,72,1],[56,72,56,73,1],[56,17,56,73,1],[58,17,58,50,1],[59,17,59,46,1],[60,17,60,49,1],[62,17,62,47,1],[65,17,65,51,1],[66,17,66,49,1],[67,17,67,41,1],[69,17,69,47,1],[72,17,72,50,1],[73,17,73,40,1],[74,13,74,14,1],[75,9,75,10,1],[79,9,79,10,1],[80,20,80,118,1],[81,13,81,14,1],[82,17,82,50,1],[85,17,85,47,1],[86,17,86,47,1],[88,17,88,50,1],[89,17,89,51,1],[92,17,92,61,1],[93,17,94,17,1],[94,17,94,18,1],[94,18,95,21,1],[95,21,95,46,1],[95,46,96,17,1],[96,17,96,18,0],[96,18,96,20,1],[93,17,96,20,1],[97,13,97,14,1],[98,9,98,10,1],[102,9,102,10,1],[103,20,103,118,1],[104,13,104,14,1],[107,17,107,50,1],[108,17,108,46,1],[109,17,109,42,1],[110,17,110,46,1],[111,17,111,49,1],[114,17,114,47,1],[115,17,115,49,1],[116,17,116,47,1],[118,17,118,64,1],[119,13,119,14,1],[120,9,120,10,1],[124,9,124,10,1],[125,20,125,118,1],[126,13,126,14,1],[129,17,129,50,1],[130,17,130,46,1],[131,17,131,42,1],[132,17,132,46,1],[133,17,133,49,1],[136,17,136,46,1],[137,17,137,49,1],[138,17,138,47,1],[140,17,140,61,1],[141,13,141,14,1],[142,9,142,10,1],[146,9,146,10,1],[147,20,147,118,1],[148,13,148,14,1],[150,17,150,50,1],[151,17,151,46,1],[152,17,152,42,1],[153,17,153,42,1],[154,17,154,49,1],[157,17,157,47,1],[159,17,159,51,1],[160,17,160,49,1],[161,17,161,36,1],[162,17,162,49,1],[165,17,165,46,1],[166,17,166,47,1],[167,13,167,14,1],[168,9,168,10,1],[173,9,173,10,1],[174,20,174,118,1],[175,13,175,14,1],[178,17,178,37,1],[179,17,179,53,1],[179,53,179,54,1],[179,54,179,55,1],[179,55,179,70,1],[179,70,179,71,1],[179,71,179,72,1],[179,72,179,73,1],[179,17,179,73,1],[180,17,180,41,1],[181,17,181,57,1],[181,57,181,58,1],[181,58,181,59,1],[181,59,181,78,1],[181,78,181,79,1],[181,79,181,80,1],[181,80,181,81,1],[181,17,181,81,1],[182,17,182,40,1],[183,17,183,56,1],[183,56,183,57,1],[183,57,183,58,1],[183,58,183,76,1],[183,76,183,77,1],[183,77,183,78,1],[183,78,183,79,1],[183,17,183,79,1],[185,17,185,50,1],[186,17,186,46,1],[187,17,187,42,1],[188,17,188,46,1],[189,17,189,49,1],[191,17,191,36,1],[192,17,192,44,1],[193,17,193,44,1],[196,17,196,51,1],[197,17,197,49,1],[199,17,199,47,1],[200,17,200,50,1],[201,17,201,40,1],[203,17,203,50,1],[204,17,204,43,1],[206,17,206,64,1],[207,13,207,14,1],[208,9,208,10,1],[212,9,212,10,1],[213,20,213,118,1],[214,13,214,14,1],[217,17,217,37,1],[218,17,218,53,1],[218,53,218,54,1],[218,54,218,55,1],[218,55,218,70,1],[218,70,218,71,1],[218,71,218,72,1],[218,72,218,73,1],[218,17,218,73,1],[219,17,219,41,1],[220,17,220,57,1],[220,57,220,58,1],[220,58,220,59,1],[220,59,220,78,1],[220,78,220,79,1],[220,79,220,80,1],[220,80,220,81,1],[220,17,220,81,1],[221,17,221,40,1],[222,17,222,56,1],[222,56,222,57,1],[222,57,222,58,1],[222,58,222,76,1],[222,76,222,77,1],[222,77,222,78,1],[222,78,222,79,1],[222,17,222,79,1],[224,17,224,50,1],[225,17,225,46,1],[226,17,226,42,1],[227,17,227,46,1],[228,17,228,49,1],[230,17,230,35,1],[231,17,231,44,1],[232,17,232,43,1],[233,17,233,40,1],[236,17,236,51,1],[237,17,237,50,1],[239,17,239,47,1],[240,17,240,50,1],[242,17,242,61,1],[243,13,243,14,1],[244,9,244,10,1],[249,9,249,10,1],[250,20,250,118,1],[251,13,251,14,1],[252,17,252,50,1],[253,13,253,14,1],[254,9,254,10,1],[259,9,259,10,1],[260,20,263,24,1],[264,13,264,14,1],[265,17,265,49,1],[266,17,266,47,1],[267,13,267,14,1],[268,9,268,10,1],[272,9,272,10,1],[273,20,273,155,1],[274,13,274,14,1],[275,17,275,49,1],[276,17,276,35,1],[277,17,277,49,1],[279,13,279,14,1],[280,9,280,10,1],[284,9,284,10,1],[286,13,286,152,1],[287,13,287,14,1],[288,17,288,49,1],[290,13,290,14,1],[292,13,292,43,1],[294,13,294,60,1],[294,60,294,84,1],[294,84,294,86,1],[294,13,294,86,1],[299,9,299,10,1],[303,9,303,10,1],[304,20,304,137,1],[305,13,305,14,1],[306,17,306,50,1],[307,17,307,34,1],[308,17,308,49,1],[310,13,310,14,1],[311,9,311,10,1],[315,9,315,10,1],[316,20,316,111,1],[317,13,317,14,1],[318,17,318,62,1],[319,17,320,17,1],[320,17,320,18,1],[320,18,321,21,1],[321,21,321,38,1],[321,38,322,17,1],[322,17,322,18,1],[322,18,322,19,1],[319,17,322,19,1],[323,17,323,42,1],[324,17,324,49,1],[325,17,325,38,1],[326,17,326,47,1],[327,17,327,50,1],[328,13,328,14,1],[329,9,329,10,1],[333,9,333,10,1],[334,20,334,130,1],[335,13,335,14,1],[336,17,336,62,1],[337,17,338,17,1],[338,17,338,18,1],[338,18,339,21,1],[339,21,339,53,1],[339,53,340,21,1],[340,21,340,38,1],[340,38,341,17,1],[341,17,341,18,1],[341,18,341,19,1],[337,17,341,19,1],[342,17,342,42,1],[343,17,343,38,1],[344,17,344,36,1],[345,17,345,49,1],[346,13,346,14,1],[347,9,347,10,1],[351,9,351,10,1],[352,20,352,111,1],[353,13,353,14,1],[354,17,354,41,1],[355,17,355,64,1],[356,17,356,34,1],[357,17,357,51,1],[358,17,358,64,1],[359,17,359,47,1],[360,13,360,14,1],[361,9,361,10,1],[366,9,366,10,1],[367,13,367,46,1],[368,18,368,27,1],[368,29,368,35,1],[368,37,368,40,1],[369,17,369,41,1],[371,20,371,179,1],[372,13,372,14,1],[373,17,373,43,1],[375,17,375,47,1],[378,17,378,46,1],[378,46,378,74,1],[378,74,378,77,1],[378,17,378,77,1],[380,17,380,97,1],[381,17,381,50,1],[382,17,382,51,1],[383,13,383,14,1],[384,9,384,10,1],[388,9,388,10,1],[389,20,389,111,1],[390,13,390,14,1],[391,17,391,41,1],[392,17,392,62,1],[393,17,393,56,1],[393,56,393,72,1],[393,72,393,73,1],[393,17,393,73,1],[394,17,394,64,1],[395,17,395,34,1],[396,17,396,38,1],[397,17,397,64,1],[398,17,398,47,1],[399,13,399,14,1],[400,9,400,10,1],[404,9,404,10,1],[405,13,405,70,1],[406,18,406,27,1],[406,29,406,35,1],[406,37,406,40,1],[407,17,407,70,1],[409,20,409,111,1],[410,13,410,14,1],[411,17,411,59,1],[411,59,411,81,1],[411,81,411,82,1],[411,17,411,82,1],[412,17,412,24,1],[412,26,412,31,1],[412,32,412,34,1],[412,35,412,40,1],[412,42,412,60,1],[415,17,415,61,1],[415,61,415,74,1],[415,74,415,87,1],[415,17,415,87,1],[416,17,416,46,1],[416,46,416,78,1],[416,78,416,81,1],[416,17,416,81,1],[418,17,418,47,1],[419,13,419,14,1],[420,9,420,10,1],[424,9,424,10,1],[425,13,426,13,1],[426,13,426,14,1],[426,14,427,17,1],[427,17,427,77,1],[427,77,428,22,1],[428,22,428,31,1],[428,31,428,33,1],[428,33,428,39,1],[428,39,428,41,1],[428,41,428,44,1],[428,44,429,17,1],[429,17,429,18,1],[429,18,430,21,1],[430,21,430,77,1],[430,77,431,17,1],[431,17,431,18,1],[431,18,432,17,1],[432,17,432,33,1],[432,33,433,13,1],[433,13,433,14,1],[433,14,433,15,1],[425,13,433,15,1],[435,13,435,72,1],[438,13,438,149,1],[439,13,439,14,1],[440,17,440,61,1],[440,61,440,83,1],[440,83,440,84,1],[440,17,440,84,1],[443,17,443,36,1],[443,36,443,55,1],[443,55,443,57,1],[443,17,443,57,1],[446,17,446,61,1],[446,61,446,74,1],[446,74,446,87,1],[446,17,446,87,1],[448,17,448,24,1],[448,26,448,34,1],[448,35,448,37,1],[448,38,448,43,1],[449,17,449,18,1],[450,21,450,72,1],[451,17,451,18,1],[454,17,454,36,1],[456,17,456,36,1],[457,17,457,36,1],[457,36,457,55,1],[457,55,457,57,1],[457,17,457,57,1],[460,17,460,61,1],[460,61,460,74,1],[460,74,460,87,1],[460,17,460,87,1],[462,17,462,24,1],[462,26,462,34,1],[462,35,462,37,1],[462,38,462,43,1],[463,17,463,18,1],[464,21,464,72,1],[465,17,465,18,1],[466,13,466,14,1],[467,9,467,10,1],[471,9,471,10,1],[472,13,473,13,1],[473,13,473,14,1],[473,14,474,17,1],[474,17,474,53,1],[474,53,475,22,1],[475,22,475,31,1],[475,31,475,33,1],[475,33,475,39,1],[475,39,475,41,1],[475,41,475,44,1],[475,44,476,17,1],[476,17,476,18,1],[476,18,477,21,1],[477,21,477,48,1],[477,48,478,17,1],[478,17,478,18,1],[478,18,479,17,1],[479,17,479,33,1],[479,33,480,13,1],[480,13,480,14,1],[480,14,480,15,1],[472,13,480,15,1],[482,13,482,47,1],[484,20,484,162,1],[485,13,485,14,1],[486,17,486,45,1],[489,17,489,53,1],[491,17,491,99,1],[492,17,492,52,1],[493,17,493,53,1],[495,17,495,24,1],[495,26,495,34,1],[495,35,495,37,1],[495,38,495,43,1],[496,17,496,18,1],[497,21,497,68,1],[498,17,498,18,1],[501,17,501,36,1],[504,17,504,45,1],[507,17,507,53,1],[509,17,509,24,1],[509,26,509,34,1],[509,35,509,37,1],[509,38,509,43,1],[510,17,510,18,1],[511,21,511,68,1],[512,17,512,18,1],[514,17,514,99,1],[515,17,515,52,1],[516,17,516,53,1],[517,13,517,14,1],[518,9,518,10,1],[523,9,523,10,1],[524,13,524,30,1],[525,13,525,58,1],[526,20,526,118,1],[527,13,527,14,1],[528,17,529,17,1],[529,17,529,18,1],[529,18,530,21,1],[530,21,530,32,1],[530,32,531,21,1],[531,21,531,38,1],[531,38,532,25,1],[532,25,532,42,1],[532,42,533,17,1],[533,17,533,18,1],[533,18,533,19,1],[528,17,533,19,1],[535,17,535,66,1],[537,17,537,34,1],[539,17,539,49,1],[540,17,540,46,1],[542,17,542,38,1],[544,17,544,52,1],[547,17,547,46,1],[550,17,550,48,1],[551,13,551,14,1],[552,9,552,10,1],[556,9,556,10,1],[557,20,557,118,1],[558,13,558,14,1],[559,17,559,58,1],[560,17,560,34,1],[561,17,561,49,1],[562,17,562,36,1],[563,17,563,49,1],[564,17,564,45,1],[565,17,565,32,1],[566,17,566,51,1],[567,17,567,44,1],[568,17,568,47,1],[569,13,569,14,1],[570,9,570,10,1],[574,9,574,10,1],[575,20,575,118,1],[576,13,576,14,1],[577,17,577,57,1],[578,17,578,34,1],[579,17,579,49,1],[580,17,580,36,1],[581,17,581,49,1],[582,17,582,45,1],[583,17,583,47,1],[584,17,584,47,1],[585,17,585,44,1],[586,13,586,14,1],[587,9,587,10,1],[592,9,592,10,1],[593,13,593,30,1],[594,13,594,58,1],[595,20,595,118,1],[596,13,596,14,1],[597,17,598,17,1],[598,17,598,18,1],[598,18,599,21,1],[599,21,599,32,1],[599,32,600,21,1],[600,21,600,38,1],[600,38,601,25,1],[601,25,601,42,1],[601,42,603,17,1],[603,17,603,18,1],[603,18,603,19,1],[597,17,603,19,1],[605,17,605,75,1],[606,17,606,34,1],[607,17,607,49,1],[608,17,608,46,1],[610,17,610,38,1],[611,17,611,52,1],[612,17,612,44,1],[615,17,615,47,1],[616,13,616,14,1],[617,9,617,10,1],[621,9,621,10,1],[622,20,622,118,1],[623,13,623,14,1],[624,17,624,67,1],[625,17,625,55,1],[625,55,625,89,1],[625,89,625,90,1],[625,17,625,90,1],[627,17,627,66,1],[628,17,628,34,1],[629,17,629,49,1],[630,17,630,47,1],[632,17,632,54,1],[633,13,633,14,1],[634,9,634,10,1],[638,9,638,10,1],[639,20,639,118,1],[640,13,640,14,1],[641,17,641,67,1],[642,17,642,55,1],[642,55,642,89,1],[642,89,642,90,1],[642,17,642,90,1],[644,17,644,66,1],[645,17,645,34,1],[646,17,646,49,1],[647,17,647,47,1],[649,17,649,54,1],[650,13,650,14,1],[651,9,651,10,1],[655,9,655,10,1],[656,20,656,118,1],[657,13,657,14,1],[658,17,658,67,1],[659,17,659,55,1],[659,55,659,89,1],[659,89,659,90,1],[659,17,659,90,1],[661,17,661,65,1],[662,17,662,34,1],[663,17,663,49,1],[664,17,664,47,1],[666,17,666,54,1],[667,13,667,14,1],[668,9,668,10,1],[672,9,672,10,1],[673,20,673,118,1],[674,13,674,14,1],[675,17,675,67,1],[676,17,676,55,1],[676,55,676,89,1],[676,89,676,90,1],[676,17,676,90,1],[678,17,678,66,1],[679,17,679,34,1],[680,17,680,49,1],[681,17,681,47,1],[683,17,683,54,1],[684,13,684,14,1],[685,9,685,10,1],[693,13,693,77,1],[694,13,694,14,1],[695,17,695,36,1],[696,17,696,36,1],[697,17,697,40,1],[698,13,698,14,1],[701,13,701,14,1],[702,17,702,36,1],[703,17,703,30,1],[704,21,704,61,1],[705,13,705,14,1],[708,13,708,14,1],[709,17,709,40,1],[710,17,710,30,1],[711,21,711,61,1],[712,13,712,14,0],[716,21,716,22,1],[716,23,716,39,1],[716,40,716,41,1],[720,13,720,14,1],[721,17,721,32,1],[722,21,722,61,1],[723,13,723,14,1],[728,34,728,38,1],[728,39,728,51,1],[731,19,731,70,1],[732,13,732,14,1],[732,15,732,16,1],[736,21,736,22,1],[736,23,736,36,1],[736,37,736,38,1],[740,13,740,14,1],[741,17,741,31,1],[742,17,742,29,1],[743,13,743,14,1],[746,13,746,14,0],[747,17,747,53,0],[750,55,750,56,1],[750,57,750,69,1],[750,70,750,71,1],[758,34,758,38,1],[758,39,758,51,1],[760,13,760,75,1],[761,13,761,14,1],[762,17,762,52,1],[763,17,763,57,1],[764,17,764,49,1],[765,13,765,14,1],[769,21,769,22,1],[769,23,769,47,1],[769,48,769,49,1],[774,21,774,22,1],[774,23,774,51,1],[774,52,774,53,1],[777,42,777,46,1],[777,47,777,59,1],[780,13,780,14,1],[781,17,781,48,1],[782,17,782,31,1],[783,13,783,14,1],[786,13,786,14,1],[787,17,787,29,1],[788,13,788,14,1],[791,13,791,14,0],[792,17,792,53,0],[797,21,797,22,1],[797,23,797,36,1],[797,37,797,38,1],[801,13,801,14,1],[801,15,801,16,1],[809,19,809,54,1],[810,13,810,14,1],[811,17,811,52,1],[812,13,812,14,1],[815,13,815,14,1],[816,17,816,48,1],[817,17,817,29,1],[818,13,818,14,1],[821,13,821,14,0],[822,17,822,53,0],[827,21,827,22,1],[827,23,827,36,1],[827,37,827,38,1],[830,55,830,56,1],[830,57,830,70,1],[830,71,830,72,1],[838,19,838,28,1],[839,13,839,14,1],[839,15,839,16,1],[841,13,841,44,1],[842,13,842,14,1],[843,17,843,46,1],[844,13,844,14,1],[847,13,847,14,1],[848,17,848,45,1],[849,13,849,14,1],[854,40,854,44,0],[854,45,854,49,0],[856,36,856,40,0],[856,41,856,55,0],[861,13,861,14,1],[862,17,862,30,1],[863,17,863,38,1],[864,13,864,14,1],[867,13,867,14,0],[868,17,868,53,0],[874,21,874,22,1],[874,23,874,36,1],[874,37,874,38,1],[878,13,878,14,0],[879,17,879,37,0],[880,13,880,14,0],[882,38,882,42,0],[882,43,882,47,0],[883,39,883,43,0],[883,44,883,48,0],[884,37,884,41,1],[884,42,884,46,1],[887,13,887,14,1],[887,15,887,16,1]]);
+    </script>
+  </body>
+</html>

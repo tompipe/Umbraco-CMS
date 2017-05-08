@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Cache\CacheRefresherEventHandler.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using Umbraco.Core;
+using Umbraco.Core.Events;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Services;
+using umbraco.BusinessLogic;
+using umbraco.cms.businesslogic;
+using System.Linq;
+using umbraco.cms.businesslogic.web;
+using Umbraco.Core.Logging;
+using Umbraco.Core.ObjectResolution;
+using Umbraco.Core.Publishing;
+using Content = Umbraco.Core.Models.Content;
+using ApplicationTree = Umbraco.Core.Models.ApplicationTree;
+using DeleteEventArgs = umbraco.cms.businesslogic.DeleteEventArgs;
+
+namespace Umbraco.Web.Cache
+{
+    /// &lt;summary&gt;
+    /// Class which listens to events on business level objects in order to invalidate the cache amongst servers when data changes
+    /// &lt;/summary&gt;
+    [Weight(int.MinValue)]
+    public class CacheRefresherEventHandler : ApplicationEventHandler
+    {
+        protected override void ApplicationStarted(UmbracoApplicationBase umbracoApplication, ApplicationContext applicationContext)
+        {
+            LogHelper.Info&lt;CacheRefresherEventHandler&gt;(&quot;Initializing Umbraco internal event handlers for cache refreshing&quot;);
+
+            //bind to application tree events
+            ApplicationTreeService.Deleted += ApplicationTreeDeleted;
+            ApplicationTreeService.Updated += ApplicationTreeUpdated;
+            ApplicationTreeService.New += ApplicationTreeNew;
+
+            //bind to application events
+            SectionService.Deleted += ApplicationDeleted;
+            SectionService.New += ApplicationNew;
+
+            //bind to user / user type events
+            UserService.SavedUserType += UserServiceSavedUserType;
+            UserService.DeletedUserType += UserServiceDeletedUserType;
+            UserService.SavedUser += UserServiceSavedUser;
+            UserService.DeletedUser += UserServiceDeletedUser;
+
+            //Bind to dictionary events
+
+            LocalizationService.DeletedDictionaryItem += LocalizationServiceDeletedDictionaryItem;
+            LocalizationService.SavedDictionaryItem += LocalizationServiceSavedDictionaryItem;
+
+            //Bind to data type events
+            //NOTE: we need to bind to legacy and new API events currently: http://issues.umbraco.org/issue/U4-1979
+
+            DataTypeService.Deleted += DataTypeServiceDeleted;
+            DataTypeService.Saved += DataTypeServiceSaved;
+
+            //Bind to stylesheet events
+
+            FileService.SavedStylesheet += FileServiceSavedStylesheet;
+            FileService.DeletedStylesheet += FileServiceDeletedStylesheet;
+
+            //Bind to domain events
+
+            DomainService.Saved += DomainService_Saved;
+            DomainService.Deleted += DomainService_Deleted;
+
+            //Bind to language events
+
+            LocalizationService.SavedLanguage += LocalizationServiceSavedLanguage;
+            LocalizationService.DeletedLanguage += LocalizationServiceDeletedLanguage;
+
+            //Bind to content type events
+
+            ContentTypeService.SavedContentType += ContentTypeServiceSavedContentType;
+            ContentTypeService.SavedMediaType += ContentTypeServiceSavedMediaType;
+            ContentTypeService.DeletedContentType += ContentTypeServiceDeletedContentType;
+            ContentTypeService.DeletedMediaType += ContentTypeServiceDeletedMediaType;
+            MemberTypeService.Saved += MemberTypeServiceSaved;
+            MemberTypeService.Deleted += MemberTypeServiceDeleted;
+
+            //Bind to permission events
+
+            //TODO: Wrap legacy permissions so we can get rid of this
+            Permission.New += PermissionNew;
+            Permission.Updated += PermissionUpdated;
+            Permission.Deleted += PermissionDeleted;
+            PermissionRepository&lt;IContent&gt;.AssignedPermissions += CacheRefresherEventHandler_AssignedPermissions;
+
+            //Bind to template events
+
+            FileService.SavedTemplate += FileServiceSavedTemplate;
+            FileService.DeletedTemplate += FileServiceDeletedTemplate;
+
+            //Bind to macro events
+
+            MacroService.Saved += MacroServiceSaved;
+            MacroService.Deleted += MacroServiceDeleted;
+
+            //Bind to member events
+
+            MemberService.Saved += MemberServiceSaved;
+            MemberService.Deleted += MemberServiceDeleted;
+            MemberGroupService.Saved += MemberGroupService_Saved;
+            MemberGroupService.Deleted += MemberGroupService_Deleted;
+
+            //Bind to media events
+
+            MediaService.Saved += MediaServiceSaved;
+            MediaService.Deleted += MediaServiceDeleted;
+            MediaService.Moved += MediaServiceMoved;
+            MediaService.Trashed += MediaServiceTrashed;
+            MediaService.EmptiedRecycleBin += MediaServiceEmptiedRecycleBin;
+
+            //Bind to content events - this is for unpublished content syncing across servers (primarily for examine)
+
+            ContentService.Saved += ContentServiceSaved;
+            ContentService.Deleted += ContentServiceDeleted;
+            ContentService.Copied += ContentServiceCopied;
+            //TODO: The Move method of the content service fires Saved/Published events during its execution so we don&#39;t need to listen to moved
+            //ContentService.Moved += ContentServiceMoved;
+            ContentService.Trashed += ContentServiceTrashed;
+            ContentService.EmptiedRecycleBin += ContentServiceEmptiedRecycleBin;
+
+            PublishingStrategy.Published += PublishingStrategy_Published;
+            PublishingStrategy.UnPublished += PublishingStrategy_UnPublished;
+
+            //public access events
+            PublicAccessService.Saved += PublicAccessService_Saved;
+            PublicAccessService.Deleted += PublicAccessService_Deleted;
+
+            RelationService.SavedRelationType += RelationType_Saved;
+            RelationService.DeletedRelationType += RelationType_Deleted;
+        }
+
+        #region Publishing
+
+        void PublishingStrategy_UnPublished(IPublishingStrategy sender, PublishEventArgs&lt;IContent&gt; e)
+        {
+            if (e.PublishedEntities.Any())
+            {
+                if (e.PublishedEntities.Count() &gt; 1)
+                {
+                    foreach (var c in e.PublishedEntities)
+                    {
+                        UnPublishSingle(c);
+                    }
+                }
+                else
+                {
+                    var content = e.PublishedEntities.FirstOrDefault();
+                    UnPublishSingle(content);
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Refreshes the xml cache for a single node by removing it
+        /// &lt;/summary&gt;
+        private void UnPublishSingle(IContent content)
+        {
+            DistributedCache.Instance.RemovePageCache(content);
+        }
+
+        void PublishingStrategy_Published(IPublishingStrategy sender, PublishEventArgs&lt;IContent&gt; e)
+        {
+            if (e.PublishedEntities.Any())
+            {
+                if (e.IsAllRepublished)
+                {
+                    UpdateEntireCache();
+                    return;
+                }
+
+                if (e.PublishedEntities.Count() &gt; 1)
+                {
+                    UpdateMultipleContentCache(e.PublishedEntities);
+                }
+                else
+                {
+                    var content = e.PublishedEntities.FirstOrDefault();
+                    UpdateSingleContentCache(content);
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Refreshes the xml cache for all nodes
+        /// &lt;/summary&gt;
+        private void UpdateEntireCache()
+        {
+            DistributedCache.Instance.RefreshAllPageCache();
+        }
+
+        /// &lt;summary&gt;
+        /// Refreshes the xml cache for nodes in list
+        /// &lt;/summary&gt;
+        private void UpdateMultipleContentCache(IEnumerable&lt;IContent&gt; content)
+        {
+            DistributedCache.Instance.RefreshPageCache(content.ToArray());
+        }
+
+        /// &lt;summary&gt;
+        /// Refreshes the xml cache for a single node
+        /// &lt;/summary&gt;
+        private void UpdateSingleContentCache(IContent content)
+        {
+            DistributedCache.Instance.RefreshPageCache(content);
+        }
+
+        #endregion
+
+        #region Public access event handlers
+
+        static void PublicAccessService_Saved(IPublicAccessService sender, SaveEventArgs&lt;PublicAccessEntry&gt; e)
+        {
+            DistributedCache.Instance.RefreshPublicAccess();
+        }
+
+        private void PublicAccessService_Deleted(IPublicAccessService sender, DeleteEventArgs&lt;PublicAccessEntry&gt; e)
+        {
+            DistributedCache.Instance.RefreshPublicAccess();
+        }
+
+        #endregion
+
+        #region Content service event handlers
+
+        static void ContentServiceEmptiedRecycleBin(IContentService sender, RecycleBinEventArgs e)
+        {
+            if (e.RecycleBinEmptiedSuccessfully &amp;&amp; e.IsContentRecycleBin)
+            {
+                DistributedCache.Instance.RemoveUnpublishedCachePermanently(e.Ids.ToArray());
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Handles cache refreshing for when content is trashed
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// This is for the unpublished page refresher - the entity will be unpublished before being moved to the trash
+        /// and the unpublished event will take care of remove it from any published caches
+        /// &lt;/remarks&gt;
+        static void ContentServiceTrashed(IContentService sender, MoveEventArgs&lt;IContent&gt; e)
+        {
+            DistributedCache.Instance.RefreshUnpublishedPageCache(
+                e.MoveInfoCollection.Select(x =&gt; x.Entity).ToArray());
+        }
+
+        /// &lt;summary&gt;
+        /// Handles cache refreshing for when content is copied
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// When an entity is copied new permissions may be assigned to it based on it&#39;s parent, if that is the
+        /// case then we need to clear all user permissions cache.
+        /// &lt;/remarks&gt;
+        static void ContentServiceCopied(IContentService sender, CopyEventArgs&lt;IContent&gt; e)
+        {
+            //check if permissions have changed
+            var permissionsChanged = ((Content)e.Copy).WasPropertyDirty(&quot;PermissionsChanged&quot;);
+            if (permissionsChanged)
+            {
+                DistributedCache.Instance.RefreshAllUserPermissionsCache();
+            }
+
+            //run the un-published cache refresher since copied content is not published
+            DistributedCache.Instance.RefreshUnpublishedPageCache(e.Copy);
+        }
+
+        /// &lt;summary&gt;
+        /// Handles cache refreshing for when content is deleted (not unpublished)
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        static void ContentServiceDeleted(IContentService sender, DeleteEventArgs&lt;IContent&gt; e)
+        {
+            DistributedCache.Instance.RemoveUnpublishedPageCache(e.DeletedEntities.ToArray());
+        }
+
+        /// &lt;summary&gt;
+        /// Handles cache refreshing for when content is saved (not published)
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// When an entity is saved we need to notify other servers about the change in order for the Examine indexes to
+        /// stay up-to-date for unpublished content.
+        ///
+        /// When an entity is created new permissions may be assigned to it based on it&#39;s parent, if that is the
+        /// case then we need to clear all user permissions cache.
+        /// &lt;/remarks&gt;
+        static void ContentServiceSaved(IContentService sender, SaveEventArgs&lt;IContent&gt; e)
+        {
+            var clearUserPermissions = false;
+            e.SavedEntities.ForEach(x =&gt;
+            {
+                //check if it is new
+                if (x.IsNewEntity())
+                {
+                    //check if permissions have changed
+                    var permissionsChanged = ((Content)x).WasPropertyDirty(&quot;PermissionsChanged&quot;);
+                    if (permissionsChanged)
+                    {
+                        clearUserPermissions = true;
+                    }
+                }
+            });
+
+            if (clearUserPermissions)
+            {
+                DistributedCache.Instance.RefreshAllUserPermissionsCache();
+            }
+
+            //filter out the entities that have only been saved (not newly published) since
+            // newly published ones will be synced with the published page cache refresher
+            var unpublished = e.SavedEntities.Where(x =&gt; x.JustPublished() == false);
+            //run the un-published cache refresher
+            DistributedCache.Instance.RefreshUnpublishedPageCache(unpublished.ToArray());
+        }
+
+
+        #endregion
+
+        #region ApplicationTree event handlers
+        static void ApplicationTreeNew(ApplicationTree sender, EventArgs e)
+        {
+            DistributedCache.Instance.RefreshAllApplicationTreeCache();
+        }
+
+        static void ApplicationTreeUpdated(ApplicationTree sender, EventArgs e)
+        {
+            DistributedCache.Instance.RefreshAllApplicationTreeCache();
+        }
+
+        static void ApplicationTreeDeleted(ApplicationTree sender, EventArgs e)
+        {
+            DistributedCache.Instance.RefreshAllApplicationTreeCache();
+        }
+        #endregion
+
+        #region Application event handlers
+        static void ApplicationNew(Section sender, EventArgs e)
+        {
+            DistributedCache.Instance.RefreshAllApplicationCache();
+        }
+
+        static void ApplicationDeleted(Section sender, EventArgs e)
+        {
+            DistributedCache.Instance.RefreshAllApplicationCache();
+        }
+        #endregion
+
+        #region UserType event handlers
+        static void UserServiceDeletedUserType(IUserService sender, DeleteEventArgs&lt;IUserType&gt; e)
+        {
+            e.DeletedEntities.ForEach(x =&gt; DistributedCache.Instance.RemoveUserTypeCache(x.Id));
+        }
+
+        static void UserServiceSavedUserType(IUserService sender, SaveEventArgs&lt;IUserType&gt; e)
+        {
+            e.SavedEntities.ForEach(x =&gt; DistributedCache.Instance.RefreshUserTypeCache(x.Id));
+        }
+
+        #endregion
+
+        #region Dictionary event handlers
+
+        static void LocalizationServiceSavedDictionaryItem(ILocalizationService sender, SaveEventArgs&lt;IDictionaryItem&gt; e)
+        {
+            e.SavedEntities.ForEach(x =&gt; DistributedCache.Instance.RefreshDictionaryCache(x.Id));
+        }
+
+        static void LocalizationServiceDeletedDictionaryItem(ILocalizationService sender, DeleteEventArgs&lt;IDictionaryItem&gt; e)
+        {
+            e.DeletedEntities.ForEach(x =&gt; DistributedCache.Instance.RemoveDictionaryCache(x.Id));
+        }
+
+        #endregion
+
+        #region DataType event handlers
+        static void DataTypeServiceSaved(IDataTypeService sender, SaveEventArgs&lt;IDataTypeDefinition&gt; e)
+        {
+            e.SavedEntities.ForEach(x =&gt; DistributedCache.Instance.RefreshDataTypeCache(x));
+        }
+
+        static void DataTypeServiceDeleted(IDataTypeService sender, DeleteEventArgs&lt;IDataTypeDefinition&gt; e)
+        {
+            e.DeletedEntities.ForEach(x =&gt; DistributedCache.Instance.RemoveDataTypeCache(x));
+        }
+
+
+        #endregion
+
+        #region Stylesheet and stylesheet property event handlers
+
+        static void FileServiceDeletedStylesheet(IFileService sender, DeleteEventArgs&lt;Stylesheet&gt; e)
+        {
+            e.DeletedEntities.ForEach(x =&gt; DistributedCache.Instance.RemoveStylesheetCache(x));
+        }
+
+        static void FileServiceSavedStylesheet(IFileService sender, SaveEventArgs&lt;Stylesheet&gt; e)
+        {
+            e.SavedEntities.ForEach(x =&gt; DistributedCache.Instance.RefreshStylesheetCache(x));
+        }
+
+        #endregion
+
+        #region Domain event handlers
+
+        static void DomainService_Saved(IDomainService sender, SaveEventArgs&lt;IDomain&gt; e)
+        {
+            e.SavedEntities.ForEach(x =&gt; DistributedCache.Instance.RefreshDomainCache(x));
+        }
+
+        static void DomainService_Deleted(IDomainService sender, DeleteEventArgs&lt;IDomain&gt; e)
+        {
+            e.DeletedEntities.ForEach(x =&gt; DistributedCache.Instance.RemoveDomainCache(x));
+        }
+
+        #endregion
+
+        #region Language event handlers
+        /// &lt;summary&gt;
+        /// Fires when a langauge is deleted
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        static void LocalizationServiceDeletedLanguage(ILocalizationService sender, DeleteEventArgs&lt;ILanguage&gt; e)
+        {
+            e.DeletedEntities.ForEach(x =&gt; DistributedCache.Instance.RemoveLanguageCache(x));
+        }
+
+        /// &lt;summary&gt;
+        /// Fires when a langauge is saved
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        static void LocalizationServiceSavedLanguage(ILocalizationService sender, SaveEventArgs&lt;ILanguage&gt; e)
+        {
+            e.SavedEntities.ForEach(x =&gt; DistributedCache.Instance.RefreshLanguageCache(x));
+        }
+
+        #endregion
+
+        #region Content/media/member Type event handlers
+        /// &lt;summary&gt;
+        /// Fires when a media type is deleted
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        static void ContentTypeServiceDeletedMediaType(IContentTypeService sender, DeleteEventArgs&lt;IMediaType&gt; e)
+        {
+            e.DeletedEntities.ForEach(x =&gt; DistributedCache.Instance.RemoveMediaTypeCache(x));
+        }
+
+        /// &lt;summary&gt;
+        /// Fires when a content type is deleted
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        static void ContentTypeServiceDeletedContentType(IContentTypeService sender, DeleteEventArgs&lt;IContentType&gt; e)
+        {
+            e.DeletedEntities.ForEach(contentType =&gt; DistributedCache.Instance.RemoveContentTypeCache(contentType));
+        }
+
+        /// &lt;summary&gt;
+        /// Fires when a member type is deleted
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        static void MemberTypeServiceDeleted(IMemberTypeService sender, DeleteEventArgs&lt;IMemberType&gt; e)
+        {
+            e.DeletedEntities.ForEach(contentType =&gt; DistributedCache.Instance.RemoveMemberTypeCache(contentType));
+        }
+
+        /// &lt;summary&gt;
+        /// Fires when a media type is saved
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        static void ContentTypeServiceSavedMediaType(IContentTypeService sender, SaveEventArgs&lt;IMediaType&gt; e)
+        {
+            e.SavedEntities.ForEach(x =&gt; DistributedCache.Instance.RefreshMediaTypeCache(x));
+        }
+
+        /// &lt;summary&gt;
+        /// Fires when a content type is saved
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        static void ContentTypeServiceSavedContentType(IContentTypeService sender, SaveEventArgs&lt;IContentType&gt; e)
+        {
+            e.SavedEntities.ForEach(contentType =&gt; DistributedCache.Instance.RefreshContentTypeCache(contentType));
+        }
+
+        /// &lt;summary&gt;
+        /// Fires when a member type is saved
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        static void MemberTypeServiceSaved(IMemberTypeService sender, SaveEventArgs&lt;IMemberType&gt; e)
+        {
+            e.SavedEntities.ForEach(x =&gt; DistributedCache.Instance.RefreshMemberTypeCache(x));
+        }
+
+
+        #endregion
+
+        #region User/permissions event handlers
+
+        static void CacheRefresherEventHandler_AssignedPermissions(PermissionRepository&lt;IContent&gt; sender, SaveEventArgs&lt;EntityPermission&gt; e)
+        {
+            var userIds = e.SavedEntities.Select(x =&gt; x.UserId).Distinct();
+            userIds.ForEach(x =&gt; DistributedCache.Instance.RefreshUserPermissionsCache(x));
+        }
+
+        static void PermissionDeleted(UserPermission sender, DeleteEventArgs e)
+        {
+            InvalidateCacheForPermissionsChange(sender);
+        }
+
+        static void PermissionUpdated(UserPermission sender, SaveEventArgs e)
+        {
+            InvalidateCacheForPermissionsChange(sender);
+        }
+
+        static void PermissionNew(UserPermission sender, NewEventArgs e)
+        {
+            InvalidateCacheForPermissionsChange(sender);
+        }
+
+        static void UserServiceSavedUser(IUserService sender, SaveEventArgs&lt;IUser&gt; e)
+        {
+            e.SavedEntities.ForEach(x =&gt; DistributedCache.Instance.RefreshUserCache(x.Id));
+        }
+
+        static void UserServiceDeletedUser(IUserService sender, DeleteEventArgs&lt;IUser&gt; e)
+        {
+            e.DeletedEntities.ForEach(x =&gt; DistributedCache.Instance.RemoveUserCache(x.Id));
+        }
+
+        private static void InvalidateCacheForPermissionsChange(UserPermission sender)
+        {
+            if (sender.User != null)
+            {
+                DistributedCache.Instance.RefreshUserPermissionsCache(sender.User.Id);
+            }
+            else if (sender.UserId &gt; -1)
+            {
+                DistributedCache.Instance.RefreshUserPermissionsCache(sender.UserId);
+            }
+            else if (sender.NodeIds.Any())
+            {
+                DistributedCache.Instance.RefreshAllUserPermissionsCache();
+            }
+        }
+
+        #endregion
+
+        #region Template event handlers
+
+        /// &lt;summary&gt;
+        /// Removes cache for template
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        static void FileServiceDeletedTemplate(IFileService sender, DeleteEventArgs&lt;ITemplate&gt; e)
+        {
+            e.DeletedEntities.ForEach(x =&gt; DistributedCache.Instance.RemoveTemplateCache(x.Id));
+        }
+
+        /// &lt;summary&gt;
+        /// Refresh cache for template
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        static void FileServiceSavedTemplate(IFileService sender, SaveEventArgs&lt;ITemplate&gt; e)
+        {
+            e.SavedEntities.ForEach(x =&gt; DistributedCache.Instance.RefreshTemplateCache(x.Id));
+        }
+
+        #endregion
+
+        #region Macro event handlers
+
+        void MacroServiceDeleted(IMacroService sender, DeleteEventArgs&lt;IMacro&gt; e)
+        {
+            foreach (var entity in e.DeletedEntities)
+            {
+                DistributedCache.Instance.RemoveMacroCache(entity);
+            }
+        }
+
+        void MacroServiceSaved(IMacroService sender, SaveEventArgs&lt;IMacro&gt; e)
+        {
+            foreach (var entity in e.SavedEntities)
+            {
+                DistributedCache.Instance.RefreshMacroCache(entity);
+            }
+        }
+
+        #endregion
+
+        #region Media event handlers
+
+        static void MediaServiceEmptiedRecycleBin(IMediaService sender, RecycleBinEventArgs e)
+        {
+            if (e.RecycleBinEmptiedSuccessfully &amp;&amp; e.IsMediaRecycleBin)
+            {
+                DistributedCache.Instance.RemoveMediaCachePermanently(e.Ids.ToArray());
+            }
+        }
+
+        static void MediaServiceTrashed(IMediaService sender, MoveEventArgs&lt;IMedia&gt; e)
+        {
+            DistributedCache.Instance.RemoveMediaCacheAfterRecycling(e.MoveInfoCollection.ToArray());
+        }
+
+        static void MediaServiceMoved(IMediaService sender, MoveEventArgs&lt;IMedia&gt; e)
+        {
+            DistributedCache.Instance.RefreshMediaCacheAfterMoving(e.MoveInfoCollection.ToArray());
+        }
+
+        static void MediaServiceDeleted(IMediaService sender, DeleteEventArgs&lt;IMedia&gt; e)
+        {
+            DistributedCache.Instance.RemoveMediaCachePermanently(e.DeletedEntities.Select(x =&gt; x.Id).ToArray());
+        }
+
+        static void MediaServiceSaved(IMediaService sender, SaveEventArgs&lt;IMedia&gt; e)
+        {
+            DistributedCache.Instance.RefreshMediaCache(e.SavedEntities.ToArray());
+        }
+        #endregion
+
+        #region Member event handlers
+
+        static void MemberServiceDeleted(IMemberService sender, DeleteEventArgs&lt;IMember&gt; e)
+        {
+            DistributedCache.Instance.RemoveMemberCache(e.DeletedEntities.ToArray());
+        }
+
+        static void MemberServiceSaved(IMemberService sender, SaveEventArgs&lt;IMember&gt; e)
+        {
+            DistributedCache.Instance.RefreshMemberCache(e.SavedEntities.ToArray());
+        }
+
+        #endregion
+
+        #region Member group event handlers
+
+        static void MemberGroupService_Deleted(IMemberGroupService sender, DeleteEventArgs&lt;IMemberGroup&gt; e)
+        {
+            foreach (var m in e.DeletedEntities.ToArray())
+            {
+                DistributedCache.Instance.RemoveMemberGroupCache(m.Id);
+            }
+        }
+
+        static void MemberGroupService_Saved(IMemberGroupService sender, SaveEventArgs&lt;IMemberGroup&gt; e)
+        {
+            foreach (var m in e.SavedEntities.ToArray())
+            {
+                DistributedCache.Instance.RemoveMemberGroupCache(m.Id);
+            }
+        }
+        #endregion
+
+        #region Relation type event handlers
+
+        private static void RelationType_Saved(IRelationService sender, SaveEventArgs&lt;IRelationType&gt; args)
+        {
+            var dc = DistributedCache.Instance;
+            foreach (var e in args.SavedEntities)
+                dc.RefreshRelationTypeCache(e.Id);
+        }
+
+        private static void RelationType_Deleted(IRelationService sender, DeleteEventArgs&lt;IRelationType&gt; args)
+        {
+            var dc = DistributedCache.Instance;
+            foreach (var e in args.DeletedEntities)
+                dc.RemoveRelationTypeCache(e.Id);
+        }
+
+        #endregion
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[29,9,29,10,0],[30,13,30,125,0],[33,13,33,70,0],[34,13,34,70,0],[35,13,35,62,0],[38,13,38,58,0],[39,13,39,50,0],[42,13,42,67,0],[43,13,43,71,0],[44,13,44,59,0],[45,13,45,63,0],[49,13,49,99,0],[50,13,50,95,0],[55,13,55,63,0],[56,13,56,59,0],[60,13,60,71,0],[61,13,61,75,0],[65,13,65,56,0],[66,13,66,60,0],[70,13,70,83,0],[71,13,71,87,0],[75,13,75,87,0],[76,13,76,83,0],[77,13,77,91,0],[78,13,78,87,0],[79,13,79,63,0],[80,13,80,67,0],[85,13,85,45,0],[86,13,86,53,0],[87,13,87,53,0],[88,13,88,114,0],[92,13,92,67,0],[93,13,93,71,0],[97,13,97,53,0],[98,13,98,57,0],[102,13,102,55,0],[103,13,103,59,0],[104,13,104,66,0],[105,13,105,70,0],[109,13,109,53,0],[110,13,110,57,0],[111,13,111,53,0],[112,13,112,57,0],[113,13,113,77,0],[117,13,117,57,0],[118,13,118,61,0],[119,13,119,59,0],[122,13,122,61,0],[123,13,123,81,0],[125,13,125,74,0],[126,13,126,78,0],[129,13,129,68,0],[130,13,130,72,0],[132,13,132,69,0],[133,13,133,73,0],[134,9,134,10,0],[139,9,139,10,0],[140,13,140,43,0],[141,13,141,14,0],[142,17,142,53,0],[143,17,143,18,0],[144,21,144,28,0],[144,30,144,35,0],[144,36,144,38,0],[144,39,144,58,0],[145,21,145,22,0],[146,25,146,44,0],[147,21,147,22,0],[148,17,148,18,0],[150,17,150,18,0],[151,21,151,72,0],[152,21,152,46,0],[153,17,153,18,0],[154,13,154,14,0],[155,9,155,10,0],[161,9,161,10,0],[162,13,162,64,0],[163,9,163,10,0],[166,9,166,10,0],[167,13,167,43,0],[168,13,168,14,0],[169,17,169,40,0],[170,17,170,18,0],[171,21,171,41,0],[172,21,172,28,0],[175,17,175,53,0],[176,17,176,18,0],[177,21,177,69,0],[178,17,178,18,0],[180,17,180,18,0],[181,21,181,72,0],[182,21,182,55,0],[183,17,183,18,0],[184,13,184,14,0],[185,9,185,10,0],[191,9,191,10,0],[192,13,192,61,0],[193,9,193,10,0],[199,9,199,10,0],[200,13,200,75,0],[201,9,201,10,0],[207,9,207,10,0],[208,13,208,65,0],[209,9,209,10,0],[216,9,216,10,0],[217,13,217,61,0],[218,9,218,10,0],[221,9,221,10,0],[222,13,222,61,0],[223,9,223,10,0],[230,9,230,10,0],[231,13,231,74,0],[232,13,232,14,0],[233,17,233,94,0],[234,13,234,14,0],[235,9,235,10,0],[247,9,247,10,0],[248,13,249,50,0],[249,50,249,58,0],[249,58,249,71,0],[248,13,249,71,0],[250,9,250,10,0],[262,9,262,10,0],[264,13,264,95,0],[265,13,265,36,0],[266,13,266,14,0],[267,17,267,76,0],[268,13,268,14,0],[271,13,271,75,0],[272,9,272,10,0],[280,9,280,10,0],[281,13,281,95,0],[282,9,282,10,0],[297,9,297,10,0],[298,13,298,46,0],[299,13,300,13,0],[300,13,300,14,0],[300,14,302,17,0],[302,17,302,37,0],[302,37,303,17,0],[303,17,303,18,0],[303,18,305,21,0],[305,21,305,98,0],[305,98,306,21,0],[306,21,306,44,0],[306,44,307,21,0],[307,21,307,22,0],[307,22,308,25,0],[308,25,308,53,0],[308,53,309,21,0],[309,21,309,22,0],[309,22,310,17,0],[310,17,310,18,0],[310,18,311,13,0],[311,13,311,14,0],[311,14,311,16,0],[299,13,311,16,0],[313,13,313,38,0],[314,13,314,14,0],[315,17,315,76,0],[316,13,316,14,0],[320,13,320,58,0],[320,58,320,84,0],[320,84,320,86,0],[320,13,320,86,0],[322,13,322,90,0],[323,9,323,10,0],[330,9,330,10,0],[331,13,331,72,0],[332,9,332,10,0],[335,9,335,10,0],[336,13,336,72,0],[337,9,337,10,0],[340,9,340,10,0],[341,13,341,72,0],[342,9,342,10,0],[347,9,347,10,0],[348,13,348,68,0],[349,9,349,10,0],[352,9,352,10,0],[353,13,353,68,0],[354,9,354,10,0],[359,9,359,10,0],[360,13,360,44,0],[360,44,360,95,0],[360,95,360,97,0],[360,13,360,97,0],[361,9,361,10,0],[364,9,364,10,0],[365,13,365,42,0],[365,42,365,94,0],[365,94,365,96,0],[365,13,365,96,0],[366,9,366,10,0],[373,9,373,10,0],[374,13,374,42,0],[374,42,374,96,0],[374,96,374,98,0],[374,13,374,98,0],[375,9,375,10,0],[378,9,378,10,0],[379,13,379,44,0],[379,44,379,97,0],[379,97,379,99,0],[379,13,379,99,0],[380,9,380,10,0],[386,9,386,10,0],[387,13,387,42,0],[387,42,387,91,0],[387,91,387,93,0],[387,13,387,93,0],[388,9,388,10,0],[391,9,391,10,0],[392,13,392,44,0],[392,44,392,92,0],[392,92,392,94,0],[392,13,392,94,0],[393,9,393,10,0],[401,9,401,10,0],[402,13,402,44,0],[402,44,402,94,0],[402,94,402,96,0],[402,13,402,96,0],[403,9,403,10,0],[406,9,406,10,0],[407,13,407,42,0],[407,42,407,93,0],[407,93,407,95,0],[407,13,407,95,0],[408,9,408,10,0],[415,9,415,10,0],[416,13,416,42,0],[416,42,416,89,0],[416,89,416,91,0],[416,13,416,91,0],[417,9,417,10,0],[420,9,420,10,0],[421,13,421,44,0],[421,44,421,90,0],[421,90,421,92,0],[421,13,421,92,0],[422,9,422,10,0],[433,9,433,10,0],[434,13,434,44,0],[434,44,434,92,0],[434,92,434,94,0],[434,13,434,94,0],[435,9,435,10,0],[443,9,443,10,0],[444,13,444,42,0],[444,42,444,91,0],[444,91,444,93,0],[444,13,444,93,0],[445,9,445,10,0],[456,9,456,10,0],[457,13,457,44,0],[457,44,457,93,0],[457,93,457,95,0],[457,13,457,95,0],[458,9,458,10,0],[466,9,466,10,0],[467,13,467,54,0],[467,54,467,115,0],[467,115,467,117,0],[467,13,467,117,0],[468,9,468,10,0],[476,9,476,10,0],[477,13,477,54,0],[477,54,477,114,0],[477,114,477,116,0],[477,13,477,116,0],[478,9,478,10,0],[486,9,486,10,0],[487,13,487,42,0],[487,42,487,92,0],[487,92,487,94,0],[487,13,487,94,0],[488,9,488,10,0],[496,9,496,10,0],[497,13,497,52,0],[497,52,497,114,0],[497,114,497,116,0],[497,13,497,116,0],[498,9,498,10,0],[506,9,506,10,0],[507,13,507,42,0],[507,42,507,93,0],[507,93,507,95,0],[507,13,507,95,0],[508,9,508,10,0],[516,9,516,10,0],[517,13,517,55,0],[517,55,517,63,0],[517,63,517,76,0],[517,13,517,76,0],[518,13,518,34,0],[518,34,518,90,0],[518,90,518,92,0],[518,13,518,92,0],[519,9,519,10,0],[522,9,522,10,0],[523,13,523,57,0],[524,9,524,10,0],[527,9,527,10,0],[528,13,528,57,0],[529,9,529,10,0],[532,9,532,10,0],[533,13,533,57,0],[534,9,534,10,0],[537,9,537,10,0],[538,13,538,42,0],[538,42,538,90,0],[538,90,538,92,0],[538,13,538,92,0],[539,9,539,10,0],[542,9,542,10,0],[543,13,543,44,0],[543,44,543,91,0],[543,91,543,93,0],[543,13,543,93,0],[544,9,544,10,0],[547,9,547,10,0],[548,13,548,37,0],[549,13,549,14,0],[550,17,550,87,0],[551,13,551,14,0],[552,18,552,41,0],[553,13,553,14,0],[554,17,554,86,0],[555,13,555,14,0],[556,18,556,43,0],[557,13,557,14,0],[558,17,558,76,0],[559,13,559,14,0],[560,9,560,10,0],[572,9,572,10,0],[573,13,573,44,0],[573,44,573,95,0],[573,95,573,97,0],[573,13,573,97,0],[574,9,574,10,0],[582,9,582,10,0],[583,13,583,42,0],[583,42,583,94,0],[583,94,583,96,0],[583,13,583,96,0],[584,9,584,10,0],[591,9,591,10,0],[592,13,592,20,0],[592,22,592,32,0],[592,33,592,35,0],[592,36,592,53,0],[593,13,593,14,0],[594,17,594,68,0],[595,13,595,14,0],[596,9,596,10,0],[599,9,599,10,0],[600,13,600,20,0],[600,22,600,32,0],[600,33,600,35,0],[600,36,600,51,0],[601,13,601,14,0],[602,17,602,69,0],[603,13,603,14,0],[604,9,604,10,0],[611,9,611,10,0],[612,13,612,72,0],[613,13,613,14,0],[614,17,614,88,0],[615,13,615,14,0],[616,9,616,10,0],[619,9,619,10,0],[620,13,620,102,0],[621,9,621,10,0],[624,9,624,10,0],[625,13,625,100,0],[626,9,626,10,0],[629,9,629,10,0],[630,13,630,97,0],[630,97,630,101,0],[630,101,630,114,0],[630,13,630,114,0],[631,9,631,10,0],[634,9,634,10,0],[635,13,635,84,0],[636,9,636,10,0],[642,9,642,10,0],[643,13,643,86,0],[644,9,644,10,0],[647,9,647,10,0],[648,13,648,85,0],[649,9,649,10,0],[656,9,656,10,0],[657,13,657,20,0],[657,22,657,27,0],[657,28,657,30,0],[657,31,657,58,0],[658,13,658,14,0],[659,17,659,72,0],[660,13,660,14,0],[661,9,661,10,0],[664,9,664,10,0],[665,13,665,20,0],[665,22,665,27,0],[665,28,665,30,0],[665,31,665,56,0],[666,13,666,14,0],[667,17,667,72,0],[668,13,668,14,0],[669,9,669,10,0],[675,9,675,10,0],[676,13,676,48,0],[677,13,677,20,0],[677,22,677,27,0],[677,28,677,30,0],[677,31,677,49,0],[678,17,678,51,0],[679,9,679,10,0],[682,9,682,10,0],[683,13,683,48,0],[684,13,684,20,0],[684,22,684,27,0],[684,28,684,30,0],[684,31,684,51,0],[685,17,685,50,0],[686,9,686,10,0]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\WebServices\ExamineManagementApiController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Web.Http;
+using Examine;
+using Examine.LuceneEngine;
+using Examine.LuceneEngine.Providers;
+using Examine.Providers;
+using Lucene.Net.Search;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Web.Search;
+using Umbraco.Web.WebApi;
+using Umbraco.Web.WebApi.Filters;
+
+namespace Umbraco.Web.WebServices
+{
+    [ValidateAngularAntiForgeryToken]
+    public class ExamineManagementApiController : UmbracoAuthorizedApiController
+    {
+        /// &lt;summary&gt;
+        /// Checks if the member internal index is consistent with the data stored in the database
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpGet]
+        public bool CheckMembersInternalIndex()
+        {
+            var total = Services.MemberService.Count();
+
+            var criteria = ExamineManager.Instance.SearchProviderCollection[Constants.Examine.InternalMemberSearcher]
+                .CreateSearchCriteria().RawQuery(&quot;__IndexType:member&quot;);
+            var totalIndexed = ExamineManager.Instance.SearchProviderCollection[Constants.Examine.InternalMemberSearcher].Search(criteria);
+
+            return total == totalIndexed.TotalItemCount;
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the media internal index is consistent with the data stored in the database
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpGet]
+        public bool CheckMediaInternalIndex()
+        {
+            var total = Services.MediaService.Count();
+
+            var criteria = ExamineManager.Instance.SearchProviderCollection[Constants.Examine.InternalSearcher]
+                .CreateSearchCriteria().RawQuery(&quot;__IndexType:media&quot;);
+            var totalIndexed = ExamineManager.Instance.SearchProviderCollection[Constants.Examine.InternalSearcher].Search(criteria);
+
+            return total == totalIndexed.TotalItemCount;
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the content internal index is consistent with the data stored in the database
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpGet]
+        public bool CheckContentInternalIndex()
+        {
+            var total = Services.ContentService.Count();
+
+            var criteria = ExamineManager.Instance.SearchProviderCollection[Constants.Examine.InternalSearcher]
+                .CreateSearchCriteria().RawQuery(&quot;__IndexType:content&quot;);
+            var totalIndexed = ExamineManager.Instance.SearchProviderCollection[Constants.Examine.InternalSearcher].Search(criteria);
+
+            return total == totalIndexed.TotalItemCount;
+        }
+
+        /// &lt;summary&gt;
+        /// Get the details for indexers
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;ExamineIndexerModel&gt; GetIndexerDetails()
+        {
+            return ExamineManager.Instance.IndexProviderCollection.Select(CreateModel);
+        }
+
+        /// &lt;summary&gt;
+        /// Get the details for searchers
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;ExamineSearcherModel&gt; GetSearcherDetails()
+        {
+            var model = new List&lt;ExamineSearcherModel&gt;(
+                ExamineManager.Instance.SearchProviderCollection.Cast&lt;BaseSearchProvider&gt;().Select(searcher =&gt;
+                {
+                    var indexerModel = new ExamineSearcherModel()
+                    {
+                        Name = searcher.Name
+                    };
+                    var props = TypeHelper.CachedDiscoverableProperties(searcher.GetType(), mustWrite: false)
+                        //ignore these properties
+                                          .Where(x =&gt; new[] {&quot;Description&quot;}.InvariantContains(x.Name) == false)
+                                          .OrderBy(x =&gt; x.Name);
+                    foreach (var p in props)
+                    {
+                        indexerModel.ProviderProperties.Add(p.Name, p.GetValue(searcher, null).ToString());
+                    }
+                    return indexerModel;
+                }));
+            return model;
+        }
+
+        public ISearchResults GetSearchResults(string searcherName, string query, string queryType)
+        {
+            if (queryType == null)
+            {
+                throw new HttpResponseException(Request.CreateResponse(HttpStatusCode.NotFound));
+            }
+                
+
+            if (query.IsNullOrWhiteSpace())
+                return SearchResults.Empty();
+
+            LuceneSearcher searcher;
+            var msg = ValidateLuceneSearcher(searcherName, out searcher);
+            if (msg.IsSuccessStatusCode)
+            {
+                if (queryType.InvariantEquals(&quot;text&quot;))
+                {
+                    return searcher.Search(query, false);
+                }
+                if (queryType.InvariantEquals(&quot;lucene&quot;))
+                {
+                    return searcher.Search(searcher.CreateSearchCriteria().RawQuery(query));
+                }
+                throw new HttpResponseException(Request.CreateResponse(HttpStatusCode.NotFound));
+            }
+            throw new HttpResponseException(msg);            
+        }
+
+        /// &lt;summary&gt;
+        /// Optimizes an index
+        /// &lt;/summary&gt;
+        public HttpResponseMessage PostOptimizeIndex(string indexerName)
+        {
+            LuceneIndexer indexer;
+            var msg = ValidateLuceneIndexer(indexerName, out indexer);
+            if (msg.IsSuccessStatusCode)
+            {
+                try
+                {
+                    indexer.OptimizeIndex();
+                }
+                catch (Exception ex)
+                {
+                    var response = Request.CreateResponse(HttpStatusCode.Conflict);
+                    response.Content = new StringContent(string.Format(&quot;The index could not be optimized, most likely there is another thread currently writing to the index. Error: {0}&quot;, ex));
+                    response.ReasonPhrase = &quot;Could Not Optimize&quot;;
+                    return response;
+                }
+            }
+            return msg;
+        }
+
+        /// &lt;summary&gt;
+        /// Rebuilds the index
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;indexerName&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public HttpResponseMessage PostRebuildIndex(string indexerName)
+        {
+            LuceneIndexer indexer;
+            var msg = ValidateLuceneIndexer(indexerName, out indexer);
+            if (msg.IsSuccessStatusCode)
+            {
+                LogHelper.Info&lt;ExamineManagementApiController&gt;(string.Format(&quot;Rebuilding index &#39;{0}&#39;&quot;, indexerName));
+
+                //remove it in case there&#39;s a handler there alraedy
+                indexer.IndexOperationComplete -= Indexer_IndexOperationComplete;
+                //now add a single handler
+                indexer.IndexOperationComplete += Indexer_IndexOperationComplete;
+
+                var cacheKey = &quot;temp_indexing_op_&quot; + indexer.Name;
+                //put temp val in cache which is used as a rudimentary way to know when the indexing is done
+                ApplicationContext.ApplicationCache.RuntimeCache.InsertCacheItem(cacheKey, () =&gt; &quot;tempValue&quot;, TimeSpan.FromMinutes(5), isSliding: false);
+
+                try
+                {
+                    indexer.RebuildIndex();
+                }
+                catch (Exception ex)
+                {
+                    //ensure it&#39;s not listening
+                    indexer.IndexOperationComplete -= Indexer_IndexOperationComplete;
+                    LogHelper.Error&lt;ExamineManagementApiController&gt;(&quot;An error occurred rebuilding index&quot;, ex);
+                    var response = Request.CreateResponse(HttpStatusCode.Conflict);
+                    response.Content = new StringContent(string.Format(&quot;The index could not be rebuilt at this time, most likely there is another thread currently writing to the index. Error: {0}&quot;, ex));
+                    response.ReasonPhrase = &quot;Could Not Rebuild&quot;;
+                    return response;
+                }
+            }
+            return msg;
+        }
+
+        //static listener so it&#39;s not GC&#39;d
+        private static void Indexer_IndexOperationComplete(object sender, EventArgs e)
+        {
+            var indexer = (LuceneIndexer) sender;
+
+            //ensure it&#39;s not listening anymore
+            indexer.IndexOperationComplete -= Indexer_IndexOperationComplete;
+
+            LogHelper.Info&lt;ExamineManagementApiController&gt;(string.Format(&quot;Rebuilding index &#39;{0}&#39; done, {1} items committed (can differ from the number of items in the index)&quot;, indexer.Name, indexer.CommitCount));
+
+            var cacheKey = &quot;temp_indexing_op_&quot; + indexer.Name;
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheItem(cacheKey);
+        }
+
+        /// &lt;summary&gt;
+        /// Check if the index has been rebuilt
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;indexerName&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This is kind of rudimentary since there&#39;s no way we can know that the index has rebuilt, we 
+        /// have a listener for the index op complete so we&#39;ll just check if that key is no longer there in the runtime cache
+        /// &lt;/remarks&gt;
+        public ExamineIndexerModel PostCheckRebuildIndex(string indexerName)
+        {
+            LuceneIndexer indexer;
+            var msg = ValidateLuceneIndexer(indexerName, out indexer);
+            if (msg.IsSuccessStatusCode)
+            {
+                var cacheKey = &quot;temp_indexing_op_&quot; + indexerName;
+                var found = ApplicationContext.ApplicationCache.RuntimeCache.GetCacheItem(cacheKey);                
+                //if its still there then it&#39;s not done
+                return found != null
+                    ? null 
+                    : CreateModel(indexer);
+            }
+            throw new HttpResponseException(msg);
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the index is optimized
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;indexerName&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public ExamineIndexerModel PostCheckOptimizeIndex(string indexerName)
+        {
+            LuceneIndexer indexer;
+            var msg = ValidateLuceneIndexer(indexerName, out indexer);
+            if (msg.IsSuccessStatusCode)
+            {
+                var isOptimized = indexer.IsIndexOptimized();
+                return !isOptimized
+                    ? null
+                    : CreateModel(indexer);
+            }
+            throw new HttpResponseException(msg);
+        }
+
+        private ExamineIndexerModel CreateModel(BaseIndexProvider indexer)
+        {
+            var indexerModel = new ExamineIndexerModel()
+            {
+                IndexCriteria = indexer.IndexerData,
+                Name = indexer.Name
+            };
+            
+            var props = TypeHelper.CachedDiscoverableProperties(indexer.GetType(), mustWrite: false)
+                //ignore these properties
+                                  .Where(x =&gt; new[] {&quot;IndexerData&quot;, &quot;Description&quot;, &quot;WorkingFolder&quot;}.InvariantContains(x.Name) == false)
+                                  .OrderBy(x =&gt; x.Name);
+								  
+            foreach (var p in props)
+            {
+                var val = p.GetValue(indexer, null);
+                if (val == null)
+                {
+                    // Do not warn for new new attribute that is optional
+                    if(string.Equals(p.Name, &quot;DirectoryFactory&quot;, StringComparison.InvariantCultureIgnoreCase) == false)
+                        LogHelper.Warn&lt;ExamineManagementApiController&gt;(&quot;Property value was null when setting up property on indexer: &quot; + indexer.Name + &quot; property: &quot; + p.Name);
+
+                    val = string.Empty;
+                }
+                indexerModel.ProviderProperties.Add(p.Name, val.ToString());
+            }
+
+            var luceneIndexer = indexer as LuceneIndexer;
+            if (luceneIndexer != null)
+            {
+                indexerModel.IsLuceneIndex = true;
+
+                if (luceneIndexer.IndexExists())
+                {
+                    Exception indexError;
+                    indexerModel.IsHealthy = luceneIndexer.IsHealthy(out indexError);
+
+                    if (indexerModel.IsHealthy == false)
+                    {
+                        //we cannot continue at this point
+                        indexerModel.Error = indexError.ToString();
+                        return indexerModel;
+                    }
+
+                    indexerModel.DocumentCount = luceneIndexer.GetIndexDocumentCount();
+                    indexerModel.FieldCount = luceneIndexer.GetIndexFieldCount();
+                    indexerModel.IsOptimized = luceneIndexer.IsIndexOptimized();
+                    indexerModel.DeletionCount = luceneIndexer.GetDeletedDocumentsCount();
+                }
+                else
+                {
+                    indexerModel.DocumentCount = 0;
+                    indexerModel.FieldCount = 0;
+                    indexerModel.IsOptimized = true;
+                    indexerModel.DeletionCount = 0;
+                }
+            }
+            return indexerModel;
+        }
+
+        private HttpResponseMessage ValidateLuceneSearcher(string searcherName, out LuceneSearcher searcher)
+        {
+            if (ExamineManager.Instance.SearchProviderCollection.Cast&lt;BaseSearchProvider&gt;().Any(x =&gt; x.Name == searcherName))
+            {
+                searcher = ExamineManager.Instance.SearchProviderCollection[searcherName] as LuceneSearcher;
+                if (searcher == null)
+                {
+                    var response = Request.CreateResponse(HttpStatusCode.BadRequest);
+                    response.Content = new StringContent(string.Format(&quot;The searcher {0} is not of type {1}&quot;, searcherName, typeof(LuceneSearcher)));
+                    response.ReasonPhrase = &quot;Wrong Searcher Type&quot;;
+                    return response;
+                }
+                //return Ok!
+                return Request.CreateResponse(HttpStatusCode.OK);
+            }
+
+            searcher = null;
+
+            var response1 = Request.CreateResponse(HttpStatusCode.BadRequest);
+            response1.Content = new StringContent(string.Format(&quot;No searcher found with name = {0}&quot;, searcherName));
+            response1.ReasonPhrase = &quot;Searcher Not Found&quot;;
+            return response1;
+        }
+
+        private HttpResponseMessage ValidateLuceneIndexer(string indexerName, out LuceneIndexer indexer)
+        {            
+            if (ExamineManager.Instance.IndexProviderCollection.Any(x =&gt; x.Name == indexerName))
+            {
+                indexer = ExamineManager.Instance.IndexProviderCollection[indexerName] as LuceneIndexer;
+                if (indexer == null)
+                {
+                    var response1 = Request.CreateResponse(HttpStatusCode.BadRequest);
+                    response1.Content = new StringContent(string.Format(&quot;The indexer {0} is not of type {1}&quot;, indexerName, typeof(LuceneIndexer)));
+                    response1.ReasonPhrase = &quot;Wrong Indexer Type&quot;;
+                    return response1;
+                }                
+                //return Ok!
+                return Request.CreateResponse(HttpStatusCode.OK);
+            }
+
+            indexer = null;
+
+            var response = Request.CreateResponse(HttpStatusCode.BadRequest);
+            response.Content = new StringContent(string.Format(&quot;No indexer found with name = {0}&quot;, indexerName));
+            response.ReasonPhrase = &quot;Indexer Not Found&quot;;
+            return response;
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[29,9,29,10,0],[30,13,30,56,0],[32,13,33,72,0],[34,13,34,140,0],[36,13,36,57,0],[37,9,37,10,0],[45,9,45,10,0],[46,13,46,55,0],[48,13,49,71,0],[50,13,50,134,0],[52,13,52,57,0],[53,9,53,10,0],[61,9,61,10,0],[62,13,62,57,0],[64,13,65,73,0],[66,13,66,134,0],[68,13,68,57,0],[69,9,69,10,0],[76,9,76,10,0],[77,13,77,88,0],[78,9,78,10,0],[85,9,85,10,0],[86,13,88,17,0],[88,17,88,18,0],[88,18,89,21,0],[89,21,92,23,0],[92,23,93,21,0],[93,21,95,55,0],[95,55,95,111,0],[95,111,96,57,0],[96,57,96,63,0],[96,63,96,65,0],[93,21,96,65,0],[96,65,97,21,0],[97,21,97,28,0],[97,28,97,30,0],[97,30,97,35,0],[97,35,97,36,0],[97,36,97,38,0],[97,38,97,39,0],[97,39,97,44,0],[97,44,98,21,0],[98,21,98,22,0],[98,22,99,25,0],[99,25,99,108,0],[99,108,100,21,0],[100,21,100,22,0],[100,22,101,21,0],[101,21,101,41,0],[101,41,102,17,0],[102,17,102,18,0],[102,18,102,21,0],[86,13,102,21,0],[103,13,103,26,0],[104,9,104,10,0],[107,9,107,10,0],[108,13,108,35,0],[109,13,109,14,0],[110,17,110,98,0],[114,13,114,44,0],[115,17,115,46,0],[118,13,118,74,0],[119,13,119,41,0],[120,13,120,14,0],[121,17,121,55,0],[122,17,122,18,0],[123,21,123,58,0],[125,17,125,57,0],[126,17,126,18,0],[127,21,127,93,0],[129,17,129,98,0],[131,13,131,50,0],[132,9,132,10,0],[138,9,138,10,0],[140,13,140,71,0],[141,13,141,41,0],[142,13,142,14,0],[144,17,144,18,0],[145,21,145,45,0],[146,17,146,18,0],[147,17,147,37,0],[148,17,148,18,0],[149,21,149,84,0],[150,21,150,193,0],[151,21,151,66,0],[152,21,152,37,0],[154,13,154,14,0],[155,13,155,24,0],[156,9,156,10,0],[164,9,164,10,0],[166,13,166,71,0],[167,13,167,41,0],[168,13,168,14,0],[169,17,169,118,0],[172,17,172,82,0],[174,17,174,82,0],[176,17,176,67,0],[178,17,178,98,0],[178,98,178,109,0],[178,109,178,154,0],[178,17,178,154,0],[181,17,181,18,0],[182,21,182,44,0],[183,17,183,18,0],[184,17,184,37,0],[185,17,185,18,0],[187,21,187,86,0],[188,21,188,111,0],[189,21,189,84,0],[190,21,190,204,0],[191,21,191,65,0],[192,21,192,37,0],[194,13,194,14,0],[195,13,195,24,0],[196,9,196,10,0],[200,9,200,10,0],[201,13,201,50,0],[204,13,204,78,0],[206,13,206,213,0],[208,13,208,63,0],[209,13,209,95,0],[210,9,210,10,0],[222,9,222,10,0],[224,13,224,71,0],[225,13,225,41,0],[226,13,226,14,0],[227,17,227,66,0],[228,17,228,101,0],[230,17,232,44,0],[234,13,234,50,0],[235,9,235,10,0],[243,9,243,10,0],[245,13,245,71,0],[246,13,246,41,0],[247,13,247,14,0],[248,17,248,62,0],[249,17,251,44,0],[253,13,253,50,0],[254,9,254,10,0],[257,9,257,10,0],[258,13,262,15,0],[264,13,266,47,0],[266,47,266,135,0],[266,135,267,49,0],[267,49,267,55,0],[267,55,267,57,0],[264,13,267,57,0],[269,13,269,20,0],[269,22,269,27,0],[269,28,269,30,0],[269,31,269,36,0],[270,13,270,14,0],[271,17,271,53,0],[272,17,272,33,0],[273,17,273,18,0],[275,21,275,120,0],[276,25,276,177,0],[278,21,278,40,0],[279,17,279,18,0],[280,17,280,77,0],[281,13,281,14,0],[283,13,283,58,0],[284,13,284,39,0],[285,13,285,14,0],[286,17,286,51,0],[288,17,288,49,0],[289,17,289,18,0],[291,21,291,86,0],[293,21,293,57,0],[294,21,294,22,0],[296,25,296,68,0],[297,25,297,45,0],[300,21,300,88,0],[301,21,301,82,0],[302,21,302,81,0],[303,21,303,91,0],[304,17,304,18,0],[306,17,306,18,0],[307,21,307,52,0],[308,21,308,49,0],[309,21,309,53,0],[310,21,310,52,0],[311,17,311,18,0],[312,13,312,14,0],[313,13,313,33,0],[314,9,314,10,0],[317,9,317,10,0],[318,13,318,102,0],[318,102,318,124,0],[318,124,318,126,0],[318,13,318,126,0],[319,13,319,14,0],[320,17,320,109,0],[321,17,321,38,0],[322,17,322,18,0],[323,21,323,86,0],[324,21,324,150,0],[325,21,325,67,0],[326,21,326,37,0],[329,17,329,66,0],[332,13,332,29,0],[334,13,334,79,0],[335,13,335,117,0],[336,13,336,59,0],[337,13,337,30,0],[338,9,338,10,0],[341,9,341,10,0],[342,13,342,74,0],[342,74,342,95,0],[342,95,342,97,0],[342,13,342,97,0],[343,13,343,14,0],[344,17,344,105,0],[345,17,345,37,0],[346,17,346,18,0],[347,21,347,87,0],[348,21,348,148,0],[349,21,349,67,0],[350,21,350,38,0],[353,17,353,66,0],[356,13,356,28,0],[358,13,358,78,0],[359,13,359,114,0],[360,13,360,57,0],[361,13,361,29,0],[362,9,362,10,0]]);
+    </script>
+  </body>
+</html>

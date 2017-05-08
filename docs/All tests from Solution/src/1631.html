@@ -1,0 +1,1528 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\BulkDataReader.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Data;
+using System.Data.Common;
+using System.Data.SqlClient;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace Umbraco.Core.Persistence
+{
+    /// &lt;summary&gt;
+    /// A base implementation of &lt;see cref=&quot;IDataReader&quot;/&gt; that is suitable for &lt;see cref=&quot;SqlBulkCopy.WriteToServer(IDataReader)&quot;/&gt;.
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// 
+    /// Borrowed from Microsoft:
+    /// See: https://blogs.msdn.microsoft.com/anthonybloesch/2013/01/23/bulk-loading-data-with-idatareader-and-sqlbulkcopy/
+    /// 
+    /// This implementation is designed to be very memory efficient requiring few memory resources and to support
+    /// rapid transfer of data to SQL Server.
+    ///
+    /// Subclasses should implement &lt;see cref=&quot;BulkDataReader.SchemaName&quot;/&gt;, &lt;see cref=&quot;BulkDataReader.TableName&quot;/&gt;,
+    /// &lt;see cref=&quot;BulkDataReader.AddSchemaTableRows()&quot;/&gt;, &lt;see cref=&quot;BulkDataReader.Read()&quot;/&gt;, &lt;see cref=&quot;BulkDataReader.GetValue(Int32)&quot;/&gt;.
+    /// If they contain disposable resources they should override &lt;see cref=&quot;BulkDataReader.Dispose(Boolean)&quot;/&gt;.
+    /// 
+    /// SD: Alternatively, we could have used a LinqEntityDataReader which is nicer to use but it uses quite a lot of reflection and
+    /// I thought this would just be quicker.
+    /// Simple example of that: https://github.com/gridsum/DataflowEx/blob/master/Gridsum.DataflowEx/Databases/BulkDataReader.cs
+    /// Full example of that: https://github.com/matthewschrager/Repository/blob/master/Repository.EntityFramework/EntityDataReader.cs
+    ///  So we know where to find that if we ever need it, these would convert any Linq data source to an IDataReader
+    /// 
+    /// &lt;/remarks&gt;
+    internal abstract class BulkDataReader : IDataReader
+    {
+
+        #region Fields
+
+        /// &lt;summary&gt;
+        /// The &lt;see cref=&quot;DataTable&quot;/&gt; containing the input row set&#39;s schema information &lt;see cref=&quot;SqlBulkCopy.WriteToServer(IDataReader)&quot;/&gt;
+        /// requires to function correctly.
+        /// &lt;/summary&gt;
+        private DataTable _schemaTable = new DataTable();
+
+        /// &lt;summary&gt;
+        /// The mapping from the row set input to the target table&#39;s columns.
+        /// &lt;/summary&gt;
+        private List&lt;SqlBulkCopyColumnMapping&gt; _columnMappings = new List&lt;SqlBulkCopyColumnMapping&gt;();
+
+        #endregion
+
+        #region Subclass utility routines
+
+        /// &lt;summary&gt;
+        /// The mapping from the row set input to the target table&#39;s columns.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// If necessary, &lt;see cref=&quot;BulkDataReader.AddSchemaTableRows()&quot;/&gt; will be called to initialize the mapping.
+        /// &lt;/remarks&gt;
+        public ReadOnlyCollection&lt;SqlBulkCopyColumnMapping&gt; ColumnMappings
+        {
+            get
+            {
+                if (this._columnMappings.Count == 0)
+                {
+                    // Need to add the column definitions and mappings.
+                    AddSchemaTableRows();
+
+                    if (this._columnMappings.Count == 0)
+                    {
+                        throw new InvalidOperationException(&quot;AddSchemaTableRows did not add rows.&quot;);
+                    }
+
+                    Debug.Assert(this._schemaTable.Rows.Count == FieldCount);
+                }
+
+                return new ReadOnlyCollection&lt;SqlBulkCopyColumnMapping&gt;(_columnMappings);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// The name of the input row set&#39;s schema.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This may be different from the target schema but usually they are identical.
+        /// &lt;/remarks&gt;
+        protected abstract string SchemaName
+        {
+            get;
+        }
+
+        /// &lt;summary&gt;
+        /// The name of the input row set&#39;s table.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This may be different from the target table but usually they are identical.
+        /// &lt;/remarks&gt;
+        protected abstract string TableName
+        {
+            get;
+        }
+
+        /// &lt;summary&gt;
+        /// Adds the input row set&#39;s schema to the object.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Call &lt;see cref=&quot;AddSchemaTableRow(String,Nullable{Int32},Nullable{Int16},Nullable{Int16},Boolean,Boolean,Boolean,SqlDbType,String,String,String,String,String)&quot;/&gt;
+        /// to do this for each row.
+        /// &lt;/remarks&gt;
+        /// &lt;seealso cref=&quot;AddSchemaTableRow(String,Nullable{Int32},Nullable{Int16},Nullable{Int16},Boolean,Boolean,Boolean,SqlDbType,String,String,String,String,String)&quot;/&gt;
+        protected abstract void AddSchemaTableRows();
+
+        /// &lt;summary&gt;
+        /// For each &lt;see cref=&quot;SqlDbType&quot;/&gt;, the optional columns that may have values.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This is used for checking the parameters of &lt;see cref=&quot;AddSchemaTableRow(String,Nullable{Int32},Nullable{Int16},Nullable{Int16},Boolean,Boolean,Boolean,SqlDbType,String,String,String,String,String)&quot;/&gt;.
+        /// &lt;/remarks&gt;
+        /// &lt;seealso cref=&quot;AddSchemaTableRow(String,Nullable{Int32},Nullable{Int16},Nullable{Int16},Boolean,Boolean,Boolean,SqlDbType,String,String,String,String,String)&quot;/&gt;
+        private static readonly Dictionary&lt;SqlDbType, List&lt;string&gt;&gt; AllowedOptionalColumnCombinations = new Dictionary&lt;SqlDbType, List&lt;string&gt;&gt;
+        {
+            { SqlDbType.BigInt, new List&lt;string&gt; { } },
+            { SqlDbType.Binary, new List&lt;string&gt; { SchemaTableColumn.ColumnSize } },
+            { SqlDbType.Bit, new List&lt;string&gt; { } },
+            { SqlDbType.Char, new List&lt;string&gt; { SchemaTableColumn.ColumnSize } },
+            { SqlDbType.Date, new List&lt;string&gt; { } },
+            { SqlDbType.DateTime, new List&lt;string&gt; { } },
+            { SqlDbType.DateTime2, new List&lt;string&gt; { SchemaTableColumn.NumericPrecision } },
+            { SqlDbType.DateTimeOffset, new List&lt;string&gt; { SchemaTableColumn.NumericPrecision } },
+            { SqlDbType.Decimal, new List&lt;string&gt; { SchemaTableColumn.NumericPrecision, SchemaTableColumn.NumericScale } },
+            { SqlDbType.Float, new List&lt;string&gt; { SchemaTableColumn.NumericPrecision, SchemaTableColumn.NumericScale } },
+            { SqlDbType.Image, new List&lt;string&gt; { } },
+            { SqlDbType.Int, new List&lt;string&gt; { } },
+            { SqlDbType.Money, new List&lt;string&gt; { } },
+            { SqlDbType.NChar, new List&lt;string&gt; { SchemaTableColumn.ColumnSize } },
+            { SqlDbType.NText, new List&lt;string&gt; { } },
+            { SqlDbType.NVarChar, new List&lt;string&gt; { SchemaTableColumn.ColumnSize } },
+            { SqlDbType.Real, new List&lt;string&gt; { } },
+            { SqlDbType.SmallDateTime, new List&lt;string&gt; { } },
+            { SqlDbType.SmallInt, new List&lt;string&gt; { } },
+            { SqlDbType.SmallMoney, new List&lt;string&gt; { } },
+            { SqlDbType.Structured, new List&lt;string&gt; { } },
+            { SqlDbType.Text, new List&lt;string&gt; { } },
+            { SqlDbType.Time, new List&lt;string&gt; { SchemaTableColumn.NumericPrecision } },
+            { SqlDbType.Timestamp, new List&lt;string&gt; { } },
+            { SqlDbType.TinyInt, new List&lt;string&gt; { } },
+            { SqlDbType.Udt, new List&lt;string&gt; { BulkDataReader.DataTypeNameSchemaColumn } },
+            { SqlDbType.UniqueIdentifier, new List&lt;string&gt; { } },
+            { SqlDbType.VarBinary, new List&lt;string&gt; { SchemaTableColumn.ColumnSize } },
+            { SqlDbType.VarChar, new List&lt;string&gt; { SchemaTableColumn.ColumnSize } },
+            { SqlDbType.Variant, new List&lt;string&gt; { } },
+            { SqlDbType.Xml, new List&lt;string&gt; { BulkDataReader.XmlSchemaCollectionDatabaseSchemaColumn, BulkDataReader.XmlSchemaCollectionOwningSchemaSchemaColumn, BulkDataReader.XmlSchemaCollectionNameSchemaColumn } }
+        };
+
+        /// &lt;summary&gt;
+        /// A helper method to support &lt;see cref=&quot;AddSchemaTableRows&quot;/&gt;.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This methds does extensive argument checks. These errors will cause hard to diagnose exceptions in latter
+        /// processing so it is important to detect them when they can be easily associated with the code defect.
+        /// &lt;/remarks&gt;
+        /// &lt;exception cref=&quot;ArgumentException&quot;&gt;
+        /// The combination of values for the parameters is not supported.
+        /// &lt;/exception&gt;
+        /// &lt;exception cref=&quot;ArgumentNullException&quot;&gt;
+        /// A null value for the parameter is not supported.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;columnName&quot;&gt;
+        /// The name of the column.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;columnSize&quot;&gt;
+        /// The size of the column which may be null if not applicable.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;numericPrecision&quot;&gt;
+        /// The precision of the column which may be null if not applicable.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;numericScale&quot;&gt;
+        /// The scale of the column which may be null if not applicable.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;isUnique&quot;&gt;
+        /// Are the column values unique (i.e. never duplicated)?
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;isKey&quot;&gt;
+        /// Is the column part of the primary key?
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;allowDbNull&quot;&gt;
+        /// Is the column nullable (i.e. optional)?
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;providerType&quot;&gt;
+        /// The corresponding &lt;see cref=&quot;SqlDbType&quot;/&gt;.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;udtSchema&quot;&gt;
+        /// The schema name of the UDT.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;udtType&quot;&gt;
+        /// The type name of the UDT.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;xmlSchemaCollectionDatabase&quot;&gt;
+        /// For XML columns the schema collection&#39;s database name. Otherwise, null.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;xmlSchemaCollectionOwningSchema&quot;&gt;
+        /// For XML columns the schema collection&#39;s schema name. Otherwise, null.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;xmlSchemaCollectionName&quot;&gt;
+        /// For XML columns the schema collection&#39;s name. Otherwise, null.
+        /// &lt;/param&gt;
+        /// &lt;seealso cref=&quot;AddSchemaTableRows&quot;/&gt;
+        protected void AddSchemaTableRow(string columnName,
+                                         int? columnSize,
+                                         short? numericPrecision,
+                                         short? numericScale,
+                                         bool isUnique,
+                                         bool isKey,
+                                         bool allowDbNull,
+                                         SqlDbType providerType,
+                                         string udtSchema,
+                                         string udtType,
+                                         string xmlSchemaCollectionDatabase,
+                                         string xmlSchemaCollectionOwningSchema,
+                                         string xmlSchemaCollectionName)
+        {
+            if (string.IsNullOrEmpty(columnName))
+            {
+                throw new ArgumentException(&quot;columnName must be a nonempty string.&quot;);
+            }
+            else if (columnSize.HasValue &amp;&amp; columnSize.Value &lt;= 0)
+            {
+                throw new ArgumentOutOfRangeException(&quot;columnSize&quot;);
+            }
+            else if (numericPrecision.HasValue &amp;&amp; numericPrecision.Value &lt;= 0)
+            {
+                throw new ArgumentOutOfRangeException(&quot;numericPrecision&quot;);
+            }
+            else if (numericScale.HasValue &amp;&amp; numericScale.Value &lt; 0)
+            {
+                throw new ArgumentOutOfRangeException(&quot;columnSize&quot;);
+            }
+
+            List&lt;string&gt; allowedOptionalColumnList;
+
+            if (BulkDataReader.AllowedOptionalColumnCombinations.TryGetValue(providerType, out allowedOptionalColumnList))
+            {
+                if ((columnSize.HasValue &amp;&amp; !allowedOptionalColumnList.Contains(SchemaTableColumn.ColumnSize)) ||
+                    (numericPrecision.HasValue &amp;&amp; !allowedOptionalColumnList.Contains(SchemaTableColumn.NumericPrecision)) ||
+                    (numericScale.HasValue &amp;&amp; !allowedOptionalColumnList.Contains(SchemaTableColumn.NumericScale)) ||
+                    (udtSchema != null &amp;&amp; !allowedOptionalColumnList.Contains(BulkDataReader.DataTypeNameSchemaColumn)) ||
+                    (udtType != null &amp;&amp; !allowedOptionalColumnList.Contains(BulkDataReader.DataTypeNameSchemaColumn)) ||
+                    (xmlSchemaCollectionDatabase != null &amp;&amp; !allowedOptionalColumnList.Contains(BulkDataReader.XmlSchemaCollectionDatabaseSchemaColumn)) ||
+                    (xmlSchemaCollectionOwningSchema != null &amp;&amp; !allowedOptionalColumnList.Contains(BulkDataReader.XmlSchemaCollectionOwningSchemaSchemaColumn)) ||
+                    (xmlSchemaCollectionName != null &amp;&amp; !allowedOptionalColumnList.Contains(BulkDataReader.XmlSchemaCollectionNameSchemaColumn)))
+                {
+                    throw new ArgumentException(&quot;Columns are set that are incompatible with the value of providerType.&quot;);
+                }
+            }
+            else
+            {
+                throw new ArgumentException(&quot;providerType is unsupported.&quot;);
+            }
+
+            Type dataType;       // Corresponding CLR type.
+            string dataTypeName; // Corresponding SQL Server type.
+            bool isLong = false; // Is the column a large value column (e.g. nvarchar(max))?
+
+            switch (providerType)
+            {
+                case SqlDbType.BigInt:
+                    dataType = typeof(long);
+                    dataTypeName = &quot;bigint&quot;;
+                    break;
+
+                case SqlDbType.Binary:
+                    dataType = typeof(byte[]);
+
+                    if (!columnSize.HasValue)
+                    {
+                        throw new ArgumentException(&quot;columnSize must be specified for \&quot;binary\&quot; type columns.&quot;);
+                    }
+                    else if (columnSize &gt; 8000)
+                    {
+                        throw new ArgumentOutOfRangeException(&quot;columnSize&quot;);
+                    }
+
+                    dataTypeName = string.Format(CultureInfo.InvariantCulture,
+                                                 &quot;binary({0})&quot;,
+                                                 columnSize.Value);
+                    break;
+
+                case SqlDbType.Bit:
+                    dataType = typeof(bool);
+                    dataTypeName = &quot;bit&quot;;
+                    break;
+
+                case SqlDbType.Char:
+                    dataType = typeof(string);
+
+                    if (!columnSize.HasValue)
+                    {
+                        throw new ArgumentException(&quot;columnSize must be specified for \&quot;char\&quot; type columns.&quot;);
+                    }
+                    else if (columnSize &gt; 8000)
+                    {
+                        throw new ArgumentOutOfRangeException(&quot;columnSize&quot;);
+                    }
+
+                    dataTypeName = string.Format(CultureInfo.InvariantCulture,
+                                                 &quot;char({0})&quot;,
+                                                 columnSize.Value);
+                    break;
+
+                case SqlDbType.Date:
+                    dataType = typeof(DateTime);
+                    dataTypeName = &quot;date&quot;;
+                    break;
+
+                case SqlDbType.DateTime:
+                    dataType = typeof(DateTime);
+                    dataTypeName = &quot;datetime&quot;;
+                    break;
+
+                case SqlDbType.DateTime2:
+                    dataType = typeof(DateTime);
+
+                    if (numericPrecision.HasValue)
+                    {
+                        if (numericPrecision.Value &gt; 7)
+                        {
+                            throw new ArgumentOutOfRangeException(&quot;numericPrecision&quot;);
+                        }
+
+                        dataTypeName = string.Format(CultureInfo.InvariantCulture,
+                                                     &quot;datetime2({0})&quot;,
+                                                     numericPrecision.Value);
+                    }
+                    else
+                    {
+                        dataTypeName = &quot;datetime2&quot;;
+                    }
+                    break;
+
+                case SqlDbType.DateTimeOffset:
+                    dataType = typeof(DateTimeOffset);
+
+                    if (numericPrecision.HasValue)
+                    {
+                        if (numericPrecision.Value &gt; 7)
+                        {
+                            throw new ArgumentOutOfRangeException(&quot;numericPrecision&quot;);
+                        }
+
+                        dataTypeName = string.Format(CultureInfo.InvariantCulture,
+                                                     &quot;datetimeoffset({0})&quot;,
+                                                     numericPrecision.Value);
+                    }
+                    else
+                    {
+                        dataTypeName = &quot;datetimeoffset&quot;;
+                    }
+                    break;
+
+                case SqlDbType.Decimal:
+                    dataType = typeof(decimal);
+
+                    if (!numericPrecision.HasValue || !numericScale.HasValue)
+                    {
+                        throw new ArgumentException(&quot;numericPrecision and numericScale must be specified for \&quot;decimal\&quot; type columns.&quot;);
+                    }
+                    else if (numericPrecision &gt; 38)
+                    {
+                        throw new ArgumentOutOfRangeException(&quot;numericPrecision&quot;);
+                    }
+                    else if (numericScale.Value &gt; numericPrecision.Value)
+                    {
+                        throw new ArgumentException(&quot;numericScale must not be larger than numericPrecision for \&quot;decimal\&quot; type columns.&quot;);
+                    }
+
+                    dataTypeName = string.Format(CultureInfo.InvariantCulture,
+                                                 &quot;decimal({0}, {1})&quot;,
+                                                 numericPrecision.Value,
+                                                 numericScale.Value);
+                    break;
+
+                case SqlDbType.Float:
+                    dataType = typeof(double);
+
+                    if (!numericPrecision.HasValue)
+                    {
+                        throw new ArgumentException(&quot;numericPrecision must be specified for \&quot;float\&quot; type columns&quot;);
+                    }
+                    else if (numericPrecision &gt; 53)
+                    {
+                        throw new ArgumentOutOfRangeException(&quot;numericPrecision&quot;);
+                    }
+
+                    dataTypeName = string.Format(CultureInfo.InvariantCulture,
+                                                 &quot;float({0})&quot;,
+                                                 numericPrecision.Value);
+                    break;
+
+                case SqlDbType.Image:
+                    dataType = typeof(byte[]);
+                    dataTypeName = &quot;image&quot;;
+                    break;
+
+                case SqlDbType.Int:
+                    dataType = typeof(int);
+                    dataTypeName = &quot;int&quot;;
+                    break;
+
+                case SqlDbType.Money:
+                    dataType = typeof(decimal);
+                    dataTypeName = &quot;money&quot;;
+                    break;
+
+                case SqlDbType.NChar:
+                    dataType = typeof(string);
+
+                    if (!columnSize.HasValue)
+                    {
+                        throw new ArgumentException(&quot;columnSize must be specified for \&quot;nchar\&quot; type columns&quot;);
+                    }
+                    else if (columnSize &gt; 4000)
+                    {
+                        throw new ArgumentOutOfRangeException(&quot;columnSize&quot;);
+                    }
+
+                    dataTypeName = string.Format(CultureInfo.InvariantCulture,
+                                                 &quot;nchar({0})&quot;,
+                                                 columnSize.Value);
+                    break;
+
+                case SqlDbType.NText:
+                    dataType = typeof(string);
+                    dataTypeName = &quot;ntext&quot;;
+                    break;
+
+                case SqlDbType.NVarChar:
+                    dataType = typeof(string);
+
+                    if (columnSize.HasValue)
+                    {
+                        if (columnSize &gt; 4000)
+                        {
+                            throw new ArgumentOutOfRangeException(&quot;columnSize&quot;);
+                        }
+
+                        dataTypeName = string.Format(CultureInfo.InvariantCulture,
+                                                     &quot;nvarchar({0})&quot;,
+                                                     columnSize.Value);
+                    }
+                    else
+                    {
+                        isLong = true;
+
+                        dataTypeName = &quot;nvarchar(max)&quot;;
+                    }
+                    break;
+
+                case SqlDbType.Real:
+                    dataType = typeof(float);
+                    dataTypeName = &quot;real&quot;;
+                    break;
+
+                case SqlDbType.SmallDateTime:
+                    dataType = typeof(DateTime);
+                    dataTypeName = &quot;smalldatetime&quot;;
+                    break;
+
+                case SqlDbType.SmallInt:
+                    dataType = typeof(Int16);
+                    dataTypeName = &quot;smallint&quot;;
+                    break;
+
+                case SqlDbType.SmallMoney:
+                    dataType = typeof(decimal);
+                    dataTypeName = &quot;smallmoney&quot;;
+                    break;
+
+                // SqlDbType.Structured not supported because it related to nested rowsets.
+
+                case SqlDbType.Text:
+                    dataType = typeof(string);
+                    dataTypeName = &quot;text&quot;;
+                    break;
+
+                case SqlDbType.Time:
+                    dataType = typeof(TimeSpan);
+
+                    if (numericPrecision.HasValue)
+                    {
+                        if (numericPrecision &gt; 7)
+                        {
+                            throw new ArgumentOutOfRangeException(&quot;numericPrecision&quot;);
+                        }
+
+                        dataTypeName = string.Format(CultureInfo.InvariantCulture,
+                                                     &quot;time({0})&quot;,
+                                                     numericPrecision.Value);
+                    }
+                    else
+                    {
+                        dataTypeName = &quot;time&quot;;
+                    }
+                    break;
+
+
+                // SqlDbType.Timestamp not supported because rowversions are not settable.
+
+                case SqlDbType.TinyInt:
+                    dataType = typeof(byte);
+                    dataTypeName = &quot;tinyint&quot;;
+                    break;
+
+                case SqlDbType.Udt:
+                    if (string.IsNullOrEmpty(udtSchema))
+                    {
+                        throw new ArgumentException(&quot;udtSchema must be nonnull and nonempty for \&quot;UDT\&quot; columns.&quot;);
+                    }
+                    else if (string.IsNullOrEmpty(udtType))
+                    {
+                        throw new ArgumentException(&quot;udtType must be nonnull and nonempty for \&quot;UDT\&quot; columns.&quot;);
+                    }
+
+                    dataType = typeof(object);
+                    using (SqlCommandBuilder commandBuilder = new SqlCommandBuilder())
+                    {
+                        dataTypeName = commandBuilder.QuoteIdentifier(udtSchema) + &quot;.&quot; + commandBuilder.QuoteIdentifier(udtType);
+                    }
+                    break;
+
+                case SqlDbType.UniqueIdentifier:
+                    dataType = typeof(Guid);
+                    dataTypeName = &quot;uniqueidentifier&quot;;
+                    break;
+
+                case SqlDbType.VarBinary:
+                    dataType = typeof(byte[]);
+
+                    if (columnSize.HasValue)
+                    {
+                        if (columnSize &gt; 8000)
+                        {
+                            throw new ArgumentOutOfRangeException(&quot;columnSize&quot;);
+                        }
+
+                        dataTypeName = string.Format(CultureInfo.InvariantCulture,
+                                                     &quot;varbinary({0})&quot;,
+                                                     columnSize.Value);
+                    }
+                    else
+                    {
+                        isLong = true;
+
+                        dataTypeName = &quot;varbinary(max)&quot;;
+                    }
+                    break;
+
+                case SqlDbType.VarChar:
+                    dataType = typeof(string);
+
+                    if (columnSize.HasValue)
+                    {
+                        if (columnSize &gt; 8000)
+                        {
+                            throw new ArgumentOutOfRangeException(&quot;columnSize&quot;);
+                        }
+
+                        dataTypeName = string.Format(CultureInfo.InvariantCulture,
+                                                     &quot;varchar({0})&quot;,
+                                                     columnSize.Value);
+                    }
+                    else
+                    {
+                        isLong = true;
+
+                        dataTypeName = &quot;varchar(max)&quot;;
+                    }
+                    break;
+
+                case SqlDbType.Variant:
+                    dataType = typeof(object);
+                    dataTypeName = &quot;sql_variant&quot;;
+                    break;
+
+                case SqlDbType.Xml:
+                    dataType = typeof(string);
+
+                    if (xmlSchemaCollectionName == null)
+                    {
+                        if (xmlSchemaCollectionDatabase != null || xmlSchemaCollectionOwningSchema != null)
+                        {
+                            throw new ArgumentException(&quot;xmlSchemaCollectionDatabase and xmlSchemaCollectionOwningSchema must be null if xmlSchemaCollectionName is null for \&quot;xml\&quot; columns.&quot;);
+                        }
+
+                        dataTypeName = &quot;xml&quot;;
+                    }
+                    else
+                    {
+                        if (xmlSchemaCollectionName.Length == 0)
+                        {
+                            throw new ArgumentException(&quot;xmlSchemaCollectionName must be nonempty or null for \&quot;xml\&quot; columns.&quot;);
+                        }
+                        else if (xmlSchemaCollectionDatabase != null &amp;&amp;
+                                 xmlSchemaCollectionDatabase.Length == 0)
+                        {
+                            throw new ArgumentException(&quot;xmlSchemaCollectionDatabase must be null or nonempty for \&quot;xml\&quot; columns.&quot;);
+                        }
+                        else if (xmlSchemaCollectionOwningSchema != null &amp;&amp;
+                                 xmlSchemaCollectionOwningSchema.Length == 0)
+                        {
+                            throw new ArgumentException(&quot;xmlSchemaCollectionOwningSchema must be null or nonempty for \&quot;xml\&quot; columns.&quot;);
+                        }
+
+                        System.Text.StringBuilder schemaCollection = new System.Text.StringBuilder(&quot;xml(&quot;);
+
+                        if (xmlSchemaCollectionDatabase != null)
+                        {
+                            schemaCollection.Append(&quot;[&quot; + xmlSchemaCollectionDatabase + &quot;]&quot;);
+                        }
+
+                        schemaCollection.Append(&quot;[&quot; + (xmlSchemaCollectionOwningSchema == null ? SchemaName : xmlSchemaCollectionOwningSchema) + &quot;]&quot;);
+                        schemaCollection.Append(&quot;[&quot; + xmlSchemaCollectionName + &quot;]&quot;);
+
+                        dataTypeName = schemaCollection.ToString();
+                    }
+                    break;
+
+                default:
+                    throw new ArgumentOutOfRangeException(&quot;providerType&quot;);
+
+            }
+
+            this._schemaTable.Rows.Add(columnName,
+                                      _schemaTable.Rows.Count,
+                                      columnSize,
+                                      numericPrecision,
+                                      numericScale,
+                                      isUnique,
+                                      isKey,
+                                      &quot;TraceServer&quot;,
+                                      &quot;TraceWarehouse&quot;,
+                                      columnName,
+                                      SchemaName,
+                                      TableName,
+                                      dataType,
+                                      allowDbNull,
+                                      providerType,
+                                      false, // isAliased
+                                      false, // isExpression
+                                      false, // isIdentity,
+                                      false, // isAutoIncrement,
+                                      false, // isRowVersion,
+                                      false, // isHidden,
+                                      isLong,
+                                      true, // isReadOnly,
+                                      dataType,
+                                      dataTypeName,
+                                      xmlSchemaCollectionDatabase,
+                                      xmlSchemaCollectionOwningSchema,
+                                      xmlSchemaCollectionName);
+
+            this._columnMappings.Add(new SqlBulkCopyColumnMapping(columnName, columnName));
+        }
+
+        #endregion
+
+        #region Constructors
+
+        private const string IsIdentitySchemaColumn = &quot;IsIdentity&quot;;
+
+        private const string DataTypeNameSchemaColumn = &quot;DataTypeName&quot;;
+
+        private const string XmlSchemaCollectionDatabaseSchemaColumn = &quot;XmlSchemaCollectionDatabase&quot;;
+
+        private const string XmlSchemaCollectionOwningSchemaSchemaColumn = &quot;XmlSchemaCollectionOwningSchema&quot;;
+
+        private const string XmlSchemaCollectionNameSchemaColumn = &quot;XmlSchemaCollectionName&quot;;
+
+        /// &lt;summary&gt;
+        /// Constructor.
+        /// &lt;/summary&gt;
+        protected BulkDataReader()
+        {
+            this._schemaTable.Locale = System.Globalization.CultureInfo.InvariantCulture;
+
+            DataColumnCollection columns = _schemaTable.Columns;
+
+            columns.Add(SchemaTableColumn.ColumnName, typeof(System.String));
+            columns.Add(SchemaTableColumn.ColumnOrdinal, typeof(System.Int32));
+            columns.Add(SchemaTableColumn.ColumnSize, typeof(System.Int32));
+            columns.Add(SchemaTableColumn.NumericPrecision, typeof(System.Int16));
+            columns.Add(SchemaTableColumn.NumericScale, typeof(System.Int16));
+            columns.Add(SchemaTableColumn.IsUnique, typeof(System.Boolean));
+            columns.Add(SchemaTableColumn.IsKey, typeof(System.Boolean));
+            columns.Add(SchemaTableOptionalColumn.BaseServerName, typeof(System.String));
+            columns.Add(SchemaTableOptionalColumn.BaseCatalogName, typeof(System.String));
+            columns.Add(SchemaTableColumn.BaseColumnName, typeof(System.String));
+            columns.Add(SchemaTableColumn.BaseSchemaName, typeof(System.String));
+            columns.Add(SchemaTableColumn.BaseTableName, typeof(System.String));
+            columns.Add(SchemaTableColumn.DataType, typeof(System.Type));
+            columns.Add(SchemaTableColumn.AllowDBNull, typeof(System.Boolean));
+            columns.Add(SchemaTableColumn.ProviderType, typeof(System.Int32));
+            columns.Add(SchemaTableColumn.IsAliased, typeof(System.Boolean));
+            columns.Add(SchemaTableColumn.IsExpression, typeof(System.Boolean));
+            columns.Add(BulkDataReader.IsIdentitySchemaColumn, typeof(System.Boolean));
+            columns.Add(SchemaTableOptionalColumn.IsAutoIncrement, typeof(System.Boolean));
+            columns.Add(SchemaTableOptionalColumn.IsRowVersion, typeof(System.Boolean));
+            columns.Add(SchemaTableOptionalColumn.IsHidden, typeof(System.Boolean));
+            columns.Add(SchemaTableColumn.IsLong, typeof(System.Boolean));
+            columns.Add(SchemaTableOptionalColumn.IsReadOnly, typeof(System.Boolean));
+            columns.Add(SchemaTableOptionalColumn.ProviderSpecificDataType, typeof(System.Type));
+            columns.Add(BulkDataReader.DataTypeNameSchemaColumn, typeof(System.String));
+            columns.Add(BulkDataReader.XmlSchemaCollectionDatabaseSchemaColumn, typeof(System.String));
+            columns.Add(BulkDataReader.XmlSchemaCollectionOwningSchemaSchemaColumn, typeof(System.String));
+            columns.Add(BulkDataReader.XmlSchemaCollectionNameSchemaColumn, typeof(System.String));
+        }
+
+        #endregion
+
+        #region IDataReader
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating the depth of nesting for the current row. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// &lt;see cref=&quot;SqlBulkCopy&quot;/&gt; does not support nested result sets so this method always returns 0.
+        /// &lt;/remarks&gt;
+        /// &lt;seealso cref=&quot;IDataReader.Depth&quot;/&gt;
+        public int Depth
+        {
+            get { return 0; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the number of columns in the current row. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.FieldCount&quot;/&gt;
+        public int FieldCount
+        {
+            get { return GetSchemaTable().Rows.Count; }
+        }
+
+        /// &lt;summary&gt;
+        /// Is the bulk copy process open?
+        /// &lt;/summary&gt;
+        bool _isOpen = true;
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether the data reader is closed. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;seealso cref=&quot;IDataReader.IsClosed&quot;/&gt;
+        public bool IsClosed
+        {
+            get { return !_isOpen; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the column located at the specified index. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// No column with the specified index was found.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based index of the column to get.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The column located at the specified index as an &lt;see cref=&quot;Object&quot;/&gt;.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;P:IDataRecord.Item(Int32)&quot;/&gt;
+        public object this[int i]
+        {
+            get { return GetValue(i); }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the column with the specified name. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// No column with the specified name was found.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;name&quot;&gt;
+        /// The name of the column to find.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The column located at the specified name as an &lt;see cref=&quot;Object&quot;/&gt;.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;P:IDataRecord.Item(String)&quot;/&gt;
+        public object this[string name]
+        {
+            get { return GetValue(GetOrdinal(name)); }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the number of rows changed, inserted, or deleted by execution of the SQL statement. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Always returns -1 which is the expected behaviour for statements.
+        /// &lt;/remarks&gt;
+        /// &lt;seealso cref=&quot;IDataReader.RecordsAffected&quot;/&gt;
+        public virtual int RecordsAffected
+        {
+            get { return -1; }
+        }
+
+        /// &lt;summary&gt;
+        /// Closes the &lt;see cref=&quot;IDataReader&quot;/&gt;. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;seealso cref=&quot;IDataReader.Close&quot;/&gt;
+        public void Close()
+        {
+            this._isOpen = false;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;Boolean&quot;/&gt;.  (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetBoolean(Int32)&quot;/&gt;
+        public bool GetBoolean(int i)
+        {
+            return (bool)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;Byte&quot;/&gt;.  (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetByte(Int32)&quot;/&gt;
+        public byte GetByte(int i)
+        {
+            return (byte)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Reads a stream of bytes from the specified column offset into the buffer as an array, starting at the given buffer offset.
+        /// (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// If you pass a buffer that is null, &lt;see cref=&quot;GetBytes&quot;/&gt; returns the length of the row in bytes.
+        /// &lt;/remarks&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;fieldOffset&quot;&gt;
+        /// The index within the field from which to start the read operation.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;buffer&quot;&gt;
+        /// The buffer into which to read the stream of bytes.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;bufferoffset&quot;&gt;
+        /// The index for buffer to start the read operation.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;length&quot;&gt;
+        /// The number of bytes to read.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The actual number of bytes read.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetBytes(Int32,Int64,Byte[],Int32,Int32)&quot;/&gt;
+        public long GetBytes(int i,
+                             long fieldOffset,
+                             byte[] buffer,
+                             int bufferoffset,
+                             int length)
+        {
+            byte[] data = (byte[])GetValue(i);
+
+            if (buffer != null)
+            {
+                Array.Copy(data, fieldOffset, buffer, bufferoffset, length);
+            }
+
+            return data.LongLength;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;Char&quot;/&gt;.  (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetChar(Int32)&quot;/&gt;
+        public char GetChar(int i)
+        {
+            char result;
+
+            object data = GetValue(i);
+            char? dataAsChar = data as char?;
+            char[] dataAsCharArray = data as char[];
+            string dataAsString = data as string;
+
+            if (dataAsChar.HasValue)
+            {
+                result = dataAsChar.Value;
+            }
+            else if (dataAsCharArray != null &amp;&amp;
+                     dataAsCharArray.Length == 1)
+            {
+                result = dataAsCharArray[0];
+            }
+            else if (dataAsString != null &amp;&amp;
+                     dataAsString.Length == 1)
+            {
+                result = dataAsString[0];
+            }
+            else
+            {
+                throw new InvalidOperationException(&quot;GetValue did not return a Char compatible type.&quot;);
+            }
+
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Reads a stream of characters from the specified column offset into the buffer as an array, starting at the given buffer offset.
+        /// (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// If you pass a buffer that is null, &lt;see cref=&quot;GetChars&quot;/&gt; returns the length of the row in bytes.
+        /// &lt;/remarks&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;fieldoffset&quot;&gt;
+        /// The index within the field from which to start the read operation.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;buffer&quot;&gt;
+        /// The buffer into which to read the stream of characters.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;bufferoffset&quot;&gt;
+        /// The index for buffer to start the read operation.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;length&quot;&gt;
+        /// The number of characters to read.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The actual number of characters read.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetChars(Int32,Int64,Char[],Int32,Int32)&quot;/&gt;
+        public long GetChars(int i,
+                             long fieldoffset,
+                             char[] buffer,
+                             int bufferoffset,
+                             int length)
+        {
+            object data = GetValue(i);
+
+            string dataAsString = data as string;
+            char[] dataAsCharArray = data as char[];
+
+            if (dataAsString != null)
+            {
+                dataAsCharArray = dataAsString.ToCharArray((int)fieldoffset, length);
+            }
+            else if (dataAsCharArray == null)
+            {
+                throw new InvalidOperationException(&quot;GetValue did not return either a Char array or a String.&quot;);
+            }
+
+            if (buffer != null)
+            {
+                Array.Copy(dataAsCharArray, fieldoffset, buffer, bufferoffset, length);
+            }
+
+            return dataAsCharArray.LongLength;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns an IDataReader for the specified column ordinal. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// &lt;see cref=&quot;SqlBulkCopy&quot;/&gt; does not support nested result sets so this method always returns null.
+        /// &lt;/remarks&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The &lt;see cref=&quot;IDataReader&quot;/&gt; for the specified column ordinal (null).
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetData(Int32)&quot;/&gt;
+        public IDataReader GetData(int i)
+        {
+            if (i &lt; 0 || i &gt;= this.FieldCount)
+            {
+                throw new ArgumentOutOfRangeException(&quot;i&quot;);
+            }
+
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// The data type information for the specified field. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The data type information for the specified field.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetDataTypeName(Int32)&quot;/&gt;
+        public string GetDataTypeName(int i)
+        {
+            return GetFieldType(i).Name;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;DateTime&quot;/&gt;.  (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetDateTime(Int32)&quot;/&gt;
+        public DateTime GetDateTime(int i)
+        {
+            return (DateTime)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;DateTimeOffset&quot;/&gt;.
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        public DateTimeOffset GetDateTimeOffset(int i)
+        {
+            return (DateTimeOffset)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;Decimal&quot;/&gt;.  (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetDecimal(Int32)&quot;/&gt;
+        public decimal GetDecimal(int i)
+        {
+            return (Decimal)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;Double&quot;/&gt;.  (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetDouble(Int32)&quot;/&gt;
+        public double GetDouble(int i)
+        {
+            return (double)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the &lt;see cref=&quot;Type&quot;/&gt; information corresponding to the type of &lt;see cref=&quot;Object&quot;/&gt; that would be returned from &lt;see cref=&quot;GetValue&quot;/&gt;.
+        /// (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The &lt;see cref=&quot;Type&quot;/&gt; information corresponding to the type of &lt;see cref=&quot;Object&quot;/&gt; that would be returned from &lt;see cref=&quot;GetValue&quot;/&gt;.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetFieldType(Int32)&quot;/&gt;
+        public Type GetFieldType(int i)
+        {
+            return (Type)GetSchemaTable().Rows[i][SchemaTableColumn.DataType];
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;Single&quot;/&gt;.  (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetFloat(Int32)&quot;/&gt;
+        public float GetFloat(int i)
+        {
+            return (float)this[i];
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;Guid&quot;/&gt;.  (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetGuid(Int32)&quot;/&gt;
+        public Guid GetGuid(int i)
+        {
+            return (Guid)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;Int16&quot;/&gt;.  (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetInt16(Int32)&quot;/&gt;
+        public short GetInt16(int i)
+        {
+            return (short)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;Int32&quot;/&gt;.  (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetInt32(Int32)&quot;/&gt;
+        public int GetInt32(int i)
+        {
+            return (int)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;Int64&quot;/&gt;.  (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetInt64(Int32)&quot;/&gt;
+        public long GetInt64(int i)
+        {
+            return (long)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the name for the field to find. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The name of the field or the empty string (&quot;&quot;), if there is no value to return.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetName(Int32)&quot;/&gt;
+        public string GetName(int i)
+        {
+            return (string)GetSchemaTable().Rows[i][SchemaTableColumn.ColumnName];
+        }
+
+        /// &lt;summary&gt;
+        /// Return the index of the named field. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index of the named field was not found.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;name&quot;&gt;
+        /// The name of the field to find.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The index of the named field.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetOrdinal(String)&quot;/&gt;
+        public int GetOrdinal(string name)
+        {
+            if (name == null) // Empty strings are handled as a IndexOutOfRangeException.
+            {
+                throw new ArgumentNullException(&quot;name&quot;);
+            }
+
+            int result = -1;
+
+            int rowCount = FieldCount;
+
+            DataRowCollection schemaRows = GetSchemaTable().Rows;
+
+            // Case sensitive search
+            for (int ordinal = 0; ordinal &lt; rowCount; ordinal++)
+            {
+                if (String.Equals((string)schemaRows[ordinal][SchemaTableColumn.ColumnName], name, StringComparison.Ordinal))
+                {
+                    result = ordinal;
+                }
+            }
+
+            if (result == -1)
+            {
+                // Case insensitive search.
+                for (int ordinal = 0; ordinal &lt; rowCount; ordinal++)
+                {
+                    if (String.Equals((string)schemaRows[ordinal][SchemaTableColumn.ColumnName], name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        result = ordinal;
+                    }
+                }
+            }
+
+            if (result == -1)
+            {
+                throw new IndexOutOfRangeException(name);
+            }
+
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a &lt;see cref=&quot;DataTable&quot;/&gt; that describes the column metadata of the &lt;see cref=&quot;IDataReader&quot;/&gt;. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;
+        /// The &lt;see cref=&quot;IDataReader&quot;/&gt; is closed.
+        /// &lt;/exception&gt;
+        /// &lt;returns&gt;
+        /// A &lt;see cref=&quot;DataTable&quot;/&gt; that describes the column metadata.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataReader.GetSchemaTable()&quot;/&gt;
+        public DataTable GetSchemaTable()
+        {
+            if (IsClosed)
+            {
+                throw new InvalidOperationException(&quot;The IDataReader is closed.&quot;);
+            }
+
+            if (_schemaTable.Rows.Count == 0)
+            {
+                // Need to add the column definitions and mappings
+                _schemaTable.TableName = TableName;
+
+                AddSchemaTableRows();
+
+                Debug.Assert(_schemaTable.Rows.Count == FieldCount);
+            }
+
+            return _schemaTable;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;String&quot;/&gt;. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetString(Int32)&quot;/&gt;
+        public string GetString(int i)
+        {
+            return (string)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;TimeSpan&quot;/&gt;.
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        public TimeSpan GetTimeSpan(int i)
+        {
+            return (TimeSpan)GetValue(i);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value of the specified column as a &lt;see cref=&quot;Object&quot;/&gt;. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The value of the column.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetValue(Int32)&quot;/&gt;
+        public abstract object GetValue(int i);
+
+        /// &lt;summary&gt;
+        /// Populates an array of objects with the column values of the current record. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;ArgumentNullException&quot;&gt;
+        /// &lt;paramref name=&quot;values&quot;/&gt; was null.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;values&quot;&gt;
+        /// An array of &lt;see cref=&quot;Object&quot;/&gt; to copy the attribute fields into.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The number of instances of &lt;see cref=&quot;Object&quot;/&gt; in the array.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.GetValues(Object[])&quot;/&gt;
+        public int GetValues(object[] values)
+        {
+            if (values == null)
+            {
+                throw new ArgumentNullException(&quot;values&quot;);
+            }
+
+            int fieldCount = Math.Min(FieldCount, values.Length);
+
+            for (int i = 0; i &lt; fieldCount; i++)
+            {
+                values[i] = GetValue(i);
+            }
+
+            return fieldCount;
+        }
+
+        /// &lt;summary&gt;
+        /// Return whether the specified field is set to null. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;IndexOutOfRangeException&quot;&gt;
+        /// The index passed was outside the range of 0 through &lt;see cref=&quot;FieldCount&quot;/&gt;.
+        /// &lt;/exception&gt;
+        /// &lt;param name=&quot;i&quot;&gt;
+        /// The zero-based column ordinal.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// True if the specified field is set to null; otherwise, false.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataRecord.IsDBNull(Int32)&quot;/&gt;
+        public bool IsDBNull(int i)
+        {
+            object data = GetValue(i);
+
+            return data == null || Convert.IsDBNull(data);
+        }
+
+        /// &lt;summary&gt;
+        /// Advances the data reader to the next result, when reading the results of batch SQL statements. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// &lt;see cref=&quot;IDataReader&quot;/&gt; for &lt;see cref=&quot;SqlBulkCopy&quot;/&gt; returns a single result set so false is always returned.
+        /// &lt;/remarks&gt;
+        /// &lt;returns&gt;
+        /// True if there are more rows; otherwise, false. &lt;see cref=&quot;IDataReader&quot;/&gt; for &lt;see cref=&quot;SqlBulkCopy&quot;/&gt; returns a single result set so false is always returned.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataReader.NextResult()&quot;/&gt;
+        public bool NextResult()
+        {
+            return false;
+        }
+
+        /// &lt;summary&gt;
+        /// Advances the &lt;see cref=&quot;IDataReader&quot;/&gt; to the next record. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;
+        /// True if there are more rows; otherwise, false.
+        /// &lt;/returns&gt;
+        /// &lt;seealso cref=&quot;IDataReader.Read()&quot;/&gt;
+        public abstract bool Read();
+
+        #endregion
+
+        #region IDisposable
+
+        /// &lt;summary&gt;
+        /// Has the object been disposed?
+        /// &lt;/summary&gt;
+        bool _disposed = false;
+
+        /// &lt;summary&gt;
+        /// Dispose of any disposable and expensive resources.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;disposing&quot;&gt;
+        /// Is this call the result of a &lt;see cref=&quot;IDisposable.Dispose&quot;/&gt; call?
+        /// &lt;/param&gt;
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!this._disposed)
+            {
+                this._disposed = true;
+
+                if (disposing)
+                {
+                    if (_schemaTable != null)
+                    {
+                        _schemaTable.Dispose();
+                        this._schemaTable = null;
+                    }
+
+                    this._columnMappings = null;
+
+                    this._isOpen = false;
+
+                    GC.SuppressFinalize(this);
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources. (Inherited from &lt;see cref=&quot;IDataReader&quot;/&gt;.)
+        /// &lt;/summary&gt;
+        /// &lt;seealso cref=&quot;IDisposable.Dispose()&quot;/&gt;
+        public void Dispose()
+        {
+            Dispose(true);
+        }
+
+        /// &lt;summary&gt;
+        /// Finalizer
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// &lt;see cref=&quot;BulkDataReader&quot;/&gt; has no unmanaged resources but a subclass may thus a finalizer is required.
+        /// &lt;/remarks&gt;
+        ~BulkDataReader()
+        {
+            Dispose(false);
+        }
+
+        #endregion
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[47,9,47,58,1],[52,9,52,103,1],[67,13,67,14,1],[68,17,68,53,1],[69,17,69,18,1],[71,21,71,42,1],[73,21,73,57,1],[74,21,74,22,0],[75,25,75,101,0],[78,21,78,78,1],[79,17,79,18,1],[81,17,81,90,1],[82,13,82,14,1],[124,9,157,11,1],[225,9,225,10,1],[226,13,226,50,1],[227,13,227,14,1],[228,17,228,86,1],[230,18,230,67,1],[231,13,231,14,1],[232,17,232,69,1],[234,18,234,79,1],[235,13,235,14,1],[236,17,236,75,1],[238,18,238,70,1],[239,13,239,14,1],[240,17,240,69,1],[245,13,245,123,1],[246,13,246,14,1],[247,17,254,146,1],[255,17,255,18,1],[256,21,256,122,1],[258,13,258,14,1],[260,13,260,14,0],[261,17,261,77,0],[266,13,266,33,1],[268,13,268,34,1],[271,21,271,45,1],[272,21,272,45,1],[273,21,273,27,1],[276,21,276,47,1],[278,21,278,46,1],[279,21,279,22,1],[280,25,280,114,1],[282,26,282,48,1],[283,21,283,22,1],[284,25,284,77,1],[287,21,289,68,1],[290,21,290,27,1],[293,21,293,45,1],[294,21,294,42,1],[295,21,295,27,1],[298,21,298,47,1],[300,21,300,46,1],[301,21,301,22,1],[302,25,302,112,1],[304,26,304,48,1],[305,21,305,22,1],[306,25,306,77,1],[309,21,311,68,1],[312,21,312,27,1],[315,21,315,49,1],[316,21,316,43,1],[317,21,317,27,1],[320,21,320,49,1],[321,21,321,47,1],[322,21,322,27,1],[325,21,325,49,1],[327,21,327,51,1],[328,21,328,22,1],[329,25,329,56,1],[330,25,330,26,1],[331,29,331,87,1],[334,25,336,78,1],[337,21,337,22,1],[339,21,339,22,1],[340,25,340,52,1],[341,21,341,22,1],[342,21,342,27,1],[345,21,345,55,1],[347,21,347,51,1],[348,21,348,22,1],[349,25,349,56,1],[350,25,350,26,1],[351,29,351,87,1],[354,25,356,78,1],[357,21,357,22,1],[359,21,359,22,1],[360,25,360,57,1],[361,21,361,22,1],[362,21,362,27,1],[365,21,365,48,1],[367,21,367,78,1],[368,21,368,22,1],[369,25,369,138,1],[371,26,371,52,1],[372,21,372,22,1],[373,25,373,83,1],[375,26,375,74,1],[376,21,376,22,1],[377,25,377,140,1],[380,21,383,70,1],[384,21,384,27,1],[387,21,387,47,1],[389,21,389,52,1],[390,21,390,22,1],[391,25,391,118,1],[393,26,393,52,1],[394,21,394,22,1],[395,25,395,83,1],[398,21,400,74,1],[401,21,401,27,1],[404,21,404,47,1],[405,21,405,44,1],[406,21,406,27,1],[409,21,409,44,1],[410,21,410,42,1],[411,21,411,27,1],[414,21,414,48,1],[415,21,415,44,1],[416,21,416,27,1],[419,21,419,47,1],[421,21,421,46,1],[422,21,422,22,1],[423,25,423,112,1],[425,26,425,48,1],[426,21,426,22,1],[427,25,427,77,1],[430,21,432,68,1],[433,21,433,27,1],[436,21,436,47,1],[437,21,437,44,1],[438,21,438,27,1],[441,21,441,47,1],[443,21,443,45,1],[444,21,444,22,1],[445,25,445,47,1],[446,25,446,26,1],[447,29,447,81,1],[450,25,452,72,1],[453,21,453,22,1],[455,21,455,22,1],[456,25,456,39,1],[458,25,458,56,1],[459,21,459,22,1],[460,21,460,27,1],[463,21,463,46,1],[464,21,464,43,1],[465,21,465,27,1],[468,21,468,49,1],[469,21,469,52,1],[470,21,470,27,1],[473,21,473,46,1],[474,21,474,47,1],[475,21,475,27,1],[478,21,478,48,1],[479,21,479,49,1],[480,21,480,27,1],[485,21,485,47,1],[486,21,486,43,1],[487,21,487,27,1],[490,21,490,49,1],[492,21,492,51,1],[493,21,493,22,1],[494,25,494,50,1],[495,25,495,26,1],[496,29,496,87,1],[499,25,501,78,1],[502,21,502,22,1],[504,21,504,22,1],[505,25,505,47,1],[506,21,506,22,1],[507,21,507,27,1],[513,21,513,45,1],[514,21,514,46,1],[515,21,515,27,1],[518,21,518,57,1],[519,21,519,22,1],[520,25,520,116,1],[522,26,522,60,1],[523,21,523,22,1],[524,25,524,114,1],[527,21,527,47,1],[528,28,528,86,1],[529,21,529,22,1],[530,25,530,130,1],[531,21,531,22,1],[532,21,532,27,1],[535,21,535,45,1],[536,21,536,55,1],[537,21,537,27,1],[540,21,540,47,1],[542,21,542,45,1],[543,21,543,22,1],[544,25,544,47,1],[545,25,545,26,1],[546,29,546,81,1],[549,25,551,72,1],[552,21,552,22,1],[554,21,554,22,1],[555,25,555,39,1],[557,25,557,57,1],[558,21,558,22,1],[559,21,559,27,1],[562,21,562,47,1],[564,21,564,45,1],[565,21,565,22,1],[566,25,566,47,1],[567,25,567,26,1],[568,29,568,81,1],[571,25,573,72,1],[574,21,574,22,1],[576,21,576,22,1],[577,25,577,39,1],[579,25,579,55,1],[580,21,580,22,1],[581,21,581,27,1],[584,21,584,47,1],[585,21,585,50,1],[586,21,586,27,1],[589,21,589,47,1],[591,21,591,57,1],[592,21,592,22,1],[593,25,593,108,1],[594,25,594,26,1],[595,29,595,193,1],[598,25,598,46,1],[599,21,599,22,1],[601,21,601,22,1],[602,25,602,65,1],[603,25,603,26,1],[604,29,604,130,1],[606,30,607,74,1],[608,25,608,26,1],[609,29,609,134,1],[611,30,612,78,1],[613,25,613,26,1],[614,29,614,138,1],[617,25,617,108,1],[619,25,619,65,1],[620,25,620,26,1],[621,29,621,94,1],[622,25,622,26,1],[624,25,624,151,1],[625,25,625,86,1],[627,25,627,68,1],[628,21,628,22,1],[629,21,629,27,1],[632,21,632,75,1],[636,13,663,64,1],[665,13,665,92,1],[666,9,666,10,1],[685,9,685,35,1],[686,9,686,10,1],[687,13,687,90,1],[689,13,689,65,1],[691,13,691,78,1],[692,13,692,80,1],[693,13,693,77,1],[694,13,694,83,1],[695,13,695,79,1],[696,13,696,77,1],[697,13,697,74,1],[698,13,698,90,1],[699,13,699,91,1],[700,13,700,82,1],[701,13,701,82,1],[702,13,702,81,1],[703,13,703,74,1],[704,13,704,80,1],[705,13,705,79,1],[706,13,706,78,1],[707,13,707,81,1],[708,13,708,88,1],[709,13,709,92,1],[710,13,710,89,1],[711,13,711,85,1],[712,13,712,75,1],[713,13,713,87,1],[714,13,714,98,1],[715,13,715,89,1],[716,13,716,104,1],[717,13,717,108,1],[718,13,718,100,1],[719,9,719,10,1],[734,17,734,18,1],[734,19,734,28,1],[734,29,734,30,1],[743,17,743,18,1],[743,19,743,54,1],[743,55,743,56,1],[749,9,749,29,1],[757,17,757,18,1],[757,19,757,35,1],[757,36,757,37,1],[775,17,775,18,1],[775,19,775,38,1],[775,39,775,40,1],[793,17,793,18,1],[793,19,793,53,1],[793,54,793,55,1],[805,17,805,18,1],[805,19,805,29,1],[805,30,805,31,1],[813,9,813,10,1],[814,13,814,34,1],[815,9,815,10,1],[831,9,831,10,1],[832,13,832,38,1],[833,9,833,10,1],[849,9,849,10,1],[850,13,850,38,1],[851,9,851,10,1],[887,9,887,10,1],[888,13,888,47,1],[890,13,890,32,1],[891,13,891,14,1],[892,17,892,77,1],[893,13,893,14,1],[895,13,895,36,1],[896,9,896,10,1],[912,9,912,10,1],[915,13,915,39,1],[916,13,916,46,1],[917,13,917,53,1],[918,13,918,50,1],[920,13,920,37,1],[921,13,921,14,1],[922,17,922,43,1],[923,13,923,14,1],[924,18,925,50,1],[926,13,926,14,1],[927,17,927,45,1],[928,13,928,14,1],[929,18,930,47,1],[931,13,931,14,1],[932,17,932,42,1],[933,13,933,14,1],[935,13,935,14,0],[936,17,936,104,0],[939,13,939,27,1],[940,9,940,10,1],[976,9,976,10,1],[977,13,977,39,1],[979,13,979,50,1],[980,13,980,53,1],[982,13,982,38,1],[983,13,983,14,1],[984,17,984,86,1],[985,13,985,14,1],[986,18,986,46,0],[987,13,987,14,0],[988,17,988,113,0],[991,13,991,32,1],[992,13,992,14,1],[993,17,993,88,1],[994,13,994,14,1],[996,13,996,47,1],[997,9,997,10,1],[1016,9,1016,10,1],[1017,13,1017,47,1],[1018,13,1018,14,1],[1019,17,1019,60,1],[1022,13,1022,25,1],[1023,9,1023,10,1],[1039,9,1039,10,1],[1040,13,1040,41,1],[1041,9,1041,10,1],[1057,9,1057,10,1],[1058,13,1058,42,1],[1059,9,1059,10,1],[1074,9,1074,10,1],[1075,13,1075,48,1],[1076,9,1076,10,1],[1092,9,1092,10,1],[1093,13,1093,41,1],[1094,9,1094,10,1],[1110,9,1110,10,1],[1111,13,1111,40,1],[1112,9,1112,10,1],[1129,9,1129,10,1],[1130,13,1130,79,1],[1131,9,1131,10,1],[1147,9,1147,10,1],[1148,13,1148,35,1],[1149,9,1149,10,1],[1165,9,1165,10,1],[1166,13,1166,38,1],[1167,9,1167,10,1],[1183,9,1183,10,1],[1184,13,1184,39,1],[1185,9,1185,10,1],[1201,9,1201,10,1],[1202,13,1202,37,1],[1203,9,1203,10,1],[1219,9,1219,10,1],[1220,13,1220,38,1],[1221,9,1221,10,1],[1237,9,1237,10,1],[1238,13,1238,83,1],[1239,9,1239,10,1],[1255,9,1255,10,1],[1256,13,1256,30,1],[1257,13,1257,14,0],[1258,17,1258,57,0],[1261,13,1261,29,1],[1263,13,1263,39,1],[1265,13,1265,66,1],[1268,18,1268,33,1],[1268,35,1268,53,1],[1268,55,1268,64,1],[1269,13,1269,14,1],[1270,17,1270,126,1],[1271,17,1271,18,1],[1272,21,1272,38,1],[1273,17,1273,18,1],[1274,13,1274,14,1],[1276,13,1276,30,1],[1277,13,1277,14,1],[1279,22,1279,37,1],[1279,39,1279,57,1],[1279,59,1279,68,1],[1280,17,1280,18,1],[1281,21,1281,140,1],[1282,21,1282,22,1],[1283,25,1283,42,1],[1284,21,1284,22,1],[1285,17,1285,18,1],[1286,13,1286,14,1],[1288,13,1288,30,1],[1289,13,1289,14,0],[1290,17,1290,58,0],[1293,13,1293,27,1],[1294,9,1294,10,1],[1307,9,1307,10,1],[1308,13,1308,26,1],[1309,13,1309,14,0],[1310,17,1310,83,0],[1313,13,1313,46,1],[1314,13,1314,14,1],[1316,17,1316,52,1],[1318,17,1318,38,1],[1320,17,1320,69,1],[1321,13,1321,14,1],[1323,13,1323,33,1],[1324,9,1324,10,1],[1340,9,1340,10,1],[1341,13,1341,40,1],[1342,9,1342,10,1],[1357,9,1357,10,1],[1358,13,1358,42,1],[1359,9,1359,10,1],[1390,9,1390,10,1],[1391,13,1391,32,1],[1392,13,1392,14,0],[1393,17,1393,59,0],[1396,13,1396,66,1],[1398,18,1398,27,1],[1398,29,1398,43,1],[1398,45,1398,48,1],[1399,13,1399,14,1],[1400,17,1400,41,1],[1401,13,1401,14,1],[1403,13,1403,31,1],[1404,9,1404,10,1],[1420,9,1420,10,1],[1421,13,1421,39,1],[1423,13,1423,59,1],[1424,9,1424,10,1],[1437,9,1437,10,1],[1438,13,1438,26,1],[1439,9,1439,10,1],[1457,9,1457,32,1],[1466,9,1466,10,1],[1467,13,1467,33,1],[1468,13,1468,14,1],[1469,17,1469,39,1],[1471,17,1471,31,1],[1472,17,1472,18,1],[1473,21,1473,46,1],[1474,21,1474,22,1],[1475,25,1475,48,1],[1476,25,1476,50,1],[1477,21,1477,22,1],[1479,21,1479,49,1],[1481,21,1481,42,1],[1483,21,1483,47,1],[1484,17,1484,18,1],[1485,13,1485,14,1],[1486,9,1486,10,1],[1493,9,1493,10,1],[1494,13,1494,27,1],[1495,9,1495,10,1],[1504,9,1504,10,1],[1504,9,1504,10,1],[1505,13,1505,28,1],[1506,9,1506,10,1],[1506,9,1506,10,1]]);
+    </script>
+  </body>
+</html>

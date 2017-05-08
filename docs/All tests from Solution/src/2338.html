@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.MacroEngines\RazorCore\RazorMacroEngine.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Web;
+using System.Web.Compilation;
+using System.Web.WebPages;
+using Umbraco.Core;
+using umbraco.MacroEngines.Resources;
+using umbraco.cms.businesslogic.macro;
+using umbraco.interfaces;
+using Umbraco.Core.IO;
+
+namespace umbraco.MacroEngines
+{
+    public class RazorMacroEngine : IMacroEngine, IMacroEngineResultStatus {
+
+        public const string RazorTempDirectory = &quot;~/App_Data/TEMP/Razor/&quot;;
+        private const string RazorWebConfig = &quot;~/App_Data/TEMP/Razor/web.config&quot;;
+
+        public string GetVirtualPathFromPhysicalPath(string physicalPath) {
+            string rootpath = HttpContext.Current.Server.MapPath(&quot;~/&quot;);
+            physicalPath = physicalPath.Replace(rootpath, &quot;&quot;);
+            physicalPath = physicalPath.Replace(&quot;\\&quot;, &quot;/&quot;);
+            return &quot;~/&quot; + physicalPath;
+        }
+
+        public string GetMd5(string text) {
+			return text.ToMd5();
+        }
+
+        /// &lt;summary&gt;
+        /// Creates A Temporary Razor File
+        /// &lt;/summary&gt;
+        public string CreateTemporaryRazorFile(string razorSyntax, string fileName, bool skipIfFileExists) {
+            if (razorSyntax == null)
+                throw new ArgumentNullException(&quot;razorSyntax&quot;);
+            if (fileName == null)
+                throw new AbandonedMutexException(&quot;fileName&quot;);
+
+            var relativePath = RazorTempDirectory + fileName;
+            var physicalPath = IOHelper.MapPath(relativePath);
+            var physicalDirectoryPath = IOHelper.MapPath(RazorTempDirectory);
+            var webconfig = IOHelper.MapPath(RazorWebConfig);
+
+            if (skipIfFileExists &amp;&amp; File.Exists(physicalPath))
+                return relativePath;
+            if (File.Exists(physicalPath))
+                File.Delete(physicalPath);
+            if (!Directory.Exists(physicalDirectoryPath))
+                Directory.CreateDirectory(physicalDirectoryPath);
+
+            //Ensure the correct razor web.config is there
+            if (File.Exists(webconfig) == false)
+            {
+                using (var writer = File.CreateText(webconfig))
+                {
+                    writer.Write(Strings.WebConfig);
+                }
+            }
+
+            using (var file = new StreamWriter(physicalPath, false, Encoding.UTF8))
+            {
+                file.Write(razorSyntax);
+            }
+            return relativePath;
+        }
+
+        public static WebPage CompileAndInstantiate(string virtualPath) {
+            //Compile Razor - We Will Leave This To ASP.NET Compilation Engine &amp; ASP.NET WebPages
+            //Security in medium trust is strict around here, so we can only pass a virtual file path
+            //ASP.NET Compilation Engine caches returned types
+            //Changed From BuildManager As Other Properties Are Attached Like Context Path/
+            var webPageBase = WebPageBase.CreateInstanceFromVirtualPath(virtualPath);
+            var webPage = webPageBase as WebPage;
+            if (webPage == null)
+                throw new InvalidCastException(&quot;Context Must Implement System.Web.WebPages.WebPage&quot;);
+            return webPage;
+        }
+
+        public static void InjectContext(WebPage razorWebPage, MacroModel macro, INode currentPage) {
+            var context = HttpContext.Current;
+            var contextWrapper = new HttpContextWrapper(context);
+
+            //inject http context - for request response
+            HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, string.Format(&quot;Loading Macro Script Context (file: {0})&quot;, macro.Name));
+            razorWebPage.Context = contextWrapper;
+            HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, string.Format(&quot;Done Loading Macro Script Context (file: {0})&quot;, macro.Name));
+
+            //Inject Macro Model And Parameters
+            if (razorWebPage is IMacroContext) {
+                HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, string.Format(&quot;Boxing Macro Script MacroContext (file: {0})&quot;, macro.Name));
+                var razorMacro = (IMacroContext)razorWebPage;
+                HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, string.Format(&quot;Done Boxing Macro Script MacroContext (file: {0})&quot;, macro.Name));
+
+                HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, string.Format(&quot;Loading Macro Script Model (file: {0})&quot;, macro.Name));
+                razorMacro.SetMembers(macro, currentPage);
+                HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, string.Format(&quot;Done Loading Macro Script Model (file: {0})&quot;, macro.Name));
+            }
+        }
+
+        public string ExecuteRazor(MacroModel macro, INode currentPage) {
+            var context = HttpContext.Current;
+            var contextWrapper = new HttpContextWrapper(context);
+
+            string fileLocation = null;
+            if (!string.IsNullOrEmpty(macro.ScriptName)) {
+                //Razor Is Already Contained In A File
+                if (macro.ScriptName.StartsWith(&quot;~&quot;))
+                    fileLocation = macro.ScriptName;
+                else
+                    fileLocation = SystemDirectories.MacroScripts + &quot;/&quot; + macro.ScriptName;
+            } else if (!string.IsNullOrEmpty(macro.ScriptCode) &amp;&amp; !string.IsNullOrEmpty(macro.ScriptLanguage)) {
+                //Inline Razor Syntax
+                fileLocation = CreateInlineRazorFile(macro.ScriptCode, macro.ScriptLanguage);
+            }
+
+            if (string.IsNullOrEmpty(fileLocation))
+                return String.Empty; //No File Location
+
+            var razorWebPage = CompileAndInstantiate(fileLocation);
+
+            HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, string.Format(&quot;Loading Macro Script Context (file: {0})&quot;, macro.Name));
+            InjectContext(razorWebPage, macro, currentPage);
+            HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, string.Format(&quot;Done Loading Macro Script Context (file: {0})&quot;, macro.Name));
+
+            //Output Razor To String
+            var output = new StringWriter();
+            HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, string.Format(&quot;Executing Macro Script (file: {0})&quot;, macro.Name));
+            razorWebPage.ExecutePageHierarchy(new WebPageContext(contextWrapper, razorWebPage, null), output);
+            HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, string.Format(&quot;Done Executing Macro Script (file: {0})&quot;, macro.Name));
+            return output.ToString();
+        }
+
+        /// &lt;summary&gt;
+        /// Creates Inline Razor File
+        /// &lt;/summary&gt;
+        public string CreateInlineRazorFile(string razorSyntax, string scriptLanguage) {
+            if (razorSyntax == null)
+                throw new ArgumentNullException(&quot;razorSyntax&quot;);
+            if (scriptLanguage == null)
+                throw new ArgumentNullException(&quot;scriptLanguage&quot;);
+
+            //Get Rid Of Whitespace From Start/End
+            razorSyntax = razorSyntax.Trim();
+            //Use MD5 as a cache key
+            var syntaxMd5 = GetMd5(razorSyntax);
+            var fileName = &quot;inline-&quot; + syntaxMd5 + &quot;.&quot; + scriptLanguage;
+            return CreateTemporaryRazorFile(razorSyntax, fileName, true);
+        }
+
+        #region IMacroEngine Members
+
+        public string Name { get { return &quot;Razor Macro Engine&quot;; } }
+
+        public IEnumerable&lt;string&gt; SupportedExtensions { get { return new List&lt;string&gt; {&quot;cshtml&quot;, &quot;vbhtml&quot;, &quot;razor&quot;}; } }
+
+        public IEnumerable&lt;string&gt; SupportedUIExtensions { get { return new List&lt;string&gt; { &quot;cshtml&quot;, &quot;vbhtml&quot; }; } }
+
+        public Dictionary&lt;string, IMacroGuiRendering&gt; SupportedProperties {
+            get { throw new NotSupportedException(); }
+        }
+
+        public bool Validate(string code, string tempFilePath, INode currentPage, out string errorMessage) {
+            var temp = GetVirtualPathFromPhysicalPath(tempFilePath);
+            try {
+                CompileAndInstantiate(temp);
+            } catch (Exception exception) {
+                errorMessage = exception.Message;
+                return false;
+            }
+            errorMessage = String.Empty;
+            return true;
+        }
+
+        public string Execute(MacroModel macro, INode currentPage) {
+            
+            //if this is executing, we need to ensure the folder exists and that the correct web.config exists on that folder too
+            var absolutePath = IOHelper.MapPath(SystemDirectories.MacroScripts);
+            if (!Directory.Exists(absolutePath))
+                Directory.CreateDirectory(absolutePath);
+            if (!File.Exists(Path.Combine(absolutePath, &quot;web.config&quot;)))
+            {
+                using (var writer = File.CreateText(Path.Combine(absolutePath, &quot;web.config&quot;)))
+                {
+                    writer.Write(Strings.WebConfig);
+                }
+            }
+            
+            try
+            {
+                Success = true;
+                return ExecuteRazor(macro, currentPage);
+            } catch (Exception exception)
+            {
+                Success = false;
+                ResultException = exception;
+                HttpContext.Current.Trace.Warn(&quot;umbracoMacro&quot;, string.Format(&quot;Error Loading Razor Script (file: {0}) {1} {2}&quot;, macro.Name, exception.Message, exception.StackTrace));
+                throw;
+            }
+        }
+
+        #endregion
+
+
+        #region IMacroEngineResultStatus Members
+
+        public bool Success { get; set; }
+
+        public Exception ResultException { get; set; }
+
+        #endregion
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,75,22,76,0],[23,13,23,72,0],[24,13,24,63,0],[25,13,25,60,0],[26,13,26,40,0],[27,9,27,10,0],[29,43,29,44,0],[30,4,30,24,0],[31,9,31,10,0],[36,108,36,109,0],[37,13,37,37,0],[38,17,38,64,0],[39,13,39,34,0],[40,17,40,63,0],[42,13,42,62,0],[43,13,43,63,0],[44,13,44,78,0],[45,13,45,62,0],[47,13,47,63,0],[48,17,48,37,0],[49,13,49,43,0],[50,17,50,43,0],[51,13,51,58,0],[52,17,52,66,0],[55,13,55,49,0],[56,13,56,14,0],[57,24,57,63,0],[58,17,58,18,0],[59,21,59,53,0],[60,17,60,18,0],[61,13,61,14,0],[63,20,63,83,0],[64,13,64,14,0],[65,17,65,41,0],[66,13,66,14,0],[67,13,67,33,0],[68,9,68,10,0],[70,73,70,74,0],[75,13,75,86,0],[76,13,76,50,0],[77,13,77,33,0],[78,17,78,102,0],[79,13,79,28,0],[80,9,80,10,0],[82,101,82,102,0],[83,13,83,47,0],[84,13,84,66,0],[87,13,87,132,0],[88,13,88,51,0],[89,13,89,137,0],[92,13,92,47,0],[92,48,92,49,0],[93,17,93,140,0],[94,17,94,62,0],[95,17,95,145,0],[97,17,97,134,0],[98,17,98,59,0],[99,17,99,139,0],[100,13,100,14,0],[101,9,101,10,0],[103,73,103,74,0],[104,13,104,47,0],[105,13,105,66,0],[107,13,107,40,0],[108,13,108,57,0],[108,58,108,59,0],[110,17,110,54,0],[111,21,111,53,0],[113,21,113,92,0],[114,13,114,14,0],[114,20,114,111,0],[114,112,114,113,0],[116,17,116,94,0],[117,13,117,14,0],[119,13,119,52,0],[120,17,120,37,0],[122,13,122,68,0],[124,13,124,132,0],[125,13,125,61,0],[126,13,126,137,0],[129,13,129,45,0],[130,13,130,126,0],[131,13,131,111,0],[132,13,132,131,0],[133,13,133,38,0],[134,9,134,10,0],[139,88,139,89,0],[140,13,140,37,0],[141,17,141,64,0],[142,13,142,40,0],[143,17,143,67,0],[146,13,146,46,0],[148,13,148,49,0],[149,13,149,73,0],[150,13,150,74,0],[151,9,151,10,0],[155,34,155,35,0],[155,36,155,64,0],[155,65,155,66,0],[157,62,157,63,0],[157,64,157,118,0],[157,119,157,120,0],[159,64,159,65,0],[159,66,159,113,0],[159,114,159,115,0],[162,17,162,18,0],[162,19,162,53,0],[165,108,165,109,0],[166,13,166,69,0],[167,17,167,18,0],[168,17,168,45,0],[169,13,169,14,0],[169,15,169,42,0],[169,43,169,44,0],[170,17,170,50,0],[171,17,171,30,0],[173,13,173,41,0],[174,13,174,25,0],[175,9,175,10,0],[177,68,177,69,0],[180,13,180,81,0],[181,13,181,49,0],[182,17,182,57,0],[183,13,183,72,0],[184,13,184,14,0],[185,24,185,94,0],[186,17,186,18,0],[187,21,187,53,0],[188,17,188,18,0],[189,13,189,14,0],[192,13,192,14,0],[193,17,193,32,0],[194,17,194,57,0],[195,15,195,42,0],[196,13,196,14,0],[197,17,197,33,0],[198,17,198,45,0],[199,17,199,182,0],[200,17,200,23,0],[202,9,202,10,0],[209,31,209,35,0],[209,36,209,40,0],[211,44,211,48,0],[211,49,211,53,0]]);
+    </script>
+  </body>
+</html>

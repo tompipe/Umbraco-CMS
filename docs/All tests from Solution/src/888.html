@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Trees\ContentTreeControllerBase.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Formatting;
+using System.Web.Http;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Persistence;
+using Umbraco.Web.Models.Trees;
+using Umbraco.Web.WebApi.Filters;
+using umbraco;
+using umbraco.BusinessLogic.Actions;
+using System.Globalization;
+
+namespace Umbraco.Web.Trees
+{
+    public abstract class ContentTreeControllerBase : TreeController
+    {
+
+        #region Actions
+
+        /// &lt;summary&gt;
+        /// Gets an individual tree node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpQueryStringFilter(&quot;queryStrings&quot;)]
+        public TreeNode GetTreeNode(string id, FormDataCollection queryStrings)
+        {
+            int asInt;
+            if (int.TryParse(id, out asInt) == false)
+            {
+                throw new HttpResponseException(Request.CreateResponse(HttpStatusCode.NotFound));
+            }
+
+            var entity = Services.EntityService.Get(asInt, UmbracoObjectType);
+            if (entity == null)
+            {
+                throw new HttpResponseException(Request.CreateResponse(HttpStatusCode.NotFound));
+            }
+
+            var node = GetSingleTreeNode(entity, entity.ParentId.ToInvariantString(), queryStrings);
+
+            //add the tree alias to the node since it is standalone (has no root for which this normally belongs)
+            node.AdditionalData[&quot;treeAlias&quot;] = TreeAlias;
+            return node;
+        }
+
+        #endregion
+
+        protected abstract TreeNode GetSingleTreeNode(IUmbracoEntity e, string parentId, FormDataCollection queryStrings);
+
+        /// &lt;summary&gt;
+        /// Returns the 
+        /// &lt;/summary&gt;
+        protected abstract int RecycleBinId { get; }
+
+        /// &lt;summary&gt;
+        /// Returns true if the recycle bin has items in it
+        /// &lt;/summary&gt;
+        protected abstract bool RecycleBinSmells { get; }
+
+        /// &lt;summary&gt;
+        /// Returns the user&#39;s start node for this tree
+        /// &lt;/summary&gt;
+        protected abstract int UserStartNode { get; }
+
+        /// &lt;summary&gt;
+        /// Gets the tree nodes for the given id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;        
+        protected virtual TreeNodeCollection PerformGetTreeNodes(string id, FormDataCollection queryStrings)
+        {
+            var nodes = new TreeNodeCollection();
+
+            var altStartId = string.Empty;
+            if (queryStrings.HasKey(TreeQueryStringParameters.StartNodeId))
+                altStartId = queryStrings.GetValue&lt;string&gt;(TreeQueryStringParameters.StartNodeId);
+
+            //check if a request has been made to render from a specific start node
+            if (string.IsNullOrEmpty(altStartId) == false &amp;&amp; altStartId != &quot;undefined&quot; &amp;&amp; altStartId != Constants.System.Root.ToString(CultureInfo.InvariantCulture))
+            {
+                id = altStartId;
+
+                //we need to verify that the user has access to view this node, otherwise we&#39;ll render an empty tree collection
+                // TODO: in the future we could return a validation statement so we can have some UI to notify the user they don&#39;t have access                
+                if (HasPathAccess(id, queryStrings) == false)
+                {
+                    LogHelper.Warn&lt;ContentTreeControllerBase&gt;(&quot;The user &quot; + Security.CurrentUser.Username + &quot; does not have access to the tree node &quot; + id);
+                    return new TreeNodeCollection();
+                }
+
+                // So there&#39;s an alt id specified, it&#39;s not the root node and the user has access to it, great! But there&#39;s one thing we
+                // need to consider: 
+                // If the tree is being rendered in a dialog view we want to render only the children of the specified id, but
+                // when the tree is being rendered normally in a section and the current user&#39;s start node is not -1, then 
+                // we want to include their start node in the tree as well.
+                // Therefore, in the latter case, we want to change the id to -1 since we want to render the current user&#39;s root node
+                // and the GetChildEntities method will take care of rendering the correct root node.
+                // If it is in dialog mode, then we don&#39;t need to change anything and the children will just render as per normal.
+                if (IsDialog(queryStrings) == false &amp;&amp; UserStartNode != Constants.System.Root)
+                {
+                    id = Constants.System.Root.ToString(CultureInfo.InvariantCulture);
+                }
+            }
+
+            var entities = GetChildEntities(id);
+            nodes.AddRange(entities.Select(entity =&gt; GetSingleTreeNode(entity, id, queryStrings)).Where(node =&gt; node != null));
+            return nodes;
+        }
+
+        protected abstract MenuItemCollection PerformGetMenuForNode(string id, FormDataCollection queryStrings);
+
+        protected abstract UmbracoObjectTypes UmbracoObjectType { get; }
+
+        protected IEnumerable&lt;IUmbracoEntity&gt; GetChildEntities(string id)
+        {
+            // use helper method to ensure we support both integer and guid lookups
+            int iid;
+
+            // look up from GUID if it&#39;s not an integer
+            if (int.TryParse(id, out iid) == false)
+            {
+
+                var idEntity = GetEntityFromId(id);
+                if (idEntity == null)
+                {
+                    throw new HttpResponseException(HttpStatusCode.NotFound);
+                }
+                iid = idEntity.Id;
+            }
+
+
+            //if a request is made for the root node data but the user&#39;s start node is not the default, then
+            // we need to return their start node data
+            if (iid == Constants.System.Root &amp;&amp; UserStartNode != Constants.System.Root)
+            {
+                //just return their single start node, it will show up under the &#39;Content&#39; label
+                var startNode = Services.EntityService.Get(UserStartNode, UmbracoObjectType);
+                if (startNode != null)
+                    return new[] { startNode };
+                else
+                {
+                    throw new EntityNotFoundException(UserStartNode, &quot;User&#39;s start content node could not be found&quot;);
+                }
+            }
+
+            return Services.EntityService.GetChildren(iid, UmbracoObjectType).ToArray();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns true or false if the current user has access to the node based on the user&#39;s allowed start node (path) access
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected abstract bool HasPathAccess(string id, FormDataCollection queryStrings);
+
+        /// &lt;summary&gt;
+        /// Ensures the recycle bin is appended when required (i.e. user has access to the root and it&#39;s not in dialog mode)
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This method is overwritten strictly to render the recycle bin, it should serve no other purpose
+        /// &lt;/remarks&gt;
+        protected sealed override TreeNodeCollection GetTreeNodes(string id, FormDataCollection queryStrings)
+        {
+            //check if we&#39;re rendering the root
+            if (id == Constants.System.Root.ToInvariantString() &amp;&amp; UserStartNode == Constants.System.Root)
+            {
+                var altStartId = string.Empty;
+
+                if (queryStrings.HasKey(TreeQueryStringParameters.StartNodeId))
+                    altStartId = queryStrings.GetValue&lt;string&gt;(TreeQueryStringParameters.StartNodeId);
+
+                //check if a request has been made to render from a specific start node                
+                if (string.IsNullOrEmpty(altStartId) == false &amp;&amp; altStartId != &quot;undefined&quot; &amp;&amp; altStartId != Constants.System.Root.ToString(CultureInfo.InvariantCulture))
+                {
+                    id = altStartId;
+                }
+
+                var nodes = GetTreeNodesInternal(id, queryStrings);
+
+                //only render the recycle bin if we are not in dialog and the start id id still the root
+                if (IsDialog(queryStrings) == false &amp;&amp; id == Constants.System.Root.ToInvariantString())
+                {
+                    nodes.Add(CreateTreeNode(
+                        RecycleBinId.ToInvariantString(),
+                        id,
+                        queryStrings,
+                        ui.GetText(&quot;general&quot;, &quot;recycleBin&quot;),
+                        &quot;icon-trash&quot;,
+                        RecycleBinSmells,
+                        queryStrings.GetValue&lt;string&gt;(&quot;application&quot;) + TreeAlias.EnsureStartsWith(&#39;/&#39;) + &quot;/recyclebin&quot;));
+
+                }
+
+                return nodes;
+            }
+
+            return GetTreeNodesInternal(id, queryStrings);
+        }
+
+        /// &lt;summary&gt;
+        /// Before we make a call to get the tree nodes we have to check if they can actually be rendered
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Currently this just checks if it is a container type, if it is we cannot render children. In the future this might check for other things.
+        /// &lt;/remarks&gt;
+        private TreeNodeCollection GetTreeNodesInternal(string id, FormDataCollection queryStrings)
+        {
+            IUmbracoEntity current = GetEntityFromId(id);
+
+            //before we get the children we need to see if this is a container node
+
+            //test if the parent is a listview / container
+            if (current != null &amp;&amp; current.IsContainer())
+            {
+                //no children!
+                return new TreeNodeCollection();
+            }
+
+            return PerformGetTreeNodes(id, queryStrings);
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the menu requested is for the recycle bin and renders that, otherwise renders the result of PerformGetMenuForNode
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected sealed override MenuItemCollection GetMenuForNode(string id, FormDataCollection queryStrings)
+        {
+            if (RecycleBinId.ToInvariantString() == id)
+            {
+                var menu = new MenuItemCollection();
+                menu.Items.Add&lt;ActionEmptyTranscan&gt;(ui.Text(&quot;actions&quot;, &quot;emptyTrashcan&quot;));
+                menu.Items.Add&lt;ActionRefresh&gt;(ui.Text(&quot;actions&quot;, ActionRefresh.Instance.Alias), true);
+                return menu;
+            }
+            return PerformGetMenuForNode(id, queryStrings);
+        }
+
+        /// &lt;summary&gt;
+        /// Based on the allowed actions, this will filter the ones that the current user is allowed
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;menuWithAllItems&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userAllowedMenuItems&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected void FilterUserAllowedMenuItems(MenuItemCollection menuWithAllItems, IEnumerable&lt;MenuItem&gt; userAllowedMenuItems)
+        {
+            var userAllowedActions = userAllowedMenuItems.Where(x =&gt; x.Action != null).Select(x =&gt; x.Action).ToArray();
+
+            var notAllowed = menuWithAllItems.Items.Where(
+                a =&gt; (a.Action != null
+                      &amp;&amp; a.Action.CanBePermissionAssigned
+                      &amp;&amp; (a.Action.CanBePermissionAssigned == false || userAllowedActions.Contains(a.Action) == false)))
+                                             .ToArray();
+
+            //remove the ones that aren&#39;t allowed.
+            foreach (var m in notAllowed)
+            {
+                menuWithAllItems.Items.Remove(m);
+            }
+        }
+
+        internal IEnumerable&lt;MenuItem&gt; GetAllowedUserMenuItemsForNode(IUmbracoEntity dd)
+        {
+            var actions = global::umbraco.BusinessLogic.Actions.Action.FromString(UmbracoUser.GetPermissions(dd.Path));
+
+            // A user is allowed to delete their own stuff
+            if (dd.CreatorId == UmbracoUser.Id &amp;&amp; actions.Contains(ActionDelete.Instance) == false)
+                actions.Add(ActionDelete.Instance);
+
+            return actions.Select(x =&gt; new MenuItem(x));
+        }
+
+        /// &lt;summary&gt;
+        /// Determins if the user has access to view the node/document
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;doc&quot;&gt;The Document to check permissions against&lt;/param&gt;
+        /// &lt;param name=&quot;allowedUserOptions&quot;&gt;A list of MenuItems that the user has permissions to execute on the current document&lt;/param&gt;
+        /// &lt;remarks&gt;By default the user must have Browse permissions to see the node in the Content tree&lt;/remarks&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;        
+        internal bool CanUserAccessNode(IUmbracoEntity doc, IEnumerable&lt;MenuItem&gt; allowedUserOptions)
+        {
+            return allowedUserOptions.Select(x =&gt; x.Action).OfType&lt;ActionBrowse&gt;().Any();
+        }
+
+        /// &lt;summary&gt;
+        /// Get an entity via an id that can be either an integer or a Guid
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IUmbracoEntity GetEntityFromId(string id)
+        {
+            IUmbracoEntity entity;
+            Guid idGuid = Guid.Empty;
+            int idInt;
+            if (Guid.TryParse(id, out idGuid))
+            {
+                entity = Services.EntityService.GetByKey(idGuid, UmbracoObjectType);
+
+            }
+            else if (int.TryParse(id, out idInt))
+            {
+                entity = Services.EntityService.Get(idInt, UmbracoObjectType);
+            }
+            else
+            {
+                return null;
+            }
+
+            return entity;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[34,9,34,10,0],[36,13,36,54,0],[37,13,37,14,0],[38,17,38,98,0],[41,13,41,79,0],[42,13,42,32,0],[43,13,43,14,0],[44,17,44,98,0],[47,13,47,101,0],[50,13,50,58,0],[51,13,51,25,0],[52,9,52,10,0],[80,9,80,10,0],[81,13,81,50,0],[83,13,83,43,0],[84,13,84,76,0],[85,17,85,99,0],[88,13,88,166,0],[89,13,89,14,0],[90,17,90,33,0],[94,17,94,62,0],[95,17,95,18,0],[96,21,96,157,0],[97,21,97,53,0],[108,17,108,95,0],[109,17,109,18,0],[110,21,110,87,0],[111,17,111,18,0],[112,13,112,14,0],[114,13,114,49,0],[115,13,115,54,0],[115,54,115,97,0],[115,97,115,113,0],[115,113,115,125,0],[115,125,115,128,0],[115,13,115,128,0],[116,13,116,26,0],[117,9,117,10,0],[124,9,124,10,0],[129,13,129,52,0],[130,13,130,14,0],[132,17,132,52,0],[133,17,133,38,0],[134,17,134,18,0],[135,21,135,78,0],[137,17,137,35,0],[138,13,138,14,0],[143,13,143,88,0],[144,13,144,14,0],[146,17,146,94,0],[147,17,147,39,0],[148,21,148,48,0],[150,17,150,18,0],[151,21,151,118,0],[155,13,155,89,0],[156,9,156,10,0],[176,9,176,10,0],[178,13,178,107,0],[179,13,179,14,0],[180,17,180,47,0],[182,17,182,80,0],[183,21,183,103,0],[186,17,186,170,0],[187,17,187,18,0],[188,21,188,37,0],[189,17,189,18,0],[191,17,191,68,0],[194,17,194,104,0],[195,17,195,18,0],[196,21,203,122,0],[205,17,205,18,0],[207,17,207,30,0],[210,13,210,59,0],[211,9,211,10,0],[223,9,223,10,0],[224,13,224,58,0],[229,13,229,58,0],[230,13,230,14,0],[232,17,232,49,0],[235,13,235,58,0],[236,9,236,10,0],[245,9,245,10,0],[246,13,246,56,0],[247,13,247,14,0],[248,17,248,53,0],[249,17,249,90,0],[250,17,250,103,0],[251,17,251,29,0],[253,13,253,60,0],[254,9,254,10,0],[263,9,263,10,0],[264,13,264,70,0],[264,70,264,86,0],[264,86,264,100,0],[264,100,264,108,0],[264,108,264,120,0],[264,13,264,120,0],[266,13,267,22,0],[267,22,269,120,0],[269,120,270,57,0],[266,13,270,57,0],[273,13,273,20,0],[273,22,273,27,0],[273,28,273,30,0],[273,31,273,41,0],[274,13,274,14,0],[275,17,275,50,0],[276,13,276,14,0],[277,9,277,10,0],[280,9,280,10,0],[281,13,281,120,0],[284,13,284,100,0],[285,17,285,52,0],[287,13,287,40,0],[287,40,287,55,0],[287,55,287,57,0],[287,13,287,57,0],[288,9,288,10,0],[298,9,298,10,0],[299,13,299,51,0],[299,51,299,59,0],[299,59,299,90,0],[299,13,299,90,0],[300,9,300,10,0],[308,9,308,10,0],[310,13,310,38,0],[312,13,312,47,0],[313,13,313,14,0],[314,17,314,85,0],[316,13,316,14,0],[317,18,317,50,0],[318,13,318,14,0],[319,17,319,79,0],[320,13,320,14,0],[322,13,322,14,0],[323,17,323,29,0],[326,13,326,27,0],[327,9,327,10,0]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\PublicAccessService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using Umbraco.Core.Events;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Services
+{
+    public class PublicAccessService : RepositoryService, IPublicAccessService
+    {
+        public PublicAccessService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory, ILogger logger, IEventMessagesFactory eventMessagesFactory)
+            : base(provider, repositoryFactory, logger, eventMessagesFactory)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all defined entries and associated rules
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;PublicAccessEntry&gt; GetAll()
+        {
+            using (var repo = RepositoryFactory.CreatePublicAccessRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repo.GetAll();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the entry defined for the content item&#39;s path
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;Returns null if no entry is found&lt;/returns&gt;
+        public PublicAccessEntry GetEntryForContent(IContent content)
+        {
+            return GetEntryForContent(content.Path.EnsureEndsWith(&quot;,&quot; + content.Id));
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the entry defined for the content item based on a content path
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentPath&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;Returns null if no entry is found&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// NOTE: This method get&#39;s called *very* often! This will return the results from cache
+        /// &lt;/remarks&gt;
+        public PublicAccessEntry GetEntryForContent(string contentPath)
+        {
+            //Get all ids in the path for the content item and ensure they all
+            // parse to ints that are not -1.
+            var ids = contentPath.Split(new[] { &#39;,&#39; }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(x =&gt;
+                {
+                    int val;
+                    if (int.TryParse(x, out val))
+                    {
+                        return val;
+                    }
+                    return -1;
+                })
+                .Where(x =&gt; x != -1)
+                .ToList();
+
+            //start with the deepest id
+            ids.Reverse();
+
+            using (var repo = RepositoryFactory.CreatePublicAccessRepository(UowProvider.GetUnitOfWork()))
+            {
+                //This will retrieve from cache!                 
+                var entries = repo.GetAll().ToArray();
+
+                foreach (var id in ids)
+                {
+                    var found = entries.FirstOrDefault(x =&gt; x.ProtectedNodeId == id);
+                    if (found != null) return found;
+                }
+            }
+
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns true if the content has an entry for it&#39;s path
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public Attempt&lt;PublicAccessEntry&gt; IsProtected(IContent content)
+        {
+            var result = GetEntryForContent(content);
+            return Attempt.If(result != null, result);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns true if the content has an entry based on a content path
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentPath&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public Attempt&lt;PublicAccessEntry&gt; IsProtected(string contentPath)
+        {
+            var result = GetEntryForContent(contentPath);
+            return Attempt.If(result != null, result);
+        }
+
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        [Obsolete(&quot;Use AddRule instead, this method will be removed in future versions&quot;)]
+        public Attempt&lt;OperationStatus&lt;PublicAccessEntry, OperationStatusType&gt;&gt; AddOrUpdateRule(IContent content, string ruleType, string ruleValue)
+        {
+            return AddRule(content, ruleType, ruleValue);
+        }
+
+        /// &lt;summary&gt;
+        /// Adds a rule
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;ruleType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;ruleValue&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public Attempt&lt;OperationStatus&lt;PublicAccessEntry, OperationStatusType&gt;&gt; AddRule(IContent content, string ruleType, string ruleValue)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repo = RepositoryFactory.CreatePublicAccessRepository(uow))
+            {
+                var entry = repo.GetAll().FirstOrDefault(x =&gt; x.ProtectedNodeId == content.Id);
+                if (entry == null)
+                    return Attempt&lt;OperationStatus&lt;PublicAccessEntry, OperationStatusType&gt;&gt;.Fail();
+
+                var existingRule = entry.Rules.FirstOrDefault(x =&gt; x.RuleType == ruleType &amp;&amp; x.RuleValue == ruleValue);
+                if (existingRule == null)
+                {
+                    entry.AddRule(ruleValue, ruleType);
+                }
+                else
+                {
+                    //If they are both the same already then there&#39;s nothing to update, exit
+                    return Attempt&lt;OperationStatus&lt;PublicAccessEntry, OperationStatusType&gt;&gt;.Succeed(
+                        new OperationStatus&lt;PublicAccessEntry, OperationStatusType&gt;(entry, OperationStatusType.Success, evtMsgs));
+                }
+
+                if (Saving.IsRaisedEventCancelled(
+                    new SaveEventArgs&lt;PublicAccessEntry&gt;(entry, evtMsgs),
+                    this))
+                {
+                    return Attempt&lt;OperationStatus&lt;PublicAccessEntry, OperationStatusType&gt;&gt;.Fail(
+                        new OperationStatus&lt;PublicAccessEntry, OperationStatusType&gt;(entry, OperationStatusType.FailedCancelledByEvent, evtMsgs));
+                }
+
+                repo.AddOrUpdate(entry);
+
+                uow.Commit();
+
+                Saved.RaiseEvent(new SaveEventArgs&lt;PublicAccessEntry&gt;(entry, false, evtMsgs), this);
+                return Attempt&lt;OperationStatus&lt;PublicAccessEntry, OperationStatusType&gt;&gt;.Succeed(
+                    new OperationStatus&lt;PublicAccessEntry, OperationStatusType&gt;(entry, OperationStatusType.Success, evtMsgs));
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Removes a rule
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;ruleType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;ruleValue&quot;&gt;&lt;/param&gt;
+        public Attempt&lt;OperationStatus&gt; RemoveRule(IContent content, string ruleType, string ruleValue)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repo = RepositoryFactory.CreatePublicAccessRepository(uow))
+            {
+                var entry = repo.GetAll().FirstOrDefault(x =&gt; x.ProtectedNodeId == content.Id);
+                if (entry == null) return Attempt&lt;OperationStatus&gt;.Fail();
+
+                var existingRule = entry.Rules.FirstOrDefault(x =&gt; x.RuleType == ruleType &amp;&amp; x.RuleValue == ruleValue);
+                if (existingRule == null) return Attempt&lt;OperationStatus&gt;.Fail();
+
+                entry.RemoveRule(existingRule);
+
+                if (Saving.IsRaisedEventCancelled(
+                    new SaveEventArgs&lt;PublicAccessEntry&gt;(entry, evtMsgs),
+                    this))
+                {
+                    return OperationStatus.Cancelled(evtMsgs);
+                }
+
+                repo.AddOrUpdate(entry);
+
+                uow.Commit();
+
+                Saved.RaiseEvent(new SaveEventArgs&lt;PublicAccessEntry&gt;(entry, false, evtMsgs), this);
+                return OperationStatus.Success(evtMsgs);
+            }
+
+        }
+
+        /// &lt;summary&gt;
+        /// Saves the entry
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entry&quot;&gt;&lt;/param&gt;
+        public Attempt&lt;OperationStatus&gt; Save(PublicAccessEntry entry)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+            if (Saving.IsRaisedEventCancelled(
+                    new SaveEventArgs&lt;PublicAccessEntry&gt;(entry, evtMsgs),
+                    this))
+            {
+                return OperationStatus.Cancelled(evtMsgs);
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repo = RepositoryFactory.CreatePublicAccessRepository(uow))
+            {
+                repo.AddOrUpdate(entry);
+                uow.Commit();
+            }
+
+            Saved.RaiseEvent(new SaveEventArgs&lt;PublicAccessEntry&gt;(entry, false, evtMsgs), this);
+            return OperationStatus.Success(evtMsgs);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes the entry and all associated rules
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entry&quot;&gt;&lt;/param&gt;
+        public Attempt&lt;OperationStatus&gt; Delete(PublicAccessEntry entry)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+            if (Deleting.IsRaisedEventCancelled(
+                    new DeleteEventArgs&lt;PublicAccessEntry&gt;(entry, evtMsgs),
+                    this))
+            {
+                return OperationStatus.Cancelled(evtMsgs);
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repo = RepositoryFactory.CreatePublicAccessRepository(uow))
+            {
+                repo.Delete(entry);
+                uow.Commit();
+            }
+
+            Deleted.RaiseEvent(new DeleteEventArgs&lt;PublicAccessEntry&gt;(entry, false, evtMsgs), this);
+            return OperationStatus.Success(evtMsgs);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs before Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPublicAccessService, SaveEventArgs&lt;PublicAccessEntry&gt;&gt; Saving;
+
+        /// &lt;summary&gt;
+        /// Occurs after Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPublicAccessService, SaveEventArgs&lt;PublicAccessEntry&gt;&gt; Saved;
+
+        /// &lt;summary&gt;
+        /// Occurs before Delete
+        /// &lt;/summary&gt;		
+        public static event TypedEventHandler&lt;IPublicAccessService, DeleteEventArgs&lt;PublicAccessEntry&gt;&gt; Deleting;
+
+        /// &lt;summary&gt;
+        /// Occurs after Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPublicAccessService, DeleteEventArgs&lt;PublicAccessEntry&gt;&gt; Deleted;
+
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[17,15,17,78,1],[18,9,18,10,1],[19,9,19,10,1],[26,9,26,10,0],[27,20,27,106,0],[28,13,28,14,0],[29,17,29,38,0],[31,9,31,10,0],[39,9,39,10,1],[40,13,40,86,1],[41,9,41,10,1],[52,9,52,10,1],[55,13,57,17,1],[57,17,57,18,1],[57,18,59,21,1],[59,21,59,50,1],[59,50,60,21,1],[60,21,60,22,1],[60,22,61,25,1],[61,25,61,36,1],[61,36,63,21,1],[63,21,63,31,0],[63,31,64,17,1],[64,17,64,18,1],[64,18,65,29,1],[65,29,65,36,1],[65,36,66,27,1],[55,13,66,27,1],[69,13,69,27,1],[71,20,71,106,1],[72,13,72,14,1],[74,17,74,55,1],[76,17,76,24,1],[76,26,76,32,1],[76,33,76,35,1],[76,36,76,39,1],[77,17,77,18,1],[78,21,78,61,1],[78,61,78,84,1],[78,84,78,86,1],[78,21,78,86,1],[79,21,79,39,1],[79,40,79,53,1],[80,17,80,18,0],[81,13,81,14,0],[83,13,83,25,0],[84,9,84,10,1],[92,9,92,10,0],[93,13,93,54,0],[94,13,94,55,0],[95,9,95,10,0],[103,9,103,10,0],[104,13,104,58,0],[105,13,105,55,0],[106,9,106,10,0],[111,9,111,10,0],[112,13,112,58,0],[113,9,113,10,0],[123,9,123,10,1],[124,13,124,54,1],[125,13,125,51,1],[126,20,126,82,1],[127,13,127,14,1],[128,17,128,63,1],[128,63,128,94,1],[128,94,128,96,1],[128,17,128,96,1],[129,17,129,35,1],[130,21,130,100,0],[132,17,132,68,1],[132,68,132,118,1],[132,118,132,120,1],[132,17,132,120,1],[133,17,133,42,1],[134,17,134,18,1],[135,21,135,56,1],[136,17,136,18,1],[138,17,138,18,0],[140,21,141,131,0],[144,17,146,27,1],[147,17,147,18,0],[148,21,149,146,0],[152,17,152,41,1],[154,17,154,30,1],[156,17,156,101,1],[157,17,158,127,1],[160,9,160,10,1],[169,9,169,10,1],[170,13,170,54,1],[171,13,171,51,1],[172,20,172,82,1],[173,13,173,14,1],[174,17,174,63,1],[174,63,174,94,1],[174,94,174,96,1],[174,17,174,96,1],[175,17,175,35,1],[175,36,175,75,0],[177,17,177,68,1],[177,68,177,118,1],[177,118,177,120,1],[177,17,177,120,1],[178,17,178,42,1],[178,43,178,82,0],[180,17,180,48,1],[182,17,184,27,1],[185,17,185,18,0],[186,21,186,63,0],[189,17,189,41,1],[191,17,191,30,1],[193,17,193,101,1],[194,17,194,57,1],[197,9,197,10,1],[204,9,204,10,1],[205,13,205,54,1],[206,13,208,27,1],[209,13,209,14,0],[210,17,210,59,0],[213,13,213,51,1],[214,20,214,82,1],[215,13,215,14,1],[216,17,216,41,1],[217,17,217,30,1],[218,13,218,14,1],[220,13,220,97,1],[221,13,221,53,1],[222,9,222,10,1],[229,9,229,10,0],[230,13,230,54,0],[231,13,233,27,0],[234,13,234,14,0],[235,17,235,59,0],[238,13,238,51,0],[239,20,239,82,0],[240,13,240,14,0],[241,17,241,36,0],[242,17,242,30,0],[243,13,243,14,0],[245,13,245,101,0],[246,13,246,53,0],[247,9,247,10,0]]);
+    </script>
+  </body>
+</html>

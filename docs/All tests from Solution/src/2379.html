@@ -1,0 +1,1804 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\ContentType.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading;
+using System.Runtime.CompilerServices;
+using System.Linq;
+using System.Xml;
+using umbraco.BusinessLogic;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Rdbms;
+
+using umbraco.cms.businesslogic.cache;
+using umbraco.cms.businesslogic.propertytype;
+using umbraco.cms.businesslogic.web;
+using umbraco.DataLayer;
+using DataTypeDefinition = umbraco.cms.businesslogic.datatype.DataTypeDefinition;
+using Language = umbraco.cms.businesslogic.language.Language;
+using PropertyType = umbraco.cms.businesslogic.propertytype.PropertyType;
+
+namespace umbraco.cms.businesslogic
+{
+    /// &lt;summary&gt;
+    /// ContentTypes defines the datafields of Content objects of that type, it&#39;s similar to defining columns 
+    /// in a database table, where the PropertyTypes on the ContentType each responds to a Column, and the Content
+    /// objects is similar to a row of data, where the Properties on the Content object corresponds to the PropertyTypes
+    /// on the ContentType.
+    /// 
+    /// Besides data definition, the ContentType also defines the sorting and grouping (in tabs) of Properties/Datafields
+    /// on the Content and which Content (by ContentType) can be created as child to the Content of the ContentType.
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;Obsolete, Use Umbraco.Core.Models.ContentType or Umbraco.Core.Models.MediaType or  or Umbraco.Core.Models.MemberType&quot;, false)]
+    public class ContentType : CMSNode
+    {
+        #region Constructors
+
+        /// &lt;summary&gt;
+        /// 
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        public ContentType(int id) : base(id) { }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;ContentType&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;The id.&lt;/param&gt;
+        public ContentType(Guid id) : base(id) { }
+
+        public ContentType(int id, bool noSetup) : base(id, noSetup) { }
+
+        public ContentType(Guid id, bool noSetup) : base(id, noSetup) { }
+
+        /// &lt;summary&gt;
+        /// Creates a new content type object manually.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;icon&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;thumbnail&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;masterContentType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;isContainer&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// This is like creating a ContentType node using optimized mode but this lets you set
+        /// all of the properties that are initialized normally from the database.
+        /// This is used for performance reasons.
+        /// &lt;/remarks&gt;
+        internal ContentType(int id, string alias, string icon, string thumbnail, int? masterContentType, bool? isContainer)
+            : base(id, true)
+        {
+            _alias = alias;
+            _iconurl = icon;
+            _thumbnail = thumbnail;
+
+            if (masterContentType.HasValue)
+                MasterContentType = masterContentType.Value;
+
+            if (isContainer.HasValue)
+                _isContainerContentType = isContainer.Value;
+        }
+
+        internal ContentType(IContentTypeComposition contentType) : base(contentType)
+        {
+            ContentTypeItem = contentType;
+        }
+
+        #endregion
+
+        #region Constants and static members
+
+        protected internal const string m_SQLOptimizedGetAll = @&quot;
+            SELECT id, createDate, trashed, parentId, nodeObjectType, nodeUser, level, path, sortOrder, uniqueID, text,
+                allowAtRoot, isContainer, Alias,icon,thumbnail,description 
+            FROM umbracoNode INNER JOIN cmsContentType ON umbracoNode.id = cmsContentType.nodeId
+            WHERE nodeObjectType = @nodeObjectType&quot;;
+
+        #endregion
+
+        #region Static Methods
+
+        /// &lt;summary&gt;
+        /// Used for cache so we don&#39;t have to lookup column names all the time, this is actually only used for the ChildrenAsTable methods
+        /// &lt;/summary&gt;
+        private static readonly ConcurrentDictionary&lt;string, IDictionary&lt;string, string&gt;&gt; AliasToNames = new ConcurrentDictionary&lt;string, IDictionary&lt;string, string&gt;&gt;();
+        private static readonly ConcurrentDictionary&lt;System.Tuple&lt;string, string&gt;, Guid&gt; PropertyTypeCache = new ConcurrentDictionary&lt;System.Tuple&lt;string, string&gt;, Guid&gt;();
+
+        /// &lt;summary&gt;
+        /// Returns a content type&#39;s columns alias -&gt; name mapping
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentTypeAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This is currently only used for ChildrenAsTable methods, caching is moved here instead of in the app logic so we can clear the cache
+        /// &lt;/remarks&gt;
+        internal static IDictionary&lt;string, string&gt; GetAliasesAndNames(string contentTypeAlias)
+        {
+            return AliasToNames.GetOrAdd(contentTypeAlias, s =&gt;
+                {
+                    var ct = GetByAlias(contentTypeAlias);
+                    var userFields = ct.PropertyTypes.ToDictionary(x =&gt; x.Alias, x =&gt; x.Name);
+                    return userFields;
+                });
+        }
+
+        /// &lt;summary&gt;
+        /// Removes the static object cache
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentTypeAlias&quot;&gt;&lt;/param&gt;
+        public static void RemoveFromDataTypeCache(string contentTypeAlias)
+        {
+            var toDelete = PropertyTypeCache.Keys.Where(key =&gt; string.Equals(key.Item1, contentTypeAlias)).ToList();
+            foreach (var key in toDelete)
+            {
+                Guid id;
+                PropertyTypeCache.TryRemove(key, out id);
+            }
+            AliasToNames.Clear();
+        }
+
+        /// &lt;summary&gt;
+        /// Removes the static object cache
+        /// &lt;/summary&gt;
+        internal static void RemoveAllDataTypeCache()
+        {
+            AliasToNames.Clear();
+            PropertyTypeCache.Clear();
+        }
+
+        public static Guid GetDataType(string contentTypeAlias, string propertyTypeAlias)
+        {
+            //propertyTypeAlias needs to be invariant, so we will store uppercase
+            var key = new System.Tuple&lt;string, string&gt;(contentTypeAlias, propertyTypeAlias.ToUpper());
+
+
+            return PropertyTypeCache.GetOrAdd(
+                key,
+                tuple =&gt;
+                {
+                    // With 4.10 we can&#39;t do this via direct SQL as we have content type mixins
+                    var controlId = Guid.Empty;
+                    var ct = GetByAlias(contentTypeAlias);
+                    var pt = ct.getPropertyType(propertyTypeAlias);
+                    if (pt != null)
+                    {
+                        controlId = pt.DataTypeDefinition.DataType.Id;
+                    }
+                    return controlId;
+                });
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the type of the content.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;The id.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static ContentType GetContentType(int id)
+        {
+            return ApplicationContext.Current.ApplicationCache.RuntimeCache.GetCacheItem&lt;ContentType&gt;
+                (string.Format(&quot;{0}{1}&quot;, CacheKeys.ContentTypeCacheKey, id),
+                 timeout:       TimeSpan.FromMinutes(30),
+                 getCacheItem:  () =&gt; new ContentType(id));
+        }
+
+        // This is needed, because the Tab class is protected and as such it&#39;s not possible for 
+        // the PropertyType class to easily access the cache flusher
+        /// &lt;summary&gt;
+        /// Flushes the tab cache.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;TabId&quot;&gt;The tab id.&lt;/param&gt;
+        [Obsolete(&quot;There is no cache to flush for tabs&quot;)]
+        public static void FlushTabCache(int TabId, int ContentTypeId)
+        {
+            Tab.FlushCache(TabId, ContentTypeId);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new ContentType
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;NodeId&quot;&gt;The CMSNode Id of the ContentType&lt;/param&gt;
+        /// &lt;param name=&quot;Alias&quot;&gt;The Alias of the ContentType&lt;/param&gt;
+        /// &lt;param name=&quot;IconUrl&quot;&gt;The Iconurl of Contents of this ContentType&lt;/param&gt;
+        protected static void Create(int NodeId, string Alias, string IconUrl)
+        {
+            Create(NodeId, Alias, IconUrl, true);
+        }
+
+        internal static void Create(int nodeId, string alias, string iconUrl, bool formatAlias)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(
+                                      &quot;Insert into cmsContentType (nodeId,alias,icon) values (&quot; + 
+                                      nodeId + &quot;,&#39;&quot; +
+                                      (formatAlias ? helpers.Casing.SafeAliasWithForcingCheck(alias) : alias) +
+                                      &quot;&#39;,&#39;&quot; + iconUrl + &quot;&#39;)&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes a ContentType object given the Alias.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Alias&quot;&gt;Alias of the content type&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The ContentType with the corrosponding Alias
+        /// &lt;/returns&gt;
+        public static ContentType GetByAlias(string Alias)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                return new ContentType(sqlHelper.ExecuteScalar&lt;int&gt;(&quot;SELECT nodeid FROM cmsContentType WHERE alias = @alias&quot;,
+                                   sqlHelper.CreateParameter(&quot;@alias&quot;, Alias)));
+        }
+
+        /// &lt;summary&gt;
+        /// Helper method for getting the Tab id from a given PropertyType
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pt&quot;&gt;The PropertyType from which to get the Tab Id&lt;/param&gt;
+        /// &lt;returns&gt;The Id of the Tab on which the PropertyType is placed&lt;/returns&gt;
+        public static int getTabIdFromPropertyType(PropertyType pt)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+            {
+                object tmp = sqlHelper.ExecuteScalar&lt;object&gt;(&quot;Select propertyTypeGroupId from cmsPropertyType where id = &quot; + pt.Id.ToString());
+                if (tmp == DBNull.Value)
+                    return 0;
+                return int.Parse(tmp.ToString());
+            }
+        }
+
+        #endregion
+
+        #region Private Members
+
+        private bool _allowAtRoot;
+        private string _alias;
+        private string _iconurl;
+        private string _description;
+        private string _thumbnail;
+        List&lt;int&gt; m_masterContentTypes;
+        private bool _isContainerContentType;
+        private List&lt;int&gt; _allowedChildContentTypeIDs;
+        private List&lt;TabI&gt; _virtualTabs;
+
+        protected internal IContentTypeComposition ContentTypeItem
+        {
+            get { return base.Entity as IContentTypeComposition; }
+            set { base.Entity = value; }
+        }
+
+        #endregion
+
+        #region Public Properties
+
+        #region Regenerate Xml Structures
+
+        /// &lt;summary&gt;
+        /// Used to rebuild all of the xml structures for content of the current content type in the cmsContentXml table
+        /// &lt;/summary&gt;
+        [MethodImpl(MethodImplOptions.Synchronized)]
+        internal void RebuildXmlStructuresForContent()
+        {
+            //Clears all xml structures in the cmsContentXml table for the current content type
+            ClearXmlStructuresForContent();
+            foreach (var i in GetContentIdsForContentType())
+            {
+                RebuildXmlStructureForContentItem(i);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all content ids associated with this content type
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This will generally just return the content ids associated with this content type but in the case
+        /// of a DocumentType where we can have inherited types, this will return all content Ids that are of 
+        /// this content type or any descendant types as well.
+        /// &lt;/remarks&gt;
+        internal virtual IEnumerable&lt;int&gt; GetContentIdsForContentType()
+        {
+            var ids = new List&lt;int&gt;();
+            //get all the content item ids of the current content type
+            using (var sqlHelper = Application.SqlHelper)
+            using (var dr = sqlHelper.ExecuteReader(@&quot;SELECT DISTINCT cmsContent.nodeId FROM cmsContent 
+                                                INNER JOIN cmsContentType ON cmsContent.contentType = cmsContentType.nodeId 
+                                                WHERE cmsContentType.nodeId = @nodeId&quot;,
+                                                    sqlHelper.CreateParameter(&quot;@nodeId&quot;, this.Id)))
+            {
+                while (dr.Read())
+                {
+                    ids.Add(dr.GetInt(&quot;nodeId&quot;));
+                }
+            }
+            return ids;
+        }
+
+        /// &lt;summary&gt;
+        /// Rebuilds the xml structure for the content item by id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentId&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// This is not thread safe
+        /// &lt;/remarks&gt;
+        internal virtual void RebuildXmlStructureForContentItem(int contentId)
+        {
+            var xd = new XmlDocument();
+            try
+            {
+                new Content(contentId).XmlGenerate(xd);
+            }
+            catch (Exception ee)
+            {
+                LogHelper.Error&lt;ContentType&gt;(&quot;Error generating xml&quot;, ee);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Clears all xml structures in the cmsContentXml table for the current content type
+        /// &lt;/summary&gt;
+        internal virtual void ClearXmlStructuresForContent()
+        {
+            //Remove all items from the cmsContentXml table that are of this current content type
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(@&quot;DELETE FROM cmsContentXml WHERE nodeId IN
+                                        (SELECT DISTINCT cmsContent.nodeId FROM cmsContent 
+                                            INNER JOIN cmsContentType ON cmsContent.contentType = cmsContentType.nodeId 
+                                            WHERE cmsContentType.nodeId = @nodeId)&quot;,
+                                      sqlHelper.CreateParameter(&quot;@nodeId&quot;, this.Id));
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// The Alias of the ContentType, is used for import/export and more human readable initialization see: GetByAlias 
+        /// method.
+        /// &lt;/summary&gt;
+        public string Alias
+        {
+            get { return _alias; }
+            set
+            {
+                _alias = helpers.Casing.SafeAliasWithForcingCheck(value);
+
+                // validate if alias is empty
+                if (String.IsNullOrEmpty(_alias))
+                {
+                    throw new ArgumentOutOfRangeException(&quot;An Alias cannot be empty&quot;);
+                }
+
+                //This switches between using new vs. legacy api.
+                //Note that this is currently only done to support both DocumentType and MediaType, which use the new api and MemberType that doesn&#39;t.
+                if (ContentTypeItem == null)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlHelper.ExecuteNonQuery(&quot;update cmsContentType set alias = @alias where nodeId = @id&quot;,
+                                              sqlHelper.CreateParameter(&quot;@alias&quot;, _alias),
+                                              sqlHelper.CreateParameter(&quot;@id&quot;, Id));
+                }
+                else
+                {
+                    ContentTypeItem.Alias = _alias;
+                }
+
+                // Remove from cache
+                FlushFromCache(Id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// A Content object is often (always) represented in the treeview in the Umbraco console, the ContentType defines
+        /// which Icon the Content of this type is representated with.
+        /// &lt;/summary&gt;
+        public string IconUrl
+        {
+            get { return _iconurl; }
+            set
+            {
+                _iconurl = value;
+
+                //This switches between using new vs. legacy api.
+                //Note that this is currently only done to support both DocumentType and MediaType, which use the new api and MemberType that doesn&#39;t.
+                if (ContentTypeItem == null)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlHelper.ExecuteNonQuery(&quot;update cmsContentType set icon=&#39;&quot; + value + &quot;&#39; where nodeid = &quot; + Id);
+                }
+                else
+                {
+                    ContentTypeItem.Icon = _iconurl;
+                }
+
+                // Remove from cache
+                FlushFromCache(Id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Get or Sets the Container status of the Content Type. A Container Content Type doesn&#39;t show its children in the tree,
+        /// but instead adds a tab when edited showing its children in a grid
+        /// &lt;/summary&gt;
+        public bool IsContainerContentType
+        {
+            get { return _isContainerContentType; }
+            set
+            {
+                _isContainerContentType = value;
+
+                //This switches between using new vs. legacy api.
+                //Note that this is currently only done to support both DocumentType and MediaType, which use the new api and MemberType that doesn&#39;t.
+                if (ContentTypeItem == null)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlHelper.ExecuteNonQuery(
+                                          &quot;update cmsContentType set isContainer = @isContainer where nodeId = @id&quot;,
+                                          sqlHelper.CreateParameter(&quot;@isContainer&quot;, value),
+                                          sqlHelper.CreateParameter(&quot;@id&quot;, Id));
+                }
+                else
+                {
+                    ContentTypeItem.IsContainer = _isContainerContentType;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the &#39;allow at root&#39; boolean
+        /// &lt;/summary&gt;
+        public bool AllowAtRoot
+        {
+            get { return _allowAtRoot; }
+            set
+            {
+                _allowAtRoot = value;
+
+                //This switches between using new vs. legacy api. 
+                //Note that this is currently only done to support both DocumentType and MediaType, which use the new api and MemberType that doesn&#39;t.
+                if (ContentTypeItem == null)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlHelper.ExecuteNonQuery(
+                                          &quot;update cmsContentType set allowAtRoot = @allowAtRoot where nodeId = @id&quot;,
+                                          sqlHelper.CreateParameter(&quot;@allowAtRoot&quot;, value),
+                                          sqlHelper.CreateParameter(&quot;@id&quot;, Id));
+                }
+                else
+                {
+                    ContentTypeItem.AllowedAsRoot = _allowAtRoot;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the description.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The description.&lt;/value&gt;
+        public string Description
+        {
+            get
+            {
+                if (_description != null)
+                {
+                    if (!_description.StartsWith(&quot;#&quot;))
+                        return _description;
+                    var lang = Language.GetByCultureCode(Thread.CurrentThread.CurrentCulture.Name);
+                    if (lang != null)
+                    {
+                        if (Dictionary.DictionaryItem.hasKey(_description.Substring(1, _description.Length - 1)))
+                        {
+                            var di =
+                                new Dictionary.DictionaryItem(_description.Substring(1, _description.Length - 1));
+                            return di.Value(lang.id);
+                        }
+                    }
+
+                    return &quot;[&quot; + _description + &quot;]&quot;;
+                }
+
+                return _description;
+            }
+            set
+            {
+                _description = value;
+
+                //This switches between using new vs. legacy api. 
+                //Note that this is currently only done to support both DocumentType and MediaType, which use the new api and MemberType that doesn&#39;t.
+                if (ContentTypeItem == null)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlHelper.ExecuteNonQuery(
+                                          &quot;update cmsContentType set description = @description where nodeId = @id&quot;,
+                                          sqlHelper.CreateParameter(&quot;@description&quot;, value),
+                                          sqlHelper.CreateParameter(&quot;@id&quot;, Id));
+                }
+                else
+                {
+                    ContentTypeItem.Description = _description;
+                }
+
+                FlushFromCache(Id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the thumbnail.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The thumbnail.&lt;/value&gt;
+        public string Thumbnail
+        {
+            get { return _thumbnail; }
+            set
+            {
+                _thumbnail = value;
+
+                //This switches between using new vs. legacy api. 
+                //Note that this is currently only done to support both DocumentType and MediaType, which use the new api and MemberType that doesn&#39;t.
+                if (ContentTypeItem == null)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlHelper.ExecuteNonQuery(
+                                          &quot;update cmsContentType set thumbnail = @thumbnail where nodeId = @id&quot;,
+                                          sqlHelper.CreateParameter(&quot;@thumbnail&quot;, value),
+                                          sqlHelper.CreateParameter(&quot;@id&quot;, Id));
+                }
+                else
+                {
+                    ContentTypeItem.Thumbnail = _thumbnail;
+                }
+
+                FlushFromCache(Id);
+            }
+        }
+
+
+        /// &lt;summary&gt;
+        /// Human readable name/label
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;&lt;/value&gt;
+        public override string Text
+        {
+            get
+            {
+                var tempText = base.Text;
+                if (!tempText.StartsWith(&quot;#&quot;))
+                    return tempText;
+                var lang = Language.GetByCultureCode(Thread.CurrentThread.CurrentCulture.Name);
+                if (lang != null)
+                {
+                    if (Dictionary.DictionaryItem.hasKey(tempText.Substring(1, tempText.Length - 1)))
+                    {
+                        var di = new Dictionary.DictionaryItem(tempText.Substring(1, tempText.Length - 1));
+                        return di.Value(lang.id);
+                    }
+                }
+
+                return &quot;[&quot; + tempText + &quot;]&quot;;
+            }
+            set
+            {
+                base.Text = value;
+
+                if (ContentTypeItem != null)
+                {
+                    ContentTypeItem.Name = value;
+                }
+
+                // Remove from cache
+                FlushFromCache(Id);
+            }
+        }
+
+        //THIS SHOULD BE IENUMERABLE&lt;PROPERTYTYPE&gt; NOT LIST!
+
+        /// &lt;summary&gt;
+        /// The &quot;datafield/column&quot; definitions, a Content object of this type will have an equivalent
+        /// list of Properties.
+        /// &lt;/summary&gt;		
+        /// &lt;remarks&gt;
+        /// Property types are are cached so any calls to this property will returne cached versions
+        /// &lt;/remarks&gt;
+        public List&lt;PropertyType&gt; PropertyTypes
+        {
+            get
+            {
+                var cacheKey = GetPropertiesCacheKey();
+
+                return ApplicationContext.Current.ApplicationCache.RuntimeCache.GetCacheItem&lt;List&lt;PropertyType&gt;&gt;(
+                    cacheKey,
+                    timeout:        TimeSpan.FromMinutes(15),
+                    getCacheItem:   () =&gt;
+                    {
+                        //MCH NOTE: For the timing being I have changed this to a dictionary to ensure that property types
+                        //aren&#39;t added multiple times through the MasterContentType structure, because each level loads
+                        //its own + inherited property types, which is wrong. Once we are able to fully switch to the new api
+                        //this should no longer be a problem as the composition always contains a correct list of property types.
+                        var result = new Dictionary&lt;int, PropertyType&gt;();
+                        using (var sqlHelper = Application.SqlHelper)
+                        using (IRecordsReader dr = sqlHelper.ExecuteReader(
+                                &quot;select id from cmsPropertyType where contentTypeId = @ctId order by sortOrder&quot;,
+                                sqlHelper.CreateParameter(&quot;@ctId&quot;, Id)))
+                        {
+                            while (dr.Read())
+                            {
+                                int id = dr.GetInt(&quot;id&quot;);
+                                PropertyType pt = PropertyType.GetPropertyType(id);
+                                if (pt != null)
+                                    result.Add(pt.Id, pt);
+                            }
+                        }
+
+                        // Get Property Types from the master content type
+                        if (MasterContentTypes.Count &gt; 0)
+                        {
+                            foreach (var mct in MasterContentTypes)
+                            {
+                                var pts = GetContentType(mct).PropertyTypes;
+                                foreach (var pt in pts)
+                                {
+                                    if (result.ContainsKey(pt.Id) == false)
+                                        result.Add(pt.Id, pt);
+                                }
+                            }
+                        }
+                        return result.Select(x =&gt; x.Value).ToList();
+                    });
+            }
+        }
+
+        public List&lt;int&gt; MasterContentTypes
+        {
+            get
+            {
+                if (m_masterContentTypes == null)
+                {
+                    // fixme - oops, what&#39;s this?
+                    //var ct = ApplicationContext.Current.Services.ContentTypeService.GetContentType(Id);
+                    //m_masterContentTypes = ct.CompositionPropertyGroups.Select(x =&gt; x.Id).ToList();
+
+                    // back to normal
+                    m_masterContentTypes = ContentTypeItem == null
+                        ? new List&lt;int&gt;()
+                        : ContentTypeItem.CompositionIds().ToList();
+
+                    if (ContentTypeItem == null)
+                    {
+                        //TODO Make this recursive, so it looks up Masters of the Master ContentType
+                        using (var sqlHelper = Application.SqlHelper)
+                        using (var dr = sqlHelper.ExecuteReader(
+                            @&quot;SELECT parentContentTypeId FROM cmsContentType2ContentType WHERE childContentTypeId = @id&quot;,
+                                sqlHelper.CreateParameter(&quot;@id&quot;, Id)))
+                        {
+                            while (dr.Read())
+                            {
+                                m_masterContentTypes.Add(dr.GetInt(&quot;parentContentTypeId&quot;));
+                            }
+                        }
+                    }
+
+                }
+                return m_masterContentTypes;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the Master Content Type for inheritance of tabs and properties.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The ID of the Master Content Type&lt;/value&gt;
+        public int MasterContentType
+        {
+            get
+            {
+                if (ContentTypeItem == null)
+                    return 0;
+
+                return ContentTypeItem.ParentId == -1 ? 0 : ContentTypeItem.ParentId;
+            }
+            set
+            {
+                if (value != MasterContentType)
+                {
+
+                    if (ContentTypeItem == null)
+                    {
+                        //Legacy
+                        if (MasterContentTypes.Count &gt; 0)
+                        {
+                            var masterId = MasterContentTypes[0];
+                            RemoveParentContentType(masterId);
+                        }
+
+                        AddParentContentType(value);
+                    }
+                    else
+                    {
+                        ContentTypeItem.ParentId = value;
+
+                        //Try to load the ContentType/MediaType through the new public api
+                        if (nodeObjectType == new Guid(Constants.ObjectTypes.DocumentType))
+                        {
+                            
+                        }
+
+                        var newMaster = CallGetContentTypeMethod(value);
+                        var added = ContentTypeItem.AddContentType(newMaster);
+                    }
+                }
+            }
+        }
+
+        public void AddParentContentType(int parentContentTypeId)
+        {
+            if (MasterContentTypes.Contains(parentContentTypeId))
+            {
+                // Should we throw an exception if you try to add something that already exist?
+            }
+            else
+            {
+                if (ContentTypeItem == null)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlHelper.ExecuteNonQuery(
+                        &quot;INSERT INTO [cmsContentType2ContentType] (parentContentTypeId, childContentTypeId) VALUES (@parentContentTypeId, @childContentTypeId)&quot;,
+                        sqlHelper.CreateParameter(&quot;@parentContentTypeId&quot;, parentContentTypeId),
+                        sqlHelper.CreateParameter(&quot;@childContentTypeId&quot;, Id));
+
+                    MasterContentTypes.Add(parentContentTypeId);
+                }
+                else
+                {
+                    var newMaster = CallGetContentTypeMethod(parentContentTypeId);
+                    var added = ContentTypeItem.AddContentType(newMaster);
+                }
+            }
+        }
+
+        public bool IsMaster()
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                return sqlHelper.ExecuteScalar&lt;int&gt;(&quot;select count(*) from cmsContentType2ContentType where parentContentTypeId = @parentContentTypeId&quot;,
+                sqlHelper.CreateParameter(&quot;@parentContentTypeId&quot;, this.Id)) &gt; 0;
+        }
+
+        public IEnumerable&lt;ContentType&gt; GetChildTypes()
+        {
+            var cts = new List&lt;ContentType&gt;();
+            using (var sqlHelper = Application.SqlHelper)
+            using (var dr = sqlHelper.ExecuteReader(@&quot;SELECT childContentTypeId FROM cmsContentType2ContentType WHERE parentContentTypeId = @parentContentTypeId&quot;,
+                sqlHelper.CreateParameter(&quot;@parentContentTypeId&quot;, Id)))
+            {
+                while (dr.Read())
+                {
+                    cts.Add(GetContentType(dr.GetInt(&quot;childContentTypeId&quot;)));
+                }
+            }
+
+            return cts;
+        }
+
+        public void RemoveParentContentType(int parentContentTypeId)
+        {
+            if (MasterContentTypes.Contains(parentContentTypeId) == false)
+            {
+                // Should we throw an exception if you&#39;re trying to remove something that doesn&#39;t exist?
+            }
+            else
+            {
+
+                // Clean up property data (when we remove a reference we also need to remove all data relating to the doc type!
+                // So that would be all propertyData that uses a propertyType from the content type with &#39;parentContentTypeId&#39; and 
+                // has a nodetype of this id
+                var contentTypeToRemove = new ContentType(parentContentTypeId);
+
+                RemoveMasterPropertyTypeData(contentTypeToRemove, this);
+
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(
+                                          &quot;DELETE FROM [cmsContentType2ContentType] WHERE parentContentTypeId = @parentContentTypeId AND childContentTypeId = @childContentTypeId&quot;,
+                                          sqlHelper.CreateParameter(&quot;@parentContentTypeId&quot;, parentContentTypeId),
+                                          sqlHelper.CreateParameter(&quot;@childContentTypeId&quot;, Id));
+                MasterContentTypes.Remove(parentContentTypeId);
+            }
+        }
+
+        private void RemoveMasterPropertyTypeData(ContentType contentTypeToRemove, ContentType currentContentType)
+        {
+            foreach (var pt in contentTypeToRemove.PropertyTypes)
+            {
+                if (pt.ContentTypeId == contentTypeToRemove.Id)
+                {
+                    // before we can remove a parent content type we need to remove all data that 
+                    // relates to property types
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlHelper.ExecuteNonQuery(
+                            @&quot;delete cmsPropertyData from cmsPropertyData
+                            inner join cmsContent on cmsContent.nodeId = cmsPropertyData.contentNodeId
+                            where cmsPropertyData.propertyTypeId = @propertyType
+                            and contentType = @contentType&quot;,
+                        sqlHelper.CreateParameter(&quot;@contentType&quot;, currentContentType.Id),
+                        sqlHelper.CreateParameter(&quot;@propertyType&quot;, pt.Id));
+                }
+            }
+
+            // remove sub data too
+            foreach (var ct in currentContentType.GetChildTypes())
+                RemoveMasterPropertyTypeData(contentTypeToRemove, ct);
+        }
+
+        public IEnumerable&lt;PropertyTypeGroup&gt; PropertyTypeGroups
+        {
+            get { return PropertyTypeGroup.GetPropertyTypeGroupsFromContentType(Id); }
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a list of all Tabs on the current ContentType
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Use PropertyTypeGroup methods instead&quot;, false)]
+        public TabI[] getVirtualTabs
+        {
+            get
+            {
+                EnsureVirtualTabs();
+                return _virtualTabs.ToArray();
+            }
+        }
+
+
+        /// &lt;summary&gt;
+        /// Clears the locally loaded tabs which forces them to be reloaded next time they requested
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Use PropertyTypeGroup methods instead&quot;, false)]
+        public void ClearVirtualTabs()
+        {
+            //NOTE: SD: There is no cache to clear so this doesn&#39;t actually do anything
+            //NOTE: SD: There is no cache to clear so this doesn&#39;t actually do anything
+            foreach (var t in getVirtualTabs)
+                Tab.FlushCache(t.Id, Id);
+
+            _virtualTabs = null;
+        }
+
+        /// &lt;summary&gt;
+        /// The list of ContentType Id&#39;s that defines which Content (by ContentType) can be created as child 
+        /// to the Content of this ContentType
+        /// &lt;/summary&gt;
+        public int[] AllowedChildContentTypeIDs
+        {
+            get
+            {
+                //optimize this property so it lazy loads the data only one time.
+                if (_allowedChildContentTypeIDs == null)
+                {
+                    _allowedChildContentTypeIDs = new List&lt;int&gt;();
+                    using (var sqlHelper = Application.SqlHelper)
+                    using (var dr = sqlHelper.ExecuteReader(&quot;Select AllowedId from cmsContentTypeAllowedContentType where id=&quot; + Id))
+                    {
+                        while (dr.Read())
+                        {
+                            _allowedChildContentTypeIDs.Add(dr.GetInt(&quot;AllowedId&quot;));
+                        }
+                    }
+                }
+
+                return _allowedChildContentTypeIDs.ToArray();
+            }
+            set
+            {
+                _allowedChildContentTypeIDs = value.ToList();
+
+                //This switches between using new vs. legacy api.
+                //Note that this is currently only done to support both DocumentType and MediaType, which use the new api and MemberType that doesn&#39;t.
+                if (ContentTypeItem == null)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlHelper.ExecuteNonQuery(
+                        &quot;delete from cmsContentTypeAllowedContentType where id=&quot; + Id);
+                    foreach (int i in value)
+                    {
+                        using (var sqlHelper = Application.SqlHelper)
+                            sqlHelper.ExecuteNonQuery(
+                            &quot;insert into cmsContentTypeAllowedContentType (id,AllowedId) values (&quot; +
+                            Id + &quot;,&quot; + i + &quot;)&quot;);
+                    }
+                }
+                else
+                {
+                    var list = new List&lt;ContentTypeSort&gt;();
+                    int sort = 0;
+                    foreach (var i in value)
+                    {
+                        int id = i;
+                        list.Add(new ContentTypeSort(id, sort));
+                        sort++;
+                    }
+
+                    ContentTypeItem.AllowedContentTypes = list;
+                }
+            }
+        }
+
+        #endregion
+
+        #region Public Methods
+        /// &lt;summary&gt;
+        /// Gets the raw text.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public string GetRawText()
+        {
+            return base.Text;
+        }
+        public string GetRawDescription()
+        {
+            return _description;
+        }
+        /// &lt;summary&gt;
+        /// Used to persist object changes to the database. In Version3.0 it&#39;s just a stub for future compatibility
+        /// &lt;/summary&gt;
+        public override void Save()
+        {
+            base.Save();
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a list of all ContentTypes
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;The list of all ContentTypes&lt;/returns&gt;
+        public ContentType[] GetAll()
+        {
+            var contentTypes = new List&lt;ContentType&gt;();
+
+            using (var sqlHelper = Application.SqlHelper)
+            using (var dr = sqlHelper.ExecuteReader(m_SQLOptimizedGetAll.Trim(), sqlHelper.CreateParameter(&quot;@nodeObjectType&quot;, nodeObjectType)))
+            {
+                while (dr.Read())
+                {
+                    //create the ContentType object without setting up
+                    var ct = new ContentType(dr.Get&lt;int&gt;(&quot;id&quot;), true);
+                    //populate it&#39;s CMSNode properties
+                    ct.PopulateCMSNodeFromReader(dr);
+                    //populate it&#39;s ContentType properties
+                    ct.PopulateContentTypeNodeFromReader(dr);
+
+                    contentTypes.Add(ct);
+                }
+            }
+
+            return contentTypes.ToArray();
+
+        }
+
+        /// &lt;summary&gt;
+        /// Adding a PropertyType to the ContentType, will add a new datafield/Property on all Documents of this Type.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dt&quot;&gt;The DataTypeDefinition of the PropertyType&lt;/param&gt;
+        /// &lt;param name=&quot;Alias&quot;&gt;The Alias of the PropertyType&lt;/param&gt;
+        /// &lt;param name=&quot;Name&quot;&gt;The userfriendly name&lt;/param&gt;
+        public PropertyType AddPropertyType(DataTypeDefinition dt, string Alias, string Name)
+        {
+            PropertyType pt = PropertyType.MakeNew(dt, this, Name, Alias);
+
+            // Optimized call
+            PopulatePropertyData(pt, Id);
+
+            // Inherited content types (document types only)
+            PopulateMasterContentTypes(pt, Id);
+
+            //			foreach (Content c in Content.getContentOfContentType(this)) 
+            //				c.addProperty(pt,c.Version);
+
+            // Remove from cache
+            FlushFromCache(Id);
+
+            return pt;
+        }
+
+        /// &lt;summary&gt;
+        /// Adding a PropertyType to a Tab, the Tabs are primarily used for making the 
+        /// editing interface more userfriendly.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pt&quot;&gt;The PropertyType&lt;/param&gt;
+        /// &lt;param name=&quot;TabId&quot;&gt;The Id of the Tab&lt;/param&gt;
+        [Obsolete(&quot;Use PropertyTypeGroup methods instead&quot;, false)]
+        public void SetTabOnPropertyType(PropertyType pt, int TabId)
+        {
+            // This is essentially just a wrapper for the property
+            pt.TabId = TabId;
+            //flush the content type cache, the the tab cache (why so much cache?! argh!)
+            pt.FlushCacheBasedOnTab();
+        }
+
+        /// &lt;summary&gt;
+        /// Removing a PropertyType from the associated Tab
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pt&quot;&gt;The PropertyType which should be freed from its tab&lt;/param&gt;
+        [Obsolete(&quot;Use PropertyTypeGroup methods instead&quot;, false)]
+        public void removePropertyTypeFromTab(PropertyType pt)
+        {
+            pt.TabId = 0; //this will set to null in the database.
+
+            if (ContentTypeItem != null)
+            {
+                ContentTypeItem.RemovePropertyType(pt.Alias);
+            }
+
+            // Remove from cache
+            FlushFromCache(Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new Tab on the Content
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Caption&quot;&gt;Returns the Id of the new Tab&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [MethodImpl(MethodImplOptions.Synchronized)]
+        [Obsolete(&quot;Use PropertyTypeGroup methods instead&quot;, false)]
+        public int AddVirtualTab(string Caption)
+        {
+            // The method is synchronized
+            PropertyTypeGroup ptg = new PropertyTypeGroup(Id, Caption);
+            ptg.Save();
+
+            // Remove from cache
+            FlushFromCache(Id);
+
+            return ptg.Id;
+        }
+
+        /// &lt;summary&gt;
+        /// Releases all PropertyTypes on tab (this does not delete the PropertyTypes) and then Deletes the Tab
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;The Id of the Tab to be deleted.&lt;/param&gt;
+        [Obsolete(&quot;Use PropertyTypeGroup methods instead&quot;, false)]
+        public void DeleteVirtualTab(int id)
+        {
+            PropertyTypeGroup.GetPropertyTypeGroup(id).Delete();
+
+            // Remove from cache
+            FlushFromCache(Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Updates the caption of the Tab
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;tabId&quot;&gt;The Id of the Tab to be updated&lt;/param&gt;
+        /// &lt;param name=&quot;Caption&quot;&gt;The new Caption&lt;/param&gt;
+        [Obsolete(&quot;Use PropertyTypeGroup methods instead&quot;, false)]
+        public void SetTabName(int tabId, string Caption)
+        {
+            var ptg = PropertyTypeGroup.GetPropertyTypeGroup(tabId);
+            ptg.Name = Caption;
+            ptg.Save();
+
+            // Remove from cache
+            FlushFromCache(Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Updates the sort order of the Tab
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;tabId&quot;&gt;The Id of the Tab to be updated&lt;/param&gt;
+        /// &lt;param name=&quot;sortOrder&quot;&gt;The new order number&lt;/param&gt;
+        [Obsolete(&quot;Use PropertyTypeGroup methods instead&quot;, false)]
+        public void SetTabSortOrder(int tabId, int sortOrder)
+        {
+            var ptg = PropertyTypeGroup.GetPropertyTypeGroup(tabId);
+            ptg.SortOrder = sortOrder;
+            ptg.Save();
+
+            // Remove from cache
+            FlushFromCache(Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a PropertyType by it&#39;s alias
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;PropertyType alias&lt;/param&gt;
+        /// &lt;returns&gt;The PropertyType with the given Alias&lt;/returns&gt;
+        public PropertyType getPropertyType(string alias)
+        {
+            // NH 22-08-08, Get from the property type stack to ensure support of master document types
+            object o = PropertyTypes.Find(pt =&gt; pt.Alias == alias);
+
+            if (o == null)
+            {
+                return null;
+            }
+            return (PropertyType)o;
+        }
+        /// &lt;summary&gt;
+        /// Deletes the current ContentType
+        /// &lt;/summary&gt;
+        public override void delete()
+        {
+            // Remove from cache
+            FlushFromCache(Id);
+
+            // Delete all propertyTypes
+            foreach (var pt in PropertyTypes)
+            {
+                if (pt.ContentTypeId == Id)
+                {
+                    pt.delete();
+                }
+            }
+
+            // delete all tabs
+            foreach (PropertyTypeGroup ptg in PropertyTypeGroups)
+            {
+                if (ptg.ContentTypeId == this.Id)
+                {
+                    ptg.Delete();
+                }
+            }
+
+            //need to delete the allowed relationships between content types
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(&quot;delete from cmsContentTypeAllowedContentType where AllowedId=@allowedId or Id=@id&quot;,
+                sqlHelper.CreateParameter(&quot;@allowedId&quot;, Id),
+                sqlHelper.CreateParameter(&quot;@id&quot;, Id));
+
+            // delete contenttype entrance
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(&quot;Delete from cmsContentType where NodeId = &quot; + Id);
+
+            // delete CMSNode entrance
+            base.delete();
+        }
+
+        #endregion
+
+        #region Protected Methods
+
+        internal protected void PopulateContentTypeFromContentTypeBase(IContentTypeComposition contentType)
+        {
+            _alias = contentType.Alias;
+            _iconurl = contentType.Icon;
+            _isContainerContentType = contentType.IsContainer;
+            _allowAtRoot = contentType.AllowedAsRoot;
+            _thumbnail = contentType.Thumbnail;
+            _description = contentType.Description;
+
+            /*if (ContentTypeItem == null)
+                ContentTypeItem = contentType;*/
+        }
+
+        protected void PopulateContentTypeNodeFromReader(IRecordsReader dr)
+        {
+            _alias = dr.GetString(&quot;Alias&quot;);
+            _iconurl = dr.GetString(&quot;icon&quot;);
+            _isContainerContentType = dr.GetBoolean(&quot;isContainer&quot;);
+            _allowAtRoot = dr.GetBoolean(&quot;allowAtRoot&quot;);
+
+            if (!dr.IsNull(&quot;thumbnail&quot;))
+                _thumbnail = dr.GetString(&quot;thumbnail&quot;);
+            if (!dr.IsNull(&quot;description&quot;))
+                _description = dr.GetString(&quot;description&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Set up the internal data of the ContentType
+        /// &lt;/summary&gt;
+        protected override void setupNode()
+        {
+            base.setupNode();
+
+            //Try to load the ContentType/MediaType through the new public api
+            if (nodeObjectType == new Guid(Constants.ObjectTypes.DocumentType))
+            {
+                var contentType = CallGetContentTypeMethod(Id);
+                if (contentType != null)
+                {
+                    PopulateContentTypeFromContentTypeBase(contentType);
+                    return;
+                }
+            }
+            else if (nodeObjectType == new Guid(Constants.ObjectTypes.MediaType))
+            {
+                var mediaType = CallGetContentTypeMethod(Id);
+                if (mediaType != null)
+                {
+                    PopulateContentTypeFromContentTypeBase(mediaType);
+                    return;
+                }
+            }
+            else if (nodeObjectType == new Guid(Constants.ObjectTypes.MemberType))
+            {
+                var memberType = CallGetContentTypeMethod(Id);
+                if (memberType != null)
+                {
+                    PopulateContentTypeFromContentTypeBase(memberType);
+                    return;
+                }
+            }
+
+            // TODO: Load master content types
+            using (var sqlHelper = Application.SqlHelper)
+            using (var dr = sqlHelper.ExecuteReader(&quot;Select allowAtRoot, isContainer, Alias,icon,thumbnail,description from cmsContentType where nodeid=&quot; + Id)
+                )
+            {
+                if (dr.Read())
+                {
+                    PopulateContentTypeNodeFromReader(dr);
+                }
+                else
+                {
+                    throw new ArgumentException(&quot;No Contenttype with id: &quot; + Id);
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Flushes the cache.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;The id.&lt;/param&gt;
+        public static void FlushFromCache(int id)
+        {
+            
+            var ct = new ContentType(id);
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheItem(string.Format(&quot;{0}{1}&quot;, CacheKeys.ContentTypeCacheKey, id));
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheItem(ct.GetPropertiesCacheKey());
+            ct.ClearVirtualTabs();
+
+            //clear the content type from the property datatype cache used by razor
+            RemoveFromDataTypeCache(ct.Alias);
+
+            // clear anything that uses this as master content type
+            if (ct.nodeObjectType == DocumentType._objectType 
+                || ct.nodeObjectType == media.MediaType._objectType)
+            {
+                //NOTE Changed from &quot;DocumentType.GetAllAsList().FindAll(dt =&gt; dt.MasterContentType == id)&quot; to loading master contenttypes directly from the db.
+                //Related to http://issues.umbraco.org/issue/U4-1714
+                var dtos = ApplicationContext.Current.DatabaseContext.Database.Fetch&lt;ContentType2ContentTypeDto&gt;(&quot;WHERE parentContentTypeId = @Id&quot;, new { Id = id });
+                foreach (var dto in dtos)
+                {
+                    FlushFromCache(dto.ChildId);
+                }
+            }
+        }
+
+        [Obsolete(&quot;The content type cache is automatically cleared by Umbraco when a content type is saved, this method is no longer used&quot;)]
+        protected internal void FlushAllFromCache()
+        {
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(CacheKeys.ContentTypeCacheKey);
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(CacheKeys.ContentTypePropertiesCacheKey);
+
+            RemoveAllDataTypeCache();
+            ClearVirtualTabs();
+        }
+
+        #endregion
+
+        #region Private Methods
+
+        private Func&lt;int, IContentTypeComposition&gt; CallGetContentTypeMethod
+        {
+            get
+            {
+                if (nodeObjectType == new Guid(Constants.ObjectTypes.DocumentType))
+                {
+                    return ApplicationContext.Current.Services.ContentTypeService.GetContentType;
+                }
+                if (nodeObjectType == new Guid(Constants.ObjectTypes.MediaType))
+                {
+                    return ApplicationContext.Current.Services.ContentTypeService.GetMediaType;
+                }
+                if (nodeObjectType == new Guid(Constants.ObjectTypes.MemberType))
+                {
+                    return ApplicationContext.Current.Services.MemberTypeService.Get;
+                }
+
+                //default to content
+                return ApplicationContext.Current.Services.ContentTypeService.GetContentType;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// The cache key used to cache the properties for the content type
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private string GetPropertiesCacheKey()
+        {
+            return CacheKeys.ContentTypePropertiesCacheKey + this.Id;
+        }
+
+
+        private readonly object _virtualTabLoadLock = new object();
+        /// &lt;summary&gt;
+        /// Checks if we&#39;ve loaded the virtual tabs into memory and if not gets them from the databse.
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Use PropertyTypeGroup methods instead&quot;, false)]
+        private void EnsureVirtualTabs()
+        {
+            // This class can be cached and potentially shared between multiple threads.
+            // Two or more threads can attempt to lazyily-load its virtual tabs at the same time.
+            // If that happens, the m_VirtualTabs will contain duplicates.
+            // We must prevent two threads from running InitializeVirtualTabs at the same time.
+            // We must also prevent m_VirtualTabs from being modified while it is being populated.
+            if (_virtualTabs == null || _virtualTabs.Count == 0)
+            {
+                lock (_virtualTabLoadLock)
+                {
+                    //optimize, lazy load the data only one time
+                    if (_virtualTabs == null || _virtualTabs.Count == 0)
+                    {
+                        InitializeVirtualTabs();
+                    }
+                }
+            }
+        }
+
+
+        /// &lt;summary&gt;
+        /// Loads the tabs into memory from the database and stores them in a local list for retreival
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Use PropertyTypeGroup methods instead&quot;, false)]
+        private void InitializeVirtualTabs()
+        {
+            // somewhat fixing... this whole class should be removed anyways
+            var ct = ContentTypeItem ?? CallGetContentTypeMethod(Id);
+
+            var tmp1 = ct.PropertyGroups
+                .Select(x =&gt; (TabI) new Tab(x.Id, x.Name, x.SortOrder, this))
+                .Union(ct.ContentTypeComposition.SelectMany(x =&gt; GetContentType(x.Id).getVirtualTabs))
+                .OrderBy(x =&gt; x.SortOrder)
+                .DistinctBy(x =&gt; x.Id)
+                .ToList();
+            _virtualTabs = tmp1;
+
+            /*
+            // While we are initialising, we should not use the class-scoped list, as it may be used by other threads
+            var temporaryList = new List&lt;TabI&gt;();
+            foreach (PropertyTypeGroup ptg in PropertyTypeGroups.Where(x =&gt; x.ParentId == 0 &amp;&amp; x.ContentTypeId == this.Id))
+                temporaryList.Add(new Tab(ptg.Id, ptg.Name, ptg.SortOrder, this));
+
+            // Master Content Type
+            if (MasterContentTypes.Count &gt; 0)
+            {
+                foreach (var mct in MasterContentTypes)
+                    temporaryList.AddRange(GetContentType(mct).getVirtualTabs.ToList());
+            }
+
+
+            // sort all tabs
+            temporaryList.Sort((a, b) =&gt; a.SortOrder.CompareTo(b.SortOrder));
+
+            // now that we aren&#39;t going to modify the list, we can set it to the class-scoped variable.
+            _virtualTabs = temporaryList.DistinctBy(x =&gt; x.Id).ToList();
+            */
+        }
+
+        private static void PopulateMasterContentTypes(PropertyType pt, int docTypeId)
+        {
+            foreach (var docType in DocumentType.GetAllAsList())
+            {
+                //TODO: Check for multiple references (mixins) not causing endless loops!
+                if (docType.MasterContentTypes.Contains(docTypeId))
+                {
+                    PopulatePropertyData(pt, docType.Id);
+                    PopulateMasterContentTypes(pt, docType.Id);
+                }
+            }
+        }
+
+        private static void PopulatePropertyData(PropertyType pt, int contentTypeId)
+        {
+            // NH: PropertyTypeId inserted directly into SQL instead of as a parameter for SQL CE 4 compatibility
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(
+                                      &quot;insert into cmsPropertyData (contentNodeId, versionId, propertyTypeId) select contentId, versionId, &quot; + pt.Id + &quot; from cmsContent inner join cmsContentVersion on cmsContent.nodeId = cmsContentVersion.contentId where contentType = @contentTypeId&quot;,
+                                      sqlHelper.CreateParameter(&quot;@contentTypeId&quot;, contentTypeId));
+        }
+
+        #endregion
+
+        #region Public TabI Interface
+        /// &lt;summary&gt;
+        /// An interface for the tabs, should be refactored
+        /// &lt;/summary&gt;
+        public interface TabI
+        {
+            /// &lt;summary&gt;
+            /// Public identifier
+            /// &lt;/summary&gt;
+            int Id { get; }
+
+            /// &lt;summary&gt;
+            /// The text on the tab
+            /// &lt;/summary&gt;
+            string Caption { get; }
+
+            /// &lt;summary&gt;
+            /// The sortorder of the tab
+            /// &lt;/summary&gt;
+            int SortOrder { get; }
+
+            // zb-00036 #29889 : removed PropertyTypes property (not making sense), replaced with methods
+
+            /// &lt;summary&gt;
+            /// Gets a list of all PropertyTypes on the Tab for a given ContentType.
+            /// &lt;/summary&gt;
+            /// &lt;remarks&gt;This includes properties inherited from master content types.&lt;/remarks&gt;
+            /// &lt;param name=&quot;contentTypeId&quot;&gt;The unique identifier of the ContentType.&lt;/param&gt;
+            /// &lt;returns&gt;An array of PropertyType.&lt;/returns&gt;
+            PropertyType[] GetPropertyTypes(int contentTypeId);
+
+            [Obsolete(&quot;Please use GetPropertyTypes() instead&quot;, false)]
+            PropertyType[] PropertyTypes { get; }
+
+            /// &lt;summary&gt;
+            /// Gets a list of all PropertyTypes on the Tab for a given ContentType.
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;contentTypeId&quot;&gt;The unique identifier of the ContentType.&lt;/param&gt;
+            /// &lt;param name=&quot;includeInheritedProperties&quot;&gt;Indicates whether properties inherited from master content types should be included.&lt;/param&gt;
+            /// &lt;returns&gt;An array of PropertyType.&lt;/returns&gt;
+            PropertyType[] GetPropertyTypes(int contentTypeId, bool includeInheritedProperties);
+
+            /// &lt;summary&gt;
+            /// Gets a list if all PropertyTypes on the Tab for all ContentTypes.
+            /// &lt;/summary&gt;
+            /// &lt;returns&gt;An IEnumerable of all the PropertyTypes.&lt;/returns&gt;
+            List&lt;PropertyType&gt; GetAllPropertyTypes();
+
+            /// &lt;summary&gt;
+            /// The contenttype
+            /// &lt;/summary&gt;
+            int ContentType { get; }
+
+            /// &lt;summary&gt;
+            /// Method for moving the tab up
+            /// &lt;/summary&gt;
+            void MoveUp();
+
+            /// &lt;summary&gt;
+            /// Method for retrieving the original, non processed name from the db
+            /// &lt;/summary&gt;
+            /// &lt;returns&gt;The original, non processed name from the db&lt;/returns&gt;
+            string GetRawCaption();
+
+            /// &lt;summary&gt;
+            /// Method for moving the tab down
+            /// &lt;/summary&gt;
+            void MoveDown();
+        }
+        #endregion
+
+        #region Protected Tab Class
+        /// &lt;summary&gt;
+        /// A tab is merely a way to organize data on a ContentType to make it more
+        /// human friendly
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Please use PropertyTypes instead&quot;, false)]
+        public class Tab : TabI
+        {
+            private readonly ContentType _contenttype;
+
+            /// &lt;summary&gt;
+            /// Initializes a new instance of the &lt;see cref=&quot;Tab&quot;/&gt; class.
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;id&quot;&gt;The id.&lt;/param&gt;
+            /// &lt;param name=&quot;caption&quot;&gt;The caption.&lt;/param&gt;
+            /// &lt;param name=&quot;sortOrder&quot;&gt;The sort order.&lt;/param&gt;
+            /// &lt;param name=&quot;cType&quot;&gt;Type of the c.&lt;/param&gt;
+            public Tab(int id, string caption, int sortOrder, ContentType cType)
+            {
+                _id = id;
+                _caption = caption;
+                _sortOrder = sortOrder;
+                _contenttype = cType;
+            }
+
+            public static Tab GetTab(int id)
+            {
+                Tab tab = null;
+                // Tabs have been replaced with PropertyTypeGroups, so we use the new api to provide legacy support
+                PropertyTypeGroup ptg = PropertyTypeGroup.GetPropertyTypeGroup(id);
+                if (ptg != null)
+                {
+                    tab = new Tab(id, ptg.Name, ptg.SortOrder, new ContentType(ptg.ContentTypeId));
+                }
+
+                return tab;
+            }
+
+            // zb-00036 #29889 : Fix content tab properties.
+            public PropertyType[] GetPropertyTypes(int contentTypeId)
+            {
+                return GetPropertyTypes(contentTypeId, true);
+            }
+
+            // zb-00036 #29889 : Fix content tab properties. Replaces getPropertyTypes, which was
+            // loading all properties for the tab, causing exceptions here and there... we want
+            // the properties for the tab for a given content type, and we want them in the right order.
+            // Also this is public now because we removed the PropertyTypes property (not making sense).
+            public PropertyType[] GetPropertyTypes(int contentTypeId, bool includeInheritedProperties)
+            {
+                // NH, temp fix for 4.9 to use the new PropertyTypeGroup API
+                var pts = PropertyTypeGroup.GetPropertyTypeGroup(this.Id).GetPropertyTypes();
+
+                if (includeInheritedProperties)
+                {
+                    // we need to 
+                    var contentType = businesslogic.ContentType.GetContentType(contentTypeId);
+                    return pts.Where(x =&gt; contentType.MasterContentTypes.Contains(x.ContentTypeId) || x.ContentTypeId == contentTypeId).ToArray();
+                }
+
+                return pts.Where(x =&gt; x.ContentTypeId == contentTypeId).ToArray();
+            }
+
+            // zb-00036 #29889 : yet we may want to be able to get *all* property types
+            // Note: This will get ALL PropertyTypes that is associated with a specific Tab 
+            // regardless of the PropertyTypes belonging to the current ContentType.
+            public List&lt;PropertyType&gt; GetAllPropertyTypes()
+            {
+                var ct = _contenttype.ContentTypeItem ?? _contenttype.CallGetContentTypeMethod(_contenttype.Id);
+                return ct.CompositionPropertyTypes
+                    .OrderBy(x =&gt; x.SortOrder)
+                    .Select(x =&gt; x.Id)
+                    .Select(PropertyType.GetPropertyType)
+                    .ToList();
+
+                /*
+                var db = ApplicationContext.Current.DatabaseContext.Database;
+                var propertyTypeDtos = db.Fetch&lt;PropertyTypeDto&gt;(&quot;WHERE propertyTypeGroupId = @Id&quot;, new { Id = _id });
+                var tmp = propertyTypeDtos
+                            .Select(propertyTypeDto =&gt; PropertyType.GetPropertyType(propertyTypeDto.Id))
+                            .ToList();
+
+                var propertyTypeGroupDtos = db.Fetch&lt;PropertyTypeGroupDto&gt;(&quot;WHERE parentGroupId = @Id&quot;, new { Id = _id });
+                foreach (var propertyTypeGroupDto in propertyTypeGroupDtos)
+                {
+                    var inheritedPropertyTypeDtos = db.Fetch&lt;PropertyTypeDto&gt;(&quot;WHERE propertyTypeGroupId = @Id&quot;, new { Id = propertyTypeGroupDto.Id });
+                    tmp.AddRange(inheritedPropertyTypeDtos
+                                     .Select(propertyTypeDto =&gt; PropertyType.GetPropertyType(propertyTypeDto.Id))
+                                     .ToList());
+                }
+
+                return tmp;
+                */
+            }
+
+            /// &lt;summary&gt;
+            /// A list of PropertyTypes on the Tab
+            /// &lt;/summary&gt;
+            [Obsolete(&quot;Please use GetPropertyTypes() instead&quot;, false)]
+            public PropertyType[] PropertyTypes
+            {
+                get { return GetPropertyTypes(ContentType, true); }
+            }
+
+
+
+            /// &lt;summary&gt;
+            /// Flushes the cache.
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;id&quot;&gt;The id.&lt;/param&gt;
+            /// &lt;param name=&quot;contentTypeId&quot;&gt;&lt;/param&gt;
+            [Obsolete(&quot;There is no cache to flush for tabs&quot;)]
+            public static void FlushCache(int id, int contentTypeId)
+            {
+                //at some stage there was probably caching for tabs but this hasn&#39;t been in place for some time, so this method
+                //now does nothing.
+            }
+
+            /// &lt;summary&gt;
+            /// Deletes this instance.
+            /// &lt;/summary&gt;
+            public void Delete()
+            {
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(&quot;update cmsPropertyType set propertyTypeGroupId = NULL where propertyTypeGroupId = @id&quot;,
+                                          sqlHelper.CreateParameter(&quot;@id&quot;, Id));
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(&quot;delete from cmsPropertyTypeGroup where id = @id&quot;,
+                                          sqlHelper.CreateParameter(&quot;@id&quot;, Id));
+            }
+
+            /// &lt;summary&gt;
+            /// Gets the tab caption by id.
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;id&quot;&gt;The id.&lt;/param&gt;
+            /// &lt;returns&gt;&lt;/returns&gt;
+            public static string GetCaptionById(int id)
+            {
+                try
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                    {
+                        var tempCaption = sqlHelper.ExecuteScalar&lt;string&gt;(&quot;Select text from cmsPropertyTypeGroup where id = &quot; + id.ToString());
+                        if (!tempCaption.StartsWith(&quot;#&quot;))
+                            return tempCaption;
+                        var lang = Language.GetByCultureCode(Thread.CurrentThread.CurrentCulture.Name);
+                        if (lang != null)
+                        {
+                            return new Dictionary.DictionaryItem(tempCaption.Substring(1, tempCaption.Length - 1)).Value(lang.id);
+                        }
+                        return &quot;[&quot; + tempCaption + &quot;]&quot;;
+                    }
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+
+            /// &lt;summary&gt;
+            /// Gets the tab caption by id.
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;id&quot;&gt;The id.&lt;/param&gt;
+            /// &lt;returns&gt;&lt;/returns&gt;
+            internal static string GetRawCaptionById(int id)
+            {
+                try
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                    {
+                        var tempCaption = sqlHelper.ExecuteScalar&lt;string&gt;(&quot;Select text from cmsPropertyTypeGroup where id = &quot; + id);
+                        return tempCaption;
+                    }
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+
+            private readonly int _id;
+
+            private int? _sortOrder;
+
+            /// &lt;summary&gt;
+            /// The sortorder of the tab
+            /// &lt;/summary&gt;
+            /// &lt;value&gt;&lt;/value&gt;
+            public int SortOrder
+            {
+                get
+                {
+                    if (!_sortOrder.HasValue)
+                    {
+                        using (var sqlHelper = Application.SqlHelper)
+                            _sortOrder = sqlHelper.ExecuteScalar&lt;int&gt;(&quot;select sortOrder from cmsPropertyTypeGroup where id = &quot; + _id);
+                    }
+                    return _sortOrder.Value;
+                }
+                set
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlHelper.ExecuteNonQuery(&quot;update cmsPropertyTypeGroup set sortOrder = &quot; + value + &quot; where id =&quot; + _id);
+                }
+            }
+
+            /// &lt;summary&gt;
+            /// Moves the Tab up
+            /// &lt;/summary&gt;
+            [Obsolete(&quot;Please use GetPropertyTypes() instead&quot;, false)]
+            public void MoveUp()
+            {
+                FixTabOrder();
+                // If this tab is not the first we can switch places with the previous tab 
+                // hence moving it up.
+                if (SortOrder &gt; 0)
+                {
+                    var newsortorder = SortOrder - 1;
+                    // Find the tab to switch with
+                    var tabs = _contenttype.getVirtualTabs;
+                    foreach (Tab t in tabs)
+                    {
+                        if (t.SortOrder == newsortorder)
+                            t.SortOrder = SortOrder;
+                    }
+                    SortOrder = newsortorder;
+                }
+            }
+
+            /// &lt;summary&gt;
+            /// Moves the Tab down
+            /// &lt;/summary&gt;
+            [Obsolete(&quot;Please use GetPropertyTypes() instead&quot;, false)]
+            public void MoveDown()
+            {
+                FixTabOrder();
+                // If this tab is not the last tab we can switch places with the next tab 
+                // hence moving it down.
+                var tabs = _contenttype.getVirtualTabs;
+                if (SortOrder &lt; tabs.Length - 1)
+                {
+                    var newsortorder = SortOrder + 1;
+                    // Find the tab to switch with
+                    foreach (Tab t in tabs)
+                    {
+                        if (t.SortOrder == newsortorder)
+                            t.SortOrder = SortOrder;
+                    }
+                    SortOrder = newsortorder;
+                }
+            }
+
+            /// &lt;summary&gt;
+            /// Method for retrieving the original, non processed name from the db
+            /// &lt;/summary&gt;
+            /// &lt;returns&gt;
+            /// The original, non processed name from the db
+            /// &lt;/returns&gt;
+            public string GetRawCaption()
+            {
+                return _caption;
+            }
+
+
+            /// &lt;summary&gt;
+            /// Fixes the tab order.
+            /// &lt;/summary&gt;
+            private void FixTabOrder()
+            {
+                var tabs = _contenttype.getVirtualTabs;
+                for (int i = 0; i &lt; tabs.Length; i++)
+                {
+                    var t = (Tab)tabs[i];
+                    t.SortOrder = i;
+                }
+            }
+
+
+            /// &lt;summary&gt;
+            /// Public identifier
+            /// &lt;/summary&gt;
+            /// &lt;value&gt;&lt;/value&gt;
+            public int Id
+            {
+                get { return _id; }
+            }
+
+            // zb-00036 #29889 : removed unused field
+            // zb-00036 #29889 : removed PropertyTypes property (not making sense)
+
+            public int ContentType
+            {
+                get { return _contenttype.Id; }
+            }
+
+            private readonly string _caption;
+
+            /// &lt;summary&gt;
+            /// The text on the tab
+            /// &lt;/summary&gt;
+            /// &lt;value&gt;&lt;/value&gt;
+            public string Caption
+            {
+                get
+                {
+                    if (!_caption.StartsWith(&quot;#&quot;))
+                        return _caption;
+
+                    var lang = Language.GetByCultureCode(Thread.CurrentThread.CurrentCulture.Name);
+                    if (lang != null)
+                    {
+                        if (Dictionary.DictionaryItem.hasKey(_caption.Substring(1, _caption.Length - 1)))
+                        {
+                            var di = new Dictionary.DictionaryItem(_caption.Substring(1, _caption.Length - 1));
+                            return di.Value(lang.id);
+                        }
+                    }
+
+                    return &quot;[&quot; + _caption + &quot;]&quot;;
+                }
+            }
+        }
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[43,38,43,46,1],[43,47,43,48,1],[43,49,43,50,1],[49,39,49,47,0],[49,48,49,49,0],[49,50,49,51,0],[51,52,51,69,0],[51,70,51,71,0],[51,72,51,73,0],[53,53,53,70,0],[53,71,53,72,0],[53,73,53,74,0],[70,15,70,29,0],[71,9,71,10,0],[72,13,72,28,0],[73,13,73,29,0],[74,13,74,36,0],[76,13,76,44,0],[77,17,77,61,0],[79,13,79,38,0],[80,17,80,61,0],[81,9,81,10,0],[83,69,83,86,0],[84,9,84,10,0],[85,13,85,43,0],[86,9,86,10,0],[105,9,105,170,1],[106,9,106,173,1],[117,9,117,10,0],[118,13,119,17,0],[119,17,119,18,0],[119,18,120,21,0],[120,21,120,59,0],[120,59,121,21,0],[121,21,121,73,0],[121,73,121,80,0],[121,80,121,87,0],[121,87,121,93,0],[121,93,121,95,0],[121,21,121,95,0],[121,95,122,21,0],[122,21,122,39,0],[122,39,123,17,0],[123,17,123,18,0],[123,18,123,20,0],[118,13,123,20,0],[124,9,124,10,0],[131,9,131,10,0],[132,13,132,64,0],[132,64,132,106,0],[132,106,132,117,0],[132,13,132,117,0],[133,13,133,20,0],[133,22,133,29,0],[133,30,133,32,0],[133,33,133,41,0],[134,13,134,14,0],[136,17,136,58,0],[137,13,137,14,0],[138,13,138,34,0],[139,9,139,10,0],[145,9,145,10,0],[146,13,146,34,0],[147,13,147,39,0],[148,9,148,10,0],[151,9,151,10,0],[153,13,153,103,0],[156,13,159,17,0],[159,17,159,18,0],[159,18,161,21,0],[161,21,161,48,0],[161,48,162,21,0],[162,21,162,59,0],[162,59,163,21,0],[163,21,163,68,0],[163,68,164,21,0],[164,21,164,36,0],[164,36,165,21,0],[165,21,165,22,0],[165,22,166,25,0],[166,25,166,71,0],[166,71,167,21,0],[167,21,167,22,0],[167,22,168,21,0],[168,21,168,38,0],[168,38,169,17,0],[169,17,169,18,0],[169,18,169,20,0],[156,13,169,20,0],[170,9,170,10,0],[178,9,178,10,0],[179,13,182,39,0],[182,39,182,58,0],[182,58,182,60,0],[179,13,182,60,0],[183,9,183,10,0],[193,9,193,10,0],[194,13,194,50,0],[195,9,195,10,0],[204,9,204,10,0],[205,13,205,50,0],[206,9,206,10,0],[209,9,209,10,0],[210,20,210,57,0],[211,17,215,63,0],[216,9,216,10,0],[226,9,226,10,0],[227,20,227,57,0],[228,17,229,81,0],[230,9,230,10,0],[238,9,238,10,0],[239,20,239,57,0],[240,13,240,14,0],[241,17,241,144,0],[242,17,242,41,0],[243,21,243,30,0],[244,17,244,50,0],[246,9,246,10,0],[264,17,264,18,1],[264,19,264,65,1],[264,66,264,67,1],[265,17,265,18,1],[265,19,265,39,1],[265,40,265,41,1],[279,9,279,10,0],[281,13,281,44,0],[282,13,282,20,0],[282,22,282,27,0],[282,28,282,30,0],[282,31,282,60,0],[283,13,283,14,0],[284,17,284,54,0],[285,13,285,14,0],[286,9,286,10,0],[298,9,298,10,0],[299,13,299,39,0],[301,20,301,57,0],[302,20,305,99,0],[306,13,306,14,0],[307,17,307,34,0],[308,17,308,18,0],[309,21,309,50,0],[310,17,310,18,0],[311,13,311,14,0],[312,13,312,24,0],[313,9,313,10,0],[323,9,323,10,0],[324,13,324,40,0],[326,13,326,14,0],[327,17,327,56,0],[328,13,328,14,0],[329,13,329,33,0],[330,13,330,14,0],[331,17,331,74,0],[332,13,332,14,0],[333,9,333,10,0],[339,9,339,10,0],[341,20,341,57,0],[342,17,346,86,0],[347,9,347,10,0],[357,17,357,18,1],[357,19,357,33,1],[357,34,357,35,1],[359,13,359,14,0],[360,17,360,74,0],[363,17,363,50,0],[364,17,364,18,0],[365,21,365,87,0],[370,17,370,45,0],[371,17,371,18,0],[372,28,372,65,0],[373,25,375,85,0],[376,17,376,18,0],[378,17,378,18,0],[379,21,379,52,0],[380,17,380,18,0],[383,17,383,36,0],[384,13,384,14,0],[393,17,393,18,0],[393,19,393,35,0],[393,36,393,37,0],[395,13,395,14,0],[396,17,396,34,0],[400,17,400,45,0],[401,17,401,18,0],[402,28,402,65,0],[403,25,403,122,0],[404,17,404,18,0],[406,17,406,18,0],[407,21,407,53,0],[408,17,408,18,0],[411,17,411,36,0],[412,13,412,14,0],[421,17,421,18,0],[421,19,421,50,0],[421,51,421,52,0],[423,13,423,14,0],[424,17,424,49,0],[428,17,428,45,0],[429,17,429,18,0],[430,28,430,65,0],[431,25,434,81,0],[435,17,435,18,0],[437,17,437,18,0],[438,21,438,75,0],[439,17,439,18,0],[440,13,440,14,0],[448,17,448,18,0],[448,19,448,39,0],[448,40,448,41,0],[450,13,450,14,0],[451,17,451,38,0],[455,17,455,45,0],[456,17,456,18,0],[457,28,457,65,0],[458,25,461,81,0],[462,17,462,18,0],[464,17,464,18,0],[465,21,465,66,0],[466,17,466,18,0],[467,13,467,14,0],[477,13,477,14,0],[478,17,478,42,0],[479,17,479,18,0],[480,21,480,55,0],[481,25,481,45,0],[482,21,482,100,0],[483,21,483,38,0],[484,21,484,22,0],[485,25,485,114,0],[486,25,486,26,0],[487,29,488,115,0],[489,29,489,54,0],[491,21,491,22,0],[493,21,493,53,0],[496,17,496,37,0],[497,13,497,14,0],[499,13,499,14,0],[500,17,500,38,0],[504,17,504,45,0],[505,17,505,18,0],[506,28,506,65,0],[507,25,510,81,0],[511,17,511,18,0],[513,17,513,18,0],[514,21,514,64,0],[515,17,515,18,0],[517,17,517,36,0],[518,13,518,14,0],[527,17,527,18,0],[527,19,527,37,0],[527,38,527,39,0],[529,13,529,14,0],[530,17,530,36,0],[534,17,534,45,0],[535,17,535,18,0],[536,28,536,65,0],[537,25,540,81,0],[541,17,541,18,0],[543,17,543,18,0],[544,21,544,60,0],[545,17,545,18,0],[547,17,547,36,0],[548,13,548,14,0],[559,13,559,14,0],[560,17,560,42,0],[561,17,561,47,0],[562,21,562,37,0],[563,17,563,96,0],[564,17,564,34,0],[565,17,565,18,0],[566,21,566,102,0],[567,21,567,22,0],[568,25,568,108,0],[569,25,569,50,0],[571,17,571,18,0],[573,17,573,45,0],[574,13,574,14,0],[576,13,576,14,0],[577,17,577,35,0],[579,17,579,45,0],[580,17,580,18,0],[581,21,581,50,0],[582,17,582,18,0],[585,17,585,36,0],[586,13,586,14,0],[601,13,601,14,1],[602,17,602,56,1],[604,17,608,21,1],[608,21,608,22,1],[608,22,613,25,1],[613,25,613,74,1],[613,74,614,32,1],[614,32,614,69,1],[614,69,615,32,1],[615,32,617,72,1],[617,72,618,25,1],[618,25,618,26,1],[618,26,619,29,1],[619,29,619,46,1],[619,46,620,29,1],[620,29,620,30,1],[620,30,621,33,1],[621,33,621,58,1],[621,58,622,33,1],[622,33,622,84,1],[622,84,623,33,1],[623,33,623,48,1],[623,48,624,37,1],[624,37,624,59,1],[624,59,625,29,1],[625,29,625,30,1],[625,30,626,25,1],[626,25,626,26,1],[626,26,629,25,1],[629,25,629,58,1],[629,58,630,25,1],[630,25,630,26,0],[630,26,631,29,1],[631,29,631,36,0],[631,36,631,38,1],[631,38,631,45,0],[631,45,631,46,1],[631,46,631,48,0],[631,48,631,49,1],[631,49,631,67,0],[631,67,632,29,1],[632,29,632,30,0],[632,30,633,33,1],[633,33,633,77,0],[633,77,634,33,1],[634,33,634,40,0],[634,40,634,42,1],[634,42,634,48,0],[634,48,634,49,1],[634,49,634,51,0],[634,51,634,52,1],[634,52,634,55,0],[634,55,635,33,1],[635,33,635,34,0],[635,34,636,37,1],[636,37,636,76,0],[636,76,637,41,1],[637,41,637,63,0],[637,63,638,33,1],[638,33,638,34,0],[638,34,639,29,1],[639,29,639,30,0],[639,30,640,25,1],[640,25,640,26,0],[640,26,641,25,1],[641,25,641,51,1],[641,51,641,58,1],[641,58,641,69,1],[641,25,641,69,1],[641,69,642,21,1],[642,21,642,22,1],[642,22,642,24,1],[604,17,642,24,1],[643,13,643,14,1],[649,13,649,14,1],[650,17,650,50,1],[651,17,651,18,1],[657,21,659,69,1],[661,21,661,49,1],[662,21,662,22,1],[664,32,664,69,1],[665,32,667,70,1],[668,25,668,26,1],[669,29,669,46,1],[670,29,670,30,0],[671,33,671,92,0],[672,29,672,30,0],[673,25,673,26,1],[674,21,674,22,1],[676,17,676,18,1],[677,17,677,45,1],[678,13,678,14,1],[688,13,688,14,0],[689,17,689,45,0],[690,21,690,30,0],[692,17,692,86,0],[693,13,693,14,0],[695,13,695,14,0],[696,17,696,48,0],[697,17,697,18,0],[699,21,699,49,0],[700,21,700,22,0],[702,25,702,58,0],[703,25,703,26,0],[704,29,704,66,0],[705,29,705,63,0],[706,25,706,26,0],[708,25,708,53,0],[709,21,709,22,0],[711,21,711,22,0],[712,25,712,58,0],[715,25,715,92,0],[716,25,716,26,0],[718,25,718,26,0],[720,25,720,73,0],[721,25,721,79,0],[722,21,722,22,0],[723,17,723,18,0],[724,13,724,14,0],[728,9,728,10,0],[729,13,729,66,0],[730,13,730,14,0],[732,13,732,14,0],[734,13,734,14,0],[735,17,735,45,0],[736,17,736,18,0],[737,28,737,65,0],[738,25,741,79,0],[743,21,743,65,0],[744,17,744,18,0],[746,17,746,18,0],[747,21,747,83,0],[748,21,748,75,0],[749,17,749,18,0],[750,13,750,14,0],[751,9,751,10,0],[754,9,754,10,0],[755,20,755,57,0],[756,17,757,81,0],[758,9,758,10,0],[761,9,761,10,0],[762,13,762,47,0],[763,20,763,57,0],[764,20,765,71,0],[766,13,766,14,0],[767,17,767,34,0],[768,17,768,18,0],[769,21,769,78,0],[770,17,770,18,0],[771,13,771,14,0],[773,13,773,24,0],[774,9,774,10,0],[777,9,777,10,0],[778,13,778,75,0],[779,13,779,14,0],[781,13,781,14,0],[783,13,783,14,0],[788,17,788,80,0],[790,17,790,73,0],[792,24,792,61,0],[793,21,796,97,0],[797,17,797,64,0],[798,13,798,14,0],[799,9,799,10,0],[802,9,802,10,0],[803,13,803,20,0],[803,22,803,28,0],[803,29,803,31,0],[803,32,803,65,0],[804,13,804,14,0],[805,17,805,64,0],[806,17,806,18,0],[809,28,809,65,0],[810,25,816,76,0],[817,17,817,18,0],[818,13,818,14,0],[821,13,821,20,0],[821,22,821,28,0],[821,29,821,31,0],[821,32,821,66,0],[822,17,822,71,0],[823,9,823,10,0],[827,17,827,18,0],[827,19,827,85,0],[827,86,827,87,0],[837,13,837,14,0],[838,17,838,37,0],[839,17,839,47,0],[840,13,840,14,0],[849,9,849,10,0],[852,13,852,20,0],[852,22,852,27,0],[852,28,852,30,0],[852,31,852,45,0],[853,17,853,42,0],[855,13,855,33,0],[856,9,856,10,0],[865,13,865,14,0],[867,17,867,57,0],[868,17,868,18,0],[869,21,869,67,0],[870,28,870,65,0],[871,28,871,133,0],[872,21,872,22,0],[873,25,873,42,0],[874,25,874,26,0],[875,29,875,85,0],[876,25,876,26,0],[877,21,877,22,0],[878,17,878,18,0],[880,17,880,62,0],[881,13,881,14,0],[883,13,883,14,0],[884,17,884,62,0],[888,17,888,45,0],[889,17,889,18,0],[890,28,890,65,0],[891,25,892,88,0],[893,21,893,28,0],[893,30,893,35,0],[893,36,893,38,0],[893,39,893,44,0],[894,21,894,22,0],[895,32,895,69,0],[896,29,898,49,0],[899,21,899,22,0],[900,17,900,18,0],[902,17,902,18,0],[903,21,903,60,0],[904,21,904,34,0],[905,21,905,28,0],[905,30,905,35,0],[905,36,905,38,0],[905,39,905,44,0],[906,21,906,22,0],[907,25,907,36,0],[908,25,908,65,0],[909,25,909,32,0],[910,21,910,22,0],[912,21,912,64,0],[913,17,913,18,0],[914,13,914,14,0],[925,9,925,10,0],[926,13,926,30,0],[927,9,927,10,0],[929,9,929,10,0],[930,13,930,33,0],[931,9,931,10,0],[936,9,936,10,0],[937,13,937,25,0],[938,9,938,10,0],[945,9,945,10,0],[946,13,946,56,0],[948,20,948,57,0],[949,20,949,143,0],[950,13,950,14,0],[951,17,951,34,0],[952,17,952,18,0],[954,21,954,71,0],[956,21,956,54,0],[958,21,958,62,0],[960,21,960,42,0],[961,17,961,18,0],[962,13,962,14,0],[964,13,964,43,0],[966,9,966,10,0],[975,9,975,10,0],[976,13,976,75,0],[979,13,979,42,0],[982,13,982,48,0],[988,13,988,32,0],[990,13,990,23,0],[991,9,991,10,0],[1001,9,1001,10,0],[1003,13,1003,30,0],[1005,13,1005,39,0],[1006,9,1006,10,0],[1014,9,1014,10,0],[1015,13,1015,26,0],[1017,13,1017,41,0],[1018,13,1018,14,0],[1019,17,1019,62,0],[1020,13,1020,14,0],[1023,13,1023,32,0],[1024,9,1024,10,0],[1034,9,1034,10,0],[1036,13,1036,72,0],[1037,13,1037,24,0],[1040,13,1040,32,0],[1042,13,1042,27,0],[1043,9,1043,10,0],[1051,9,1051,10,0],[1052,13,1052,65,0],[1055,13,1055,32,0],[1056,9,1056,10,0],[1065,9,1065,10,0],[1066,13,1066,69,0],[1067,13,1067,32,0],[1068,13,1068,24,0],[1071,13,1071,32,0],[1072,9,1072,10,0],[1081,9,1081,10,0],[1082,13,1082,69,0],[1083,13,1083,39,0],[1084,13,1084,24,0],[1087,13,1087,32,0],[1088,9,1088,10,0],[1096,9,1096,10,0],[1098,13,1098,49,0],[1098,49,1098,66,0],[1098,66,1098,68,0],[1098,13,1098,68,0],[1100,13,1100,27,0],[1101,13,1101,14,0],[1102,17,1102,29,0],[1104,13,1104,36,0],[1105,9,1105,10,0],[1110,9,1110,10,0],[1112,13,1112,32,0],[1115,13,1115,20,0],[1115,22,1115,28,0],[1115,29,1115,31,0],[1115,32,1115,45,0],[1116,13,1116,14,0],[1117,17,1117,44,0],[1118,17,1118,18,0],[1119,21,1119,33,0],[1120,17,1120,18,0],[1121,13,1121,14,0],[1124,13,1124,20,0],[1124,22,1124,43,0],[1124,44,1124,46,0],[1124,47,1124,65,0],[1125,13,1125,14,0],[1126,17,1126,50,0],[1127,17,1127,18,0],[1128,21,1128,34,0],[1129,17,1129,18,0],[1130,13,1130,14,0],[1133,20,1133,57,0],[1134,17,1136,55,0],[1139,20,1139,57,0],[1140,17,1140,94,0],[1143,13,1143,27,0],[1144,9,1144,10,0],[1151,9,1151,10,1],[1152,13,1152,40,1],[1153,13,1153,41,1],[1154,13,1154,63,1],[1155,13,1155,54,1],[1156,13,1156,48,1],[1157,13,1157,52,1],[1161,9,1161,10,1],[1164,9,1164,10,0],[1165,13,1165,44,0],[1166,13,1166,45,0],[1167,13,1167,68,0],[1168,13,1168,57,0],[1170,13,1170,41,0],[1171,17,1171,56,0],[1172,13,1172,43,0],[1173,17,1173,60,0],[1174,9,1174,10,0],[1180,9,1180,10,1],[1181,13,1181,30,1],[1184,13,1184,80,1],[1185,13,1185,14,1],[1186,17,1186,64,1],[1187,17,1187,41,1],[1188,17,1188,18,1],[1189,21,1189,73,1],[1190,21,1190,28,1],[1192,13,1192,14,0],[1193,18,1193,82,1],[1194,13,1194,14,1],[1195,17,1195,62,1],[1196,17,1196,39,1],[1197,17,1197,18,1],[1198,21,1198,71,1],[1199,21,1199,28,1],[1201,13,1201,14,0],[1202,18,1202,83,0],[1203,13,1203,14,0],[1204,17,1204,63,0],[1205,17,1205,40,0],[1206,17,1206,18,0],[1207,21,1207,72,0],[1208,21,1208,28,0],[1210,13,1210,14,0],[1213,20,1213,57,0],[1214,20,1214,160,0],[1216,13,1216,14,0],[1217,17,1217,31,0],[1218,17,1218,18,0],[1219,21,1219,59,0],[1220,17,1220,18,0],[1222,17,1222,18,0],[1223,21,1223,82,0],[1225,13,1225,14,0],[1226,9,1226,10,1],[1233,9,1233,10,0],[1235,13,1235,42,0],[1236,13,1236,145,0],[1237,13,1237,113,0],[1238,13,1238,35,0],[1241,13,1241,47,0],[1244,13,1245,69,0],[1246,13,1246,14,0],[1249,17,1249,166,0],[1250,17,1250,24,0],[1250,26,1250,33,0],[1250,34,1250,36,0],[1250,37,1250,41,0],[1251,17,1251,18,0],[1252,21,1252,49,0],[1253,17,1253,18,0],[1254,13,1254,14,0],[1255,9,1255,10,0],[1259,9,1259,10,0],[1260,13,1260,123,0],[1261,13,1261,133,0],[1263,13,1263,38,0],[1264,13,1264,32,0],[1265,9,1265,10,0],[1274,13,1274,14,1],[1275,17,1275,84,1],[1276,17,1276,18,1],[1277,21,1277,98,1],[1279,17,1279,81,1],[1280,17,1280,18,1],[1281,21,1281,96,1],[1283,17,1283,82,0],[1284,17,1284,18,0],[1285,21,1285,86,0],[1289,17,1289,94,0],[1290,13,1290,14,1],[1298,9,1298,10,1],[1299,13,1299,70,1],[1300,9,1300,10,1],[1303,9,1303,68,1],[1303,9,1303,68,0],[1303,9,1303,68,0],[1303,9,1303,68,0],[1303,9,1303,68,0],[1303,9,1303,68,0],[1309,9,1309,10,0],[1315,13,1315,65,0],[1316,13,1316,14,0],[1317,17,1317,43,0],[1318,17,1318,18,0],[1320,21,1320,73,0],[1321,21,1321,22,0],[1322,25,1322,49,0],[1323,21,1323,22,0],[1324,17,1324,18,0],[1325,13,1325,14,0],[1326,9,1326,10,0],[1334,9,1334,10,0],[1336,13,1336,70,0],[1338,13,1339,30,0],[1339,30,1339,77,0],[1339,77,1340,66,0],[1340,66,1340,101,0],[1340,101,1341,31,0],[1341,31,1341,42,0],[1341,42,1342,34,0],[1342,34,1342,38,0],[1342,38,1343,27,0],[1338,13,1343,27,0],[1344,13,1344,33,0],[1366,9,1366,10,0],[1369,9,1369,10,0],[1370,13,1370,20,0],[1370,22,1370,33,0],[1370,34,1370,36,0],[1370,37,1370,64,0],[1371,13,1371,14,0],[1373,17,1373,68,0],[1374,17,1374,18,0],[1375,21,1375,58,0],[1376,21,1376,64,0],[1377,17,1377,18,0],[1378,13,1378,14,0],[1379,9,1379,10,0],[1382,9,1382,10,0],[1384,20,1384,57,0],[1385,17,1387,99,0],[1388,9,1388,10,0],[1480,13,1480,81,0],[1481,13,1481,14,0],[1482,17,1482,26,0],[1483,17,1483,36,0],[1484,17,1484,40,0],[1485,17,1485,38,0],[1486,13,1486,14,0],[1489,13,1489,14,0],[1490,17,1490,32,0],[1492,17,1492,84,0],[1493,17,1493,33,0],[1494,17,1494,18,0],[1495,21,1495,100,0],[1496,17,1496,18,0],[1498,17,1498,28,0],[1499,13,1499,14,0],[1503,13,1503,14,0],[1504,17,1504,62,0],[1505,13,1505,14,0],[1512,13,1512,14,0],[1514,17,1514,94,0],[1516,17,1516,48,0],[1517,17,1517,18,0],[1519,21,1519,95,0],[1520,21,1520,43,0],[1520,43,1520,135,0],[1520,135,1520,147,0],[1520,21,1520,147,0],[1523,17,1523,39,0],[1523,39,1523,71,0],[1523,71,1523,83,0],[1523,17,1523,83,0],[1524,13,1524,14,0],[1530,13,1530,14,0],[1531,17,1531,113,0],[1532,17,1533,35,0],[1533,35,1533,46,0],[1533,46,1534,34,0],[1534,34,1534,38,0],[1534,38,1536,31,0],[1532,17,1536,31,0],[1556,13,1556,14,0],[1564,21,1564,22,0],[1564,23,1564,66,0],[1564,67,1564,68,0],[1576,13,1576,14,0],[1579,13,1579,14,0],[1585,13,1585,14,0],[1586,24,1586,61,0],[1587,21,1588,81,0],[1589,24,1589,61,0],[1590,21,1591,81,0],[1592,13,1592,14,0],[1600,13,1600,14,0],[1602,17,1602,18,0],[1603,28,1603,65,0],[1604,21,1604,22,0],[1605,25,1605,144,0],[1606,25,1606,58,0],[1607,29,1607,48,0],[1608,25,1608,104,0],[1609,25,1609,42,0],[1610,25,1610,26,0],[1611,29,1611,131,0],[1613,25,1613,56,0],[1616,17,1616,22,0],[1617,17,1617,18,0],[1618,21,1618,33,0],[1620,13,1620,14,0],[1628,13,1628,14,0],[1630,17,1630,18,0],[1631,28,1631,65,0],[1632,21,1632,22,0],[1633,25,1633,133,0],[1634,25,1634,44,0],[1637,17,1637,22,0],[1638,17,1638,18,0],[1639,21,1639,33,0],[1641,13,1641,14,0],[1654,17,1654,18,0],[1655,21,1655,46,0],[1656,21,1656,22,0],[1657,32,1657,69,0],[1658,29,1658,135,0],[1659,21,1659,22,0],[1660,21,1660,45,0],[1661,17,1661,18,0],[1663,17,1663,18,0],[1664,28,1664,65,0],[1665,25,1665,129,0],[1666,17,1666,18,0],[1674,13,1674,14,0],[1675,17,1675,31,0],[1678,17,1678,35,0],[1679,17,1679,18,0],[1680,21,1680,54,0],[1682,21,1682,60,0],[1683,21,1683,28,0],[1683,30,1683,35,0],[1683,36,1683,38,0],[1683,39,1683,43,0],[1684,21,1684,22,0],[1685,25,1685,57,0],[1686,29,1686,53,0],[1687,21,1687,22,0],[1688,21,1688,46,0],[1689,17,1689,18,0],[1690,13,1690,14,0],[1697,13,1697,14,0],[1698,17,1698,31,0],[1701,17,1701,56,0],[1702,17,1702,49,0],[1703,17,1703,18,0],[1704,21,1704,54,0],[1706,21,1706,28,0],[1706,30,1706,35,0],[1706,36,1706,38,0],[1706,39,1706,43,0],[1707,21,1707,22,0],[1708,25,1708,57,0],[1709,29,1709,53,0],[1710,21,1710,22,0],[1711,21,1711,46,0],[1712,17,1712,18,0],[1713,13,1713,14,0],[1722,13,1722,14,0],[1723,17,1723,33,0],[1724,13,1724,14,0],[1731,13,1731,14,0],[1732,17,1732,56,0],[1733,22,1733,31,0],[1733,33,1733,48,0],[1733,50,1733,53,0],[1734,17,1734,18,0],[1735,21,1735,42,0],[1736,21,1736,37,0],[1737,17,1737,18,0],[1738,13,1738,14,0],[1747,21,1747,22,0],[1747,23,1747,34,0],[1747,35,1747,36,0],[1755,21,1755,22,0],[1755,23,1755,46,0],[1755,47,1755,48,0],[1767,17,1767,18,0],[1768,21,1768,51,0],[1769,25,1769,41,0],[1771,21,1771,100,0],[1772,21,1772,38,0],[1773,21,1773,22,0],[1774,25,1774,106,0],[1775,25,1775,26,0],[1776,29,1776,112,0],[1777,29,1777,54,0],[1779,21,1779,22,0],[1781,21,1781,49,0],[1782,17,1782,18,0]]);
+    </script>
+  </body>
+</html>

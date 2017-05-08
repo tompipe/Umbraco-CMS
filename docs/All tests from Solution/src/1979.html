@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Models\DeepCloneHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+
+namespace Umbraco.Core.Models
+{
+    public static class DeepCloneHelper
+    {
+        /// &lt;summary&gt;
+        /// Stores the metadata for the properties for a given type so we know how to create them
+        /// &lt;/summary&gt;
+        private struct ClonePropertyInfo
+        {
+            public ClonePropertyInfo(PropertyInfo propertyInfo) : this()
+            {
+                if (propertyInfo == null) throw new ArgumentNullException(&quot;propertyInfo&quot;);
+                PropertyInfo = propertyInfo;
+            }
+
+            public PropertyInfo PropertyInfo { get; private set; }
+            public bool IsDeepCloneable { get; set; }
+            public Type GenericListType { get; set; }           
+            public bool IsList
+            {
+                get { return GenericListType != null; }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Used to avoid constant reflection (perf)
+        /// &lt;/summary&gt;
+        private static readonly ConcurrentDictionary&lt;Type, ClonePropertyInfo[]&gt; PropCache = new ConcurrentDictionary&lt;Type, ClonePropertyInfo[]&gt;();
+
+        /// &lt;summary&gt;
+        /// Used to deep clone any reference properties on the object (should be done after a MemberwiseClone for which the outcome is &#39;output&#39;)
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;input&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;output&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;        
+        public static void DeepCloneRefProperties(IDeepCloneable input, IDeepCloneable output)
+        {
+            var inputType = input.GetType();
+            var outputType = output.GetType();
+
+            if (inputType != outputType)
+            {
+                throw new InvalidOperationException(&quot;Both the input and output types must be the same&quot;);
+            }
+
+            //get the property metadata from cache so we only have to figure this out once per type
+            var refProperties = PropCache.GetOrAdd(inputType, type =&gt;
+                inputType.GetProperties()
+                    .Select&lt;PropertyInfo, ClonePropertyInfo?&gt;(propertyInfo =&gt;
+                    {
+                        if (
+                            //is not attributed with the ignore clone attribute
+                            propertyInfo.GetCustomAttribute&lt;DoNotCloneAttribute&gt;() != null
+                            //reference type but not string
+                            || propertyInfo.PropertyType.IsValueType || propertyInfo.PropertyType == typeof (string)
+                            //settable
+                            || propertyInfo.CanWrite == false
+                            //non-indexed
+                            || propertyInfo.GetIndexParameters().Any())
+                        {
+                            return null;
+                        }
+                        
+
+                        if (TypeHelper.IsTypeAssignableFrom&lt;IDeepCloneable&gt;(propertyInfo.PropertyType))
+                        {
+                            return new ClonePropertyInfo(propertyInfo) { IsDeepCloneable = true };
+                        }
+
+                        if (TypeHelper.IsTypeAssignableFrom&lt;IEnumerable&gt;(propertyInfo.PropertyType)
+                            &amp;&amp; TypeHelper.IsTypeAssignableFrom&lt;string&gt;(propertyInfo.PropertyType) == false)
+                        {
+                            if (propertyInfo.PropertyType.IsGenericType
+                                &amp;&amp; (propertyInfo.PropertyType.GetGenericTypeDefinition() == typeof(IEnumerable&lt;&gt;)
+                                    || propertyInfo.PropertyType.GetGenericTypeDefinition() == typeof(ICollection&lt;&gt;)
+                                    || propertyInfo.PropertyType.GetGenericTypeDefinition() == typeof(IList&lt;&gt;)))
+                            {
+                                //if it is a IEnumerable&lt;&gt;, IList&lt;T&gt; or ICollection&lt;&gt; we&#39;ll use a List&lt;&gt;
+                                var genericType = typeof(List&lt;&gt;).MakeGenericType(propertyInfo.PropertyType.GetGenericArguments());
+                                return new ClonePropertyInfo(propertyInfo) { GenericListType = genericType };
+                            }
+                            if (propertyInfo.PropertyType.IsArray
+                                || (propertyInfo.PropertyType.IsInterface &amp;&amp; propertyInfo.PropertyType.IsGenericType == false))
+                            {
+                                //if its an array, we&#39;ll create a list to work with first and then convert to array later
+                                //otherwise if its just a regular derivitave of IEnumerable, we can use a list too
+                                return new ClonePropertyInfo(propertyInfo) { GenericListType = typeof(List&lt;object&gt;) };
+                            }
+                            //skip instead of trying to create instance of abstract or interface
+                            if (propertyInfo.PropertyType.IsAbstract || propertyInfo.PropertyType.IsInterface)
+                            {
+                                return null;
+                            }
+
+                            //its a custom IEnumerable, we&#39;ll try to create it
+                            try
+                            {
+                                var custom = Activator.CreateInstance(propertyInfo.PropertyType);
+                                //if it&#39;s an IList we can work with it, otherwise we cannot
+                                var newList = custom as IList;
+                                if (newList == null)
+                                {
+                                    return null;
+                                }
+                                return new ClonePropertyInfo(propertyInfo) {GenericListType = propertyInfo.PropertyType};
+                            }
+                            catch (Exception)
+                            {
+                                //could not create this type so we&#39;ll skip it
+                                return null;
+                            }
+                        }
+                        return new ClonePropertyInfo(propertyInfo);
+                    })
+                    .Where(x =&gt; x.HasValue)
+                    .Select(x =&gt; x.Value)
+                    .ToArray());
+
+            foreach (var clonePropertyInfo in refProperties)
+            {
+                if (clonePropertyInfo.IsDeepCloneable)
+                {
+                    //this ref property is also deep cloneable so clone it
+                    var result = (IDeepCloneable)clonePropertyInfo.PropertyInfo.GetValue(input, null);
+
+                    if (result != null)
+                    {
+                        //set the cloned value to the property
+                        clonePropertyInfo.PropertyInfo.SetValue(output, result.DeepClone(), null);
+                    }
+                }
+                else if (clonePropertyInfo.IsList)
+                {
+                    var enumerable = (IEnumerable)clonePropertyInfo.PropertyInfo.GetValue(input, null);
+                    if (enumerable == null) continue;
+
+                    var newList = (IList)Activator.CreateInstance(clonePropertyInfo.GenericListType);
+
+                    var isUsableType = true;
+
+                    //now clone each item
+                    foreach (var o in enumerable)
+                    {
+                        //first check if the item is deep cloneable and copy that way
+                        var dc = o as IDeepCloneable;
+                        if (dc != null)
+                        {
+                            newList.Add(dc.DeepClone());
+                        }
+                        else if (o is string || o.GetType().IsValueType)
+                        {
+                            //check if the item is a value type or a string, then we can just use it                         
+                            newList.Add(o);
+                        }
+                        else
+                        {
+                            //this will occur if the item is not a string or value type or IDeepCloneable, in this case we cannot
+                            // clone each element, we&#39;ll need to skip this property, people will have to manually clone this list
+                            isUsableType = false;
+                            break;
+                        }
+                    }
+
+                    //if this was not usable, skip this property
+                    if (isUsableType == false)
+                    {
+                        continue;
+                    }
+
+                    if (clonePropertyInfo.PropertyInfo.PropertyType.IsArray)
+                    {
+                        //need to convert to array
+                        var arr = (object[])Activator.CreateInstance(clonePropertyInfo.PropertyInfo.PropertyType, newList.Count);
+                        for (int i = 0; i &lt; newList.Count; i++)
+                        {
+                            arr[i] = newList[i];
+                        }
+                        //set the cloned collection
+                        clonePropertyInfo.PropertyInfo.SetValue(output, arr, null);
+                    }
+                    else
+                    {
+                        //set the cloned collection
+                        clonePropertyInfo.PropertyInfo.SetValue(output, newList, null);
+                    }
+
+                }
+            }
+        }
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[17,67,17,73,1],[18,13,18,14,1],[19,17,19,42,1],[19,43,19,91,0],[20,17,20,45,1],[21,13,21,14,1],[23,48,23,52,1],[23,53,23,65,1],[24,43,24,47,1],[24,48,24,52,1],[25,43,25,47,1],[25,48,25,52,1],[28,21,28,22,1],[28,23,28,54,1],[28,55,28,56,1],[35,9,35,147,1],[44,9,44,10,1],[45,13,45,45,1],[46,13,46,47,1],[48,13,48,41,1],[49,13,49,14,0],[50,17,50,105,0],[54,13,55,17,1],[55,17,57,21,1],[57,21,57,22,1],[57,22,58,25,1],[58,25,66,72,1],[66,72,67,25,1],[67,25,67,26,1],[67,26,68,29,1],[68,29,68,41,1],[68,41,72,25,1],[72,25,72,104,1],[72,104,73,25,1],[73,25,73,26,1],[73,26,74,29,1],[74,29,74,99,1],[74,99,77,25,1],[77,25,78,108,1],[78,108,79,25,1],[79,25,79,26,1],[79,26,80,29,1],[80,29,83,113,1],[83,113,84,29,1],[84,29,84,30,1],[84,30,86,33,1],[86,33,86,131,1],[86,131,87,33,1],[87,33,87,110,1],[87,110,89,29,1],[89,29,90,128,1],[90,128,91,29,1],[91,29,91,30,1],[91,30,94,33,1],[94,33,94,119,1],[94,119,97,29,1],[97,29,97,111,1],[97,111,98,29,1],[98,29,98,30,1],[98,30,99,33,1],[99,33,99,45,1],[99,45,104,29,1],[104,29,104,30,1],[104,30,105,33,1],[105,33,105,98,1],[105,98,107,33,1],[107,33,107,63,1],[107,63,108,33,1],[108,33,108,53,1],[108,53,109,33,1],[109,33,109,34,0],[109,34,110,37,1],[110,37,110,49,0],[110,49,112,33,1],[112,33,112,122,1],[112,122,114,29,1],[114,29,114,46,0],[114,46,115,29,1],[115,29,115,30,0],[115,30,117,33,1],[117,33,117,45,0],[117,45,120,25,1],[120,25,120,68,1],[120,68,121,21,1],[121,21,121,22,1],[121,22,122,33,1],[122,33,122,43,1],[122,43,123,34,1],[123,34,123,41,1],[123,41,124,31,1],[55,17,124,31,1],[124,31,124,33,1],[54,13,124,33,1],[126,13,126,20,1],[126,22,126,43,1],[126,44,126,46,1],[126,47,126,60,1],[127,13,127,14,1],[128,17,128,55,1],[129,17,129,18,1],[131,21,131,103,1],[133,21,133,40,1],[134,21,134,22,1],[136,25,136,99,1],[137,21,137,22,1],[138,17,138,18,1],[139,22,139,51,1],[140,17,140,18,1],[141,21,141,104,1],[142,21,142,44,1],[142,45,142,54,1],[144,21,144,102,1],[146,21,146,45,1],[149,21,149,28,1],[149,30,149,35,1],[149,36,149,38,1],[149,39,149,49,1],[150,21,150,22,1],[152,25,152,54,1],[153,25,153,40,1],[154,25,154,26,1],[155,29,155,57,1],[156,25,156,26,1],[157,30,157,73,1],[158,25,158,26,1],[160,29,160,44,1],[161,25,161,26,1],[163,25,163,26,1],[166,29,166,50,1],[167,29,167,35,1],[169,21,169,22,1],[172,21,172,47,1],[173,21,173,22,1],[174,25,174,34,1],[177,21,177,77,1],[178,21,178,22,1],[180,25,180,130,1],[181,30,181,39,1],[181,41,181,58,1],[181,60,181,63,1],[182,25,182,26,1],[183,29,183,49,1],[184,25,184,26,1],[186,25,186,84,1],[187,21,187,22,1],[189,21,189,22,1],[191,25,191,88,1],[192,21,192,22,1],[194,17,194,18,1],[195,13,195,14,1],[196,9,196,10,1]]);
+    </script>
+  </body>
+</html>

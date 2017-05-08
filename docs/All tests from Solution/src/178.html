@@ -1,0 +1,1585 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Services\ContentTypeServiceTests.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using NUnit.Framework;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core;
+using Umbraco.Core.Exceptions;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Services;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Tests.TestHelpers.Entities;
+
+namespace Umbraco.Tests.Services
+{
+
+    [DatabaseTestBehavior(DatabaseBehavior.NewDbFileAndSchemaPerTest)]
+    [TestFixture, RequiresSTA]
+    public class ContentTypeServiceTests : BaseServiceTest
+    {
+        [SetUp]
+        public override void Initialize()
+        {
+            base.Initialize();
+        }
+
+        [TearDown]
+        public override void TearDown()
+        {
+            base.TearDown();
+        }
+
+        [Test]
+        public void Deleting_PropertyType_Removes_The_Property_From_Content()
+        {
+            IContentType contentType1 = MockedContentTypes.CreateTextpageContentType(&quot;test1&quot;, &quot;Test1&quot;);
+            ServiceContext.ContentTypeService.Save(contentType1);
+            IContent contentItem = MockedContent.CreateTextpageContent(contentType1, &quot;Testing&quot;, -1);
+            ServiceContext.ContentService.SaveAndPublishWithStatus(contentItem);
+            var initProps = contentItem.Properties.Count;
+            var initPropTypes = contentItem.PropertyTypes.Count();
+
+            //remove a property
+            contentType1.RemovePropertyType(contentType1.PropertyTypes.First().Alias);
+            ServiceContext.ContentTypeService.Save(contentType1);
+
+            //re-load it from the db
+            contentItem = ServiceContext.ContentService.GetById(contentItem.Id);
+
+            Assert.AreEqual(initPropTypes - 1, contentItem.PropertyTypes.Count());
+            Assert.AreEqual(initProps - 1, contentItem.Properties.Count);
+        }
+
+        [Test]
+        public void Rebuild_Content_Xml_On_Alias_Change()
+        {
+            var contentType1 = MockedContentTypes.CreateTextpageContentType(&quot;test1&quot;, &quot;Test1&quot;);
+            var contentType2 = MockedContentTypes.CreateTextpageContentType(&quot;test2&quot;, &quot;Test2&quot;);
+            ServiceContext.ContentTypeService.Save(contentType1);
+            ServiceContext.ContentTypeService.Save(contentType2);
+            var contentItems1 = MockedContent.CreateTextpageContent(contentType1, -1, 10).ToArray();
+            contentItems1.ForEach(x =&gt; ServiceContext.ContentService.SaveAndPublishWithStatus(x));
+            var contentItems2 = MockedContent.CreateTextpageContent(contentType2, -1, 5).ToArray();
+            contentItems2.ForEach(x =&gt; ServiceContext.ContentService.SaveAndPublishWithStatus(x));
+            //only update the contentType1 alias which will force an xml rebuild for all content of that type
+            contentType1.Alias = &quot;newAlias&quot;;
+            ServiceContext.ContentTypeService.Save(contentType1);
+
+            foreach (var c in contentItems1)
+            {
+                var xml = DatabaseContext.Database.FirstOrDefault&lt;ContentXmlDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = c.Id });
+                Assert.IsNotNull(xml);
+                Assert.IsTrue(xml.Xml.StartsWith(&quot;&lt;newAlias&quot;));
+            }
+
+            foreach (var c in contentItems2)
+            {
+                var xml = DatabaseContext.Database.FirstOrDefault&lt;ContentXmlDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = c.Id });
+                Assert.IsNotNull(xml);
+                Assert.IsTrue(xml.Xml.StartsWith(&quot;&lt;test2&quot;)); //should remain the same
+            }
+        }
+
+        [Test]
+        public void Rebuild_Content_Xml_On_Property_Removal()
+        {
+            var contentType1 = MockedContentTypes.CreateTextpageContentType(&quot;test1&quot;, &quot;Test1&quot;);
+            ServiceContext.ContentTypeService.Save(contentType1);
+            var contentItems1 = MockedContent.CreateTextpageContent(contentType1, -1, 10).ToArray();
+            contentItems1.ForEach(x =&gt; ServiceContext.ContentService.SaveAndPublishWithStatus(x));
+            var alias = contentType1.PropertyTypes.First().Alias;
+            var elementToMatch = &quot;&lt;&quot; + alias + &quot;&gt;&quot;;
+
+            foreach (var c in contentItems1)
+            {
+                var xml = DatabaseContext.Database.FirstOrDefault&lt;ContentXmlDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = c.Id });
+                Assert.IsNotNull(xml);
+                Assert.IsTrue(xml.Xml.Contains(elementToMatch)); //verify that it is there before we remove the property
+            }
+
+            //remove a property
+            contentType1.RemovePropertyType(contentType1.PropertyTypes.First().Alias);
+            ServiceContext.ContentTypeService.Save(contentType1);
+
+            var reQueried = ServiceContext.ContentTypeService.GetContentType(contentType1.Id);
+            var reContent = ServiceContext.ContentService.GetById(contentItems1.First().Id);
+
+            foreach (var c in contentItems1)
+            {
+                var xml = DatabaseContext.Database.FirstOrDefault&lt;ContentXmlDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = c.Id });
+                Assert.IsNotNull(xml);
+                Assert.IsFalse(xml.Xml.Contains(elementToMatch)); //verify that it is no longer there
+            }
+        }
+
+        [Test]
+        public void Get_Descendants()
+        {
+            // Arrange
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var hierarchy = CreateContentTypeHierarchy();
+            contentTypeService.Save(hierarchy, 0); //ensure they are saved!
+            var master = hierarchy.First();
+
+            //Act
+            var descendants = master.Descendants();
+
+            //Assert
+            Assert.AreEqual(10, descendants.Count());
+        }
+
+        [Test]
+        public void Get_Descendants_And_Self()
+        {
+            // Arrange
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var hierarchy = CreateContentTypeHierarchy();
+            contentTypeService.Save(hierarchy, 0); //ensure they are saved!
+            var master = hierarchy.First();
+
+            //Act
+            var descendants = master.DescendantsAndSelf();
+
+            //Assert
+            Assert.AreEqual(11, descendants.Count());
+        }
+
+        [Test]
+        public void Get_With_Missing_Guid()
+        {
+            // Arrange
+            var contentTypeService = ServiceContext.ContentTypeService;
+
+            //Act
+            var result = contentTypeService.GetMediaType(Guid.NewGuid());
+
+            //Assert
+            Assert.IsNull(result);
+        }
+
+        [Test]
+        public void Can_Bulk_Save_New_Hierarchy_Content_Types()
+        {
+            // Arrange
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var hierarchy = CreateContentTypeHierarchy();
+
+            // Act
+            contentTypeService.Save(hierarchy, 0);
+
+            Assert.That(hierarchy.Any(), Is.True);
+            Assert.That(hierarchy.Any(x =&gt; x.HasIdentity == false), Is.False);
+            //all parent id&#39;s should be ok, they are lazy and if they equal zero an exception will be thrown
+            Assert.DoesNotThrow(() =&gt; hierarchy.Any(x =&gt; x.ParentId != 0));
+            for (var i = 0; i &lt; hierarchy.Count(); i++)
+            {
+                if (i == 0) continue;
+                Assert.AreEqual(hierarchy.ElementAt(i).ParentId, hierarchy.ElementAt(i - 1).Id);
+            }
+        }
+
+        [Test]
+        public void Can_Save_ContentType_Structure_And_Create_Content_Based_On_It()
+        {
+            // Arrange
+            var cs = ServiceContext.ContentService;
+            var cts = ServiceContext.ContentTypeService;
+            var dtdYesNo = ServiceContext.DataTypeService.GetDataTypeDefinitionById(-49);
+            var ctBase = new ContentType(-1) { Name = &quot;Base&quot;, Alias = &quot;Base&quot;, Icon = &quot;folder.gif&quot;, Thumbnail = &quot;folder.png&quot; };
+            ctBase.AddPropertyType(new PropertyType(dtdYesNo, Constants.Conventions.Content.NaviHide)
+            {
+                Name = &quot;Hide From Navigation&quot;,
+            }
+                /*,&quot;Navigation&quot;*/);
+            cts.Save(ctBase);
+
+            const string contentTypeAlias = &quot;HomePage&quot;;
+            var ctHomePage = new ContentType(ctBase, contentTypeAlias)
+            {
+                Name = &quot;Home Page&quot;,
+                Alias = contentTypeAlias,
+                Icon = &quot;settingDomain.gif&quot;,
+                Thumbnail = &quot;folder.png&quot;,
+                AllowedAsRoot = true
+            };
+            ctHomePage.AddPropertyType(new PropertyType(dtdYesNo, &quot;someProperty&quot;) { Name = &quot;Some property&quot; }
+                /*,&quot;Navigation&quot;*/);
+            cts.Save(ctHomePage);
+
+            // Act
+            var homeDoc = cs.CreateContent(&quot;Home Page&quot;, -1, contentTypeAlias);
+            cs.SaveAndPublishWithStatus(homeDoc);
+
+            // Assert
+            Assert.That(ctBase.HasIdentity, Is.True);
+            Assert.That(ctHomePage.HasIdentity, Is.True);
+            Assert.That(homeDoc.HasIdentity, Is.True);
+            Assert.That(homeDoc.ContentTypeId, Is.EqualTo(ctHomePage.Id));
+        }
+
+        [Test]
+        public void Create_Content_Type_Ensures_Sort_Orders()
+        {
+            var service = ServiceContext.ContentTypeService;
+
+            var contentType = new ContentType(-1)
+            {
+                Alias = &quot;test&quot;,
+                Name = &quot;Test&quot;,
+                Description = &quot;ContentType used for simple text pages&quot;,
+                Icon = &quot;.sprTreeDoc3&quot;,
+                Thumbnail = &quot;doc2.png&quot;,
+                SortOrder = 1,
+                CreatorId = 0,
+                Trashed = false
+            };
+
+            contentType.AddPropertyType(new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;title&quot;) { Name = &quot;Title&quot;, Description = &quot;&quot;, Mandatory = false, DataTypeDefinitionId = -88 });
+            contentType.AddPropertyType(new PropertyType(Constants.PropertyEditors.TinyMCEAlias, DataTypeDatabaseType.Ntext, &quot;bodyText&quot;) { Name = &quot;Body Text&quot;, Description = &quot;&quot;, Mandatory = false, DataTypeDefinitionId = -87 });
+            contentType.AddPropertyType(new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;author&quot;) { Name = &quot;Author&quot;, Description = &quot;Name of the author&quot;, Mandatory = false, DataTypeDefinitionId = -88 });
+
+            service.Save(contentType);
+
+            var sortOrders = contentType.PropertyTypes.Select(x =&gt; x.SortOrder).ToArray();
+
+            Assert.AreEqual(1, sortOrders.Count(x =&gt; x == 0));
+            Assert.AreEqual(1, sortOrders.Count(x =&gt; x == 1));
+            Assert.AreEqual(1, sortOrders.Count(x =&gt; x == 2));
+        }
+
+        [Test]
+        public void Can_Create_And_Save_ContentType_Composition()
+        {
+            /*
+             * Global
+             * - Components
+             * - Category
+             */
+            var service = ServiceContext.ContentTypeService;
+            var global = MockedContentTypes.CreateSimpleContentType(&quot;global&quot;, &quot;Global&quot;);
+            service.Save(global);
+
+            var components = MockedContentTypes.CreateSimpleContentType(&quot;components&quot;, &quot;Components&quot;, global, true);
+            service.Save(components);
+
+            var component = MockedContentTypes.CreateSimpleContentType(&quot;component&quot;, &quot;Component&quot;, components, true);
+            service.Save(component);
+
+            var category = MockedContentTypes.CreateSimpleContentType(&quot;category&quot;, &quot;Category&quot;, global, true);
+            service.Save(category);
+
+            var success = category.AddContentType(component);
+
+            Assert.That(success, Is.False);
+        }
+
+        [Test]
+        public void Can_Delete_Parent_ContentType_When_Child_Has_Content()
+        {
+            var cts = ServiceContext.ContentTypeService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;page&quot;, &quot;Page&quot;, null, true);
+            cts.Save(contentType);
+            var childContentType = MockedContentTypes.CreateSimpleContentType(&quot;childPage&quot;, &quot;Child Page&quot;, contentType, true, &quot;Child Content&quot;);
+            cts.Save(childContentType);
+            var cs = ServiceContext.ContentService;
+            var content = cs.CreateContent(&quot;Page 1&quot;, -1, childContentType.Alias);
+            cs.Save(content);
+
+            cts.Delete(contentType);
+
+            Assert.IsNotNull(content.Id);
+            Assert.AreNotEqual(0, content.Id);
+            Assert.IsNotNull(childContentType.Id);
+            Assert.AreNotEqual(0, childContentType.Id);
+            Assert.IsNotNull(contentType.Id);
+            Assert.AreNotEqual(0, contentType.Id);
+            var deletedContent = cs.GetById(content.Id);
+            var deletedChildContentType = cts.GetContentType(childContentType.Id);
+            var deletedContentType = cts.GetContentType(contentType.Id);
+            
+            Assert.IsNull(deletedChildContentType);
+            Assert.IsNull(deletedContent);
+            Assert.IsNull(deletedContentType);
+        }
+
+        [Test]
+        public void Can_Create_Container()
+        {
+            // Arrange
+            var cts = ServiceContext.ContentTypeService;
+
+            // Act
+            var container = new EntityContainer(Constants.ObjectTypes.DocumentTypeGuid);
+            container.Name = &quot;container1&quot;;
+            cts.SaveContentTypeContainer(container);
+
+            // Assert
+            var createdContainer = cts.GetContentTypeContainer(container.Id);
+            Assert.IsNotNull(createdContainer);
+        }
+
+        [Test]
+        public void Can_Get_All_Containers()
+        {
+            // Arrange
+            var cts = ServiceContext.ContentTypeService;
+
+            // Act
+            var container1 = new EntityContainer(Constants.ObjectTypes.DocumentTypeGuid);
+            container1.Name = &quot;container1&quot;;
+            cts.SaveContentTypeContainer(container1);
+
+            var container2 = new EntityContainer(Constants.ObjectTypes.DocumentTypeGuid);
+            container2.Name = &quot;container2&quot;;
+            cts.SaveContentTypeContainer(container2);
+
+            // Assert
+            var containers = cts.GetContentTypeContainers(new int[0]);
+            Assert.AreEqual(2, containers.Count());
+        }
+
+        [Test]
+        public void Deleting_ContentType_Sends_Correct_Number_Of_DeletedEntities_In_Events()
+        {
+            var cts = ServiceContext.ContentTypeService;
+            var deletedEntities = 0;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;page&quot;, &quot;Page&quot;);
+            cts.Save(contentType);
+
+            ContentTypeService.DeletedContentType += (sender, args) =&gt;
+            {
+                deletedEntities += args.DeletedEntities.Count();
+            };
+
+            cts.Delete(contentType);
+
+            Assert.AreEqual(deletedEntities, 1);
+        }
+
+        [Test]
+        public void Deleting_Multiple_ContentTypes_Sends_Correct_Number_Of_DeletedEntities_In_Events()
+        {
+            var cts = ServiceContext.ContentTypeService;
+            var deletedEntities = 0;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;page&quot;, &quot;Page&quot;);
+            cts.Save(contentType);
+            var contentType2 = MockedContentTypes.CreateSimpleContentType(&quot;otherPage&quot;, &quot;Other page&quot;);
+            cts.Save(contentType2);
+
+            ContentTypeService.DeletedContentType += (sender, args) =&gt;
+            {
+                deletedEntities += args.DeletedEntities.Count();
+            };
+
+            cts.Delete(contentType);
+            cts.Delete(contentType2);
+
+            Assert.AreEqual(2, deletedEntities);
+        }
+
+        [Test]
+        public void Deleting_ContentType_With_Child_Sends_Correct_Number_Of_DeletedEntities_In_Events()
+        {
+            var cts = ServiceContext.ContentTypeService;
+            var deletedEntities = 0;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;page&quot;, &quot;Page&quot;);
+            cts.Save(contentType);
+            var contentType2 = MockedContentTypes.CreateSimpleContentType(&quot;subPage&quot;, &quot;Sub page&quot;);
+            contentType2.ParentId = contentType.Id;
+            cts.Save(contentType2);
+
+            ContentTypeService.DeletedContentType += (sender, args) =&gt;
+            {
+                deletedEntities += args.DeletedEntities.Count();
+            };
+
+            cts.Delete(contentType);
+
+            Assert.AreEqual(2, deletedEntities);
+        }
+
+        [Test]
+        public void Can_Remove_ContentType_Composition_From_ContentType()
+        {
+            //Test for U4-2234
+            var cts = ServiceContext.ContentTypeService;
+            //Arrange
+            var component = CreateComponent();
+            cts.Save(component);
+            var banner = CreateBannerComponent(component);
+            cts.Save(banner);
+            var site = CreateSite();
+            cts.Save(site);
+            var homepage = CreateHomepage(site);
+            cts.Save(homepage);
+
+            //Add banner to homepage
+            var added = homepage.AddContentType(banner);
+            cts.Save(homepage);
+
+            //Assert composition
+            var bannerExists = homepage.ContentTypeCompositionExists(banner.Alias);
+            var bannerPropertyExists = homepage.CompositionPropertyTypes.Any(x =&gt; x.Alias.Equals(&quot;bannerName&quot;));
+            Assert.That(added, Is.True);
+            Assert.That(bannerExists, Is.True);
+            Assert.That(bannerPropertyExists, Is.True);
+            Assert.That(homepage.CompositionPropertyTypes.Count(), Is.EqualTo(6));
+
+            //Remove banner from homepage
+            var removed = homepage.RemoveContentType(banner.Alias);
+            cts.Save(homepage);
+
+            //Assert composition
+            var bannerStillExists = homepage.ContentTypeCompositionExists(banner.Alias);
+            var bannerPropertyStillExists = homepage.CompositionPropertyTypes.Any(x =&gt; x.Alias.Equals(&quot;bannerName&quot;));
+            Assert.That(removed, Is.True);
+            Assert.That(bannerStillExists, Is.False);
+            Assert.That(bannerPropertyStillExists, Is.False);
+            Assert.That(homepage.CompositionPropertyTypes.Count(), Is.EqualTo(4));
+        }
+
+        [Test]
+        public void Can_Copy_ContentType_By_Performing_Clone()
+        {
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+            var metaContentType = MockedContentTypes.CreateMetaContentType();
+            service.Save(metaContentType);
+
+            var simpleContentType = MockedContentTypes.CreateSimpleContentType(&quot;category&quot;, &quot;Category&quot;, metaContentType);
+            service.Save(simpleContentType);
+            var categoryId = simpleContentType.Id;
+
+            // Act
+            var sut = simpleContentType.DeepCloneWithResetIdentities(&quot;newcategory&quot;);
+            service.Save(sut);
+
+            // Assert
+            Assert.That(sut.HasIdentity, Is.True);
+
+            var contentType = service.GetContentType(sut.Id);
+            var category = service.GetContentType(categoryId);
+
+            Assert.That(contentType.CompositionAliases().Any(x =&gt; x.Equals(&quot;meta&quot;)), Is.True);
+            Assert.AreEqual(contentType.ParentId, category.ParentId);
+            Assert.AreEqual(contentType.Level, category.Level);
+            Assert.AreEqual(contentType.PropertyTypes.Count(), category.PropertyTypes.Count());
+            Assert.AreNotEqual(contentType.Id, category.Id);
+            Assert.AreNotEqual(contentType.Key, category.Key);
+            Assert.AreNotEqual(contentType.Path, category.Path);
+            Assert.AreNotEqual(contentType.SortOrder, category.SortOrder);
+            Assert.AreNotEqual(contentType.PropertyTypes.First(x =&gt; x.Alias.Equals(&quot;title&quot;)).Id, category.PropertyTypes.First(x =&gt; x.Alias.Equals(&quot;title&quot;)).Id);
+            Assert.AreNotEqual(contentType.PropertyGroups.First(x =&gt; x.Name.Equals(&quot;Content&quot;)).Id, category.PropertyGroups.First(x =&gt; x.Name.Equals(&quot;Content&quot;)).Id);
+        }
+
+        [Test]
+        public void Can_Copy_ContentType_To_New_Parent_By_Performing_Clone()
+        {
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+
+            var parentContentType1 = MockedContentTypes.CreateSimpleContentType(&quot;parent1&quot;, &quot;Parent1&quot;);
+            service.Save(parentContentType1);
+            var parentContentType2 = MockedContentTypes.CreateSimpleContentType(&quot;parent2&quot;, &quot;Parent2&quot;, null, true);
+            service.Save(parentContentType2);
+
+            var simpleContentType = MockedContentTypes.CreateSimpleContentType(&quot;category&quot;, &quot;Category&quot;, parentContentType1, true);
+            service.Save(simpleContentType);
+
+            // Act
+            var clone = simpleContentType.DeepCloneWithResetIdentities(&quot;newcategory&quot;);
+            clone.RemoveContentType(&quot;parent1&quot;);
+            clone.AddContentType(parentContentType2);
+            clone.ParentId = parentContentType2.Id;
+            service.Save(clone);
+
+            // Assert
+            Assert.That(clone.HasIdentity, Is.True);
+
+            var clonedContentType = service.GetContentType(clone.Id);
+            var originalContentType = service.GetContentType(simpleContentType.Id);
+
+            Assert.That(clonedContentType.CompositionAliases().Any(x =&gt; x.Equals(&quot;parent2&quot;)), Is.True);
+            Assert.That(clonedContentType.CompositionAliases().Any(x =&gt; x.Equals(&quot;parent1&quot;)), Is.False);
+
+            Assert.AreEqual(clonedContentType.Path, &quot;-1,&quot; + parentContentType2.Id + &quot;,&quot; + clonedContentType.Id);
+            Assert.AreEqual(clonedContentType.PropertyTypes.Count(), originalContentType.PropertyTypes.Count());
+
+            Assert.AreNotEqual(clonedContentType.ParentId, originalContentType.ParentId);
+            Assert.AreEqual(clonedContentType.ParentId, parentContentType2.Id);
+
+            Assert.AreNotEqual(clonedContentType.Id, originalContentType.Id);
+            Assert.AreNotEqual(clonedContentType.Key, originalContentType.Key);
+            Assert.AreNotEqual(clonedContentType.Path, originalContentType.Path);
+
+            Assert.AreNotEqual(clonedContentType.PropertyTypes.First(x =&gt; x.Alias.StartsWith(&quot;title&quot;)).Id, originalContentType.PropertyTypes.First(x =&gt; x.Alias.StartsWith(&quot;title&quot;)).Id);
+            Assert.AreNotEqual(clonedContentType.PropertyGroups.First(x =&gt; x.Name.StartsWith(&quot;Content&quot;)).Id, originalContentType.PropertyGroups.First(x =&gt; x.Name.StartsWith(&quot;Content&quot;)).Id);
+        }
+
+        [Test]
+        public void Can_Copy_ContentType_With_Service_To_Root()
+        {
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+            var metaContentType = MockedContentTypes.CreateMetaContentType();
+            service.Save(metaContentType);
+
+            var simpleContentType = MockedContentTypes.CreateSimpleContentType(&quot;category&quot;, &quot;Category&quot;, metaContentType);
+            service.Save(simpleContentType);
+            var categoryId = simpleContentType.Id;
+
+            // Act
+            var clone = service.Copy(simpleContentType, &quot;newcategory&quot;, &quot;new category&quot;);
+
+            // Assert
+            Assert.That(clone.HasIdentity, Is.True);
+
+            var cloned = service.GetContentType(clone.Id);
+            var original = service.GetContentType(categoryId);
+
+            Assert.That(cloned.CompositionAliases().Any(x =&gt; x.Equals(&quot;meta&quot;)), Is.False); //it&#39;s been copied to root
+            Assert.AreEqual(cloned.ParentId, -1);
+            Assert.AreEqual(cloned.Level, 1);
+            Assert.AreEqual(cloned.PropertyTypes.Count(), original.PropertyTypes.Count());
+            Assert.AreEqual(cloned.PropertyGroups.Count(), original.PropertyGroups.Count());
+
+            for (int i = 0; i &lt; cloned.PropertyGroups.Count; i++)
+            {
+                Assert.AreEqual(cloned.PropertyGroups[i].PropertyTypes.Count, original.PropertyGroups[i].PropertyTypes.Count);
+                foreach (var propertyType in cloned.PropertyGroups[i].PropertyTypes)
+                {
+                    Assert.IsTrue(propertyType.HasIdentity);
+                }
+            }
+
+            foreach (var propertyType in cloned.PropertyTypes)
+            {
+                Assert.IsTrue(propertyType.HasIdentity);
+            }
+
+            Assert.AreNotEqual(cloned.Id, original.Id);
+            Assert.AreNotEqual(cloned.Key, original.Key);
+            Assert.AreNotEqual(cloned.Path, original.Path);
+            Assert.AreNotEqual(cloned.SortOrder, original.SortOrder);
+            Assert.AreNotEqual(cloned.PropertyTypes.First(x =&gt; x.Alias.Equals(&quot;title&quot;)).Id, original.PropertyTypes.First(x =&gt; x.Alias.Equals(&quot;title&quot;)).Id);
+            Assert.AreNotEqual(cloned.PropertyGroups.First(x =&gt; x.Name.Equals(&quot;Content&quot;)).Id, original.PropertyGroups.First(x =&gt; x.Name.Equals(&quot;Content&quot;)).Id);
+        }
+
+        [Test]
+        public void Can_Copy_ContentType_To_New_Parent_With_Service()
+        {
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+
+            var parentContentType1 = MockedContentTypes.CreateSimpleContentType(&quot;parent1&quot;, &quot;Parent1&quot;);
+            service.Save(parentContentType1);
+            var parentContentType2 = MockedContentTypes.CreateSimpleContentType(&quot;parent2&quot;, &quot;Parent2&quot;, null, true);
+            service.Save(parentContentType2);
+
+            var simpleContentType = MockedContentTypes.CreateSimpleContentType(&quot;category&quot;, &quot;Category&quot;, parentContentType1, true);
+            service.Save(simpleContentType);
+
+            // Act
+            var clone = service.Copy(simpleContentType, &quot;newAlias&quot;, &quot;new alias&quot;, parentContentType2);
+
+            // Assert
+            Assert.That(clone.HasIdentity, Is.True);
+
+            var clonedContentType = service.GetContentType(clone.Id);
+            var originalContentType = service.GetContentType(simpleContentType.Id);
+
+            Assert.That(clonedContentType.CompositionAliases().Any(x =&gt; x.Equals(&quot;parent2&quot;)), Is.True);
+            Assert.That(clonedContentType.CompositionAliases().Any(x =&gt; x.Equals(&quot;parent1&quot;)), Is.False);
+
+            Assert.AreEqual(clonedContentType.Path, &quot;-1,&quot; + parentContentType2.Id + &quot;,&quot; + clonedContentType.Id);
+            Assert.AreEqual(clonedContentType.PropertyTypes.Count(), originalContentType.PropertyTypes.Count());
+
+            Assert.AreNotEqual(clonedContentType.ParentId, originalContentType.ParentId);
+            Assert.AreEqual(clonedContentType.ParentId, parentContentType2.Id);
+
+            Assert.AreNotEqual(clonedContentType.Id, originalContentType.Id);
+            Assert.AreNotEqual(clonedContentType.Key, originalContentType.Key);
+            Assert.AreNotEqual(clonedContentType.Path, originalContentType.Path);
+
+            Assert.AreNotEqual(clonedContentType.PropertyTypes.First(x =&gt; x.Alias.StartsWith(&quot;title&quot;)).Id, originalContentType.PropertyTypes.First(x =&gt; x.Alias.StartsWith(&quot;title&quot;)).Id);
+            Assert.AreNotEqual(clonedContentType.PropertyGroups.First(x =&gt; x.Name.StartsWith(&quot;Content&quot;)).Id, originalContentType.PropertyGroups.First(x =&gt; x.Name.StartsWith(&quot;Content&quot;)).Id);
+        }
+
+        [Test]
+        public void Cannot_Add_Duplicate_PropertyType_Alias_To_Referenced_Composition()
+        {
+            //Related the second issue in screencast from this post http://issues.umbraco.org/issue/U4-5986
+
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+
+            var parent = MockedContentTypes.CreateSimpleContentType();
+            service.Save(parent);
+            var child = MockedContentTypes.CreateSimpleContentType(&quot;simpleChildPage&quot;, &quot;Simple Child Page&quot;, parent, true);
+            service.Save(child);
+            var composition = MockedContentTypes.CreateMetaContentType();
+            service.Save(composition);
+
+            //Adding Meta-composition to child doc type
+            child.AddContentType(composition);
+            service.Save(child);
+
+            // Act
+            var duplicatePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;title&quot;)
+            {
+                 Name = &quot;Title&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var added = composition.AddPropertyType(duplicatePropertyType, &quot;Meta&quot;);
+
+            // Assert
+            Assert.That(added, Is.True);
+            Assert.Throws&lt;InvalidCompositionException&gt;(() =&gt; service.Save(composition));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;simpleChildPage&quot;));
+        }
+
+        [Test]
+        public void Cannot_Add_Duplicate_PropertyType_Alias_In_Composition_Graph()
+        {
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+
+            var basePage = MockedContentTypes.CreateSimpleContentType(&quot;basePage&quot;, &quot;Base Page&quot;, null, true);
+            service.Save(basePage);
+            var contentPage = MockedContentTypes.CreateSimpleContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, basePage);
+            service.Save(contentPage);
+            var advancedPage = MockedContentTypes.CreateSimpleContentType(&quot;advancedPage&quot;, &quot;Advanced Page&quot;, contentPage, true);
+            service.Save(advancedPage);
+
+            var metaComposition = MockedContentTypes.CreateMetaContentType();
+            service.Save(metaComposition);
+            var seoComposition = MockedContentTypes.CreateSeoContentType();
+            service.Save(seoComposition);
+
+            var metaAdded = contentPage.AddContentType(metaComposition);
+            service.Save(contentPage);
+            var seoAdded = advancedPage.AddContentType(seoComposition);
+            service.Save(advancedPage);
+
+            // Act
+            var duplicatePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;title&quot;)
+            {
+                 Name = &quot;Title&quot;, Description = &quot;&quot;, Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var addedToBasePage = basePage.AddPropertyType(duplicatePropertyType, &quot;Content&quot;);
+            var addedToAdvancedPage = advancedPage.AddPropertyType(duplicatePropertyType, &quot;Content&quot;);
+            var addedToMeta = metaComposition.AddPropertyType(duplicatePropertyType, &quot;Meta&quot;);
+            var addedToSeo = seoComposition.AddPropertyType(duplicatePropertyType, &quot;Seo&quot;);
+
+            // Assert
+            Assert.That(metaAdded, Is.True);
+            Assert.That(seoAdded, Is.True);
+
+            Assert.That(addedToBasePage, Is.True);
+            Assert.That(addedToAdvancedPage, Is.False);
+            Assert.That(addedToMeta, Is.True);
+            Assert.That(addedToSeo, Is.True);
+
+            Assert.Throws&lt;InvalidCompositionException&gt;(() =&gt; service.Save(basePage));
+            Assert.Throws&lt;InvalidCompositionException&gt;(() =&gt; service.Save(metaComposition));
+            Assert.Throws&lt;InvalidCompositionException&gt;(() =&gt; service.Save(seoComposition));
+
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;contentPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;advancedPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;meta&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;seo&quot;));
+        }
+
+        [Test]
+        public void Cannot_Add_Duplicate_PropertyType_Alias_At_Root_Which_Conflicts_With_Third_Levels_Composition()
+        {
+            /*
+             * BasePage, gets &#39;Title&#39; added but should not be allowed
+             * -- Content Page
+             * ---- Advanced Page -&gt; Content Meta
+             * Content Meta :: Composition, has &#39;Title&#39;
+             *
+             * Content Meta has &#39;Title&#39; PropertyType
+             * Adding &#39;Title&#39; to BasePage should fail
+            */
+
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+            var basePage = MockedContentTypes.CreateBasicContentType();
+            service.Save(basePage);
+            var contentPage = MockedContentTypes.CreateBasicContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, basePage);
+            service.Save(contentPage);
+            var advancedPage = MockedContentTypes.CreateBasicContentType(&quot;advancedPage&quot;, &quot;Advanced Page&quot;, contentPage);
+            service.Save(advancedPage);
+
+            var contentMetaComposition = MockedContentTypes.CreateContentMetaContentType();
+            service.Save(contentMetaComposition);
+
+            // Act
+            var bodyTextPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;bodyText&quot;)
+            {
+                 Name = &quot;Body Text&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var bodyTextAdded = basePage.AddPropertyType(bodyTextPropertyType, &quot;Content&quot;);
+            service.Save(basePage);
+
+            var authorPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;author&quot;)
+            {
+                 Name = &quot;Author&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var authorAdded = contentPage.AddPropertyType(authorPropertyType, &quot;Content&quot;);
+            service.Save(contentPage);
+
+            var compositionAdded = advancedPage.AddContentType(contentMetaComposition);
+            service.Save(advancedPage);
+
+            //NOTE: It should not be possible to Save &#39;BasePage&#39; with the Title PropertyType added
+            var titlePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;title&quot;)
+            {
+                 Name = &quot;Title&quot;, Description = &quot;&quot;, Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var titleAdded = basePage.AddPropertyType(titlePropertyType, &quot;Content&quot;);
+
+            // Assert
+            Assert.That(bodyTextAdded, Is.True);
+            Assert.That(authorAdded, Is.True);
+            Assert.That(titleAdded, Is.True);
+            Assert.That(compositionAdded, Is.True);
+
+            Assert.Throws&lt;InvalidCompositionException&gt;(() =&gt; service.Save(basePage));
+
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;contentPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;advancedPage&quot;));
+        }
+
+        [Test]
+        public void Cannot_Save_ContentType_With_Empty_Name()
+        {
+            // Arrange
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;contentType&quot;, string.Empty);
+            
+            // Act &amp; Assert
+            Assert.Throws&lt;ArgumentException&gt;(() =&gt; ServiceContext.ContentTypeService.Save(contentType));
+        }
+
+        [Test]
+        public void Cannot_Rename_PropertyType_Alias_On_Composition_Which_Would_Cause_Conflict_In_Other_Composition()
+        {
+            /*
+             * Meta renames alias to &#39;title&#39;
+             * Seo has &#39;Title&#39;
+             * BasePage
+             * -- ContentPage
+             * ---- AdvancedPage -&gt; Seo
+             * ------ MoreAdvanedPage -&gt; Meta
+             */
+
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+            var basePage = MockedContentTypes.CreateBasicContentType();
+            service.Save(basePage);
+            var contentPage = MockedContentTypes.CreateBasicContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, basePage);
+            service.Save(contentPage);
+            var advancedPage = MockedContentTypes.CreateBasicContentType(&quot;advancedPage&quot;, &quot;Advanced Page&quot;, contentPage);
+            service.Save(advancedPage);
+            var moreAdvancedPage = MockedContentTypes.CreateBasicContentType(&quot;moreAdvancedPage&quot;, &quot;More Advanced Page&quot;, advancedPage);
+            service.Save(moreAdvancedPage);
+
+            var seoComposition = MockedContentTypes.CreateSeoContentType();
+            service.Save(seoComposition);
+            var metaComposition = MockedContentTypes.CreateMetaContentType();
+            service.Save(metaComposition);
+
+            // Act
+            var bodyTextPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;bodyText&quot;)
+            {
+                 Name = &quot;Body Text&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var bodyTextAdded = basePage.AddPropertyType(bodyTextPropertyType, &quot;Content&quot;);
+            service.Save(basePage);
+
+            var authorPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;author&quot;)
+            {
+                 Name = &quot;Author&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var authorAdded = contentPage.AddPropertyType(authorPropertyType, &quot;Content&quot;);
+            service.Save(contentPage);
+
+            var subtitlePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;subtitle&quot;)
+            {
+                 Name = &quot;Subtitle&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var subtitleAdded = advancedPage.AddPropertyType(subtitlePropertyType, &quot;Content&quot;);
+            service.Save(advancedPage);
+
+            var titlePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;title&quot;)
+            {
+                 Name = &quot;Title&quot;, Description = &quot;&quot;, Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var titleAdded = seoComposition.AddPropertyType(titlePropertyType, &quot;Content&quot;);
+            service.Save(seoComposition);
+
+            var seoCompositionAdded = advancedPage.AddContentType(seoComposition);
+            var metaCompositionAdded = moreAdvancedPage.AddContentType(metaComposition);
+            service.Save(advancedPage);
+            service.Save(moreAdvancedPage);
+
+            var keywordsPropertyType = metaComposition.PropertyTypes.First(x =&gt; x.Alias.Equals(&quot;metakeywords&quot;));
+            keywordsPropertyType.Alias = &quot;title&quot;;
+
+            // Assert
+            Assert.That(bodyTextAdded, Is.True);
+            Assert.That(subtitleAdded, Is.True);
+            Assert.That(authorAdded, Is.True);
+            Assert.That(titleAdded, Is.True);
+            Assert.That(seoCompositionAdded, Is.True);
+            Assert.That(metaCompositionAdded, Is.True);
+
+            Assert.Throws&lt;InvalidCompositionException&gt;(() =&gt; service.Save(metaComposition));
+
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;contentPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;advancedPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;moreAdvancedPage&quot;));
+        }
+
+        [Test]
+        public void Can_Add_Additional_Properties_On_Composition_Once_Composition_Has_Been_Saved()
+        {
+            /*
+             * Meta renames alias to &#39;title&#39;
+             * Seo has &#39;Title&#39;
+             * BasePage
+             * -- ContentPage
+             * ---- AdvancedPage -&gt; Seo
+             * ------ MoreAdvancedPage -&gt; Meta
+             */
+
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+            var basePage = MockedContentTypes.CreateBasicContentType();
+            service.Save(basePage);
+            var contentPage = MockedContentTypes.CreateBasicContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, basePage);
+            service.Save(contentPage);
+            var advancedPage = MockedContentTypes.CreateBasicContentType(&quot;advancedPage&quot;, &quot;Advanced Page&quot;, contentPage);
+            service.Save(advancedPage);
+            var moreAdvancedPage = MockedContentTypes.CreateBasicContentType(&quot;moreAdvancedPage&quot;, &quot;More Advanced Page&quot;, advancedPage);
+            service.Save(moreAdvancedPage);
+
+            var seoComposition = MockedContentTypes.CreateSeoContentType();
+            service.Save(seoComposition);
+            var metaComposition = MockedContentTypes.CreateMetaContentType();
+            service.Save(metaComposition);
+
+            // Act
+            var bodyTextPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;bodyText&quot;)
+            {
+                 Name = &quot;Body Text&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var bodyTextAdded = basePage.AddPropertyType(bodyTextPropertyType, &quot;Content&quot;);
+            service.Save(basePage);
+
+            var authorPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;author&quot;)
+            {
+                 Name = &quot;Author&quot;, Description = &quot;&quot;, Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var authorAdded = contentPage.AddPropertyType(authorPropertyType, &quot;Content&quot;);
+            service.Save(contentPage);
+
+            var subtitlePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;subtitle&quot;)
+            {
+                 Name = &quot;Subtitle&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var subtitleAdded = advancedPage.AddPropertyType(subtitlePropertyType, &quot;Content&quot;);
+            service.Save(advancedPage);
+
+            var titlePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;title&quot;)
+            {
+                 Name = &quot;Title&quot;, Description = &quot;&quot;, Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var titleAdded = seoComposition.AddPropertyType(titlePropertyType, &quot;Content&quot;);
+            service.Save(seoComposition);
+
+            var seoCompositionAdded = advancedPage.AddContentType(seoComposition);
+            var metaCompositionAdded = moreAdvancedPage.AddContentType(metaComposition);
+            service.Save(advancedPage);
+            service.Save(moreAdvancedPage);
+
+            // Assert
+            Assert.That(bodyTextAdded, Is.True);
+            Assert.That(subtitleAdded, Is.True);
+            Assert.That(authorAdded, Is.True);
+            Assert.That(titleAdded, Is.True);
+            Assert.That(seoCompositionAdded, Is.True);
+            Assert.That(metaCompositionAdded, Is.True);
+
+            var testPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;test&quot;)
+            {
+                 Name = &quot;Test&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var testAdded = seoComposition.AddPropertyType(testPropertyType, &quot;Content&quot;);
+            service.Save(seoComposition);
+
+            Assert.That(testAdded, Is.True);
+
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;contentPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;advancedPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;moreAdvancedPage&quot;));
+        }
+
+        [Test]
+        public void Cannot_Rename_PropertyGroup_On_Child_Avoiding_Conflict_With_Parent_PropertyGroup()
+        {
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+            var page = MockedContentTypes.CreateSimpleContentType(&quot;page&quot;, &quot;Page&quot;, null, true, &quot;Content&quot;);
+            service.Save(page);
+            var contentPage = MockedContentTypes.CreateSimpleContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, page, true, &quot;Content_&quot;);
+            service.Save(contentPage);
+            var advancedPage = MockedContentTypes.CreateSimpleContentType(&quot;advancedPage&quot;, &quot;Advanced Page&quot;, contentPage, true, &quot;Details&quot;);
+            service.Save(advancedPage);
+
+            var contentMetaComposition = MockedContentTypes.CreateContentMetaContentType();
+            service.Save(contentMetaComposition);
+
+            // Act
+            var subtitlePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;subtitle&quot;)
+            {
+                 Name = &quot;Subtitle&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var authorPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;author&quot;)
+            {
+                 Name = &quot;Author&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var subtitleAdded = contentPage.AddPropertyType(subtitlePropertyType, &quot;Content&quot;);
+            var authorAdded = contentPage.AddPropertyType(authorPropertyType, &quot;Content&quot;);
+            service.Save(contentPage);
+
+            var compositionAdded = contentPage.AddContentType(contentMetaComposition);
+            service.Save(contentPage);
+
+            //Change the name of the tab on the &quot;root&quot; content type &#39;page&#39;.
+            var propertyGroup = contentPage.PropertyGroups[&quot;Content_&quot;];
+            Assert.Throws&lt;Exception&gt;(() =&gt; contentPage.PropertyGroups.Add(new PropertyGroup
+            {
+                Id = propertyGroup.Id,
+                Name = &quot;Content&quot;,
+                SortOrder = 0
+            }));
+
+            // Assert
+            Assert.That(compositionAdded, Is.True);
+            Assert.That(subtitleAdded, Is.True);
+            Assert.That(authorAdded, Is.True);
+
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;contentPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;advancedPage&quot;));
+        }
+
+        [Test]
+        public void Cannot_Rename_PropertyType_Alias_Causing_Conflicts_With_Parents()
+        {
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+            var basePage = MockedContentTypes.CreateBasicContentType();
+            service.Save(basePage);
+            var contentPage = MockedContentTypes.CreateBasicContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, basePage);
+            service.Save(contentPage);
+            var advancedPage = MockedContentTypes.CreateBasicContentType(&quot;advancedPage&quot;, &quot;Advanced Page&quot;, contentPage);
+            service.Save(advancedPage);
+
+            // Act
+            var titlePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;title&quot;)
+            {
+                 Name = &quot;Title&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var titleAdded = basePage.AddPropertyType(titlePropertyType, &quot;Content&quot;);
+            var bodyTextPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;bodyText&quot;)
+            {
+                 Name = &quot;Body Text&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var bodyTextAdded = contentPage.AddPropertyType(bodyTextPropertyType, &quot;Content&quot;);
+            var subtitlePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;subtitle&quot;)
+            {
+                 Name = &quot;Subtitle&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var subtitleAdded = contentPage.AddPropertyType(subtitlePropertyType, &quot;Content&quot;);
+            var authorPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;author&quot;)
+            {
+                 Name = &quot;Author&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var authorAdded = advancedPage.AddPropertyType(authorPropertyType, &quot;Content&quot;);
+            service.Save(basePage);
+            service.Save(contentPage);
+            service.Save(advancedPage);
+
+            //Rename the PropertyType to something that already exists in the Composition - NOTE this should not be allowed and Saving should throw an exception
+            var authorPropertyTypeToRename = advancedPage.PropertyTypes.First(x =&gt; x.Alias.Equals(&quot;author&quot;));
+            authorPropertyTypeToRename.Alias = &quot;title&quot;;
+
+            // Assert
+            Assert.That(bodyTextAdded, Is.True);
+            Assert.That(authorAdded, Is.True);
+            Assert.That(titleAdded, Is.True);
+            Assert.That(subtitleAdded, Is.True);
+
+            Assert.Throws&lt;InvalidCompositionException&gt;(() =&gt; service.Save(advancedPage));
+
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;contentPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;advancedPage&quot;));
+        }
+
+        [Test]
+        public void Can_Add_PropertyType_Alias_Which_Exists_In_Composition_Outside_Graph()
+        {
+            /*
+             * Meta (Composition)
+             * Content Meta (Composition) has &#39;Title&#39; -&gt; Meta
+             * BasePage
+             * -- ContentPage gets &#39;Title&#39; added -&gt; Meta
+             * ---- Advanced Page
+             */
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+
+            var basePage = MockedContentTypes.CreateSimpleContentType(&quot;basePage&quot;, &quot;Base Page&quot;, null, true);
+            service.Save(basePage);
+            var contentPage = MockedContentTypes.CreateSimpleContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, basePage, true);
+            service.Save(contentPage);
+            var advancedPage = MockedContentTypes.CreateSimpleContentType(&quot;advancedPage&quot;, &quot;Advanced Page&quot;, contentPage, true);
+            service.Save(advancedPage);
+
+            var metaComposition = MockedContentTypes.CreateMetaContentType();
+            service.Save(metaComposition);
+
+            var contentMetaComposition = MockedContentTypes.CreateContentMetaContentType();
+            service.Save(contentMetaComposition);
+
+            var metaAdded = contentPage.AddContentType(metaComposition);
+            service.Save(contentPage);
+
+            var metaAddedToComposition = contentMetaComposition.AddContentType(metaComposition);
+            service.Save(contentMetaComposition);
+
+            // Act
+            var propertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;title&quot;)
+            {
+                 Name = &quot;Title&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var addedToContentPage = contentPage.AddPropertyType(propertyType, &quot;Content&quot;);
+
+            // Assert
+            Assert.That(metaAdded, Is.True);
+            Assert.That(metaAddedToComposition, Is.True);
+
+            Assert.That(addedToContentPage, Is.True);
+            Assert.DoesNotThrow(() =&gt; service.Save(contentPage));
+        }
+
+        [Test]
+        public void Can_Rename_PropertyGroup_With_Inherited_PropertyGroups()
+        {
+            //Related the first issue in screencast from this post http://issues.umbraco.org/issue/U4-5986
+
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+
+            var page = MockedContentTypes.CreateSimpleContentType(&quot;page&quot;, &quot;Page&quot;, null, false, &quot;Content_&quot;);
+            service.Save(page);
+            var contentPage = MockedContentTypes.CreateSimpleContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, page, true);
+            service.Save(contentPage);
+            var composition = MockedContentTypes.CreateMetaContentType();
+            composition.AddPropertyGroup(&quot;Content&quot;);
+            service.Save(composition);
+            //Adding Meta-composition to child doc type
+            contentPage.AddContentType(composition);
+            service.Save(contentPage);
+
+            // Act
+            var propertyTypeOne = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;testTextbox&quot;)
+            {
+                 Name = &quot;Test Textbox&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var firstOneAdded = contentPage.AddPropertyType(propertyTypeOne, &quot;Content_&quot;);
+            var propertyTypeTwo = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;anotherTextbox&quot;)
+            {
+                 Name = &quot;Another Test Textbox&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var secondOneAdded = contentPage.AddPropertyType(propertyTypeTwo, &quot;Content&quot;);
+            service.Save(contentPage);
+
+            Assert.That(page.PropertyGroups.Contains(&quot;Content_&quot;), Is.True);
+            var propertyGroup = page.PropertyGroups[&quot;Content_&quot;];
+            page.PropertyGroups.Add(new PropertyGroup{ Id = propertyGroup.Id, Name = &quot;ContentTab&quot;, SortOrder = 0});
+            service.Save(page);
+
+            // Assert
+            Assert.That(firstOneAdded, Is.True);
+            Assert.That(secondOneAdded, Is.True);
+
+            var contentType = service.GetContentType(&quot;contentPage&quot;);
+            Assert.That(contentType, Is.Not.Null);
+
+            var compositionPropertyGroups = contentType.CompositionPropertyGroups;
+
+            // now it is still 1, because we don&#39;t propagate renames anymore
+            Assert.That(compositionPropertyGroups.Count(x =&gt; x.Name.Equals(&quot;Content_&quot;)), Is.EqualTo(1));
+
+            var propertyTypeCount = contentType.PropertyTypes.Count();
+            var compPropertyTypeCount = contentType.CompositionPropertyTypes.Count();
+            Assert.That(propertyTypeCount, Is.EqualTo(5));
+            Assert.That(compPropertyTypeCount, Is.EqualTo(10));
+        }
+
+        [Test]
+        public void Can_Rename_PropertyGroup_On_Parent_Without_Causing_Duplicate_PropertyGroups()
+        {
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+            var page = MockedContentTypes.CreateSimpleContentType(&quot;page&quot;, &quot;Page&quot;, null, true, &quot;Content_&quot;);
+            service.Save(page);
+            var contentPage = MockedContentTypes.CreateSimpleContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, page, true, &quot;Contentx&quot;);
+            service.Save(contentPage);
+            var advancedPage = MockedContentTypes.CreateSimpleContentType(&quot;advancedPage&quot;, &quot;Advanced Page&quot;, contentPage, true, &quot;Contenty&quot;);
+            service.Save(advancedPage);
+
+            var contentMetaComposition = MockedContentTypes.CreateContentMetaContentType();
+            service.Save(contentMetaComposition);
+            var compositionAdded = contentPage.AddContentType(contentMetaComposition);
+            service.Save(contentPage);
+
+            // Act
+            var bodyTextPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;bodyText&quot;)
+            {
+                 Name = &quot;Body Text&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var subtitlePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;subtitle&quot;)
+            {
+                 Name = &quot;Subtitle&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var bodyTextAdded = contentPage.AddPropertyType(bodyTextPropertyType, &quot;Content_&quot;);//Will be added to the parent tab
+            var subtitleAdded = contentPage.AddPropertyType(subtitlePropertyType, &quot;Content&quot;);//Will be added to the &quot;Content Meta&quot; composition
+            service.Save(contentPage);
+
+            var authorPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;author&quot;)
+            {
+                 Name = &quot;Author&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var descriptionPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;description&quot;)
+            {
+                 Name = &quot;Description&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var keywordsPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;keywords&quot;)
+            {
+                 Name = &quot;Keywords&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var authorAdded = advancedPage.AddPropertyType(authorPropertyType, &quot;Content_&quot;);//Will be added to an ancestor tab
+            var descriptionAdded = advancedPage.AddPropertyType(descriptionPropertyType, &quot;Contentx&quot;);//Will be added to a parent tab
+            var keywordsAdded = advancedPage.AddPropertyType(keywordsPropertyType, &quot;Content&quot;);//Will be added to the &quot;Content Meta&quot; composition
+            service.Save(advancedPage);
+
+            //Change the name of the tab on the &quot;root&quot; content type &#39;page&#39;.
+            var propertyGroup = page.PropertyGroups[&quot;Content_&quot;];
+            page.PropertyGroups.Add(new PropertyGroup { Id = propertyGroup.Id, Name = &quot;Content&quot;, SortOrder = 0 });
+            service.Save(page);
+
+            // Assert
+            Assert.That(compositionAdded, Is.True);
+            Assert.That(bodyTextAdded, Is.True);
+            Assert.That(subtitleAdded, Is.True);
+            Assert.That(authorAdded, Is.True);
+            Assert.That(descriptionAdded, Is.True);
+            Assert.That(keywordsAdded, Is.True);
+
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;contentPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;advancedPage&quot;));
+
+            var advancedPageReloaded = service.GetContentType(&quot;advancedPage&quot;);
+            var contentUnderscoreTabExists = advancedPageReloaded.CompositionPropertyGroups.Any(x =&gt; x.Name.Equals(&quot;Content_&quot;));
+
+            // now is true, because we don&#39;t propagate renames anymore
+            Assert.That(contentUnderscoreTabExists, Is.True);
+
+            var numberOfContentTabs = advancedPageReloaded.CompositionPropertyGroups.Count(x =&gt; x.Name.Equals(&quot;Content&quot;));
+            Assert.That(numberOfContentTabs, Is.EqualTo(4));
+        }
+
+        [Test]
+        public void Can_Rename_PropertyGroup_On_Parent_Without_Causing_Duplicate_PropertyGroups_v2()
+        {
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+            var page = MockedContentTypes.CreateSimpleContentType(&quot;page&quot;, &quot;Page&quot;, null, true, &quot;Content_&quot;);
+            service.Save(page);
+            var contentPage = MockedContentTypes.CreateSimpleContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, page, true, &quot;Content&quot;);
+            service.Save(contentPage);
+
+            var contentMetaComposition = MockedContentTypes.CreateContentMetaContentType();
+            service.Save(contentMetaComposition);
+
+            // Act
+            var bodyTextPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;bodyText&quot;)
+            {
+                 Name = &quot;Body Text&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var subtitlePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;subtitle&quot;)
+            {
+                 Name = &quot;Subtitle&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var authorPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;author&quot;)
+            {
+                 Name = &quot;Author&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var bodyTextAdded = page.AddPropertyType(bodyTextPropertyType, &quot;Content_&quot;);
+            var subtitleAdded = contentPage.AddPropertyType(subtitlePropertyType, &quot;Content&quot;);
+            var authorAdded = contentPage.AddPropertyType(authorPropertyType, &quot;Content_&quot;);
+            service.Save(page);
+            service.Save(contentPage);
+
+            var compositionAdded = contentPage.AddContentType(contentMetaComposition);
+            service.Save(contentPage);
+
+            //Change the name of the tab on the &quot;root&quot; content type &#39;page&#39;.
+            var propertyGroup = page.PropertyGroups[&quot;Content_&quot;];
+            page.PropertyGroups.Add(new PropertyGroup { Id = propertyGroup.Id, Name = &quot;Content&quot;, SortOrder = 0 });
+            service.Save(page);
+
+            // Assert
+            Assert.That(compositionAdded, Is.True);
+            Assert.That(bodyTextAdded, Is.True);
+            Assert.That(subtitleAdded, Is.True);
+            Assert.That(authorAdded, Is.True);
+
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;contentPage&quot;));
+        }
+
+        [Test]
+        public void Can_Remove_PropertyGroup_On_Parent_Without_Causing_Duplicate_PropertyGroups()
+        {
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+            var basePage = MockedContentTypes.CreateBasicContentType();
+            service.Save(basePage);
+
+            var contentPage = MockedContentTypes.CreateBasicContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, basePage);
+            service.Save(contentPage);
+
+            var advancedPage = MockedContentTypes.CreateBasicContentType(&quot;advancedPage&quot;, &quot;Advanced Page&quot;, contentPage);
+            service.Save(advancedPage);
+
+            var contentMetaComposition = MockedContentTypes.CreateContentMetaContentType();
+            service.Save(contentMetaComposition);
+
+            // Act
+            var bodyTextPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;bodyText&quot;)
+            {
+                 Name = &quot;Body Text&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var bodyTextAdded = basePage.AddPropertyType(bodyTextPropertyType, &quot;Content&quot;);
+            service.Save(basePage);
+
+            var authorPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;author&quot;)
+            {
+                 Name = &quot;Author&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var authorAdded = contentPage.AddPropertyType(authorPropertyType, &quot;Content&quot;);
+            service.Save(contentPage);
+
+            var compositionAdded = contentPage.AddContentType(contentMetaComposition);
+            service.Save(contentPage);
+
+            basePage.RemovePropertyGroup(&quot;Content&quot;);
+            service.Save(basePage);
+
+            // Assert
+            Assert.That(bodyTextAdded, Is.True);
+            Assert.That(authorAdded, Is.True);
+            Assert.That(compositionAdded, Is.True);
+
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;contentPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;advancedPage&quot;));
+
+            var contentType = service.GetContentType(&quot;contentPage&quot;);
+            var propertyGroup = contentType.PropertyGroups[&quot;Content&quot;];
+        }
+
+        [Test]
+        public void Can_Remove_PropertyGroup_Without_Removing_Property_Types()
+        {
+            var service = ServiceContext.ContentTypeService;
+            var basePage = (IContentType)MockedContentTypes.CreateBasicContentType();
+            basePage.AddPropertyGroup(&quot;Content&quot;);
+            basePage.AddPropertyGroup(&quot;Meta&quot;);
+            service.Save(basePage);
+
+            var authorPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;author&quot;)
+            {
+                Name = &quot;Author&quot;,
+                Description = &quot;&quot;,
+                Mandatory = false,
+                SortOrder = 1,
+                DataTypeDefinitionId = -88
+            };
+            var authorAdded = basePage.AddPropertyType(authorPropertyType, &quot;Content&quot;);
+            var titlePropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;title&quot;)
+            {
+                Name = &quot;Title&quot;,
+                Description = &quot;&quot;,
+                Mandatory = false,
+                SortOrder = 1,
+                DataTypeDefinitionId = -88
+            };
+            var titleAdded = basePage.AddPropertyType(authorPropertyType, &quot;Meta&quot;);
+
+            service.Save(basePage);
+
+            basePage = service.GetContentType(basePage.Id);
+
+            var totalPt = basePage.PropertyTypes.Count();
+
+            basePage.RemovePropertyGroup(&quot;Content&quot;);
+            service.Save(basePage);
+
+            basePage = service.GetContentType(basePage.Id);
+
+            Assert.AreEqual(totalPt, basePage.PropertyTypes.Count());
+        }
+
+        [Test]
+        public void Can_Add_PropertyGroup_With_Same_Name_On_Parent_and_Child()
+        {
+            /*
+             * BasePage
+             * - Content Page
+             * -- Advanced Page
+             * Content Meta :: Composition
+            */
+
+            // Arrange
+            var service = ServiceContext.ContentTypeService;
+            var basePage = MockedContentTypes.CreateBasicContentType();
+            service.Save(basePage);
+
+            var contentPage = MockedContentTypes.CreateBasicContentType(&quot;contentPage&quot;, &quot;Content Page&quot;, basePage);
+            service.Save(contentPage);
+
+            var advancedPage = MockedContentTypes.CreateBasicContentType(&quot;advancedPage&quot;, &quot;Advanced Page&quot;, contentPage);
+            service.Save(advancedPage);
+
+            var contentMetaComposition = MockedContentTypes.CreateContentMetaContentType();
+            service.Save(contentMetaComposition);
+
+            // Act
+            var authorPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;author&quot;)
+            {
+                 Name = &quot;Author&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var authorAdded = contentPage.AddPropertyType(authorPropertyType, &quot;Content&quot;);
+            service.Save(contentPage);
+
+            var bodyTextPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, &quot;bodyText&quot;)
+            {
+                 Name = &quot;Body Text&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88
+            };
+            var bodyTextAdded = basePage.AddPropertyType(bodyTextPropertyType, &quot;Content&quot;);
+            service.Save(basePage);
+
+            var compositionAdded = contentPage.AddContentType(contentMetaComposition);
+            service.Save(contentPage);
+
+            // Assert
+            Assert.That(bodyTextAdded, Is.True);
+            Assert.That(authorAdded, Is.True);
+            Assert.That(compositionAdded, Is.True);
+
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;contentPage&quot;));
+            Assert.DoesNotThrow(() =&gt; service.GetContentType(&quot;advancedPage&quot;));
+
+            var contentType = service.GetContentType(&quot;contentPage&quot;);
+            var propertyGroup = contentType.PropertyGroups[&quot;Content&quot;];
+
+            var numberOfContentTabs = contentType.CompositionPropertyGroups.Count(x =&gt; x.Name.Equals(&quot;Content&quot;));
+            Assert.That(numberOfContentTabs, Is.EqualTo(3));
+
+            //Ensure that adding a new PropertyType to the &quot;Content&quot;-tab also adds it to the right group
+
+            var descriptionPropertyType = new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext)
+            {
+                Alias = &quot;description&quot;, Name = &quot;Description&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1,DataTypeDefinitionId = -88
+            };
+            var descriptionAdded = contentType.AddPropertyType(descriptionPropertyType, &quot;Content&quot;);
+            service.Save(contentType);
+            Assert.That(descriptionAdded, Is.True);
+
+            var contentPageReloaded = service.GetContentType(&quot;contentPage&quot;);
+            var propertyGroupReloaded = contentPageReloaded.PropertyGroups[&quot;Content&quot;];
+            var hasDescriptionPropertyType = propertyGroupReloaded.PropertyTypes.Contains(&quot;description&quot;);
+            Assert.That(hasDescriptionPropertyType, Is.True);
+
+            var descriptionPropertyTypeReloaded = propertyGroupReloaded.PropertyTypes[&quot;description&quot;];
+            Assert.That(descriptionPropertyTypeReloaded.PropertyGroupId.IsValueCreated, Is.False);
+        }
+
+        [Test]
+        public void Empty_Description_Is_Always_Null_After_Saving_Content_Type()
+        {
+            var service = ServiceContext.ContentTypeService;
+            var contentType = MockedContentTypes.CreateBasicContentType();
+            contentType.Description = null;
+            service.Save(contentType);
+
+            var contentType2 = MockedContentTypes.CreateBasicContentType(&quot;basePage2&quot;, &quot;Base Page 2&quot;);
+            contentType2.Description = string.Empty;
+            service.Save(contentType2);
+
+            Assert.IsNull(contentType.Description);
+            Assert.IsNull(contentType2.Description);
+        }
+
+        [Test]
+        public void Empty_Description_Is_Always_Null_After_Saving_Media_Type()
+        {
+            var service = ServiceContext.ContentTypeService;
+            var mediaType = MockedContentTypes.CreateSimpleMediaType(&quot;mediaType&quot;, &quot;Media Type&quot;);
+            mediaType.Description = null;
+            service.Save(mediaType);
+
+            var mediaType2 = MockedContentTypes.CreateSimpleMediaType(&quot;mediaType2&quot;, &quot;Media Type 2&quot;);
+            mediaType2.Description = string.Empty;
+            service.Save(mediaType2);
+
+            Assert.IsNull(mediaType.Description);
+            Assert.IsNull(mediaType2.Description);
+        }
+
+        private ContentType CreateComponent()
+        {
+            var component = new ContentType(-1)
+            {
+                Alias = &quot;component&quot;,
+                Name = &quot;Component&quot;,
+                Description = &quot;ContentType used for Component grouping&quot;,
+                Icon = &quot;.sprTreeDoc3&quot;,
+                Thumbnail = &quot;doc.png&quot;,
+                SortOrder = 1,
+                CreatorId = 0,
+                Trashed = false
+            };
+
+            var contentCollection = new PropertyTypeCollection();
+            contentCollection.Add(new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;componentGroup&quot;) { Name = &quot;Component Group&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88 });
+            component.PropertyGroups.Add(new PropertyGroup(contentCollection) { Name = &quot;Component&quot;, SortOrder = 1 });
+
+            return component;
+        }
+
+        private ContentType CreateBannerComponent(ContentType parent)
+        {
+            const string contentTypeAlias = &quot;banner&quot;;
+            var banner = new ContentType(parent, contentTypeAlias)
+            {
+                Alias = contentTypeAlias,
+                Name = &quot;Banner Component&quot;,
+                Description = &quot;ContentType used for Banner Component&quot;,
+                Icon = &quot;.sprTreeDoc3&quot;,
+                Thumbnail = &quot;doc.png&quot;,
+                SortOrder = 1,
+                CreatorId = 0,
+                Trashed = false
+            };
+
+            var propertyType = new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;bannerName&quot;)
+            {
+                Name = &quot;Banner Name&quot;,
+                Description = &quot;&quot;,
+                Mandatory = false,
+                SortOrder = 2,
+                DataTypeDefinitionId = -88
+            };
+            banner.AddPropertyType(propertyType, &quot;Component&quot;);
+            return banner;
+        }
+
+        private ContentType CreateSite()
+        {
+            var site = new ContentType(-1)
+            {
+                Alias = &quot;site&quot;,
+                Name = &quot;Site&quot;,
+                Description = &quot;ContentType used for Site inheritence&quot;,
+                Icon = &quot;.sprTreeDoc3&quot;,
+                Thumbnail = &quot;doc.png&quot;,
+                SortOrder = 2,
+                CreatorId = 0,
+                Trashed = false
+            };
+
+            var contentCollection = new PropertyTypeCollection();
+            contentCollection.Add(new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;hostname&quot;) { Name = &quot;Hostname&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88 });
+            site.PropertyGroups.Add(new PropertyGroup(contentCollection) { Name = &quot;Site Settings&quot;, SortOrder = 1 });
+
+            return site;
+        }
+
+        private ContentType CreateHomepage(ContentType parent)
+        {
+            const string contentTypeAlias = &quot;homepage&quot;;
+            var contentType = new ContentType(parent, contentTypeAlias)
+            {
+                Alias = contentTypeAlias,
+                Name = &quot;Homepage&quot;,
+                Description = &quot;ContentType used for the Homepage&quot;,
+                Icon = &quot;.sprTreeDoc3&quot;,
+                Thumbnail = &quot;doc.png&quot;,
+                SortOrder = 1,
+                CreatorId = 0,
+                Trashed = false
+            };
+
+            var contentCollection = new PropertyTypeCollection();
+            contentCollection.Add(new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;title&quot;) { Name = &quot;Title&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88 });
+            contentCollection.Add(new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;bodyText&quot;) { Name = &quot;Body Text&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 2, DataTypeDefinitionId = -87 });
+            contentCollection.Add(new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;author&quot;) { Name = &quot;Author&quot;, Description = &quot;Name of the author&quot;,  Mandatory = false, SortOrder = 3, DataTypeDefinitionId = -88 });
+
+            contentType.PropertyGroups.Add(new PropertyGroup(contentCollection) { Name = &quot;Content&quot;, SortOrder = 1 });
+
+            return contentType;
+        }
+
+        private IContentType[] CreateContentTypeHierarchy()
+        {
+            //create the master type
+            var masterContentType = MockedContentTypes.CreateSimpleContentType(&quot;masterContentType&quot;, &quot;MasterContentType&quot;);
+            masterContentType.Key = new Guid(&quot;C00CA18E-5A9D-483B-A371-EECE0D89B4AE&quot;);
+            ServiceContext.ContentTypeService.Save(masterContentType);
+
+            //add the one we just created
+            var list = new List&lt;IContentType&gt; { masterContentType };
+
+            for (var i = 0; i &lt; 10; i++)
+            {
+                var contentType = MockedContentTypes.CreateSimpleContentType(&quot;childType&quot; + i, &quot;ChildType&quot; + i,
+                    //make the last entry in the list, this one&#39;s parent
+                    list.Last(), true);
+
+                list.Add(contentType);
+            }
+
+            return list.ToArray();
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,9,22,10,1],[23,13,23,31,1],[24,9,24,10,1],[28,9,28,10,1],[29,13,29,29,1],[30,9,30,10,1],[34,9,34,10,1],[35,13,35,104,1],[36,13,36,66,1],[37,13,37,101,1],[38,13,38,81,1],[39,13,39,58,1],[40,13,40,67,1],[43,13,43,87,1],[44,13,44,66,1],[47,13,47,81,1],[49,13,49,83,1],[50,13,50,74,1],[51,9,51,10,1],[55,9,55,10,1],[56,13,56,95,1],[57,13,57,95,1],[58,13,58,66,1],[59,13,59,66,1],[60,13,60,101,1],[61,13,61,40,1],[61,40,61,97,1],[61,97,61,99,1],[61,13,61,99,1],[62,13,62,100,1],[63,13,63,40,1],[63,40,63,97,1],[63,97,63,99,1],[63,13,63,99,1],[65,13,65,45,1],[66,13,66,66,1],[68,13,68,20,1],[68,22,68,27,1],[68,28,68,30,1],[68,31,68,44,1],[69,13,69,14,1],[70,17,70,123,1],[71,17,71,39,1],[72,17,72,64,1],[73,13,73,14,1],[75,13,75,20,1],[75,22,75,27,1],[75,28,75,30,1],[75,31,75,44,1],[76,13,76,14,1],[77,17,77,123,1],[78,17,78,39,1],[79,17,79,61,1],[80,13,80,14,1],[81,9,81,10,1],[85,9,85,10,1],[86,13,86,95,1],[87,13,87,66,1],[88,13,88,101,1],[89,13,89,40,1],[89,40,89,97,1],[89,97,89,99,1],[89,13,89,99,1],[90,13,90,66,1],[91,13,91,52,1],[93,13,93,20,1],[93,22,93,27,1],[93,28,93,30,1],[93,31,93,44,1],[94,13,94,14,1],[95,17,95,123,1],[96,17,96,39,1],[97,17,97,65,1],[98,13,98,14,1],[101,13,101,87,1],[102,13,102,66,1],[104,13,104,95,1],[105,13,105,93,1],[107,13,107,20,1],[107,22,107,27,1],[107,28,107,30,1],[107,31,107,44,1],[108,13,108,14,1],[109,17,109,123,1],[110,17,110,39,1],[111,17,111,66,1],[112,13,112,14,1],[113,9,113,10,1],[117,9,117,10,1],[119,13,119,72,1],[120,13,120,58,1],[121,13,121,51,1],[122,13,122,44,1],[125,13,125,52,1],[128,13,128,54,1],[129,9,129,10,1],[133,9,133,10,1],[135,13,135,72,1],[136,13,136,58,1],[137,13,137,51,1],[138,13,138,44,1],[141,13,141,59,1],[144,13,144,54,1],[145,9,145,10,1],[149,9,149,10,1],[151,13,151,72,1],[154,13,154,74,1],[157,13,157,35,1],[158,9,158,10,1],[162,9,162,10,1],[164,13,164,72,1],[165,13,165,58,1],[168,13,168,51,1],[170,13,170,51,1],[171,13,171,44,1],[171,44,171,66,1],[171,66,171,79,1],[171,13,171,79,1],[173,13,173,39,1],[173,39,173,58,1],[173,58,173,73,1],[173,73,173,74,1],[173,39,173,74,1],[173,74,173,76,1],[173,13,173,76,1],[174,18,174,27,1],[174,29,174,50,1],[174,52,174,55,1],[175,13,175,14,1],[176,17,176,28,1],[176,29,176,38,1],[177,17,177,97,1],[178,13,178,14,1],[179,9,179,10,1],[183,9,183,10,1],[185,13,185,52,1],[186,13,186,57,1],[187,13,187,90,1],[188,13,188,127,1],[189,13,193,36,1],[194,13,194,30,1],[197,13,204,15,1],[205,13,206,36,1],[207,13,207,34,1],[210,13,210,79,1],[211,13,211,50,1],[214,13,214,54,1],[215,13,215,58,1],[216,13,216,55,1],[217,13,217,75,1],[218,9,218,10,1],[222,9,222,10,1],[223,13,223,61,1],[225,13,235,15,1],[237,13,237,220,1],[238,13,238,227,1],[239,13,239,240,1],[241,13,241,39,1],[243,13,243,68,1],[243,68,243,79,1],[243,79,243,91,1],[243,13,243,91,1],[245,13,245,54,1],[245,54,245,60,1],[245,60,245,63,1],[245,13,245,63,1],[246,13,246,54,1],[246,54,246,60,1],[246,60,246,63,1],[246,13,246,63,1],[247,13,247,54,1],[247,54,247,60,1],[247,60,247,63,1],[247,13,247,63,1],[248,9,248,10,1],[252,9,252,10,1],[258,13,258,61,1],[259,13,259,89,1],[260,13,260,34,1],[262,13,262,115,1],[263,13,263,38,1],[265,13,265,116,1],[266,13,266,37,1],[268,13,268,109,1],[269,13,269,36,1],[271,13,271,62,1],[273,13,273,44,1],[274,9,274,10,1],[278,9,278,10,1],[279,13,279,57,1],[280,13,280,102,1],[281,13,281,35,1],[282,13,282,142,1],[283,13,283,40,1],[284,13,284,52,1],[285,13,285,82,1],[286,13,286,30,1],[288,13,288,37,1],[290,13,290,42,1],[291,13,291,47,1],[292,13,292,51,1],[293,13,293,56,1],[294,13,294,46,1],[295,13,295,51,1],[296,13,296,57,1],[297,13,297,83,1],[298,13,298,73,1],[300,13,300,52,1],[301,13,301,43,1],[302,13,302,47,1],[303,9,303,10,1],[307,9,307,10,1],[309,13,309,57,1],[312,13,312,89,1],[313,13,313,43,1],[314,13,314,53,1],[317,13,317,78,1],[318,13,318,48,1],[319,9,319,10,1],[323,9,323,10,1],[325,13,325,57,1],[328,13,328,90,1],[329,13,329,44,1],[330,13,330,54,1],[332,13,332,90,1],[333,13,333,44,1],[334,13,334,54,1],[337,13,337,71,1],[338,13,338,52,1],[339,9,339,10,1],[343,9,343,10,1],[344,13,344,57,1],[345,13,345,37,1],[346,13,346,90,1],[347,13,347,35,1],[349,13,350,13,1],[350,13,350,14,1],[350,14,351,17,1],[351,17,351,65,1],[351,65,352,13,1],[352,13,352,14,1],[352,14,352,15,1],[349,13,352,15,1],[354,13,354,37,1],[356,13,356,49,1],[357,9,357,10,1],[361,9,361,10,1],[362,13,362,57,1],[363,13,363,37,1],[364,13,364,90,1],[365,13,365,35,1],[366,13,366,102,1],[367,13,367,36,1],[369,13,370,13,1],[370,13,370,14,1],[370,14,371,17,1],[371,17,371,65,1],[371,65,372,13,1],[372,13,372,14,1],[372,14,372,15,1],[369,13,372,15,1],[374,13,374,37,1],[375,13,375,38,1],[377,13,377,49,1],[378,9,378,10,1],[382,9,382,10,1],[383,13,383,57,1],[384,13,384,37,1],[385,13,385,90,1],[386,13,386,35,1],[387,13,387,98,1],[388,13,388,52,1],[389,13,389,36,1],[391,13,392,13,1],[392,13,392,14,1],[392,14,393,17,1],[393,17,393,65,1],[393,65,394,13,1],[394,13,394,14,1],[394,14,394,15,1],[391,13,394,15,1],[396,13,396,37,1],[398,13,398,49,1],[399,9,399,10,1],[403,9,403,10,1],[405,13,405,57,1],[407,13,407,47,1],[408,13,408,33,1],[409,13,409,59,1],[410,13,410,30,1],[411,13,411,37,1],[412,13,412,28,1],[413,13,413,49,1],[414,13,414,32,1],[417,13,417,57,1],[418,13,418,32,1],[421,13,421,84,1],[422,13,422,83,1],[422,83,422,111,1],[422,111,422,113,1],[422,13,422,113,1],[423,13,423,41,1],[424,13,424,48,1],[425,13,425,56,1],[426,13,426,83,1],[429,13,429,68,1],[430,13,430,32,1],[433,13,433,89,1],[434,13,434,88,1],[434,88,434,116,1],[434,116,434,118,1],[434,13,434,118,1],[435,13,435,43,1],[436,13,436,54,1],[437,13,437,62,1],[438,13,438,83,1],[439,9,439,10,1],[443,9,443,10,1],[445,13,445,61,1],[446,13,446,78,1],[447,13,447,43,1],[449,13,449,121,1],[450,13,450,45,1],[451,13,451,51,1],[454,13,454,85,1],[455,13,455,31,1],[458,13,458,51,1],[460,13,460,62,1],[461,13,461,63,1],[463,13,463,67,1],[463,67,463,83,1],[463,83,463,95,1],[463,13,463,95,1],[464,13,464,70,1],[465,13,465,64,1],[466,13,466,96,1],[467,13,467,61,1],[468,13,468,63,1],[469,13,469,65,1],[470,13,470,75,1],[471,13,471,69,1],[471,69,471,92,1],[471,92,471,132,1],[471,132,471,155,1],[471,155,471,161,1],[471,13,471,161,1],[472,13,472,70,1],[472,70,472,94,1],[472,94,472,135,1],[472,135,472,159,1],[472,159,472,165,1],[472,13,472,165,1],[473,9,473,10,1],[477,9,477,10,1],[479,13,479,61,1],[481,13,481,103,1],[482,13,482,46,1],[483,13,483,115,1],[484,13,484,46,1],[486,13,486,130,1],[487,13,487,45,1],[490,13,490,87,1],[491,13,491,48,1],[492,13,492,54,1],[493,13,493,52,1],[494,13,494,33,1],[497,13,497,53,1],[499,13,499,70,1],[500,13,500,84,1],[502,13,502,73,1],[502,73,502,92,1],[502,92,502,104,1],[502,13,502,104,1],[503,13,503,73,1],[503,73,503,92,1],[503,92,503,105,1],[503,13,503,105,1],[505,13,505,113,1],[506,13,506,113,1],[508,13,508,90,1],[509,13,509,80,1],[511,13,511,78,1],[512,13,512,80,1],[513,13,513,82,1],[515,13,515,75,1],[515,75,515,102,1],[515,102,515,153,1],[515,153,515,180,1],[515,180,515,186,1],[515,13,515,186,1],[516,13,516,76,1],[516,76,516,104,1],[516,104,516,156,1],[516,156,516,184,1],[516,184,516,190,1],[516,13,516,190,1],[517,9,517,10,1],[521,9,521,10,1],[523,13,523,61,1],[524,13,524,78,1],[525,13,525,43,1],[527,13,527,121,1],[528,13,528,45,1],[529,13,529,51,1],[532,13,532,88,1],[535,13,535,53,1],[537,13,537,59,1],[538,13,538,63,1],[540,13,540,62,1],[540,62,540,78,0],[540,78,540,91,1],[540,13,540,91,1],[541,13,541,50,1],[542,13,542,46,1],[543,13,543,91,1],[544,13,544,93,1],[546,18,546,27,1],[546,29,546,60,1],[546,62,546,65,1],[547,13,547,14,1],[548,17,548,127,1],[549,17,549,24,1],[549,26,549,42,1],[549,43,549,45,1],[549,46,549,84,1],[550,17,550,18,1],[551,21,551,61,1],[552,17,552,18,1],[553,13,553,14,1],[555,13,555,20,1],[555,22,555,38,1],[555,39,555,41,1],[555,42,555,62,1],[556,13,556,14,1],[557,17,557,57,1],[558,13,558,14,1],[560,13,560,56,1],[561,13,561,58,1],[562,13,562,60,1],[563,13,563,70,1],[564,13,564,64,1],[564,64,564,87,1],[564,87,564,127,1],[564,127,564,150,1],[564,150,564,156,1],[564,13,564,156,1],[565,13,565,65,1],[565,65,565,89,1],[565,89,565,130,1],[565,130,565,154,1],[565,154,565,160,1],[565,13,565,160,1],[566,9,566,10,1],[570,9,570,10,1],[572,13,572,61,1],[574,13,574,103,1],[575,13,575,46,1],[576,13,576,115,1],[577,13,577,46,1],[579,13,579,130,1],[580,13,580,45,1],[583,13,583,102,1],[586,13,586,53,1],[588,13,588,70,1],[589,13,589,84,1],[591,13,591,73,1],[591,73,591,92,1],[591,92,591,104,1],[591,13,591,104,1],[592,13,592,73,1],[592,73,592,92,1],[592,92,592,105,1],[592,13,592,105,1],[594,13,594,113,1],[595,13,595,113,1],[597,13,597,90,1],[598,13,598,80,1],[600,13,600,78,1],[601,13,601,80,1],[602,13,602,82,1],[604,13,604,75,1],[604,75,604,102,1],[604,102,604,153,1],[604,153,604,180,1],[604,180,604,186,1],[604,13,604,186,1],[605,13,605,76,1],[605,76,605,104,1],[605,104,605,156,1],[605,156,605,184,1],[605,184,605,190,1],[605,13,605,190,1],[606,9,606,10,1],[610,9,610,10,1],[614,13,614,61,1],[616,13,616,71,1],[617,13,617,34,1],[618,13,618,122,1],[619,13,619,33,1],[620,13,620,74,1],[621,13,621,39,1],[624,13,624,47,1],[625,13,625,33,1],[628,13,631,15,1],[632,13,632,84,1],[635,13,635,41,1],[636,13,636,62,1],[636,62,636,87,1],[636,87,636,89,1],[636,13,636,89,1],[637,13,637,39,1],[637,39,637,80,1],[637,80,637,82,1],[637,13,637,82,1],[638,9,638,10,1],[642,9,642,10,1],[644,13,644,61,1],[646,13,646,108,1],[647,13,647,36,1],[648,13,648,115,1],[649,13,649,39,1],[650,13,650,127,1],[651,13,651,40,1],[653,13,653,78,1],[654,13,654,43,1],[655,13,655,76,1],[656,13,656,42,1],[658,13,658,73,1],[659,13,659,39,1],[660,13,660,72,1],[661,13,661,40,1],[664,13,667,15,1],[668,13,668,94,1],[669,13,669,102,1],[670,13,670,94,1],[671,13,671,91,1],[674,13,674,45,1],[675,13,675,44,1],[677,13,677,51,1],[678,13,678,56,1],[679,13,679,47,1],[680,13,680,46,1],[682,13,682,62,1],[682,62,682,84,1],[682,84,682,86,1],[682,13,682,86,1],[683,13,683,62,1],[683,62,683,91,1],[683,91,683,93,1],[683,13,683,93,1],[684,13,684,62,1],[684,62,684,90,1],[684,90,684,92,1],[684,13,684,92,1],[686,13,686,39,1],[686,39,686,76,1],[686,76,686,78,1],[686,13,686,78,1],[687,13,687,39,1],[687,39,687,77,1],[687,77,687,79,1],[687,13,687,79,1],[688,13,688,39,1],[688,39,688,69,1],[688,69,688,71,1],[688,13,688,71,1],[689,13,689,39,1],[689,39,689,68,1],[689,68,689,70,1],[689,13,689,70,1],[690,9,690,10,1],[694,9,694,10,1],[706,13,706,61,1],[707,13,707,72,1],[708,13,708,36,1],[709,13,709,114,1],[710,13,710,39,1],[711,13,711,120,1],[712,13,712,40,1],[714,13,714,92,1],[715,13,715,50,1],[718,13,721,15,1],[722,13,722,91,1],[723,13,723,36,1],[725,13,728,15,1],[729,13,729,90,1],[730,13,730,39,1],[732,13,732,88,1],[733,13,733,40,1],[736,13,739,15,1],[740,13,740,85,1],[743,13,743,49,1],[744,13,744,47,1],[745,13,745,46,1],[746,13,746,52,1],[748,13,748,62,1],[748,62,748,84,1],[748,84,748,86,1],[748,13,748,86,1],[750,13,750,39,1],[750,39,750,76,1],[750,76,750,78,1],[750,13,750,78,1],[751,13,751,39,1],[751,39,751,77,1],[751,77,751,79,1],[751,13,751,79,1],[752,9,752,10,1],[756,9,756,10,1],[758,13,758,103,1],[761,13,761,52,1],[761,52,761,103,1],[761,103,761,105,1],[761,13,761,105,1],[762,9,762,10,1],[766,9,766,10,1],[777,13,777,61,1],[778,13,778,72,1],[779,13,779,36,1],[780,13,780,114,1],[781,13,781,39,1],[782,13,782,120,1],[783,13,783,40,1],[784,13,784,134,1],[785,13,785,44,1],[787,13,787,76,1],[788,13,788,42,1],[789,13,789,78,1],[790,13,790,43,1],[793,13,796,15,1],[797,13,797,91,1],[798,13,798,36,1],[800,13,803,15,1],[804,13,804,90,1],[805,13,805,39,1],[807,13,810,15,1],[811,13,811,95,1],[812,13,812,40,1],[814,13,817,15,1],[818,13,818,91,1],[819,13,819,42,1],[821,13,821,83,1],[822,13,822,89,1],[823,13,823,40,1],[824,13,824,44,1],[826,13,826,81,1],[826,81,826,111,1],[826,111,826,113,1],[826,13,826,113,1],[827,13,827,50,1],[830,13,830,49,1],[831,13,831,49,1],[832,13,832,47,1],[833,13,833,46,1],[834,13,834,55,1],[835,13,835,56,1],[837,13,837,62,1],[837,62,837,91,1],[837,91,837,93,1],[837,13,837,93,1],[839,13,839,39,1],[839,39,839,76,1],[839,76,839,78,1],[839,13,839,78,1],[840,13,840,39,1],[840,39,840,77,1],[840,77,840,79,1],[840,13,840,79,1],[841,13,841,39,1],[841,39,841,81,1],[841,81,841,83,1],[841,13,841,83,1],[842,9,842,10,1],[846,9,846,10,1],[857,13,857,61,1],[858,13,858,72,1],[859,13,859,36,1],[860,13,860,114,1],[861,13,861,39,1],[862,13,862,120,1],[863,13,863,40,1],[864,13,864,134,1],[865,13,865,44,1],[867,13,867,76,1],[868,13,868,42,1],[869,13,869,78,1],[870,13,870,43,1],[873,13,876,15,1],[877,13,877,91,1],[878,13,878,36,1],[880,13,883,15,1],[884,13,884,90,1],[885,13,885,39,1],[887,13,890,15,1],[891,13,891,95,1],[892,13,892,40,1],[894,13,897,15,1],[898,13,898,91,1],[899,13,899,42,1],[901,13,901,83,1],[902,13,902,89,1],[903,13,903,40,1],[904,13,904,44,1],[907,13,907,49,1],[908,13,908,49,1],[909,13,909,47,1],[910,13,910,46,1],[911,13,911,55,1],[912,13,912,56,1],[914,13,917,15,1],[918,13,918,89,1],[919,13,919,42,1],[921,13,921,45,1],[923,13,923,39,1],[923,39,923,76,1],[923,76,923,78,1],[923,13,923,78,1],[924,13,924,39,1],[924,39,924,77,1],[924,77,924,79,1],[924,13,924,79,1],[925,13,925,39,1],[925,39,925,81,1],[925,81,925,83,1],[925,13,925,83,1],[926,9,926,10,1],[930,9,930,10,1],[932,13,932,61,1],[933,13,933,106,1],[934,13,934,32,1],[935,13,935,129,1],[936,13,936,39,1],[937,13,937,138,1],[938,13,938,40,1],[940,13,940,92,1],[941,13,941,50,1],[944,13,947,15,1],[948,13,951,15,1],[952,13,952,94,1],[953,13,953,90,1],[954,13,954,39,1],[956,13,956,87,1],[957,13,957,39,1],[960,13,960,72,1],[961,13,961,44,1],[961,44,966,15,1],[966,15,966,17,1],[961,13,966,17,1],[969,13,969,52,1],[970,13,970,49,1],[971,13,971,47,1],[973,13,973,39,1],[973,39,973,76,1],[973,76,973,78,1],[973,13,973,78,1],[974,13,974,39,1],[974,39,974,77,1],[974,77,974,79,1],[974,13,974,79,1],[975,9,975,10,1],[979,9,979,10,1],[981,13,981,61,1],[982,13,982,72,1],[983,13,983,36,1],[984,13,984,114,1],[985,13,985,39,1],[986,13,986,120,1],[987,13,987,40,1],[990,13,993,15,1],[994,13,994,85,1],[995,13,998,15,1],[999,13,999,94,1],[1000,13,1003,15,1],[1004,13,1004,94,1],[1005,13,1008,15,1],[1009,13,1009,91,1],[1010,13,1010,36,1],[1011,13,1011,39,1],[1012,13,1012,40,1],[1015,13,1015,84,1],[1015,84,1015,108,1],[1015,108,1015,110,1],[1015,13,1015,110,1],[1016,13,1016,56,1],[1019,13,1019,49,1],[1020,13,1020,47,1],[1021,13,1021,46,1],[1022,13,1022,49,1],[1024,13,1024,62,1],[1024,62,1024,88,1],[1024,88,1024,90,1],[1024,13,1024,90,1],[1026,13,1026,39,1],[1026,39,1026,76,1],[1026,76,1026,78,1],[1026,13,1026,78,1],[1027,13,1027,39,1],[1027,39,1027,77,1],[1027,77,1027,79,1],[1027,13,1027,79,1],[1028,9,1028,10,1],[1032,9,1032,10,1],[1041,13,1041,61,1],[1043,13,1043,108,1],[1044,13,1044,36,1],[1045,13,1045,121,1],[1046,13,1046,39,1],[1047,13,1047,127,1],[1048,13,1048,40,1],[1050,13,1050,78,1],[1051,13,1051,43,1],[1053,13,1053,92,1],[1054,13,1054,50,1],[1056,13,1056,73,1],[1057,13,1057,39,1],[1059,13,1059,97,1],[1060,13,1060,50,1],[1063,13,1066,15,1],[1067,13,1067,91,1],[1070,13,1070,45,1],[1071,13,1071,58,1],[1073,13,1073,54,1],[1074,13,1074,39,1],[1074,39,1074,64,1],[1074,64,1074,66,1],[1074,13,1074,66,1],[1075,9,1075,10,1],[1079,9,1079,10,1],[1083,13,1083,61,1],[1085,13,1085,108,1],[1086,13,1086,32,1],[1087,13,1087,117,1],[1088,13,1088,39,1],[1089,13,1089,74,1],[1090,13,1090,53,1],[1091,13,1091,39,1],[1093,13,1093,53,1],[1094,13,1094,39,1],[1097,13,1100,15,1],[1101,13,1101,90,1],[1102,13,1105,15,1],[1106,13,1106,90,1],[1107,13,1107,39,1],[1109,13,1109,76,1],[1110,13,1110,65,1],[1111,13,1111,116,1],[1112,13,1112,32,1],[1115,13,1115,49,1],[1116,13,1116,50,1],[1118,13,1118,69,1],[1119,13,1119,51,1],[1121,13,1121,83,1],[1124,13,1124,62,1],[1124,62,1124,87,1],[1124,87,1124,105,1],[1124,13,1124,105,1],[1126,13,1126,71,1],[1127,13,1127,86,1],[1128,13,1128,59,1],[1129,13,1129,64,1],[1130,9,1130,10,1],[1134,9,1134,10,1],[1136,13,1136,61,1],[1137,13,1137,107,1],[1138,13,1138,32,1],[1139,13,1139,129,1],[1140,13,1140,39,1],[1141,13,1141,139,1],[1142,13,1142,40,1],[1144,13,1144,92,1],[1145,13,1145,50,1],[1146,13,1146,87,1],[1147,13,1147,39,1],[1150,13,1153,15,1],[1154,13,1157,15,1],[1158,13,1158,95,1],[1159,13,1159,94,1],[1160,13,1160,39,1],[1162,13,1165,15,1],[1166,13,1169,15,1],[1170,13,1173,15,1],[1174,13,1174,92,1],[1175,13,1175,102,1],[1176,13,1176,95,1],[1177,13,1177,40,1],[1180,13,1180,65,1],[1181,13,1181,115,1],[1182,13,1182,32,1],[1185,13,1185,52,1],[1186,13,1186,49,1],[1187,13,1187,49,1],[1188,13,1188,47,1],[1189,13,1189,52,1],[1190,13,1190,49,1],[1192,13,1192,39,1],[1192,39,1192,76,1],[1192,76,1192,78,1],[1192,13,1192,78,1],[1193,13,1193,39,1],[1193,39,1193,77,1],[1193,77,1193,79,1],[1193,13,1193,79,1],[1195,13,1195,79,1],[1196,13,1196,102,1],[1196,102,1196,127,1],[1196,127,1196,129,1],[1196,13,1196,129,1],[1199,13,1199,62,1],[1201,13,1201,97,1],[1201,97,1201,121,1],[1201,121,1201,123,1],[1201,13,1201,123,1],[1202,13,1202,61,1],[1203,9,1203,10,1],[1207,9,1207,10,1],[1209,13,1209,61,1],[1210,13,1210,107,1],[1211,13,1211,32,1],[1212,13,1212,128,1],[1213,13,1213,39,1],[1215,13,1215,92,1],[1216,13,1216,50,1],[1219,13,1222,15,1],[1223,13,1226,15,1],[1227,13,1230,15,1],[1231,13,1231,88,1],[1232,13,1232,94,1],[1233,13,1233,91,1],[1234,13,1234,32,1],[1235,13,1235,39,1],[1237,13,1237,87,1],[1238,13,1238,39,1],[1241,13,1241,65,1],[1242,13,1242,115,1],[1243,13,1243,32,1],[1246,13,1246,52,1],[1247,13,1247,49,1],[1248,13,1248,49,1],[1249,13,1249,47,1],[1251,13,1251,39,1],[1251,39,1251,76,1],[1251,76,1251,78,1],[1251,13,1251,78,1],[1252,9,1252,10,1],[1256,9,1256,10,1],[1258,13,1258,61,1],[1259,13,1259,72,1],[1260,13,1260,36,1],[1262,13,1262,114,1],[1263,13,1263,39,1],[1265,13,1265,120,1],[1266,13,1266,40,1],[1268,13,1268,92,1],[1269,13,1269,50,1],[1272,13,1275,15,1],[1276,13,1276,91,1],[1277,13,1277,36,1],[1279,13,1282,15,1],[1283,13,1283,90,1],[1284,13,1284,39,1],[1286,13,1286,87,1],[1287,13,1287,39,1],[1289,13,1289,53,1],[1290,13,1290,36,1],[1293,13,1293,49,1],[1294,13,1294,47,1],[1295,13,1295,52,1],[1297,13,1297,39,1],[1297,39,1297,76,1],[1297,76,1297,78,1],[1297,13,1297,78,1],[1298,13,1298,39,1],[1298,39,1298,77,1],[1298,77,1298,79,1],[1298,13,1298,79,1],[1300,13,1300,69,1],[1301,13,1301,71,1],[1302,9,1302,10,1],[1306,9,1306,10,1],[1307,13,1307,61,1],[1308,13,1308,86,1],[1309,13,1309,50,1],[1310,13,1310,47,1],[1311,13,1311,36,1],[1313,13,1320,15,1],[1321,13,1321,87,1],[1322,13,1329,15,1],[1330,13,1330,83,1],[1332,13,1332,36,1],[1334,13,1334,60,1],[1336,13,1336,58,1],[1338,13,1338,53,1],[1339,13,1339,36,1],[1341,13,1341,60,1],[1343,13,1343,70,1],[1344,9,1344,10,1],[1348,9,1348,10,1],[1357,13,1357,61,1],[1358,13,1358,72,1],[1359,13,1359,36,1],[1361,13,1361,114,1],[1362,13,1362,39,1],[1364,13,1364,120,1],[1365,13,1365,40,1],[1367,13,1367,92,1],[1368,13,1368,50,1],[1371,13,1374,15,1],[1375,13,1375,90,1],[1376,13,1376,39,1],[1378,13,1381,15,1],[1382,13,1382,91,1],[1383,13,1383,36,1],[1385,13,1385,87,1],[1386,13,1386,39,1],[1389,13,1389,49,1],[1390,13,1390,47,1],[1391,13,1391,52,1],[1393,13,1393,39,1],[1393,39,1393,76,1],[1393,76,1393,78,1],[1393,13,1393,78,1],[1394,13,1394,39,1],[1394,39,1394,77,1],[1394,77,1394,79,1],[1394,13,1394,79,1],[1396,13,1396,69,1],[1397,13,1397,71,1],[1399,13,1399,88,1],[1399,88,1399,112,1],[1399,112,1399,114,1],[1399,13,1399,114,1],[1400,13,1400,61,1],[1404,13,1407,15,1],[1408,13,1408,100,1],[1409,13,1409,39,1],[1410,13,1410,52,1],[1412,13,1412,77,1],[1413,13,1413,87,1],[1414,13,1414,106,1],[1415,13,1415,62,1],[1417,13,1417,102,1],[1418,13,1418,99,1],[1419,9,1419,10,1],[1423,9,1423,10,1],[1424,13,1424,61,1],[1425,13,1425,75,1],[1426,13,1426,44,1],[1427,13,1427,39,1],[1429,13,1429,102,1],[1430,13,1430,53,1],[1431,13,1431,40,1],[1433,13,1433,52,1],[1434,13,1434,53,1],[1435,9,1435,10,1],[1439,9,1439,10,1],[1440,13,1440,61,1],[1441,13,1441,97,1],[1442,13,1442,42,1],[1443,13,1443,37,1],[1445,13,1445,101,1],[1446,13,1446,51,1],[1447,13,1447,38,1],[1449,13,1449,50,1],[1450,13,1450,51,1],[1451,9,1451,10,1],[1454,9,1454,10,1],[1455,13,1465,15,1],[1467,13,1467,66,1],[1468,13,1468,217,1],[1469,13,1469,118,1],[1471,13,1471,30,1],[1472,9,1472,10,1],[1475,9,1475,10,1],[1477,13,1487,15,1],[1489,13,1496,15,1],[1497,13,1497,63,1],[1498,13,1498,27,1],[1499,9,1499,10,1],[1502,9,1502,10,1],[1503,13,1513,15,1],[1515,13,1515,66,1],[1516,13,1516,204,1],[1517,13,1517,117,1],[1519,13,1519,25,1],[1520,9,1520,10,1],[1523,9,1523,10,1],[1525,13,1535,15,1],[1537,13,1537,66,1],[1538,13,1538,198,1],[1539,13,1539,205,1],[1540,13,1540,218,1],[1542,13,1542,118,1],[1544,13,1544,32,1],[1545,9,1545,10,1],[1548,9,1548,10,1],[1550,13,1550,122,1],[1551,13,1551,86,1],[1552,13,1552,71,1],[1555,13,1555,69,1],[1557,18,1557,27,1],[1557,29,1557,35,1],[1557,37,1557,40,1],[1558,13,1558,14,1],[1559,17,1561,40,1],[1563,17,1563,39,1],[1564,13,1564,14,1],[1566,13,1566,35,1],[1567,9,1567,10,1]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Packaging\PackageBinaryInspector.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Security;
+using System.Security.Permissions;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Core.Packaging
+{
+    // Note
+    // That class uses ReflectionOnlyLoad which does NOT handle policies (bindingRedirect) and
+    // therefore raised warnings when installing a package, if an exact dependency could not be
+    // found, though it would be found via policies. So we have to explicitely apply policies
+    // where appropriate.
+
+    internal class PackageBinaryInspector : MarshalByRefObject
+    {
+        /// &lt;summary&gt;
+        /// Entry point to call from your code
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;assemblys&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;errorReport&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Will perform the assembly scan in a separate app domain
+        /// &lt;/remarks&gt;
+        public static IEnumerable&lt;string&gt; ScanAssembliesForTypeReference&lt;T&gt;(IEnumerable&lt;byte[]&gt; assemblys, out string[] errorReport)
+        {
+            var appDomain = GetTempAppDomain();
+            var type = typeof(PackageBinaryInspector);
+            try
+            {
+                var value = (PackageBinaryInspector)appDomain.CreateInstanceAndUnwrap(
+                       type.Assembly.FullName,
+                       type.FullName);
+                // do NOT turn PerformScan into static (even if ReSharper says so)!
+                var result = value.PerformScan&lt;T&gt;(assemblys.ToArray(), out errorReport);
+                return result;
+            }
+            finally
+            {
+                AppDomain.Unload(appDomain);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Entry point to call from your code
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;dllPath&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;errorReport&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Will perform the assembly scan in a separate app domain
+        /// &lt;/remarks&gt;
+        public static IEnumerable&lt;string&gt; ScanAssembliesForTypeReference&lt;T&gt;(string dllPath, out string[] errorReport)
+        {
+            var appDomain = GetTempAppDomain();
+            var type = typeof(PackageBinaryInspector);
+            try
+            {
+                var value = (PackageBinaryInspector)appDomain.CreateInstanceAndUnwrap(
+                       type.Assembly.FullName,
+                       type.FullName);
+                // do NOT turn PerformScan into static (even if ReSharper says so)!
+                var result = value.PerformScan&lt;T&gt;(dllPath, out errorReport);
+                return result;
+            }
+            finally
+            {
+                AppDomain.Unload(appDomain);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Performs the assembly scanning
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;        
+        /// &lt;param name=&quot;assemblies&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;errorReport&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This method is executed in a separate app domain
+        /// &lt;/remarks&gt;
+        private IEnumerable&lt;string&gt; PerformScan&lt;T&gt;(IEnumerable&lt;byte[]&gt; assemblies, out string[] errorReport)
+        {
+            //we need this handler to resolve assembly dependencies when loading below
+            AppDomain.CurrentDomain.ReflectionOnlyAssemblyResolve += (s, e) =&gt;
+            {
+                var name = AppDomain.CurrentDomain.ApplyPolicy(e.Name);
+                var a = Assembly.ReflectionOnlyLoad(name);
+                if (a == null) throw new TypeLoadException(&quot;Could not load assembly &quot; + e.Name);
+                return a;
+            };
+
+            //First load each dll file into the context
+            // do NOT apply policy here: we want to scan the dlls that are in the binaries
+            var loaded = assemblies.Select(Assembly.ReflectionOnlyLoad).ToList();
+
+            //scan
+            return PerformScan&lt;T&gt;(loaded, out errorReport);
+        }
+
+        /// &lt;summary&gt;
+        /// Performs the assembly scanning
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;        
+        /// &lt;param name=&quot;dllPath&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;errorReport&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This method is executed in a separate app domain
+        /// &lt;/remarks&gt;
+        private IEnumerable&lt;string&gt; PerformScan&lt;T&gt;(string dllPath, out string[] errorReport)
+        {
+            if (Directory.Exists(dllPath) == false)
+            {
+                throw new DirectoryNotFoundException(&quot;Could not find directory &quot; + dllPath);
+            }
+
+            //we need this handler to resolve assembly dependencies when loading below
+            AppDomain.CurrentDomain.ReflectionOnlyAssemblyResolve += (s, e) =&gt;
+            {
+                var name = AppDomain.CurrentDomain.ApplyPolicy(e.Name);
+                var a = Assembly.ReflectionOnlyLoad(name);
+                if (a == null) throw new TypeLoadException(&quot;Could not load assembly &quot; + e.Name);
+                return a;
+            };
+
+            //First load each dll file into the context
+            // do NOT apply policy here: we want to scan the dlls that are in the path
+            var files = Directory.GetFiles(dllPath, &quot;*.dll&quot;);
+            var loaded = files.Select(Assembly.ReflectionOnlyLoadFrom).ToList();
+
+            //scan
+            return PerformScan&lt;T&gt;(loaded, out errorReport);
+        }
+
+        private static IEnumerable&lt;string&gt; PerformScan&lt;T&gt;(IList&lt;Assembly&gt; loaded, out string[] errorReport)
+        {
+            var dllsWithReference = new List&lt;string&gt;();
+            var errors = new List&lt;string&gt;();
+            var assembliesWithErrors = new List&lt;Assembly&gt;();
+
+            //load each of the LoadFrom assemblies into the Load context too
+            foreach (var a in loaded)
+            {
+                var name = AppDomain.CurrentDomain.ApplyPolicy(a.FullName);
+                Assembly.ReflectionOnlyLoad(name);
+            }
+
+            //get the list of assembly names to compare below
+            var loadedNames = loaded.Select(x =&gt; x.GetName().Name).ToArray();
+            
+            //Then load each referenced assembly into the context
+            foreach (var a in loaded)
+            {
+                //don&#39;t load any referenced assemblies that are already found in the loaded array - this is based on name
+                // regardless of version. We&#39;ll assume that if the assembly found in the folder matches the assembly name
+                // being looked for, that is the version the user has shipped their package with and therefore it &#39;must&#39; be correct
+                foreach (var assemblyName in a.GetReferencedAssemblies().Where(ass =&gt; loadedNames.Contains(ass.Name) == false))
+                {
+                    try
+                    {
+                        var name = AppDomain.CurrentDomain.ApplyPolicy(assemblyName.FullName);
+                        Assembly.ReflectionOnlyLoad(name);
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        //if an exception occurs it means that a referenced assembly could not be found                        
+                        errors.Add(
+                            string.Concat(&quot;This package references the assembly &#39;&quot;,
+                                          assemblyName.Name,
+                                          &quot;&#39; which was not found&quot;));
+                        assembliesWithErrors.Add(a);
+                    }
+                    catch (Exception ex)
+                    {
+                        //if an exception occurs it means that a referenced assembly could not be found                        
+                        errors.Add(
+                            string.Concat(&quot;This package could not be verified for compatibility. An error occurred while loading a referenced assembly &#39;&quot;,
+                                          assemblyName.Name,
+                                          &quot;&#39; see error log for full details.&quot;));
+                        assembliesWithErrors.Add(a);
+                        LogHelper.Error&lt;PackageBinaryInspector&gt;(&quot;An error occurred scanning package assemblies&quot;, ex);
+                    }
+                }
+            }
+
+            var contractType = GetLoadFromContractType&lt;T&gt;();
+
+            //now that we have all referenced types into the context we can look up stuff
+            foreach (var a in loaded.Except(assembliesWithErrors))
+            {
+                //now we need to see if they contain any type &#39;T&#39;
+                var reflectedAssembly = a;
+                
+                try
+                {
+                    var found = reflectedAssembly.GetExportedTypes()
+                                .Where(contractType.IsAssignableFrom);
+
+                    if (found.Any())
+                    {
+                        dllsWithReference.Add(reflectedAssembly.FullName);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    //This is a hack that nobody can seem to get around, I&#39;ve read everything and it seems that 
+                    // this is quite a common thing when loading types into reflection only load context, so 
+                    // we&#39;re just going to ignore this specific one for now
+                    var typeLoadEx = ex as TypeLoadException;
+                    if (typeLoadEx != null)
+                    {
+                        if (typeLoadEx.Message.InvariantContains(&quot;does not have an implementation&quot;))
+                        {
+                            //ignore
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        errors.Add(
+                            string.Concat(&quot;This package could not be verified for compatibility. An error occurred while scanning a packaged assembly &#39;&quot;,
+                                          a.GetName().Name,
+                                          &quot;&#39; see error log for full details.&quot;));
+                        assembliesWithErrors.Add(a);
+                        LogHelper.Error&lt;PackageBinaryInspector&gt;(&quot;An error occurred scanning package assemblies&quot;, ex);
+                    }
+                }
+                
+            }
+
+            errorReport = errors.ToArray();
+            return dllsWithReference;
+        }
+
+        /// &lt;summary&gt;
+        /// In order to compare types, the types must be in the same context, this method will return the type that
+        /// we are checking against but from the Load context.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private static Type GetLoadFromContractType&lt;T&gt;()
+        {
+            var name = AppDomain.CurrentDomain.ApplyPolicy(typeof(T).Assembly.FullName);
+            var contractAssemblyLoadFrom = Assembly.ReflectionOnlyLoad(name);
+
+            var contractType = contractAssemblyLoadFrom.GetExportedTypes()
+                .FirstOrDefault(x =&gt; x.FullName == typeof(T).FullName &amp;&amp; x.Assembly.FullName == typeof(T).Assembly.FullName);
+            
+            if (contractType == null)
+            {
+                throw new InvalidOperationException(&quot;Could not find type &quot; + typeof(T) + &quot; in the LoadFrom assemblies&quot;);
+            }
+            return contractType;
+        }
+
+        /// &lt;summary&gt;
+        /// Create an app domain
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private static AppDomain GetTempAppDomain()
+        {
+            //copy the current app domain setup but don&#39;t shadow copy files
+            var appName = &quot;TempDomain&quot; + Guid.NewGuid();
+            var domainSetup = new AppDomainSetup
+                {
+                    ApplicationName = appName,
+                    ShadowCopyFiles = &quot;false&quot;,
+                    ApplicationBase = AppDomain.CurrentDomain.SetupInformation.ApplicationBase,
+                    ConfigurationFile = AppDomain.CurrentDomain.SetupInformation.ConfigurationFile,
+                    DynamicBase = AppDomain.CurrentDomain.SetupInformation.DynamicBase,
+                    LicenseFile = AppDomain.CurrentDomain.SetupInformation.LicenseFile,
+                    LoaderOptimization = AppDomain.CurrentDomain.SetupInformation.LoaderOptimization,
+                    PrivateBinPath = AppDomain.CurrentDomain.SetupInformation.PrivateBinPath,
+                    PrivateBinPathProbe = AppDomain.CurrentDomain.SetupInformation.PrivateBinPathProbe
+                };
+
+            //create new domain with full trust
+            return AppDomain.CreateDomain(
+                appName,
+                AppDomain.CurrentDomain.Evidence,
+                domainSetup,
+                new PermissionSet(PermissionState.Unrestricted));
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[31,9,31,10,1],[32,13,32,48,1],[33,13,33,55,1],[35,13,35,14,1],[36,17,38,39,1],[40,17,40,89,1],[41,17,41,31,1],[44,13,44,14,1],[45,17,45,45,1],[46,13,46,14,1],[47,9,47,10,1],[60,9,60,10,0],[61,13,61,48,0],[62,13,62,55,0],[64,13,64,14,0],[65,17,67,39,0],[69,17,69,77,0],[70,17,70,31,0],[73,13,73,14,0],[74,17,74,45,0],[75,13,75,14,0],[76,9,76,10,0],[89,9,89,10,1],[91,13,92,13,1],[92,13,92,14,1],[92,14,93,17,1],[93,17,93,72,1],[93,72,94,17,1],[94,17,94,59,1],[94,59,95,17,1],[95,17,95,31,1],[95,31,95,32,1],[95,32,95,97,0],[95,97,96,17,1],[96,17,96,26,1],[96,26,97,13,1],[97,13,97,14,1],[97,14,97,15,1],[91,13,97,15,1],[101,13,101,82,1],[104,13,104,60,1],[105,9,105,10,1],[118,9,118,10,0],[119,13,119,52,0],[120,13,120,14,0],[121,17,121,93,0],[125,13,126,13,0],[126,13,126,14,0],[126,14,127,17,0],[127,17,127,72,0],[127,72,128,17,0],[128,17,128,59,0],[128,59,129,17,0],[129,17,129,31,0],[129,31,129,32,0],[129,32,129,97,0],[129,97,130,17,0],[130,17,130,26,0],[130,26,131,13,0],[131,13,131,14,0],[131,14,131,15,0],[125,13,131,15,0],[135,13,135,62,0],[136,13,136,81,0],[139,13,139,60,0],[140,9,140,10,0],[143,9,143,10,1],[144,13,144,56,1],[145,13,145,45,1],[146,13,146,61,1],[149,13,149,20,1],[149,22,149,27,1],[149,28,149,30,1],[149,31,149,37,1],[150,13,150,14,1],[151,17,151,76,1],[152,17,152,51,1],[153,13,153,14,1],[156,13,156,50,1],[156,50,156,66,1],[156,66,156,78,1],[156,13,156,78,1],[159,13,159,20,1],[159,22,159,27,1],[159,28,159,30,1],[159,31,159,37,1],[160,13,160,14,1],[164,17,164,24,1],[164,26,164,42,1],[164,43,164,45,1],[164,46,164,87,1],[164,87,164,126,1],[164,126,164,127,1],[164,46,164,127,1],[165,17,165,18,1],[167,21,167,22,1],[168,25,168,95,1],[169,25,169,59,1],[170,21,170,22,1],[171,21,171,50,0],[172,21,172,22,0],[174,25,177,69,0],[178,25,178,53,0],[179,21,179,22,0],[180,21,180,41,0],[181,21,181,22,0],[183,25,186,81,0],[187,25,187,53,0],[188,25,188,118,0],[189,21,189,22,0],[190,17,190,18,1],[191,13,191,14,1],[193,13,193,61,1],[196,13,196,20,1],[196,22,196,27,1],[196,28,196,30,1],[196,31,196,66,1],[197,13,197,14,1],[199,17,199,43,1],[202,17,202,18,1],[203,21,204,71,1],[206,21,206,37,1],[207,21,207,22,1],[208,25,208,75,1],[209,21,209,22,1],[210,17,210,18,1],[211,17,211,37,0],[212,17,212,18,0],[216,21,216,62,0],[217,21,217,44,0],[218,21,218,22,0],[219,25,219,101,0],[220,25,220,26,0],[222,29,222,38,0],[224,21,224,22,0],[226,21,226,22,0],[227,25,230,81,0],[231,25,231,53,0],[232,25,232,118,0],[233,21,233,22,0],[234,17,234,18,0],[236,13,236,14,1],[238,13,238,44,1],[239,13,239,38,1],[240,9,240,10,1],[249,9,249,10,1],[250,13,250,89,1],[251,13,251,78,1],[253,13,254,38,1],[254,38,254,124,1],[254,124,254,126,1],[253,13,254,126,1],[256,13,256,38,1],[257,13,257,14,0],[258,17,258,121,0],[260,13,260,33,1],[261,9,261,10,1],[268,9,268,10,1],[270,13,270,57,1],[271,13,282,19,1],[285,13,289,66,1],[290,9,290,10,1]]);
+    </script>
+  </body>
+</html>

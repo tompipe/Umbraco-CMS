@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Editors\ContentController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Formatting;
+using System.Text;
+using System.Web.Http;
+using System.Web.Http.ModelBinding;
+using System.Web.Http.ModelBinding.Binders;
+using AutoMapper;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Publishing;
+using Umbraco.Core.Services;
+using Umbraco.Web.Models;
+using Umbraco.Web.Models.ContentEditing;
+using Umbraco.Web.Models.Mapping;
+using Umbraco.Web.Mvc;
+using Umbraco.Web.Security;
+using Umbraco.Web.WebApi;
+using Umbraco.Web.WebApi.Binders;
+using Umbraco.Web.WebApi.Filters;
+using umbraco;
+using Umbraco.Core.Models;
+using Umbraco.Core.Dynamics;
+using umbraco.BusinessLogic.Actions;
+using umbraco.cms.businesslogic.web;
+using umbraco.presentation.preview;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Web.UI;
+using Constants = Umbraco.Core.Constants;
+using Notification = Umbraco.Web.Models.ContentEditing.Notification;
+
+namespace Umbraco.Web.Editors
+{
+    /// &lt;summary&gt;
+    /// The API controller used for editing content
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// This controller is decorated with the UmbracoApplicationAuthorizeAttribute which means that any user requesting
+    /// access to ALL of the methods on this controller will need access to the content application.
+    /// &lt;/remarks&gt;
+    [PluginController(&quot;UmbracoApi&quot;)]
+    [UmbracoApplicationAuthorizeAttribute(Constants.Applications.Content)]
+    public class ContentController : ContentControllerBase
+    {
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        public ContentController()
+                : this(UmbracoContext.Current)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbracoContext&quot;&gt;&lt;/param&gt;
+        public ContentController(UmbracoContext umbracoContext)
+                : base(umbracoContext)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Return content for the specified ids
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ids&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [FilterAllowedOutgoingContent(typeof(IEnumerable&lt;ContentItemDisplay&gt;))]
+        public IEnumerable&lt;ContentItemDisplay&gt; GetByIds([FromUri]int[] ids)
+        {
+            var foundContent = Services.ContentService.GetByIds(ids);
+            return foundContent.Select(Mapper.Map&lt;IContent, ContentItemDisplay&gt;);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns an item to be used to display the recycle bin for content
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public ContentItemDisplay GetRecycleBin()
+        {
+            var display = new ContentItemDisplay
+            {
+                Id = Constants.System.RecycleBinContent,
+                Alias = &quot;recycleBin&quot;,
+                ParentId = -1,
+                Name = Services.TextService.Localize(&quot;general/recycleBin&quot;),
+                ContentTypeAlias = &quot;recycleBin&quot;,
+                CreateDate = DateTime.Now,
+                IsContainer = true,
+                Path = &quot;-1,&quot; + Constants.System.RecycleBinContent
+            };
+
+            TabsAndPropertiesResolver.AddListView(display, &quot;content&quot;, Services.DataTypeService, Services.TextService);
+
+            return display;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the content json for the content id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [OutgoingEditorModelEvent]
+        [EnsureUserPermissionForContent(&quot;id&quot;)]
+        public ContentItemDisplay GetById(int id)
+        {
+            var foundContent = GetObjectFromRequest(() =&gt; Services.ContentService.GetById(id));
+            if (foundContent == null)
+            {
+                HandleContentNotFound(id);
+            }
+
+            var content = Mapper.Map&lt;IContent, ContentItemDisplay&gt;(foundContent);
+            return content;
+        }
+
+        [EnsureUserPermissionForContent(&quot;id&quot;)]
+        public ContentItemDisplay GetWithTreeDefinition(int id)
+        {
+            var foundContent = GetObjectFromRequest(() =&gt; Services.ContentService.GetById(id));
+            if (foundContent == null)
+            {
+                HandleContentNotFound(id);
+            }
+
+            var content = Mapper.Map&lt;IContent, ContentItemDisplay&gt;(foundContent);
+            return content;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an empty content item for the 
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentTypeAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// If this is a container type, we&#39;ll remove the umbContainerView tab for a new item since
+        /// it cannot actually list children if it doesn&#39;t exist yet.
+        /// &lt;/returns&gt;
+        [OutgoingEditorModelEvent]
+        public ContentItemDisplay GetEmpty(string contentTypeAlias, int parentId)
+        {
+            var contentType = Services.ContentTypeService.GetContentType(contentTypeAlias);
+            if (contentType == null)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+
+            var emptyContent = Services.ContentService.CreateContent(&quot;&quot;, parentId, contentType.Alias, UmbracoUser.Id);
+            var mapped = Mapper.Map&lt;IContent, ContentItemDisplay&gt;(emptyContent);
+
+            //remove this tab if it exists: umbContainerView
+            var containerTab = mapped.Tabs.FirstOrDefault(x =&gt; x.Alias == Constants.Conventions.PropertyGroups.ListViewGroupName);
+            mapped.Tabs = mapped.Tabs.Except(new[] { containerTab });
+            return mapped;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the Url for a given node ID
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public HttpResponseMessage GetNiceUrl(int id)
+        {
+            var url = Umbraco.NiceUrl(id);
+            var response = Request.CreateResponse(HttpStatusCode.OK);
+            response.Content = new StringContent(url, Encoding.UTF8, &quot;application/json&quot;);
+            return response;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the children for the content id passed in
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;        
+        [FilterAllowedOutgoingContent(typeof(IEnumerable&lt;ContentItemBasic&lt;ContentPropertyBasic, IContent&gt;&gt;), &quot;Items&quot;)]
+        public PagedResult&lt;ContentItemBasic&lt;ContentPropertyBasic, IContent&gt;&gt; GetChildren(
+                int id,
+                int pageNumber = 0,  //TODO: This should be &#39;1&#39; as it&#39;s not the index
+                int pageSize = 0,
+                string orderBy = &quot;SortOrder&quot;,
+                Direction orderDirection = Direction.Ascending,
+                bool orderBySystemField = true,
+                string filter = &quot;&quot;)
+        {            
+            long totalChildren;
+            IContent[] children;
+            if (pageNumber &gt; 0 &amp;&amp; pageSize &gt; 0)
+            {
+                children = Services.ContentService
+                 .GetPagedChildren(id, (pageNumber - 1), pageSize, out totalChildren
+                 , orderBy, orderDirection, orderBySystemField, filter).ToArray();
+            }
+            else
+            {
+                children = Services.ContentService.GetChildren(id).ToArray();
+                totalChildren = children.Length;
+            }
+
+            if (totalChildren == 0)
+            {
+                return new PagedResult&lt;ContentItemBasic&lt;ContentPropertyBasic, IContent&gt;&gt;(0, 0, 0);
+            }
+
+            var pagedResult = new PagedResult&lt;ContentItemBasic&lt;ContentPropertyBasic, IContent&gt;&gt;(totalChildren, pageNumber, pageSize);
+            pagedResult.Items = children
+                    .Select(Mapper.Map&lt;IContent, ContentItemBasic&lt;ContentPropertyBasic, IContent&gt;&gt;);
+
+            return pagedResult;
+        }
+
+        [Obsolete(&quot;Dont use this, it is incorrectly named, use HasPermission instead&quot;)]
+        public bool GetHasPermission(string permissionToCheck, int nodeId)
+        {
+            return HasPermission(permissionToCheck, nodeId);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns permissions for all nodes passed in for the current user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;nodeIds&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpPost]
+        public Dictionary&lt;int, string[]&gt; GetPermissions(int[] nodeIds)
+        {
+            return Services.UserService
+                    .GetPermissions(Security.CurrentUser, nodeIds)
+                    .ToDictionary(x =&gt; x.EntityId, x =&gt; x.AssignedPermissions);
+        }
+
+        [HttpGet]
+        public bool HasPermission(string permissionToCheck, int nodeId)
+        {
+            var p = Services.UserService.GetPermissions(Security.CurrentUser, nodeId).FirstOrDefault();
+            if (p != null &amp;&amp; p.AssignedPermissions.Contains(permissionToCheck.ToString(CultureInfo.InvariantCulture)))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        /// &lt;summary&gt;
+        /// Saves content
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [FileUploadCleanupFilter]
+        [ContentPostValidate]
+        public ContentItemDisplay PostSave(
+                [ModelBinder(typeof(ContentItemBinder))]
+                                ContentItemSave contentItem)
+        {
+            //If we&#39;ve reached here it means:
+            // * Our model has been bound
+            // * and validated
+            // * any file attachments have been saved to their temporary location for us to use
+            // * we have a reference to the DTO object and the persisted object
+            // * Permissions are valid
+
+            MapPropertyValues(contentItem);
+
+            //We need to manually check the validation results here because:
+            // * We still need to save the entity even if there are validation value errors
+            // * Depending on if the entity is new, and if there are non property validation errors (i.e. the name is null)
+            //      then we cannot continue saving, we can only display errors
+            // * If there are validation errors and they were attempting to publish, we can only save, NOT publish and display 
+            //      a message indicating this
+            if (ModelState.IsValid == false)
+            {
+                if (ValidationHelper.ModelHasRequiredForPersistenceErrors(contentItem) &amp;&amp; IsCreatingAction(contentItem.Action))
+                {
+                    //ok, so the absolute mandatory data is invalid and it&#39;s new, we cannot actually continue!
+                    // add the modelstate to the outgoing object and throw a validation message
+                    var forDisplay = Mapper.Map&lt;IContent, ContentItemDisplay&gt;(contentItem.PersistedContent);
+                    forDisplay.Errors = ModelState.ToErrorDictionary();
+                    throw new HttpResponseException(Request.CreateValidationErrorResponse(forDisplay));
+
+                }
+
+                //if the model state is not valid we cannot publish so change it to save
+                switch (contentItem.Action)
+                {
+                    case ContentSaveAction.Publish:
+                        contentItem.Action = ContentSaveAction.Save;
+                        break;
+                    case ContentSaveAction.PublishNew:
+                        contentItem.Action = ContentSaveAction.SaveNew;
+                        break;
+                }
+            }
+
+            //initialize this to successful
+            var publishStatus = Attempt&lt;PublishStatus&gt;.Succeed();
+            var wasCancelled = false;
+
+            if (contentItem.Action == ContentSaveAction.Save || contentItem.Action == ContentSaveAction.SaveNew)
+            {
+                //save the item
+                var saveResult = Services.ContentService.WithResult().Save(contentItem.PersistedContent, Security.CurrentUser.Id);
+
+                wasCancelled = saveResult.Success == false &amp;&amp; saveResult.Result.StatusType == OperationStatusType.FailedCancelledByEvent;
+            }
+            else if (contentItem.Action == ContentSaveAction.SendPublish || contentItem.Action == ContentSaveAction.SendPublishNew)
+            {
+                var sendResult = Services.ContentService.SendToPublication(contentItem.PersistedContent, Security.CurrentUser.Id);
+                wasCancelled = sendResult == false;
+            }
+            else
+            {
+                //publish the item and check if it worked, if not we will show a diff msg below
+                publishStatus = Services.ContentService.SaveAndPublishWithStatus(contentItem.PersistedContent, Security.CurrentUser.Id);
+                wasCancelled = publishStatus.Result.StatusType == PublishStatusType.FailedCancelledByEvent;
+            }
+
+            //return the updated model
+            var display = Mapper.Map&lt;IContent, ContentItemDisplay&gt;(contentItem.PersistedContent);
+
+            //lasty, if it is not valid, add the modelstate to the outgoing object and throw a 403
+            HandleInvalidModelState(display);
+
+            //put the correct msgs in 
+            switch (contentItem.Action)
+            {
+                case ContentSaveAction.Save:
+                case ContentSaveAction.SaveNew:
+                    if (wasCancelled == false)
+                    {
+                        display.AddSuccessNotification(
+                                Services.TextService.Localize(&quot;speechBubbles/editContentSavedHeader&quot;),
+                                Services.TextService.Localize(&quot;speechBubbles/editContentSavedText&quot;));
+                    }
+                    else
+                    {
+                        AddCancelMessage(display);
+                    }
+                    break;
+                case ContentSaveAction.SendPublish:
+                case ContentSaveAction.SendPublishNew:
+                    if (wasCancelled == false)
+                    {
+                        display.AddSuccessNotification(
+                                Services.TextService.Localize(&quot;speechBubbles/editContentSendToPublish&quot;),
+                                Services.TextService.Localize(&quot;speechBubbles/editContentSendToPublishText&quot;));
+                    }
+                    else
+                    {
+                        AddCancelMessage(display);
+                    }
+                    break;
+                case ContentSaveAction.Publish:
+                case ContentSaveAction.PublishNew:
+                    ShowMessageForPublishStatus(publishStatus.Result, display);
+                    break;
+            }
+
+            UpdatePreviewContext(contentItem.PersistedContent.Id);
+
+            //If the item is new and the operation was cancelled, we need to return a different
+            // status code so the UI can handle it since it won&#39;t be able to redirect since there
+            // is no Id to redirect to!
+            if (wasCancelled &amp;&amp; IsCreatingAction(contentItem.Action))
+            {
+                throw new HttpResponseException(Request.CreateValidationErrorResponse(display));
+            }
+
+            return display;
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a document with a given ID
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// The CanAccessContentAuthorize attribute will deny access to this method if the current user
+        /// does not have Publish access to this node.
+        /// &lt;/remarks&gt;
+        /// 
+        [EnsureUserPermissionForContent(&quot;id&quot;, &#39;U&#39;)]
+        public HttpResponseMessage PostPublishById(int id)
+        {
+            var foundContent = GetObjectFromRequest(() =&gt; Services.ContentService.GetById(id));
+
+            if (foundContent == null)
+            {
+                return HandleContentNotFound(id, false);
+            }
+
+            var publishResult = Services.ContentService.PublishWithStatus(foundContent, Security.GetUserId());
+            if (publishResult.Success == false)
+            {
+                var notificationModel = new SimpleNotificationModel();
+                ShowMessageForPublishStatus(publishResult.Result, notificationModel);
+                return Request.CreateValidationErrorResponse(notificationModel);
+            }
+
+            //return ok
+            return Request.CreateResponse(HttpStatusCode.OK);
+
+        }
+
+        /// &lt;summary&gt;
+        /// Moves an item to the recycle bin, if it is already there then it will permanently delete it
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// The CanAccessContentAuthorize attribute will deny access to this method if the current user
+        /// does not have Delete access to this node.
+        /// &lt;/remarks&gt;
+        [EnsureUserPermissionForContent(&quot;id&quot;, &#39;D&#39;)]
+        [HttpDelete]
+        [HttpPost]
+        public HttpResponseMessage DeleteById(int id)
+        {
+            var foundContent = GetObjectFromRequest(() =&gt; Services.ContentService.GetById(id));
+
+            if (foundContent == null)
+            {
+                return HandleContentNotFound(id, false);
+            }
+
+            //if the current item is in the recycle bin
+            if (foundContent.IsInRecycleBin() == false)
+            {
+                var moveResult = Services.ContentService.WithResult().MoveToRecycleBin(foundContent, Security.GetUserId());
+                if (moveResult == false)
+                {
+                    //returning an object of INotificationModel will ensure that any pending 
+                    // notification messages are added to the response.
+                    return Request.CreateValidationErrorResponse(new SimpleNotificationModel());
+                }
+            }
+            else
+            {
+                var deleteResult = Services.ContentService.WithResult().Delete(foundContent, Security.GetUserId());
+                if (deleteResult == false)
+                {
+                    //returning an object of INotificationModel will ensure that any pending 
+                    // notification messages are added to the response.
+                    return Request.CreateValidationErrorResponse(new SimpleNotificationModel());
+                }
+            }
+
+            return Request.CreateResponse(HttpStatusCode.OK);
+        }
+
+        /// &lt;summary&gt;
+        /// Empties the recycle bin
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// attributed with EnsureUserPermissionForContent to verify the user has access to the recycle bin
+        /// &lt;/remarks&gt;
+        [HttpDelete]
+        [HttpPost]
+        [EnsureUserPermissionForContent(Constants.System.RecycleBinContent)]
+        public HttpResponseMessage EmptyRecycleBin()
+        {
+            Services.ContentService.EmptyRecycleBin();
+
+            return Request.CreateNotificationSuccessResponse(Services.TextService.Localize(&quot;defaultdialogs/recycleBinIsEmpty&quot;));
+        }
+
+        /// &lt;summary&gt;
+        /// Change the sort order for content
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sorted&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [EnsureUserPermissionForContent(&quot;sorted.ParentId&quot;, &#39;S&#39;)]
+        public HttpResponseMessage PostSort(ContentSortOrder sorted)
+        {
+            if (sorted == null)
+            {
+                return Request.CreateResponse(HttpStatusCode.NotFound);
+            }
+
+            //if there&#39;s nothing to sort just return ok
+            if (sorted.IdSortOrder.Length == 0)
+            {
+                return Request.CreateResponse(HttpStatusCode.OK);
+            }
+
+            try
+            {
+                var contentService = Services.ContentService;
+
+                // content service GetByIds does order the content items based on the order of Ids passed in
+                var content = contentService.GetByIds(sorted.IdSortOrder);
+
+                // Save content with new sort order and update content xml in db accordingly
+                if (contentService.Sort(content) == false)
+                {
+                    LogHelper.Warn&lt;ContentController&gt;(&quot;Content sorting failed, this was probably caused by an event being cancelled&quot;);
+                    return Request.CreateValidationErrorResponse(&quot;Content sorting failed, this was probably caused by an event being cancelled&quot;);
+                }
+                return Request.CreateResponse(HttpStatusCode.OK);
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Error&lt;ContentController&gt;(&quot;Could not update content sort order&quot;, ex);
+                throw;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Change the sort order for media
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;move&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [EnsureUserPermissionForContent(&quot;move.ParentId&quot;, &#39;M&#39;)]
+        public HttpResponseMessage PostMove(MoveOrCopy move)
+        {
+            var toMove = ValidateMoveOrCopy(move);
+
+            Services.ContentService.Move(toMove, move.ParentId);
+
+            var response = Request.CreateResponse(HttpStatusCode.OK);
+            response.Content = new StringContent(toMove.Path, Encoding.UTF8, &quot;application/json&quot;);
+            return response;
+        }
+
+        /// &lt;summary&gt;
+        /// Copies a content item and places the copy as a child of a given parent Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;copy&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [EnsureUserPermissionForContent(&quot;copy.ParentId&quot;, &#39;C&#39;)]
+        public HttpResponseMessage PostCopy(MoveOrCopy copy)
+        {
+            var toCopy = ValidateMoveOrCopy(copy);
+
+            var c = Services.ContentService.Copy(toCopy, copy.ParentId, copy.RelateToOriginal, copy.Recursive);
+
+            var response = Request.CreateResponse(HttpStatusCode.OK);
+            response.Content = new StringContent(c.Path, Encoding.UTF8, &quot;application/json&quot;);
+            return response;
+        }
+
+        /// &lt;summary&gt;
+        /// Unpublishes a node with a given Id and returns the unpublished entity
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [EnsureUserPermissionForContent(&quot;id&quot;, &#39;U&#39;)]
+        public ContentItemDisplay PostUnPublish(int id)
+        {
+            var foundContent = GetObjectFromRequest(() =&gt; Services.ContentService.GetById(id));
+
+            if (foundContent == null)
+                HandleContentNotFound(id);
+
+            var unpublishResult = Services.ContentService.WithResult().UnPublish(foundContent, Security.CurrentUser.Id);
+
+            var content = Mapper.Map&lt;IContent, ContentItemDisplay&gt;(foundContent);
+
+            if (unpublishResult == false)
+            {
+                AddCancelMessage(content);
+                throw new HttpResponseException(Request.CreateValidationErrorResponse(content));
+            }
+            else
+            {
+                content.AddSuccessNotification(Services.TextService.Localize(&quot;content/unPublish&quot;), Services.TextService.Localize(&quot;speechBubbles/contentUnpublished&quot;));
+                return content;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the user is currently in preview mode and if so will update the preview content for this item
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentId&quot;&gt;&lt;/param&gt;
+        private void UpdatePreviewContext(int contentId)
+        {
+            var previewId = Request.GetPreviewCookieValue();
+            if (previewId.IsNullOrWhiteSpace()) return;
+            Guid id;
+            if (Guid.TryParse(previewId, out id))
+            {
+                var d = new Document(contentId);
+                var pc = new PreviewContent(UmbracoUser, id, false);
+                pc.PrepareDocument(UmbracoUser, d, true);
+                pc.SavePreviewSet();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Maps the dto property values to the persisted model
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentItem&quot;&gt;&lt;/param&gt;
+        private void MapPropertyValues(ContentItemSave contentItem)
+        {
+            UpdateName(contentItem);
+
+            //TODO: We need to support &#39;send to publish&#39;
+
+            contentItem.PersistedContent.ExpireDate = contentItem.ExpireDate;
+            contentItem.PersistedContent.ReleaseDate = contentItem.ReleaseDate;
+            //only set the template if it didn&#39;t change
+            var templateChanged = (contentItem.PersistedContent.Template == null &amp;&amp; contentItem.TemplateAlias.IsNullOrWhiteSpace() == false)
+                                                        || (contentItem.PersistedContent.Template != null &amp;&amp; contentItem.PersistedContent.Template.Alias != contentItem.TemplateAlias)
+                                                        || (contentItem.PersistedContent.Template != null &amp;&amp; contentItem.TemplateAlias.IsNullOrWhiteSpace());
+            if (templateChanged)
+            {
+                var template = Services.FileService.GetTemplate(contentItem.TemplateAlias);
+                if (template == null &amp;&amp; contentItem.TemplateAlias.IsNullOrWhiteSpace() == false)
+                {
+                    //ModelState.AddModelError(&quot;Template&quot;, &quot;No template exists with the specified alias: &quot; + contentItem.TemplateAlias);
+                    LogHelper.Warn&lt;ContentController&gt;(&quot;No template exists with the specified alias: &quot; + contentItem.TemplateAlias);
+                }
+                else
+                {
+                    //NOTE: this could be null if there was a template and the posted template is null, this should remove the assigned template
+                    contentItem.PersistedContent.Template = template;
+                }
+            }
+
+            base.MapPropertyValues(contentItem);
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures the item can be moved/copied to the new location
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IContent ValidateMoveOrCopy(MoveOrCopy model)
+        {
+            if (model == null)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+
+            var contentService = Services.ContentService;
+            var toMove = contentService.GetById(model.Id);
+            if (toMove == null)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+            if (model.ParentId &lt; 0)
+            {
+                //cannot move if the content item is not allowed at the root
+                if (toMove.ContentType.AllowedAsRoot == false)
+                {
+                    throw new HttpResponseException(
+                            Request.CreateNotificationValidationErrorResponse(
+                                    Services.TextService.Localize(&quot;moveOrCopy/notAllowedAtRoot&quot;)));
+                }
+            }
+            else
+            {
+                var parent = contentService.GetById(model.ParentId);
+                if (parent == null)
+                {
+                    throw new HttpResponseException(HttpStatusCode.NotFound);
+                }
+
+                //check if the item is allowed under this one
+                if (parent.ContentType.AllowedContentTypes.Select(x =&gt; x.Id).ToArray()
+                        .Any(x =&gt; x.Value == toMove.ContentType.Id) == false)
+                {
+                    throw new HttpResponseException(
+                            Request.CreateNotificationValidationErrorResponse(
+                                    Services.TextService.Localize(&quot;moveOrCopy/notAllowedByContentType&quot;)));
+                }
+
+                // Check on paths
+                if ((string.Format(&quot;,{0},&quot;, parent.Path)).IndexOf(string.Format(&quot;,{0},&quot;, toMove.Id), StringComparison.Ordinal) &gt; -1)
+                {
+                    throw new HttpResponseException(
+                            Request.CreateNotificationValidationErrorResponse(
+                                    Services.TextService.Localize(&quot;moveOrCopy/notAllowedByPath&quot;)));
+                }
+            }
+
+            return toMove;
+        }
+
+        private void ShowMessageForPublishStatus(PublishStatus status, INotificationModel display)
+        {
+            switch (status.StatusType)
+            {
+                case PublishStatusType.Success:
+                case PublishStatusType.SuccessAlreadyPublished:
+                    display.AddSuccessNotification(
+                            Services.TextService.Localize(&quot;speechBubbles/editContentPublishedHeader&quot;),
+                            Services.TextService.Localize(&quot;speechBubbles/editContentPublishedText&quot;));
+                    break;
+                case PublishStatusType.FailedPathNotPublished:
+                    display.AddWarningNotification(
+                            Services.TextService.Localize(&quot;publish&quot;),
+                            Services.TextService.Localize(&quot;publish/contentPublishedFailedByParent&quot;,
+                                    new[] { string.Format(&quot;{0} ({1})&quot;, status.ContentItem.Name, status.ContentItem.Id) }).Trim());
+                    break;
+                case PublishStatusType.FailedCancelledByEvent:
+                    AddCancelMessage(display, &quot;publish&quot;, &quot;speechBubbles/contentPublishedFailedByEvent&quot;);
+                    break;
+                case PublishStatusType.FailedAwaitingRelease:
+                    display.AddWarningNotification(
+                            Services.TextService.Localize(&quot;publish&quot;),
+                            Services.TextService.Localize(&quot;publish/contentPublishedFailedAwaitingRelease&quot;,
+                                    new[] { string.Format(&quot;{0} ({1})&quot;, status.ContentItem.Name, status.ContentItem.Id) }).Trim());
+                    break;
+                case PublishStatusType.FailedHasExpired:
+                    display.AddWarningNotification(
+                            Services.TextService.Localize(&quot;publish&quot;),
+                            Services.TextService.Localize(&quot;publish/contentPublishedFailedExpired&quot;,
+                                    new[]
+                                    {
+                                                                string.Format(&quot;{0} ({1})&quot;, status.ContentItem.Name, status.ContentItem.Id),
+                                    }).Trim());
+                    break;
+                case PublishStatusType.FailedIsTrashed:
+                    //TODO: We should add proper error messaging for this!
+                    break;
+                case PublishStatusType.FailedContentInvalid:
+                    display.AddWarningNotification(
+                            Services.TextService.Localize(&quot;publish&quot;),
+                            Services.TextService.Localize(&quot;publish/contentPublishedFailedInvalid&quot;,
+                                    new[]
+                                    {
+                                                                string.Format(&quot;{0} ({1})&quot;, status.ContentItem.Name, status.ContentItem.Id),
+                                                                string.Join(&quot;,&quot;, status.InvalidProperties.Select(x =&gt; x.Alias))
+                                    }).Trim());
+                    break;
+                default:
+                    throw new IndexOutOfRangeException();
+            }
+        }
+
+
+
+        /// &lt;summary&gt;
+        /// Performs a permissions check for the user to check if it has access to the node based on 
+        /// start node and/or permissions for the node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;storage&quot;&gt;The storage to add the content item to so it can be reused&lt;/param&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userService&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;contentService&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;nodeId&quot;&gt;The content to lookup, if the contentItem is not specified&lt;/param&gt;
+        /// &lt;param name=&quot;permissionsToCheck&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;contentItem&quot;&gt;Specifies the already resolved content item to check against&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static bool CheckPermissions(
+                IDictionary&lt;string, object&gt; storage,
+                IUser user,
+                IUserService userService,
+                IContentService contentService,
+                int nodeId,
+                char[] permissionsToCheck = null,
+                IContent contentItem = null)
+        {
+
+            if (contentItem == null &amp;&amp; nodeId != Constants.System.Root &amp;&amp; nodeId != Constants.System.RecycleBinContent)
+            {
+                contentItem = contentService.GetById(nodeId);
+                //put the content item into storage so it can be retreived 
+                // in the controller (saves a lookup)
+                storage[typeof(IContent).ToString()] = contentItem;
+            }
+
+            if (contentItem == null &amp;&amp; nodeId != Constants.System.Root &amp;&amp; nodeId != Constants.System.RecycleBinContent)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+
+            var hasPathAccess = (nodeId == Constants.System.Root)
+                                                            ? UserExtensions.HasPathAccess(
+                                                                    Constants.System.Root.ToInvariantString(),
+                                                                    user.StartContentId,
+                                                                    Constants.System.RecycleBinContent)
+                                                            : (nodeId == Constants.System.RecycleBinContent)
+                                                                        ? UserExtensions.HasPathAccess(
+                                                                                Constants.System.RecycleBinContent.ToInvariantString(),
+                                                                                user.StartContentId,
+                                                                                Constants.System.RecycleBinContent)
+                                                                        : user.HasPathAccess(contentItem);
+
+            if (hasPathAccess == false)
+            {
+                return false;
+            }
+
+            if (permissionsToCheck == null || permissionsToCheck.Any() == false)
+            {
+                return true;
+            }
+
+            var permission = userService.GetPermissions(user, nodeId).FirstOrDefault();
+
+            var allowed = true;
+            foreach (var p in permissionsToCheck)
+            {
+                if (permission == null || permission.AssignedPermissions.Contains(p.ToString(CultureInfo.InvariantCulture)) == false)
+                {
+                    allowed = false;
+                }
+            }
+            return allowed;
+        }
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[56,19,56,47,0],[57,9,57,10,0],[58,9,58,10,0],[65,19,65,39,0],[66,9,66,10,0],[67,9,67,10,0],[76,9,76,10,0],[77,13,77,70,0],[78,13,78,82,0],[79,9,79,10,0],[86,9,86,10,0],[87,13,97,15,0],[99,13,99,119,0],[101,13,101,28,0],[102,9,102,10,0],[112,9,112,10,0],[113,13,113,59,0],[113,59,113,94,0],[113,94,113,96,0],[113,13,113,96,0],[114,13,114,38,0],[115,13,115,14,0],[116,17,116,43,0],[117,13,117,14,0],[119,13,119,82,0],[120,13,120,28,0],[121,9,121,10,0],[125,9,125,10,0],[126,13,126,59,0],[126,59,126,94,0],[126,94,126,96,0],[126,13,126,96,0],[127,13,127,38,0],[128,13,128,14,0],[129,17,129,43,0],[130,13,130,14,0],[132,13,132,82,0],[133,13,133,28,0],[134,9,134,10,0],[147,9,147,10,0],[148,13,148,92,0],[149,13,149,37,0],[150,13,150,14,0],[151,17,151,74,0],[154,13,154,119,0],[155,13,155,81,0],[158,13,158,64,0],[158,64,158,129,0],[158,129,158,131,0],[158,13,158,131,0],[159,13,159,70,0],[160,13,160,27,0],[161,9,161,10,0],[169,9,169,10,0],[170,13,170,43,0],[171,13,171,70,0],[172,13,172,90,0],[173,13,173,29,0],[174,9,174,10,0],[189,9,189,10,0],[192,13,192,48,0],[193,13,193,14,0],[194,17,196,83,0],[197,13,197,14,0],[199,13,199,14,0],[200,17,200,78,0],[201,17,201,49,0],[202,13,202,14,0],[204,13,204,36,0],[205,13,205,14,0],[206,17,206,99,0],[209,13,209,134,0],[210,13,211,101,0],[213,13,213,32,0],[214,9,214,10,0],[218,9,218,10,0],[219,13,219,61,0],[220,9,220,10,0],[229,9,229,10,0],[230,13,232,40,0],[232,40,232,50,0],[232,50,232,57,0],[232,57,232,78,0],[232,78,232,80,0],[230,13,232,80,0],[233,9,233,10,0],[237,9,237,10,0],[238,13,238,104,0],[239,13,239,119,0],[240,13,240,14,0],[241,17,241,29,0],[244,13,244,26,0],[245,9,245,10,0],[256,9,256,10,0],[264,13,264,44,0],[272,13,272,45,0],[273,13,273,14,0],[274,17,274,128,0],[275,17,275,18,0],[278,21,278,109,0],[279,21,279,72,0],[280,21,280,104,0],[285,17,285,44,0],[288,25,288,69,0],[289,25,289,31,0],[291,25,291,72,0],[292,25,292,31,0],[294,13,294,14,0],[297,13,297,66,0],[298,13,298,38,0],[300,13,300,113,0],[301,13,301,14,0],[303,17,303,131,0],[305,17,305,138,0],[306,13,306,14,0],[307,18,307,132,0],[308,13,308,14,0],[309,17,309,131,0],[310,17,310,52,0],[311,13,311,14,0],[313,13,313,14,0],[315,17,315,137,0],[316,17,316,108,0],[317,13,317,14,0],[320,13,320,98,0],[323,13,323,46,0],[326,13,326,40,0],[330,21,330,47,0],[331,21,331,22,0],[332,25,334,102,0],[335,21,335,22,0],[337,21,337,22,0],[338,25,338,51,0],[339,21,339,22,0],[340,21,340,27,0],[343,21,343,47,0],[344,21,344,22,0],[345,25,347,110,0],[348,21,348,22,0],[350,21,350,22,0],[351,25,351,51,0],[352,21,352,22,0],[353,21,353,27,0],[356,21,356,80,0],[357,21,357,27,0],[360,13,360,67,0],[365,13,365,70,0],[366,13,366,14,0],[367,17,367,97,0],[370,13,370,28,0],[371,9,371,10,0],[385,9,385,10,0],[386,13,386,59,0],[386,59,386,94,0],[386,94,386,96,0],[386,13,386,96,0],[388,13,388,38,0],[389,13,389,14,0],[390,17,390,57,0],[393,13,393,111,0],[394,13,394,48,0],[395,13,395,14,0],[396,17,396,71,0],[397,17,397,86,0],[398,17,398,81,0],[402,13,402,62,0],[404,9,404,10,0],[419,9,419,10,0],[420,13,420,59,0],[420,59,420,94,0],[420,94,420,96,0],[420,13,420,96,0],[422,13,422,38,0],[423,13,423,14,0],[424,17,424,57,0],[428,13,428,56,0],[429,13,429,14,0],[430,17,430,124,0],[431,17,431,41,0],[432,17,432,18,0],[435,21,435,97,0],[437,13,437,14,0],[439,13,439,14,0],[440,17,440,116,0],[441,17,441,43,0],[442,17,442,18,0],[445,21,445,97,0],[447,13,447,14,0],[449,13,449,62,0],[450,9,450,10,0],[463,9,463,10,0],[464,13,464,55,0],[466,13,466,129,0],[467,9,467,10,0],[476,9,476,10,0],[477,13,477,32,0],[478,13,478,14,0],[479,17,479,72,0],[483,13,483,48,0],[484,13,484,14,0],[485,17,485,66,0],[489,13,489,14,0],[490,17,490,62,0],[493,17,493,75,0],[496,17,496,59,0],[497,17,497,18,0],[498,21,498,135,0],[499,21,499,146,0],[501,17,501,66,0],[503,13,503,33,0],[504,13,504,14,0],[505,17,505,95,0],[506,17,506,23,0],[508,9,508,10,0],[517,9,517,10,0],[518,13,518,51,0],[520,13,520,65,0],[522,13,522,70,0],[523,13,523,98,0],[524,13,524,29,0],[525,9,525,10,0],[534,9,534,10,0],[535,13,535,51,0],[537,13,537,112,0],[539,13,539,70,0],[540,13,540,93,0],[541,13,541,29,0],[542,9,542,10,0],[551,9,551,10,0],[552,13,552,59,0],[552,59,552,94,0],[552,94,552,96,0],[552,13,552,96,0],[554,13,554,38,0],[555,17,555,43,0],[557,13,557,121,0],[559,13,559,82,0],[561,13,561,42,0],[562,13,562,14,0],[563,17,563,43,0],[564,17,564,97,0],[567,13,567,14,0],[568,17,568,167,0],[569,17,569,32,0],[571,9,571,10,0],[578,9,578,10,0],[579,13,579,61,0],[580,13,580,48,0],[580,49,580,56,0],[582,13,582,50,0],[583,13,583,14,0],[584,17,584,49,0],[585,17,585,69,0],[586,17,586,58,0],[587,17,587,37,0],[588,13,588,14,0],[589,9,589,10,0],[596,9,596,10,0],[597,13,597,37,0],[601,13,601,78,0],[602,13,602,80,0],[604,13,606,158,0],[607,13,607,33,0],[608,13,608,14,0],[609,17,609,92,0],[610,17,610,97,0],[611,17,611,18,0],[613,21,613,132,0],[614,17,614,18,0],[616,17,616,18,0],[618,21,618,70,0],[619,17,619,18,0],[620,13,620,14,0],[622,13,622,49,0],[623,9,623,10,0],[631,9,631,10,0],[632,13,632,31,0],[633,13,633,14,0],[634,17,634,74,0],[637,13,637,58,0],[638,13,638,59,0],[639,13,639,32,0],[640,13,640,14,0],[641,17,641,74,0],[643,13,643,36,0],[644,13,644,14,0],[646,17,646,63,0],[647,17,647,18,0],[648,21,650,100,0],[652,13,652,14,0],[654,13,654,14,0],[655,17,655,69,0],[656,17,656,36,0],[657,17,657,18,0],[658,21,658,78,0],[662,17,662,72,0],[662,72,662,76,0],[662,76,663,35,0],[663,35,663,67,0],[663,67,663,78,0],[662,17,663,78,0],[664,17,664,18,0],[665,21,667,107,0],[671,17,671,133,0],[672,17,672,18,0],[673,21,675,100,0],[677,13,677,14,0],[679,13,679,27,0],[680,9,680,10,0],[683,9,683,10,0],[684,13,684,39,0],[688,21,690,102,0],[691,21,691,27,0],[693,21,696,131,0],[697,21,697,27,0],[699,21,699,105,0],[700,21,700,27,0],[702,21,705,131,0],[706,21,706,27,0],[708,21,714,48,0],[715,21,715,27,0],[718,21,718,27,0],[720,21,726,119,0],[726,119,726,126,0],[726,126,727,48,0],[720,21,727,48,0],[728,21,728,27,0],[730,21,730,58,0],[732,9,732,10,0],[756,9,756,10,1],[758,13,758,120,1],[759,13,759,14,1],[760,17,760,62,1],[763,17,763,68,1],[764,13,764,14,1],[766,13,766,120,1],[767,13,767,14,1],[768,17,768,74,1],[771,13,781,107,1],[783,13,783,40,1],[784,13,784,14,1],[785,17,785,30,1],[788,13,788,81,1],[789,13,789,14,1],[790,17,790,29,1],[793,13,793,88,1],[795,13,795,32,1],[796,13,796,20,1],[796,22,796,27,1],[796,28,796,30,1],[796,31,796,49,1],[797,13,797,14,1],[798,17,798,134,1],[799,17,799,18,1],[800,21,800,37,1],[801,17,801,18,1],[802,13,802,14,1],[803,13,803,28,1],[804,9,804,10,1]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Models\Mapping\PropertyTypeGroupResolver.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using AutoMapper;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core;
+using Umbraco.Core.Models;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Web.Models.ContentEditing;
+
+namespace Umbraco.Web.Models.Mapping
+{
+    internal class PropertyTypeGroupResolver&lt;TPropertyType&gt; : ValueResolver&lt;IContentTypeComposition, IEnumerable&lt;PropertyGroupDisplay&lt;TPropertyType&gt;&gt;&gt; 
+        where TPropertyType : PropertyTypeDisplay, new()
+    {
+        private readonly ApplicationContext _applicationContext;
+        private readonly Lazy&lt;PropertyEditorResolver&gt; _propertyEditorResolver;
+
+        public PropertyTypeGroupResolver(ApplicationContext applicationContext, Lazy&lt;PropertyEditorResolver&gt; propertyEditorResolver)
+        {
+            _applicationContext = applicationContext;
+            _propertyEditorResolver = propertyEditorResolver;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the content type that defines a property group, within a composition.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentType&quot;&gt;The composition.&lt;/param&gt;
+        /// &lt;param name=&quot;propertyGroupId&quot;&gt;The identifier of the property group.&lt;/param&gt;
+        /// &lt;returns&gt;The composition content type that defines the specified property group.&lt;/returns&gt;
+        private static IContentTypeComposition GetContentTypeForPropertyGroup(IContentTypeComposition contentType, int propertyGroupId)
+        {
+            // test local groups
+            if (contentType.PropertyGroups.Any(x =&gt; x.Id == propertyGroupId))
+                return contentType;
+
+            // test composition types groups
+            // .ContentTypeComposition is just the local ones, not recursive,
+            // so we have to recurse here
+            return contentType.ContentTypeComposition
+                .Select(x =&gt; GetContentTypeForPropertyGroup(x, propertyGroupId))
+                .FirstOrDefault(x =&gt; x != null);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the content type that defines a property group, within a composition.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentType&quot;&gt;The composition.&lt;/param&gt;
+        /// &lt;param name=&quot;propertyTypeId&quot;&gt;The identifier of the property type.&lt;/param&gt;
+        /// &lt;returns&gt;The composition content type that defines the specified property group.&lt;/returns&gt;
+        private static IContentTypeComposition GetContentTypeForPropertyType(IContentTypeComposition contentType, int propertyTypeId)
+        {
+            // test local property types
+            if (contentType.PropertyTypes.Any(x =&gt; x.Id == propertyTypeId))
+                return contentType;
+
+            // test composition property types
+            // .ContentTypeComposition is just the local ones, not recursive,
+            // so we have to recurse here
+            return contentType.ContentTypeComposition
+                .Select(x =&gt; GetContentTypeForPropertyType(x, propertyTypeId))
+                .FirstOrDefault(x =&gt; x != null);
+        }
+
+        protected override IEnumerable&lt;PropertyGroupDisplay&lt;TPropertyType&gt;&gt; ResolveCore(IContentTypeComposition source)
+        {
+            // deal with groups
+            var groups = new List&lt;PropertyGroupDisplay&lt;TPropertyType&gt;&gt;();
+
+            // add groups local to this content type
+            foreach (var tab in source.PropertyGroups)
+            {
+                var group = new PropertyGroupDisplay&lt;TPropertyType&gt;
+                {
+                    Id = tab.Id,
+                    Inherited = false,
+                    Name = tab.Name,
+                    SortOrder = tab.SortOrder,
+                    ContentTypeId = source.Id
+                };
+
+                group.Properties = MapProperties(tab.PropertyTypes, source, tab.Id, false);
+                groups.Add(group);
+            }         
+
+            // add groups inherited through composition
+            var localGroupIds = groups.Select(x =&gt; x.Id).ToArray();
+            foreach (var tab in source.CompositionPropertyGroups)
+            {
+                // skip those that are local to this content type
+                if (localGroupIds.Contains(tab.Id)) continue;
+
+                // get the content type that defines this group
+                var definingContentType = GetContentTypeForPropertyGroup(source, tab.Id);
+                if (definingContentType == null) 
+                    throw new Exception(&quot;PropertyGroup with id=&quot; + tab.Id + &quot; was not found on any of the content type&#39;s compositions.&quot;);
+
+                var group = new PropertyGroupDisplay&lt;TPropertyType&gt;
+                {
+                    Id = tab.Id,
+                    Inherited = true,
+                    Name = tab.Name,
+                    SortOrder = tab.SortOrder,
+                    ContentTypeId = definingContentType.Id,
+                    ParentTabContentTypes = new[] { definingContentType.Id },
+                    ParentTabContentTypeNames = new[] { definingContentType.Name }
+                };
+
+                group.Properties = MapProperties(tab.PropertyTypes, definingContentType, tab.Id, true);
+                groups.Add(group);
+            }
+
+            // deal with generic properties
+            var genericProperties = new List&lt;TPropertyType&gt;();
+
+            // add generic properties local to this content type
+            var entityGenericProperties = source.PropertyTypes.Where(x =&gt; x.PropertyGroupId == null);
+            genericProperties.AddRange(MapProperties(entityGenericProperties, source, PropertyGroupBasic.GenericPropertiesGroupId, false));
+
+            // add generic properties inherited through compositions
+            var localGenericPropertyIds = genericProperties.Select(x =&gt; x.Id).ToArray();
+            var compositionGenericProperties = source.CompositionPropertyTypes
+                .Where(x =&gt; x.PropertyGroupId == null // generic
+                    &amp;&amp; localGenericPropertyIds.Contains(x.Id) == false); // skip those that are local
+            foreach (var compositionGenericProperty in compositionGenericProperties)
+            {
+                var definingContentType = GetContentTypeForPropertyType(source, compositionGenericProperty.Id);
+                if (definingContentType == null)
+                    throw new Exception(&quot;PropertyType with id=&quot; + compositionGenericProperty.Id + &quot; was not found on any of the content type&#39;s compositions.&quot;);
+                genericProperties.AddRange(MapProperties(new [] { compositionGenericProperty }, definingContentType, PropertyGroupBasic.GenericPropertiesGroupId, true));
+            }
+
+            // if there are any generic properties, add the corresponding tab
+            if (genericProperties.Any())
+            {
+                var genericTab = new PropertyGroupDisplay&lt;TPropertyType&gt;
+                {
+                    Id = PropertyGroupBasic.GenericPropertiesGroupId, 
+                    Name = &quot;Generic properties&quot;,
+                    ContentTypeId = source.Id, 
+                    SortOrder = 999,
+                    Inherited = false, 
+                    Properties = genericProperties
+                };
+                groups.Add(genericTab);
+            }
+
+            // handle locked properties
+            var lockedPropertyAliases = new List&lt;string&gt;();
+            // add built-in member property aliases to list of aliases to be locked
+            foreach (var propertyAlias in Constants.Conventions.Member.GetStandardPropertyTypeStubs().Keys)
+            {
+                lockedPropertyAliases.Add(propertyAlias);
+            }
+            // lock properties by aliases
+            foreach (var property in groups.SelectMany(x =&gt; x.Properties))
+            {
+                property.Locked = lockedPropertyAliases.Contains(property.Alias);
+            }
+
+            // now merge tabs based on names
+            // as for one name, we might have one local tab, plus some inherited tabs
+            var groupsGroupsByName = groups.GroupBy(x =&gt; x.Name).ToArray();
+            groups = new List&lt;PropertyGroupDisplay&lt;TPropertyType&gt;&gt;(); // start with a fresh list
+            foreach (var groupsByName in groupsGroupsByName)
+            {
+                // single group, just use it
+                if (groupsByName.Count() == 1)
+                {
+                    groups.Add(groupsByName.First());
+                    continue;
+                }
+
+                // multiple groups, merge
+                var group = groupsByName.FirstOrDefault(x =&gt; x.Inherited == false) // try local
+                    ?? groupsByName.First(); // else pick one randomly
+                groups.Add(group);
+
+                // in case we use the local one, flag as inherited
+                group.Inherited = true;
+
+                // merge (and sort) properties
+                var properties = groupsByName.SelectMany(x =&gt; x.Properties).OrderBy(x =&gt; x.SortOrder).ToArray();
+                group.Properties = properties;
+
+                // collect parent group info
+                var parentGroups = groupsByName.Where(x =&gt; x.ContentTypeId != source.Id).ToArray();
+                group.ParentTabContentTypes = parentGroups.SelectMany(x =&gt; x.ParentTabContentTypes).ToArray();
+                group.ParentTabContentTypeNames = parentGroups.SelectMany(x =&gt; x.ParentTabContentTypeNames).ToArray();
+            }
+
+            return groups.OrderBy(x =&gt; x.SortOrder);
+        }
+
+        private IEnumerable&lt;TPropertyType&gt; MapProperties(IEnumerable&lt;PropertyType&gt; properties, IContentTypeBase contentType, int groupId, bool inherited)
+        {
+            var mappedProperties = new List&lt;TPropertyType&gt;();
+
+            foreach (var p in properties.Where(x =&gt; x.DataTypeDefinitionId != 0).OrderBy(x =&gt; x.SortOrder))
+            {
+                var propertyEditor = _propertyEditorResolver.Value.GetByAlias(p.PropertyEditorAlias);
+                var preValues = _applicationContext.Services.DataTypeService.GetPreValuesCollectionByDataTypeId(p.DataTypeDefinitionId);
+
+                if (propertyEditor == null) 
+                    throw new InvalidOperationException(&quot;No property editor could be resolved with the alias: &quot; + p.PropertyEditorAlias + &quot;, ensure all packages are installed correctly.&quot;);
+
+                mappedProperties.Add(new TPropertyType
+                {
+                    Id = p.Id,
+                    Alias = p.Alias,
+                    Description = p.Description,
+                    Editor = p.PropertyEditorAlias,
+                    Validation = new PropertyTypeValidation {Mandatory = p.Mandatory, Pattern = p.ValidationRegExp},
+                    Label = p.Name,
+                    View = propertyEditor.ValueEditor.View,
+                    Config = propertyEditor.PreValueEditor.ConvertDbToEditor(propertyEditor.DefaultPreValues, preValues),
+                    //Value = &quot;&quot;,
+                    GroupId = groupId,
+                    Inherited = inherited,
+                    DataTypeId = p.DataTypeDefinitionId,
+                    SortOrder = p.SortOrder,
+                    ContentTypeId = contentType.Id,
+                    ContentTypeName = contentType.Name
+                });
+            }
+
+            return mappedProperties;
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[18,9,18,133,1],[19,9,19,10,1],[20,13,20,54,1],[21,13,21,62,1],[22,9,22,10,1],[31,9,31,10,1],[33,13,33,53,1],[33,53,33,76,1],[33,76,33,78,1],[33,13,33,78,1],[34,17,34,36,1],[39,13,40,30,1],[40,30,40,80,1],[40,80,41,38,1],[41,38,41,47,1],[41,47,41,49,1],[39,13,41,49,1],[42,9,42,10,1],[51,9,51,10,1],[53,13,53,52,1],[53,52,53,74,1],[53,74,53,76,1],[53,13,53,76,1],[54,17,54,36,1],[59,13,60,30,1],[60,30,60,78,1],[60,78,61,38,1],[61,38,61,47,1],[61,47,61,49,1],[59,13,61,49,1],[62,9,62,10,1],[65,9,65,10,1],[67,13,67,74,1],[70,13,70,20,1],[70,22,70,29,1],[70,30,70,32,1],[70,33,70,54,1],[71,13,71,14,1],[72,17,79,19,1],[81,17,81,92,1],[82,17,82,35,1],[83,13,83,14,1],[86,13,86,52,1],[86,52,86,56,1],[86,56,86,68,1],[86,13,86,68,1],[87,13,87,20,1],[87,22,87,29,1],[87,30,87,32,1],[87,33,87,65,1],[88,13,88,14,1],[90,17,90,52,1],[90,53,90,62,1],[93,17,93,90,1],[94,17,94,49,1],[95,21,95,138,0],[97,17,106,19,1],[108,17,108,104,1],[109,17,109,35,1],[110,13,110,14,1],[113,13,113,63,1],[116,13,116,75,1],[116,75,116,100,1],[116,100,116,102,1],[116,13,116,102,1],[117,13,117,140,1],[120,13,120,73,1],[120,73,120,77,1],[120,77,120,89,1],[120,13,120,89,1],[121,13,122,29,1],[122,29,123,71,1],[123,71,123,73,1],[121,13,123,73,1],[124,13,124,20,1],[124,22,124,52,1],[124,53,124,55,1],[124,56,124,84,1],[125,13,125,14,1],[126,17,126,112,1],[127,17,127,49,1],[128,21,128,160,0],[129,17,129,170,1],[130,13,130,14,1],[133,13,133,41,1],[134,13,134,14,1],[135,17,143,19,1],[144,17,144,40,1],[145,13,145,14,1],[148,13,148,60,1],[150,13,150,20,1],[150,22,150,39,1],[150,40,150,42,1],[150,43,150,107,1],[151,13,151,14,1],[152,17,152,58,1],[153,13,153,14,1],[155,13,155,20,1],[155,22,155,34,1],[155,35,155,37,1],[155,38,155,61,1],[155,61,155,73,1],[155,73,155,74,1],[155,38,155,74,1],[156,13,156,14,1],[157,17,157,82,1],[158,13,158,14,1],[162,13,162,58,1],[162,58,162,64,1],[162,64,162,76,1],[162,13,162,76,1],[163,13,163,70,1],[164,13,164,20,1],[164,22,164,38,1],[164,39,164,41,1],[164,42,164,60,1],[165,13,165,14,1],[167,17,167,47,1],[168,17,168,18,1],[169,21,169,54,1],[170,21,170,30,1],[174,17,174,62,1],[174,62,174,82,1],[174,82,175,45,1],[174,17,175,45,1],[176,17,176,35,1],[179,17,179,40,1],[182,17,182,63,1],[182,63,182,75,1],[182,75,182,90,1],[182,90,182,101,1],[182,101,182,113,1],[182,17,182,113,1],[183,17,183,47,1],[186,17,186,60,1],[186,60,186,88,1],[186,88,186,100,1],[186,17,186,100,1],[187,17,187,76,1],[187,76,187,99,1],[187,99,187,111,1],[187,17,187,111,1],[188,17,188,80,1],[188,80,188,107,1],[188,107,188,119,1],[188,17,188,119,1],[189,13,189,14,1],[191,13,191,40,1],[191,40,191,51,1],[191,51,191,53,1],[191,13,191,53,1],[192,9,192,10,1],[195,9,195,10,1],[196,13,196,62,1],[198,13,198,20,1],[198,22,198,27,1],[198,28,198,30,1],[198,31,198,53,1],[198,53,198,80,1],[198,80,198,95,1],[198,95,198,106,1],[198,106,198,107,1],[198,31,198,107,1],[199,13,199,14,1],[200,17,200,102,1],[201,17,201,137,1],[203,17,203,44,1],[204,21,204,189,0],[206,17,223,20,1],[224,13,224,14,1],[226,13,226,37,1],[227,9,227,10,1]]);
+    </script>
+  </body>
+</html>

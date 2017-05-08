@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\ContentTypeRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents a repository for doing CRUD operations for &lt;see cref=&quot;IContentType&quot;/&gt;
+    /// &lt;/summary&gt;
+    internal class ContentTypeRepository : ContentTypeBaseRepository&lt;IContentType&gt;, IContentTypeRepository
+    {
+        private readonly ITemplateRepository _templateRepository;
+
+        public ContentTypeRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax, ITemplateRepository templateRepository)
+            : base(work, cache, logger, sqlSyntax)
+        {
+            _templateRepository = templateRepository;
+        }
+
+        private FullDataSetRepositoryCachePolicyFactory&lt;IContentType, int&gt; _cachePolicyFactory;
+        protected override IRepositoryCachePolicyFactory&lt;IContentType, int&gt; CachePolicyFactory
+        {
+            get
+            {
+                //Use a FullDataSet cache policy - this will cache the entire GetAll result in a single collection
+                return _cachePolicyFactory ?? (_cachePolicyFactory = new FullDataSetRepositoryCachePolicyFactory&lt;IContentType, int&gt;(
+                    RuntimeCache, GetEntityId, () =&gt; PerformGetAll(), 
+                    //allow this cache to expire
+                    expires:true));
+            }
+        }
+
+        protected override IContentType PerformGet(int id)
+        {
+            //use the underlying GetAll which will force cache all content types
+            return GetAll().FirstOrDefault(x =&gt; x.Id == id);
+        }
+
+        protected override IEnumerable&lt;IContentType&gt; PerformGetAll(params int[] ids)
+        {
+            if (ids.Any())
+            {
+                //NOTE: This logic should never be executed according to our cache policy
+                return ContentTypeQueryMapper.GetContentTypes(Database, SqlSyntax, this, _templateRepository)
+                    .Where(x =&gt; ids.Contains(x.Id));
+            }
+
+            return ContentTypeQueryMapper.GetContentTypes(Database, SqlSyntax, this, _templateRepository);
+        }
+
+        protected override IEnumerable&lt;IContentType&gt; PerformGetByQuery(IQuery&lt;IContentType&gt; query)
+        {
+            var sqlClause = GetBaseQuery(false);
+            var translator = new SqlTranslator&lt;IContentType&gt;(sqlClause, query);
+            var sql = translator.Translate();                
+
+            var dtos = Database.Fetch&lt;ContentTypeTemplateDto, ContentTypeDto, NodeDto&gt;(sql);
+
+            return
+                //This returns a lookup from the GetAll cached looup
+                (dtos.Any()
+                    ? GetAll(dtos.DistinctBy(x =&gt; x.ContentTypeDto.NodeId).Select(x =&gt; x.ContentTypeDto.NodeId).ToArray())
+                    : Enumerable.Empty&lt;IContentType&gt;())
+                    //order the result by name
+                    .OrderBy(x =&gt; x.Name);
+        }
+        
+        /// &lt;summary&gt;
+        /// Gets all entities of the specified &lt;see cref=&quot;PropertyType&quot;/&gt; query
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;query&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;IContentType&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContentType&gt; GetByQuery(IQuery&lt;PropertyType&gt; query)
+        {
+            var ints = PerformGetByQuery(query).ToArray();
+            return ints.Any()
+                ? GetAll(ints)
+                : Enumerable.Empty&lt;IContentType&gt;();
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all property type aliases.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;string&gt; GetAllPropertyTypeAliases()
+        {
+            return Database.Fetch&lt;string&gt;(&quot;SELECT DISTINCT Alias FROM cmsPropertyType ORDER BY Alias&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all content type aliases
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;objectTypes&quot;&gt;
+        /// If this list is empty, it will return all content type aliases for media, members and content, otherwise
+        /// it will only return content type aliases for the object types specified
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;string&gt; GetAllContentTypeAliases(params Guid[] objectTypes)
+        {
+            var sql = new Sql().Select(&quot;cmsContentType.alias&quot;)
+                .From&lt;ContentTypeDto&gt;(SqlSyntax)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;ContentTypeDto, NodeDto&gt;(SqlSyntax, dto =&gt; dto.NodeId, dto =&gt; dto.NodeId);
+
+            if (objectTypes.Any())
+            {
+                sql = sql.Where(&quot;umbracoNode.nodeObjectType IN (@objectTypes)&quot;, new {objectTypes = objectTypes});
+            }
+
+            return Database.Fetch&lt;string&gt;(sql);
+        }
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+
+            sql.Select(isCount ? &quot;COUNT(*)&quot; : &quot;*&quot;)
+               .From&lt;ContentTypeDto&gt;(SqlSyntax)
+               .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+               .On&lt;ContentTypeDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+               .LeftJoin&lt;ContentTypeTemplateDto&gt;(SqlSyntax)
+               .On&lt;ContentTypeTemplateDto, ContentTypeDto&gt;(SqlSyntax, left =&gt; left.ContentTypeNodeId, right =&gt; right.NodeId)
+               .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId);
+
+            return sql;
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoNode.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            var list = new List&lt;string&gt;
+                           {
+                               &quot;DELETE FROM umbracoUser2NodeNotify WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodePermission WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsTagRelationship WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentTypeAllowedContentType WHERE Id = @Id&quot;,
+                               &quot;DELETE FROM cmsContentTypeAllowedContentType WHERE AllowedId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentType2ContentType WHERE parentContentTypeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentType2ContentType WHERE childContentTypeId = @Id&quot;,
+                               &quot;DELETE FROM cmsPropertyType WHERE contentTypeId = @Id&quot;,
+                               &quot;DELETE FROM cmsPropertyTypeGroup WHERE contenttypeNodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsDocumentType WHERE contentTypeNodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentType WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoNode WHERE id = @Id&quot;
+                           };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { return new Guid(Constants.ObjectTypes.DocumentType); }
+        }
+        
+        /// &lt;summary&gt;
+        /// Deletes a content type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// First checks for children and removes those first
+        /// &lt;/remarks&gt;
+        protected override void PersistDeletedItem(IContentType entity)
+        {
+            var query = Query&lt;IContentType&gt;.Builder.Where(x =&gt; x.ParentId == entity.Id);
+            var children = GetByQuery(query);
+            foreach (var child in children)
+            {
+                //NOTE: We must cast here so that it goes to the outter method to
+                // ensure the cache is updated.
+                PersistDeletedItem((IEntity)child);
+            }
+
+            //Before we call the base class methods to run all delete clauses, we need to first 
+            // delete all of the property data associated with this document type. Normally this will
+            // be done in the ContentTypeService by deleting all associated content first, but in some cases
+            // like when we switch a document type, there is property data left over that is linked
+            // to the previous document type. So we need to ensure it&#39;s removed.
+            var sql = new Sql().Select(&quot;DISTINCT cmsPropertyData.propertytypeid&quot;)
+                .From&lt;PropertyDataDto&gt;(SqlSyntax)
+                .InnerJoin&lt;PropertyTypeDto&gt;(SqlSyntax)
+                .On&lt;PropertyDataDto, PropertyTypeDto&gt;(SqlSyntax, dto =&gt; dto.PropertyTypeId, dto =&gt; dto.Id)
+                .InnerJoin&lt;ContentTypeDto&gt;(SqlSyntax)
+                .On&lt;ContentTypeDto, PropertyTypeDto&gt;(SqlSyntax, dto =&gt; dto.NodeId, dto =&gt; dto.ContentTypeId)
+                .Where&lt;ContentTypeDto&gt;(dto =&gt; dto.NodeId == entity.Id);
+
+            //Delete all cmsPropertyData where propertytypeid EXISTS in the subquery above
+            Database.Execute(SqlSyntax.GetDeleteSubquery(&quot;cmsPropertyData&quot;, &quot;propertytypeid&quot;, sql));
+
+            base.PersistDeletedItem(entity);
+        }
+
+        protected override void PersistNewItem(IContentType entity)
+        {
+            Mandate.That&lt;Exception&gt;(string.IsNullOrEmpty(entity.Alias) == false,
+                                    () =&gt;
+                                    {
+                                        var message =
+                                            string.Format(
+                                                &quot;ContentType &#39;{0}&#39; cannot have an empty Alias. This is most likely due to invalid characters stripped from the Alias.&quot;,
+                                                entity.Name);
+                                        var exception = new Exception(message);
+
+                                        Logger.Error&lt;ContentTypeRepository&gt;(message, exception);
+                                        throw exception;
+                                    });
+
+            ((ContentType)entity).AddingEntity();
+
+            PersistNewBaseContentType(entity);
+            PersistTemplates(entity, false);
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected void PersistTemplates(IContentType entity, bool clearAll)
+        {
+            // remove and insert, if required
+            Database.Delete&lt;ContentTypeTemplateDto&gt;(&quot;WHERE contentTypeNodeId = @Id&quot;, new { Id = entity.Id });
+
+            // we could do it all in foreach if we assume that the default template is an allowed template??
+            var defaultTemplateId = ((ContentType) entity).DefaultTemplateId;
+            if (defaultTemplateId &gt; 0)
+            {
+                Database.Insert(new ContentTypeTemplateDto
+                {
+                    ContentTypeNodeId = entity.Id,
+                    TemplateNodeId = defaultTemplateId,
+                    IsDefault = true
+                });
+            }
+            foreach (var template in entity.AllowedTemplates.Where(x =&gt; x != null &amp;&amp; x.Id != defaultTemplateId))
+            {
+                Database.Insert(new ContentTypeTemplateDto
+                {
+                    ContentTypeNodeId = entity.Id,
+                    TemplateNodeId = template.Id,
+                    IsDefault = false
+                });
+            }
+        }
+
+        protected override void PersistUpdatedItem(IContentType entity)
+        {
+            ValidateAlias(entity);
+
+            //Updates Modified date
+            ((ContentType)entity).UpdatingEntity();
+
+            //Look up parent to get and set the correct Path if ParentId has changed
+            if (entity.IsPropertyDirty(&quot;ParentId&quot;))
+            {
+                var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = entity.ParentId });
+                entity.Path = string.Concat(parent.Path, &quot;,&quot;, entity.Id);
+                entity.Level = parent.Level + 1;
+                var maxSortOrder =
+                    Database.ExecuteScalar&lt;int&gt;(
+                        &quot;SELECT coalesce(max(sortOrder),0) FROM umbracoNode WHERE parentid = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                        new { ParentId = entity.ParentId, NodeObjectType = NodeObjectTypeId });
+                entity.SortOrder = maxSortOrder + 1;
+            }
+
+            PersistUpdatedBaseContentType(entity);
+            PersistTemplates(entity, true);
+
+            entity.ResetDirtyProperties();
+        }
+        
+        protected override IContentType PerformGet(Guid id)
+        {
+            //use the underlying GetAll which will force cache all content types
+            return GetAll().FirstOrDefault(x =&gt; x.Key == id);
+        }
+
+        protected override IContentType PerformGet(string alias)
+        {
+            //use the underlying GetAll which will force cache all content types
+            return GetAll().FirstOrDefault(x =&gt; x.Alias.InvariantEquals(alias));
+        }
+
+        protected override IEnumerable&lt;IContentType&gt; PerformGetAll(params Guid[] ids)
+        {
+            //use the underlying GetAll which will force cache all content types
+
+            if (ids.Any())
+            {
+                return GetAll().Where(x =&gt; ids.Contains(x.Key));
+            }
+            else
+            {
+                return GetAll();
+            }
+        }
+
+        protected override bool PerformExists(Guid id)
+        {
+            return GetAll().FirstOrDefault(x =&gt; x.Key == id) != null;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[23,15,23,51,1],[24,9,24,10,1],[25,13,25,54,1],[26,9,26,10,1],[32,13,32,14,1],[34,17,35,54,1],[35,54,35,69,1],[35,69,37,36,1],[34,17,37,36,1],[38,13,38,14,1],[42,9,42,10,0],[44,13,44,49,0],[44,49,44,59,0],[44,59,44,61,0],[44,13,44,61,0],[45,9,45,10,0],[48,9,48,10,1],[49,13,49,27,1],[50,13,50,14,0],[52,17,53,33,0],[53,33,53,51,0],[53,51,53,53,0],[52,17,53,53,0],[56,13,56,107,1],[57,9,57,10,1],[60,9,60,10,1],[61,13,61,49,1],[62,13,62,80,1],[63,13,63,46,1],[65,13,65,93,1],[67,13,70,51,1],[70,51,70,74,1],[70,74,70,88,1],[70,88,70,111,1],[70,111,73,35,1],[73,35,73,41,1],[73,41,73,43,1],[67,13,73,43,1],[74,9,74,10,1],[82,9,82,10,1],[83,13,83,59,1],[84,13,86,52,1],[87,9,87,10,1],[94,9,94,10,0],[95,13,95,104,0],[96,9,96,10,0],[107,9,107,10,0],[108,13,111,95,0],[113,13,113,35,0],[114,13,114,14,0],[115,17,115,114,0],[116,13,116,14,0],[118,13,118,48,0],[119,9,119,10,0],[122,9,122,10,1],[123,13,123,33,1],[125,13,131,75,1],[133,13,133,24,1],[134,9,134,10,1],[137,9,137,10,0],[138,13,138,43,0],[139,9,139,10,0],[142,9,142,10,1],[143,13,157,30,1],[158,13,158,25,1],[159,9,159,10,1],[163,17,163,18,1],[163,19,163,71,1],[163,72,163,73,1],[174,9,174,10,1],[175,13,175,89,1],[176,13,176,46,1],[177,13,177,20,1],[177,22,177,31,1],[177,32,177,34,1],[177,35,177,43,1],[178,13,178,14,1],[181,17,181,52,1],[182,13,182,14,1],[189,13,195,72,1],[198,13,198,101,1],[200,13,200,45,1],[201,9,201,10,1],[204,9,204,10,1],[205,13,207,37,1],[207,37,207,38,0],[207,38,208,41,1],[208,41,211,62,0],[211,62,212,41,1],[212,41,212,80,0],[212,80,214,41,1],[214,41,214,97,0],[214,97,215,41,1],[215,41,215,57,0],[215,57,216,40,1],[205,13,216,40,1],[218,13,218,50,1],[220,13,220,47,1],[221,13,221,45,1],[223,13,223,43,1],[224,9,224,10,1],[227,9,227,10,1],[229,13,229,110,1],[232,13,232,78,1],[233,13,233,39,1],[234,13,234,14,1],[235,17,240,20,1],[241,13,241,14,1],[242,13,242,20,1],[242,22,242,34,1],[242,35,242,37,1],[242,38,242,73,1],[242,73,242,111,1],[242,111,242,112,1],[242,38,242,112,1],[243,13,243,14,1],[244,17,249,20,1],[250,13,250,14,1],[251,9,251,10,1],[254,9,254,10,1],[255,13,255,35,1],[258,13,258,52,1],[261,13,261,52,1],[262,13,262,14,1],[263,17,263,114,1],[264,17,264,74,1],[265,17,265,49,1],[266,17,269,96,1],[270,17,270,53,1],[271,13,271,14,1],[273,13,273,51,1],[274,13,274,44,1],[276,13,276,43,1],[277,9,277,10,1],[280,9,280,10,1],[282,13,282,49,1],[282,49,282,60,1],[282,60,282,62,1],[282,13,282,62,1],[283,9,283,10,1],[286,9,286,10,1],[288,13,288,49,1],[288,49,288,79,1],[288,79,288,81,1],[288,13,288,81,1],[289,9,289,10,1],[292,9,292,10,1],[295,13,295,27,1],[296,13,296,14,1],[297,17,297,44,1],[297,44,297,63,1],[297,63,297,65,1],[297,17,297,65,1],[300,13,300,14,1],[301,17,301,33,1],[303,9,303,10,1],[306,9,306,10,0],[307,13,307,49,0],[307,49,307,60,0],[307,60,307,70,0],[307,13,307,70,0],[308,9,308,10,0]]);
+    </script>
+  </body>
+</html>

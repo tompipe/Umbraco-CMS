@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\webservices\nodeSorter.asmx.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Globalization;
+using System.Linq;
+using System.Web.Script.Services;
+using System.Web.Services;
+using System.Xml;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Web;
+using Umbraco.Web.WebServices;
+using umbraco.BasePages;
+using umbraco.BusinessLogic;
+using umbraco.BusinessLogic.Actions;
+using umbraco.cms.businesslogic.web;
+
+namespace umbraco.presentation.webservices
+{
+    /// &lt;summary&gt;
+    /// Summary description for nodeSorter
+    /// &lt;/summary&gt;
+    [WebService(Namespace = &quot;http://umbraco.org/&quot;)]
+    [WebServiceBinding(ConformsTo = WsiProfiles.BasicProfile1_1)]
+    [ToolboxItem(false)]
+    [ScriptService]
+    public class nodeSorter : UmbracoAuthorizedWebService
+    {
+        [WebMethod]
+        public SortNode GetNodes(string ParentId, string App)
+        {
+            if (BasePage.ValidateUserContextID(BasePage.umbracoUserContextID))
+            {
+                var nodes = new List&lt;SortNode&gt;();
+
+                // &quot;hack for stylesheet&quot;
+                if (App == &quot;settings&quot;)
+                {
+                    var stylesheet = Services.FileService.GetStylesheetByName(ParentId.EnsureEndsWith(&quot;.css&quot;));
+                    if (stylesheet == null) throw new InvalidOperationException(&quot;No stylesheet found by name &quot; + ParentId);
+
+                    var sort = 0;
+                    foreach (var child in stylesheet.Properties)
+                    {
+                        nodes.Add(new SortNode(child.Name.GetHashCode(), sort, child.Name, DateTime.Now));
+                        sort++;
+                    }
+
+                    return new SortNode()
+                    {
+                        SortNodes = nodes.ToArray()
+                    };
+                }
+                else
+                {
+                    var asInt = int.Parse(ParentId);
+
+                    var parent = new SortNode { Id = asInt };
+
+                    var entityService = base.ApplicationContext.Services.EntityService;
+
+                    // Root nodes?
+                    if (asInt == -1)
+                    {
+                        if (App == &quot;media&quot;)
+                        {
+                            var rootMedia = entityService.GetRootEntities(UmbracoObjectTypes.Media);
+                            nodes.AddRange(rootMedia.Select(media =&gt; new SortNode(media.Id, media.SortOrder, media.Name, media.CreateDate)));
+                        }
+                        else
+                        {
+                            var rootContent = entityService.GetRootEntities(UmbracoObjectTypes.Document);
+                            nodes.AddRange(rootContent.Select(content =&gt; new SortNode(content.Id, content.SortOrder, content.Name, content.CreateDate)));
+                        }
+                    }
+                    else
+                    {
+                        var children = entityService.GetChildren(asInt);
+                        nodes.AddRange(children.Select(child =&gt; new SortNode(child.Id, child.SortOrder, child.Name, child.CreateDate)));
+                    }
+
+
+                    parent.SortNodes = nodes.ToArray();
+
+                    return parent;
+                }
+            }
+
+            throw new ArgumentException(&quot;User not logged in&quot;);
+        }
+
+        public void UpdateSortOrder(int ParentId, string SortOrder)
+        {
+            UpdateSortOrder(ParentId.ToString(), SortOrder);
+        }
+
+        [WebMethod]
+        public void UpdateSortOrder(string ParentId, string SortOrder)
+        {
+            if (AuthorizeRequest() == false) return;
+            if (SortOrder.Trim().Length &lt;= 0) return;
+
+            var isContent = helper.Request(&quot;app&quot;) == &quot;content&quot; | helper.Request(&quot;app&quot;) == &quot;&quot;;
+            var isMedia = helper.Request(&quot;app&quot;) == &quot;media&quot;;
+
+            //ensure user is authorized for the app requested
+            if (isContent &amp;&amp; AuthorizeRequest(DefaultApps.content.ToString()) == false) return;
+            if (isMedia &amp;&amp; AuthorizeRequest(DefaultApps.media.ToString()) == false) return;
+
+            var ids = SortOrder.Split(new[] { &quot;,&quot; }, StringSplitOptions.RemoveEmptyEntries);
+            if (isContent)
+            {
+                SortContent(ids, int.Parse(ParentId));
+            }
+            else if (isMedia)
+            {
+                SortMedia(ids);
+            }
+            else
+            {
+                SortStylesheetProperties(ParentId, ids);
+            }
+        }
+
+        private void SortMedia(string[] ids)
+        {
+            var mediaService = base.ApplicationContext.Services.MediaService;
+            var sortedMedia = new List&lt;IMedia&gt;();
+            try
+            {
+                for (var i = 0; i &lt; ids.Length; i++)
+                {
+                    var id = int.Parse(ids[i]);
+                    var m = mediaService.GetById(id);
+                    sortedMedia.Add(m);
+                }
+
+                // Save Media with new sort order and update content xml in db accordingly
+                var sorted = mediaService.Sort(sortedMedia);
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Error&lt;nodeSorter&gt;(&quot;Could not update media sort order&quot;, ex);
+            }
+        }
+
+
+        private void SortStylesheetProperties(string stylesheetName, string[] names)
+        {
+            var stylesheet = Services.FileService.GetStylesheetByName(stylesheetName.EnsureEndsWith(&quot;.css&quot;));
+            if (stylesheet == null) throw new InvalidOperationException(&quot;No stylesheet found by name &quot; + stylesheetName);
+
+            var currProps = stylesheet.Properties.ToArray();
+            //remove them all first
+            foreach (var prop in currProps)
+            {
+                stylesheet.RemoveProperty(prop.Name);
+            }
+
+            //re-add them in the right order
+            for (var i = 0; i &lt; names.Length; i++)
+            {
+                var found = currProps.Single(x =&gt; x.Name == names[i]);
+                stylesheet.AddProperty(found);
+            }
+
+            Services.FileService.SaveStylesheet(stylesheet);
+        }
+
+        private void SortContent(string[] ids, int parentId)
+        {
+            var contentService = ApplicationContext.Services.ContentService;
+            try
+            {
+                var intIds = ids.Select(int.Parse).ToArray();
+                var allContent = contentService.GetByIds(intIds).ToDictionary(x =&gt; x.Id, x =&gt; x);
+                var sortedContent = intIds.Select(x =&gt; allContent[x]);
+
+                // Save content with new sort order and update db+cache accordingly
+                var sorted = contentService.Sort(sortedContent);
+
+                // refresh sort order on cached xml
+                // but no... this is not distributed - solely relying on content service &amp; events should be enough
+                //content.Instance.SortNodes(parentId);
+
+                //send notifications! TODO: This should be put somewhere centralized instead of hard coded directly here
+                if (parentId &gt; 0)
+                {
+                    ApplicationContext.Services.NotificationService.SendNotification(contentService.GetById(parentId), ActionSort.Instance, UmbracoContext, ApplicationContext);
+                }
+
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Error&lt;nodeSorter&gt;(&quot;Could not update content sort order&quot;, ex);
+            }
+        }
+
+    }
+
+    [Serializable]
+    public class SortNode
+    {
+        public SortNode()
+        {
+        }
+
+        private SortNode[] _sortNodes;
+
+        public SortNode[] SortNodes
+        {
+            get { return _sortNodes; }
+            set { _sortNodes = value; }
+        }
+
+        public int TotalNodes
+        {
+            get { return _sortNodes != null ? _sortNodes.Length : 0; }
+            set { int test = value; }
+        }
+
+        public SortNode(int Id, int SortOrder, string Name, DateTime CreateDate)
+        {
+            _id = Id;
+            _sortOrder = SortOrder;
+            _name = Name;
+            _createDate = CreateDate;
+        }
+
+        private DateTime _createDate;
+
+        public DateTime CreateDate
+        {
+            get { return _createDate; }
+            set { _createDate = value; }
+        }
+
+        private string _name;
+
+        public string Name
+        {
+            get { return _name; }
+            set { _name = value; }
+        }
+
+        private int _sortOrder;
+
+        public int SortOrder
+        {
+            get { return _sortOrder; }
+            set { _sortOrder = value; }
+        }
+
+        private int _id;
+
+        public int Id
+        {
+            get { return _id; }
+            set { _id = value; }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[35,9,35,10,0],[36,13,36,79,0],[37,13,37,14,0],[38,17,38,50,0],[41,17,41,39,0],[42,17,42,18,0],[43,21,43,112,0],[44,21,44,44,0],[44,45,44,124,0],[46,21,46,34,0],[47,21,47,28,0],[47,30,47,39,0],[47,40,47,42,0],[47,43,47,64,0],[48,21,48,22,0],[49,25,49,107,0],[50,25,50,32,0],[51,21,51,22,0],[53,21,56,23,0],[59,17,59,18,0],[60,21,60,53,0],[62,21,62,62,0],[64,21,64,88,0],[67,21,67,37,0],[68,21,68,22,0],[69,25,69,44,0],[70,25,70,26,0],[71,29,71,101,0],[72,29,72,70,0],[72,70,72,139,0],[72,139,72,142,0],[72,29,72,142,0],[73,25,73,26,0],[75,25,75,26,0],[76,29,76,106,0],[77,29,77,74,0],[77,74,77,151,0],[77,151,77,154,0],[77,29,77,154,0],[78,25,78,26,0],[79,21,79,22,0],[81,21,81,22,0],[82,25,82,73,0],[83,25,83,65,0],[83,65,83,134,0],[83,134,83,137,0],[83,25,83,137,0],[84,21,84,22,0],[87,21,87,56,0],[89,21,89,35,0],[93,13,93,63,0],[94,9,94,10,0],[97,9,97,10,0],[98,13,98,61,0],[99,9,99,10,0],[103,9,103,10,0],[104,13,104,45,0],[104,46,104,53,0],[105,13,105,46,0],[105,47,105,54,0],[107,13,107,94,0],[108,13,108,60,0],[111,13,111,88,0],[111,89,111,96,0],[112,13,112,84,0],[112,85,112,92,0],[114,13,114,93,0],[115,13,115,27,0],[116,13,116,14,0],[117,17,117,55,0],[118,13,118,14,0],[119,18,119,30,0],[120,13,120,14,0],[121,17,121,32,0],[122,13,122,14,0],[124,13,124,14,0],[125,17,125,57,0],[126,13,126,14,0],[127,9,127,10,0],[130,9,130,10,0],[131,13,131,78,0],[132,13,132,50,0],[134,13,134,14,0],[135,22,135,31,0],[135,33,135,47,0],[135,49,135,52,0],[136,17,136,18,0],[137,21,137,48,0],[138,21,138,54,0],[139,21,139,40,0],[140,17,140,18,0],[143,17,143,61,0],[144,13,144,14,0],[145,13,145,33,0],[146,13,146,14,0],[147,17,147,86,0],[148,13,148,14,0],[149,9,149,10,0],[153,9,153,10,0],[154,13,154,110,0],[155,13,155,36,0],[155,37,155,122,0],[157,13,157,61,0],[159,13,159,20,0],[159,22,159,30,0],[159,31,159,33,0],[159,34,159,43,0],[160,13,160,14,0],[161,17,161,54,0],[162,13,162,14,0],[165,18,165,27,0],[165,29,165,45,0],[165,47,165,50,0],[166,13,166,14,0],[167,17,167,51,0],[167,51,167,69,0],[167,69,167,71,0],[167,17,167,71,0],[168,17,168,47,0],[169,13,169,14,0],[171,13,171,61,0],[172,9,172,10,0],[175,9,175,10,0],[176,13,176,77,0],[178,13,178,14,0],[179,17,179,62,0],[180,17,180,84,0],[180,84,180,88,0],[180,88,180,95,0],[180,95,180,96,0],[180,96,180,98,0],[180,17,180,98,0],[181,17,181,56,0],[181,56,181,69,0],[181,69,181,71,0],[181,17,181,71,0],[184,17,184,65,0],[191,17,191,34,0],[192,17,192,18,0],[193,21,193,177,0],[194,17,194,18,0],[196,13,196,14,0],[197,13,197,33,0],[198,13,198,14,0],[199,17,199,88,0],[200,13,200,14,0],[201,9,201,10,0],[208,9,208,26,0],[209,9,209,10,0],[210,9,210,10,0],[216,17,216,18,0],[216,19,216,37,0],[216,38,216,39,0],[217,17,217,18,0],[217,19,217,38,0],[217,39,217,40,0],[222,17,222,18,0],[222,19,222,69,0],[222,70,222,71,0],[223,17,223,18,0],[223,19,223,36,0],[223,37,223,38,0],[226,9,226,81,0],[227,9,227,10,0],[228,13,228,22,0],[229,13,229,36,0],[230,13,230,26,0],[231,13,231,38,0],[232,9,232,10,0],[238,17,238,18,0],[238,19,238,38,0],[238,39,238,40,0],[239,17,239,18,0],[239,19,239,39,0],[239,40,239,41,0],[246,17,246,18,0],[246,19,246,32,0],[246,33,246,34,0],[247,17,247,18,0],[247,19,247,33,0],[247,34,247,35,0],[254,17,254,18,0],[254,19,254,37,0],[254,38,254,39,0],[255,17,255,18,0],[255,19,255,38,0],[255,39,255,40,0],[262,17,262,18,0],[262,19,262,30,0],[262,31,262,32,0],[263,17,263,18,0],[263,19,263,31,0],[263,32,263,33,0]]);
+    </script>
+  </body>
+</html>

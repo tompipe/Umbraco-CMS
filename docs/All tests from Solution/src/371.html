@@ -1,0 +1,998 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Persistence\Repositories\ContentTypeRepositoryTest.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using AutoMapper;
+using Moq;
+using NUnit.Framework;
+using Umbraco.Core;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Tests.TestHelpers.Entities;
+using Umbraco.Web.Models.ContentEditing;
+
+namespace Umbraco.Tests.Persistence.Repositories
+{
+    [RequiresAutoMapperMappings]
+    [DatabaseTestBehavior(DatabaseBehavior.NewDbFileAndSchemaPerTest)]
+    [TestFixture]
+    public class ContentTypeRepositoryTest : BaseDatabaseFactoryTest
+    {
+        [SetUp]
+        public override void Initialize()
+        {
+            base.Initialize();
+
+            CreateTestData();
+        }
+
+        [TearDown]
+        public override void TearDown()
+        {
+            base.TearDown();
+        }
+
+        private ContentRepository CreateRepository(IDatabaseUnitOfWork unitOfWork, out ContentTypeRepository contentTypeRepository)
+        {
+            var templateRepository = new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;ITemplatesSection&gt;());
+            var tagRepository = new TagRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax);
+            contentTypeRepository = new ContentTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, templateRepository);
+            var repository = new ContentRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, contentTypeRepository, templateRepository, tagRepository, Mock.Of&lt;IContentSection&gt;());
+            return repository;
+        }
+
+        private ContentTypeRepository CreateRepository(IDatabaseUnitOfWork unitOfWork)
+        {
+            var templateRepository = new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;ITemplatesSection&gt;());
+            var contentTypeRepository = new ContentTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, templateRepository);
+            return contentTypeRepository;
+        }
+
+        private MediaTypeRepository CreateMediaTypeRepository(IDatabaseUnitOfWork unitOfWork)
+        {
+            var contentTypeRepository = new MediaTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax);
+            return contentTypeRepository;
+        }
+
+        private EntityContainerRepository CreateContainerRepository(IDatabaseUnitOfWork unitOfWork, Guid containerEntityType)
+        {
+            return new EntityContainerRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, containerEntityType);
+        }
+
+        //TODO Add test to verify SetDefaultTemplates updates both AllowedTemplates and DefaultTemplate(id).
+
+
+        [Test]
+        public void Maps_Templates_Correctly()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var templateRepo = new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;ITemplatesSection&gt;()))
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var templates = new[]
+                {
+                    new Template(&quot;test1.cshtml&quot;, &quot;test1&quot;, &quot;test1&quot;),
+                    new Template(&quot;test2.cshtml&quot;, &quot;test2&quot;, &quot;test2&quot;),
+                    new Template(&quot;test3.cshtml&quot;, &quot;test3&quot;, &quot;test3&quot;)
+                };
+                foreach (var template in templates)
+                {
+                    templateRepo.AddOrUpdate(template);
+                }
+                unitOfWork.Commit();
+
+                var contentType = MockedContentTypes.CreateSimpleContentType();
+                contentType.AllowedTemplates = new[] {templates[0], templates[1]};
+                contentType.SetDefaultTemplate(templates[0]);
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                //re-get
+                var result = repository.Get(contentType.Id);
+
+                Assert.AreEqual(2, result.AllowedTemplates.Count());
+                Assert.AreEqual(templates[0].Id, result.DefaultTemplate.Id);
+            }
+
+        }
+
+        [Test]
+        public void Can_Move()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var containerRepository = CreateContainerRepository(unitOfWork, Constants.ObjectTypes.DocumentTypeContainerGuid))
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var container1 = new EntityContainer(Constants.ObjectTypes.DocumentTypeGuid) { Name = &quot;blah1&quot; };
+                containerRepository.AddOrUpdate(container1);
+                unitOfWork.Commit();
+
+                var container2 = new EntityContainer(Constants.ObjectTypes.DocumentTypeGuid) { Name = &quot;blah2&quot;, ParentId = container1.Id };
+                containerRepository.AddOrUpdate(container2);
+                unitOfWork.Commit();
+
+                var contentType = (IContentType) MockedContentTypes.CreateBasicContentType(&quot;asdfasdf&quot;);
+                contentType.ParentId = container2.Id;
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                //create a
+                var contentType2 = (IContentType)new ContentType(contentType, &quot;hello&quot;)
+                {
+                    Name = &quot;Blahasdfsadf&quot;
+                };
+                contentType.ParentId = contentType.Id;
+                repository.AddOrUpdate(contentType2);
+                unitOfWork.Commit();
+
+                var result = repository.Move(contentType, container1).ToArray();
+                unitOfWork.Commit();
+
+                Assert.AreEqual(2, result.Count());
+
+                //re-get
+                contentType = repository.Get(contentType.Id);
+                contentType2 = repository.Get(contentType2.Id);
+
+                Assert.AreEqual(container1.Id, contentType.ParentId);
+                Assert.AreNotEqual(result.Single(x =&gt; x.Entity.Id == contentType.Id).OriginalPath, contentType.Path);
+                Assert.AreNotEqual(result.Single(x =&gt; x.Entity.Id == contentType2.Id).OriginalPath, contentType2.Path);
+            }
+
+        }
+
+        [Test]
+        public void Can_Create_Container()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            EntityContainer container;
+            using (var containerRepository = CreateContainerRepository(unitOfWork, Constants.ObjectTypes.DocumentTypeContainerGuid))
+            {
+                container = new EntityContainer(Constants.ObjectTypes.DocumentTypeGuid) { Name = &quot;blah&quot; };
+                containerRepository.AddOrUpdate(container);
+                unitOfWork.Commit();
+                Assert.That(container.Id, Is.GreaterThan(0));
+            }
+            using (var containerRepository = CreateContainerRepository(unitOfWork, Constants.ObjectTypes.DocumentTypeContainerGuid))
+            {
+                var found = containerRepository.Get(container.Id);
+                Assert.IsNotNull(found);
+            }
+        }
+
+        [Test]
+        public void Can_Get_All_Containers()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            EntityContainer container1, container2, container3;
+            using (var containerRepository = CreateContainerRepository(unitOfWork, Constants.ObjectTypes.DocumentTypeContainerGuid))
+            {
+                container1 = new EntityContainer(Constants.ObjectTypes.DocumentTypeGuid) { Name = &quot;container1&quot; };
+                containerRepository.AddOrUpdate(container1);
+                container2 = new EntityContainer(Constants.ObjectTypes.DocumentTypeGuid) { Name = &quot;container2&quot; };
+                containerRepository.AddOrUpdate(container2);
+                container3 = new EntityContainer(Constants.ObjectTypes.DocumentTypeGuid) { Name = &quot;container3&quot; };
+                containerRepository.AddOrUpdate(container3);
+                unitOfWork.Commit();
+                Assert.That(container1.Id, Is.GreaterThan(0));
+                Assert.That(container2.Id, Is.GreaterThan(0));
+                Assert.That(container3.Id, Is.GreaterThan(0));
+            }
+            using (var containerRepository = CreateContainerRepository(unitOfWork, Constants.ObjectTypes.DocumentTypeContainerGuid))
+            {
+                var found1 = containerRepository.Get(container1.Id);
+                Assert.IsNotNull(found1);
+                var found2 = containerRepository.Get(container2.Id);
+                Assert.IsNotNull(found2);
+                var found3 = containerRepository.Get(container3.Id);
+                Assert.IsNotNull(found3);
+                var allContainers = containerRepository.GetAll();
+                Assert.AreEqual(3, allContainers.Count());
+            }
+        }
+
+        [Test]
+        public void Can_Delete_Container()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            EntityContainer container;
+            using (var containerRepository = CreateContainerRepository(unitOfWork, Constants.ObjectTypes.DocumentTypeContainerGuid))
+            {
+                container = new EntityContainer(Constants.ObjectTypes.DocumentTypeGuid) { Name = &quot;blah&quot; };
+                containerRepository.AddOrUpdate(container);
+                unitOfWork.Commit();
+            }
+            using (var containerRepository = CreateContainerRepository(unitOfWork, Constants.ObjectTypes.DocumentTypeContainerGuid))
+            {
+                // Act
+                containerRepository.Delete(container);
+                unitOfWork.Commit();
+            }
+            using (var containerRepository = CreateContainerRepository(unitOfWork, Constants.ObjectTypes.DocumentTypeContainerGuid))
+            {
+                var found = containerRepository.Get(container.Id);
+                Assert.IsNull(found);
+            }
+        }
+
+        [Test]
+        public void Can_Create_Container_Containing_Media_Types()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var containerRepository = CreateContainerRepository(unitOfWork, Constants.ObjectTypes.MediaTypeContainerGuid))
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var container = new EntityContainer(Constants.ObjectTypes.MediaTypeGuid) { Name = &quot;blah&quot; };
+                containerRepository.AddOrUpdate(container);
+                unitOfWork.Commit();
+
+                var contentType = MockedContentTypes.CreateSimpleContentType(&quot;test&quot;, &quot;Test&quot;, propertyGroupName: &quot;testGroup&quot;);
+                contentType.ParentId = container.Id;
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                Assert.AreEqual(container.Id, contentType.ParentId);
+            }
+        }
+
+        [Test]
+        public void Can_Delete_Container_Containing_Media_Types()
+        {
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            EntityContainer container;
+            IMediaType contentType;
+            using (var containerRepository = CreateContainerRepository(unitOfWork, Constants.ObjectTypes.MediaTypeContainerGuid))
+            using (var repository = CreateMediaTypeRepository(unitOfWork))
+            {
+                container = new EntityContainer(Constants.ObjectTypes.MediaTypeGuid) { Name = &quot;blah&quot; };
+                containerRepository.AddOrUpdate(container);
+                unitOfWork.Commit();
+
+                contentType = MockedContentTypes.CreateSimpleMediaType(&quot;test&quot;, &quot;Test&quot;, propertyGroupName: &quot;testGroup&quot;);
+                contentType.ParentId = container.Id;
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+            }
+            using (var containerRepository = CreateContainerRepository(unitOfWork, Constants.ObjectTypes.MediaTypeContainerGuid))
+            using (var repository = CreateMediaTypeRepository(unitOfWork))
+            {
+                // Act
+                containerRepository.Delete(container);
+                unitOfWork.Commit();
+
+                var found = containerRepository.Get(container.Id);
+                Assert.IsNull(found);
+
+                contentType = repository.Get(contentType.Id);
+                Assert.IsNotNull(contentType);
+                Assert.AreEqual(-1, contentType.ParentId);
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Add_On_ContentTypeRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var contentType = MockedContentTypes.CreateSimpleContentType(&quot;test&quot;, &quot;Test&quot;, propertyGroupName: &quot;testGroup&quot;);
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                var fetched = repository.Get(contentType.Id);
+
+                // Assert
+                Assert.That(contentType.HasIdentity, Is.True);
+                Assert.That(contentType.PropertyGroups.All(x =&gt; x.HasIdentity), Is.True);
+                Assert.That(contentType.PropertyTypes.All(x =&gt; x.HasIdentity), Is.True);
+                Assert.That(contentType.Path.Contains(&quot;,&quot;), Is.True);
+                Assert.That(contentType.SortOrder, Is.GreaterThan(0));
+
+                Assert.That(contentType.PropertyGroups.ElementAt(0).Name == &quot;testGroup&quot;, Is.True);
+                var groupId = contentType.PropertyGroups.ElementAt(0).Id;
+                Assert.That(contentType.PropertyTypes.All(x =&gt; x.PropertyGroupId.Value == groupId), Is.True);
+
+                foreach (var propertyType in contentType.PropertyTypes)
+                {
+                    Assert.AreNotEqual(propertyType.Key, Guid.Empty);
+                }
+
+                TestHelper.AssertAllPropertyValuesAreEquals(contentType, fetched, &quot;yyyy-MM-dd HH:mm:ss&quot;, ignoreProperties: new [] { &quot;DefaultTemplate&quot;, &quot;AllowedTemplates&quot;, &quot;UpdateDate&quot; });
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Add_On_ContentTypeRepository_After_Model_Mapping()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var contentType = (IContentType)MockedContentTypes.CreateSimpleContentType2(&quot;test&quot;, &quot;Test&quot;, propertyGroupName: &quot;testGroup&quot;);
+
+                Assert.AreEqual(4, contentType.PropertyTypes.Count());
+
+                // there is NO mapping from display to contentType, but only from save
+                // to contentType, so if we want to test, let&#39;s to it properly!
+                var display = Mapper.Map&lt;DocumentTypeDisplay&gt;(contentType);
+                var save = MapToContentTypeSave(display);
+                var mapped = Mapper.Map&lt;IContentType&gt;(save);
+
+                Assert.AreEqual(4, mapped.PropertyTypes.Count());
+
+                repository.AddOrUpdate(mapped);
+                unitOfWork.Commit();
+
+                Assert.AreEqual(4, mapped.PropertyTypes.Count());
+
+                //re-get
+                contentType = repository.Get(mapped.Id);
+
+                Assert.AreEqual(4, contentType.PropertyTypes.Count());
+
+                // Assert
+                Assert.That(contentType.HasIdentity, Is.True);
+                Assert.That(contentType.PropertyGroups.All(x =&gt; x.HasIdentity), Is.True);
+                Assert.That(contentType.PropertyTypes.All(x =&gt; x.HasIdentity), Is.True);
+                Assert.That(contentType.Path.Contains(&quot;,&quot;), Is.True);
+                Assert.That(contentType.SortOrder, Is.GreaterThan(0));
+
+                Assert.That(contentType.PropertyGroups.ElementAt(0).Name == &quot;testGroup&quot;, Is.True);
+                var groupId = contentType.PropertyGroups.ElementAt(0).Id;
+
+                var propertyTypes = contentType.PropertyTypes.ToArray();
+                Assert.AreEqual(&quot;gen&quot;, propertyTypes[0].Alias); // just to be sure
+                Assert.IsNull(propertyTypes[0].PropertyGroupId);
+                Assert.IsTrue(propertyTypes.Skip(1).All((x =&gt; x.PropertyGroupId.Value == groupId)));
+            }
+
+        }
+
+        [Test]
+        public void Can_Perform_Update_On_ContentTypeRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                contentType.Thumbnail = &quot;Doc2.png&quot;;
+            contentType.PropertyGroups[&quot;Content&quot;].PropertyTypes.Add(new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;subtitle&quot;)
+                {
+                    Name = &quot;Subtitle&quot;,
+                    Description = &quot;Optional Subtitle&quot;,
+                    Mandatory = false,
+                    SortOrder = 1,
+                    DataTypeDefinitionId = -88
+                });
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                var dirty = ((ICanBeDirty)contentType).IsDirty();
+
+                // Assert
+                Assert.That(contentType.HasIdentity, Is.True);
+                Assert.That(dirty, Is.False);
+                Assert.That(contentType.Thumbnail, Is.EqualTo(&quot;Doc2.png&quot;));
+                Assert.That(contentType.PropertyTypes.Any(x =&gt; x.Alias == &quot;subtitle&quot;), Is.True);
+            }
+
+
+        }
+
+        // this is for tests only because it makes no sense at all to have such a
+        // mapping defined, we only need it for the weird tests that use it
+        private DocumentTypeSave MapToContentTypeSave(DocumentTypeDisplay display)
+        {
+            return new DocumentTypeSave
+            {
+                // EntityBasic
+                Name = display.Name,
+                Icon = display.Icon,
+                Trashed = display.Trashed,
+                Key = display.Key,
+                ParentId = display.ParentId,
+                //Alias = display.Alias,
+                Path = display.Path,
+                //AdditionalData = display.AdditionalData,
+
+                // ContentTypeBasic
+                Alias = display.Alias,
+                UpdateDate = display.UpdateDate,
+                CreateDate = display.CreateDate,
+                Description = display.Description,
+                Thumbnail = display.Thumbnail,
+
+                // ContentTypeSave
+                CompositeContentTypes = display.CompositeContentTypes,
+                IsContainer = display.IsContainer,
+                AllowAsRoot = display.AllowAsRoot,
+                AllowedTemplates = display.AllowedTemplates.Select(x =&gt; x.Alias),
+                AllowedContentTypes = display.AllowedContentTypes,
+                DefaultTemplate = display.DefaultTemplate == null ? null : display.DefaultTemplate.Alias,
+                Groups = display.Groups.Select(x =&gt; new PropertyGroupBasic&lt;PropertyTypeBasic&gt;
+                {
+                    Inherited = x.Inherited,
+                    Id = x.Id,
+                    Properties = x.Properties,
+                    SortOrder = x.SortOrder,
+                    Name = x.Name
+                }).ToArray()
+            };
+        }
+
+        [Test]
+        public void Can_Perform_Update_On_ContentTypeRepository_After_Model_Mapping()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                // there is NO mapping from display to contentType, but only from save
+                // to contentType, so if we want to test, let&#39;s to it properly!
+                var display = Mapper.Map&lt;DocumentTypeDisplay&gt;(contentType);
+                var save = MapToContentTypeSave(display);
+
+                // modify...
+                save.Thumbnail = &quot;Doc2.png&quot;;
+                var contentGroup = save.Groups.Single(x =&gt; x.Name == &quot;Content&quot;);
+                contentGroup.Properties = contentGroup.Properties.Concat(new[]
+                {
+                    new PropertyTypeBasic
+                    {
+                        Alias = &quot;subtitle&quot;,
+                        Label = &quot;Subtitle&quot;,
+                        Description = &quot;Optional Subtitle&quot;,
+                        Validation = new PropertyTypeValidation
+                        {
+                            Mandatory = false,
+                            Pattern = &quot;&quot;
+                        },
+                        SortOrder = 1,
+                        DataTypeId = -88
+                    }
+                });
+
+                var mapped = Mapper.Map(save, contentType);
+
+                // just making sure
+                Assert.AreEqual(mapped.Thumbnail, &quot;Doc2.png&quot;);
+                Assert.IsTrue(mapped.PropertyTypes.Any(x =&gt; x.Alias == &quot;subtitle&quot;));
+
+                repository.AddOrUpdate(mapped);
+                unitOfWork.Commit();
+
+                var dirty = mapped.IsDirty();
+
+                //re-get
+                contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                // Assert
+                Assert.That(contentType.HasIdentity, Is.True);
+                Assert.That(dirty, Is.False);
+                Assert.That(contentType.Thumbnail, Is.EqualTo(&quot;Doc2.png&quot;));
+                Assert.That(contentType.PropertyTypes.Any(x =&gt; x.Alias == &quot;subtitle&quot;), Is.True);
+                foreach (var propertyType in contentType.PropertyTypes)
+                {
+                    Assert.IsTrue(propertyType.HasIdentity);
+                    Assert.Greater(propertyType.Id, 0);
+                }
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Delete_On_ContentTypeRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var contentType = MockedContentTypes.CreateSimpleContentType();
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                var contentType2 = repository.Get(contentType.Id);
+                repository.Delete(contentType2);
+                unitOfWork.Commit();
+
+                var exists = repository.Exists(contentType.Id);
+
+                // Assert
+                Assert.That(exists, Is.False);
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Delete_With_Heirarchy_On_ContentTypeRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var ctMain = MockedContentTypes.CreateSimpleContentType();
+                var ctChild1 = MockedContentTypes.CreateSimpleContentType(&quot;child1&quot;, &quot;Child 1&quot;, ctMain, true);
+                var ctChild2 = MockedContentTypes.CreateSimpleContentType(&quot;child2&quot;, &quot;Child 2&quot;, ctChild1, true);
+
+                repository.AddOrUpdate(ctMain);
+                repository.AddOrUpdate(ctChild1);
+                repository.AddOrUpdate(ctChild2);
+                unitOfWork.Commit();
+
+                // Act
+
+                var resolvedParent = repository.Get(ctMain.Id);
+                repository.Delete(resolvedParent);
+                unitOfWork.Commit();
+
+                // Assert
+                Assert.That(repository.Exists(ctMain.Id), Is.False);
+                Assert.That(repository.Exists(ctChild1.Id), Is.False);
+                Assert.That(repository.Exists(ctChild2.Id), Is.False);
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Query_On_ContentTypeRepository_Sort_By_Name()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+                var child1 = MockedContentTypes.CreateSimpleContentType(&quot;abc&quot;, &quot;abc&quot;, contentType, randomizeAliases: true);
+                repository.AddOrUpdate(child1);
+                var child3 = MockedContentTypes.CreateSimpleContentType(&quot;zyx&quot;, &quot;zyx&quot;, contentType, randomizeAliases: true);
+                repository.AddOrUpdate(child3);
+                var child2 = MockedContentTypes.CreateSimpleContentType(&quot;a123&quot;, &quot;a123&quot;, contentType, randomizeAliases: true);
+                repository.AddOrUpdate(child2);
+                unitOfWork.Commit();
+
+                // Act
+                var contentTypes = repository.GetByQuery(new Query&lt;IContentType&gt;().Where(x =&gt; x.ParentId == contentType.Id));
+
+                // Assert
+                Assert.That(contentTypes.Count(), Is.EqualTo(3));
+                Assert.AreEqual(&quot;a123&quot;, contentTypes.ElementAt(0).Name);
+                Assert.AreEqual(&quot;abc&quot;, contentTypes.ElementAt(1).Name);
+                Assert.AreEqual(&quot;zyx&quot;, contentTypes.ElementAt(2).Name);
+            }
+
+        }
+
+        [Test]
+        public void Can_Perform_Get_On_ContentTypeRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                // Act
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                // Assert
+                Assert.That(contentType, Is.Not.Null);
+                Assert.That(contentType.Id, Is.EqualTo(NodeDto.NodeIdSeed + 1));
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Get_By_Guid_On_ContentTypeRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+                var childContentType = MockedContentTypes.CreateSimpleContentType(&quot;blah&quot;, &quot;Blah&quot;, contentType, randomizeAliases:true);
+                repository.AddOrUpdate(childContentType);
+                unitOfWork.Commit();
+
+                // Act
+                var result = repository.Get(childContentType.Key);
+
+                // Assert
+                Assert.That(result, Is.Not.Null);
+                Assert.That(result.Id, Is.EqualTo(childContentType.Id));
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Get_By_Missing_Guid_On_ContentTypeRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var result = repository.Get(Guid.NewGuid());
+
+                // Assert
+                Assert.That(result, Is.Null);
+            }
+        }
+
+        [Test]
+        public void Can_Perform_GetAll_On_ContentTypeRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                // Act
+                var contentTypes = repository.GetAll();
+                int count =
+                    DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                        &quot;SELECT COUNT(*) FROM umbracoNode WHERE nodeObjectType = @NodeObjectType&quot;,
+                        new {NodeObjectType = new Guid(Constants.ObjectTypes.DocumentType)});
+
+                // Assert
+                Assert.That(contentTypes.Any(), Is.True);
+                Assert.That(contentTypes.Count(), Is.EqualTo(count));
+            }
+        }
+
+        [Test]
+        public void Can_Perform_GetAll_By_Guid_On_ContentTypeRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var allGuidIds = repository.GetAll().Select(x =&gt; x.Key).ToArray();
+
+                // Act
+                var contentTypes = ((IReadRepository&lt;Guid, IContentType&gt;)repository).GetAll(allGuidIds);
+                int count =
+                    DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                        &quot;SELECT COUNT(*) FROM umbracoNode WHERE nodeObjectType = @NodeObjectType&quot;,
+                        new { NodeObjectType = new Guid(Constants.ObjectTypes.DocumentType) });
+
+                // Assert
+                Assert.That(contentTypes.Any(), Is.True);
+                Assert.That(contentTypes.Count(), Is.EqualTo(count));
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Exists_On_ContentTypeRepository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                // Act
+                var exists = repository.Exists(NodeDto.NodeIdSeed);
+
+                // Assert
+                Assert.That(exists, Is.True);
+            }
+        }
+
+        [Test]
+        public void Can_Update_ContentType_With_PropertyType_Removed()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                // Act
+                contentType.PropertyGroups[&quot;Meta&quot;].PropertyTypes.Remove(&quot;description&quot;);
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                var result = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                // Assert
+                Assert.That(result.PropertyTypes.Any(x =&gt; x.Alias == &quot;description&quot;), Is.False);
+                Assert.That(contentType.PropertyGroups.Count, Is.EqualTo(result.PropertyGroups.Count));
+                Assert.That(contentType.PropertyTypes.Count(), Is.EqualTo(result.PropertyTypes.Count()));
+            }
+        }
+
+        [Test]
+        public void Can_Verify_PropertyTypes_On_SimpleTextpage()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                // Act
+                var contentType = repository.Get(NodeDto.NodeIdSeed);
+
+                // Assert
+                Assert.That(contentType.PropertyTypes.Count(), Is.EqualTo(3));
+                Assert.That(contentType.PropertyGroups.Count(), Is.EqualTo(1));
+            }
+        }
+
+        [Test]
+        public void Can_Verify_PropertyTypes_On_Textpage()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                // Act
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                // Assert
+                Assert.That(contentType.PropertyTypes.Count(), Is.EqualTo(4));
+                Assert.That(contentType.PropertyGroups.Count(), Is.EqualTo(2));
+            }
+        }
+
+        [Test]
+        public void Can_Verify_PropertyType_With_No_Group()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                // Act
+                var urlAlias = new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Nvarchar, &quot;urlAlias&quot;)
+                    {
+                        Name = &quot;Url Alias&quot;,
+                        Description = &quot;&quot;,
+                        Mandatory = false,
+                        SortOrder = 1,
+                        DataTypeDefinitionId = -88
+                    };
+
+                var addedPropertyType = contentType.AddPropertyType(urlAlias);
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                // Assert
+                var updated = repository.Get(NodeDto.NodeIdSeed + 1);
+                Assert.That(addedPropertyType, Is.True);
+                Assert.That(updated.PropertyGroups.Count(), Is.EqualTo(2));
+                Assert.That(updated.PropertyTypes.Count(), Is.EqualTo(5));
+                Assert.That(updated.PropertyTypes.Any(x =&gt; x.Alias == &quot;urlAlias&quot;), Is.True);
+                Assert.That(updated.PropertyTypes.First(x =&gt; x.Alias == &quot;urlAlias&quot;).PropertyGroupId, Is.Null);
+            }
+        }
+
+        [Test]
+        public void Can_Verify_AllowedChildContentTypes_On_ContentType()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                var subpageContentType = MockedContentTypes.CreateSimpleContentType(&quot;umbSubpage&quot;, &quot;Subpage&quot;);
+                var simpleSubpageContentType = MockedContentTypes.CreateSimpleContentType(&quot;umbSimpleSubpage&quot;, &quot;Simple Subpage&quot;);
+                repository.AddOrUpdate(subpageContentType);
+                repository.AddOrUpdate(simpleSubpageContentType);
+                unitOfWork.Commit();
+
+                // Act
+                var contentType = repository.Get(NodeDto.NodeIdSeed);
+                contentType.AllowedContentTypes = new List&lt;ContentTypeSort&gt;
+                    {
+                        new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; subpageContentType.Id), 0, subpageContentType.Alias),
+                        new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; simpleSubpageContentType.Id), 1, simpleSubpageContentType.Alias)
+                    };
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                //Assert
+                var updated = repository.Get(NodeDto.NodeIdSeed);
+
+                Assert.That(updated.AllowedContentTypes.Any(), Is.True);
+                Assert.That(updated.AllowedContentTypes.Any(x =&gt; x.Alias == subpageContentType.Alias), Is.True);
+                Assert.That(updated.AllowedContentTypes.Any(x =&gt; x.Alias == simpleSubpageContentType.Alias), Is.True);
+            }
+        }
+
+        [Test]
+        public void Can_Verify_Removal_Of_Used_PropertyType_From_ContentType()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            ContentTypeRepository repository;
+            using (var contentRepository = CreateRepository(unitOfWork, out repository))
+            {
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                var subpage = MockedContent.CreateTextpageContent(contentType, &quot;Text Page 1&quot;, contentType.Id);
+                contentRepository.AddOrUpdate(subpage);
+                unitOfWork.Commit();
+
+                // Act
+                contentType.RemovePropertyType(&quot;keywords&quot;);
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                // Assert
+                Assert.That(contentType.PropertyTypes.Count(), Is.EqualTo(3));
+                Assert.That(contentType.PropertyTypes.Any(x =&gt; x.Alias == &quot;keywords&quot;), Is.False);
+                Assert.That(subpage.Properties.First(x =&gt; x.Alias == &quot;description&quot;).Value, Is.EqualTo(&quot;This is the meta description for a textpage&quot;));
+            }
+        }
+
+        [Test]
+        public void Can_Verify_Addition_Of_PropertyType_After_ContentType_Is_Used()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            ContentTypeRepository repository;
+            using (var contentRepository = CreateRepository(unitOfWork, out repository))
+            {
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                var subpage = MockedContent.CreateTextpageContent(contentType, &quot;Text Page 1&quot;, contentType.Id);
+                contentRepository.AddOrUpdate(subpage);
+                unitOfWork.Commit();
+
+                // Act
+                var propertyGroup = contentType.PropertyGroups.First(x =&gt; x.Name == &quot;Meta&quot;);
+                propertyGroup.PropertyTypes.Add(new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;metaAuthor&quot;) { Name = &quot;Meta Author&quot;, Description = &quot;&quot;, Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88 });
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                // Assert
+                Assert.That(contentType.PropertyTypes.Count(), Is.EqualTo(5));
+                Assert.That(contentType.PropertyTypes.Any(x =&gt; x.Alias == &quot;metaAuthor&quot;), Is.True);
+            }
+
+        }
+
+        [Test]
+        public void Can_Verify_Usage_Of_New_PropertyType_On_Content()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            ContentTypeRepository repository;
+            using (var contentRepository = CreateRepository(unitOfWork, out repository))
+            {
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                var subpage = MockedContent.CreateTextpageContent(contentType, &quot;Text Page 1&quot;, contentType.Id);
+                contentRepository.AddOrUpdate(subpage);
+                unitOfWork.Commit();
+
+                var propertyGroup = contentType.PropertyGroups.First(x =&gt; x.Name == &quot;Meta&quot;);
+                propertyGroup.PropertyTypes.Add(new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;metaAuthor&quot;) { Name = &quot;Meta Author&quot;, Description = &quot;&quot;, Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88 });
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                // Act
+                var content = contentRepository.Get(subpage.Id);
+                content.SetValue(&quot;metaAuthor&quot;, &quot;John Doe&quot;);
+                contentRepository.AddOrUpdate(content);
+                unitOfWork.Commit();
+
+                //Assert
+                var updated = contentRepository.Get(subpage.Id);
+                Assert.That(updated.GetValue(&quot;metaAuthor&quot;).ToString(), Is.EqualTo(&quot;John Doe&quot;));
+                Assert.That(contentType.PropertyTypes.Count(), Is.EqualTo(5));
+                Assert.That(contentType.PropertyTypes.Any(x =&gt; x.Alias == &quot;metaAuthor&quot;), Is.True);
+            }
+        }
+
+        [Test]
+        public void
+            Can_Verify_That_A_Combination_Of_Adding_And_Deleting_PropertyTypes_Doesnt_Cause_Issues_For_Content_And_ContentType
+            ()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            ContentTypeRepository repository;
+            using (var contentRepository = CreateRepository(unitOfWork, out repository))
+            {
+                var contentType = repository.Get(NodeDto.NodeIdSeed + 1);
+
+                var subpage = MockedContent.CreateTextpageContent(contentType, &quot;Text Page 1&quot;, contentType.Id);
+                contentRepository.AddOrUpdate(subpage);
+                unitOfWork.Commit();
+
+                //Remove PropertyType
+                contentType.RemovePropertyType(&quot;keywords&quot;);
+                //Add PropertyType
+                var propertyGroup = contentType.PropertyGroups.First(x =&gt; x.Name == &quot;Meta&quot;);
+                propertyGroup.PropertyTypes.Add(new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;metaAuthor&quot;) { Name = &quot;Meta Author&quot;, Description = &quot;&quot;,  Mandatory = false, SortOrder = 1, DataTypeDefinitionId = -88 });
+                repository.AddOrUpdate(contentType);
+                unitOfWork.Commit();
+
+                // Act
+                var content = contentRepository.Get(subpage.Id);
+                content.SetValue(&quot;metaAuthor&quot;, &quot;John Doe&quot;);
+                contentRepository.AddOrUpdate(content);
+                unitOfWork.Commit();
+
+                //Assert
+                var updated = contentRepository.Get(subpage.Id);
+                Assert.That(updated.GetValue(&quot;metaAuthor&quot;).ToString(), Is.EqualTo(&quot;John Doe&quot;));
+                Assert.That(updated.Properties.First(x =&gt; x.Alias == &quot;description&quot;).Value, Is.EqualTo(&quot;This is the meta description for a textpage&quot;));
+
+                Assert.That(contentType.PropertyTypes.Count(), Is.EqualTo(4));
+                Assert.That(contentType.PropertyTypes.Any(x =&gt; x.Alias == &quot;metaAuthor&quot;), Is.True);
+                Assert.That(contentType.PropertyTypes.Any(x =&gt; x.Alias == &quot;keywords&quot;), Is.False);
+            }
+        }
+
+        public void CreateTestData()
+        {
+            //Create and Save ContentType &quot;umbTextpage&quot; -&gt; (NodeDto.NodeIdSeed)
+            ContentType simpleContentType = MockedContentTypes.CreateSimpleContentType(&quot;umbTextpage&quot;, &quot;Textpage&quot;);
+            ServiceContext.ContentTypeService.Save(simpleContentType);
+
+            //Create and Save ContentType &quot;textPage&quot; -&gt; (NodeDto.NodeIdSeed + 1)
+            ContentType textpageContentType = MockedContentTypes.CreateTextpageContentType();
+            ServiceContext.ContentTypeService.Save(textpageContentType);
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[31,9,31,10,1],[32,13,32,31,1],[34,13,34,30,1],[35,9,35,10,1],[39,9,39,10,1],[40,13,40,29,1],[41,9,41,10,1],[44,9,44,10,1],[45,13,45,223,1],[46,13,46,135,1],[47,13,47,167,1],[48,13,48,222,1],[49,13,49,31,1],[50,9,50,10,1],[53,9,53,10,1],[54,13,54,223,1],[55,13,55,171,1],[56,13,56,42,1],[57,9,57,10,1],[60,9,60,10,1],[61,13,61,149,1],[62,13,62,42,1],[63,9,63,10,1],[66,9,66,10,1],[67,13,67,155,1],[68,9,68,10,1],[75,9,75,10,1],[77,13,77,67,1],[78,13,78,55,1],[79,20,79,223,1],[80,20,80,65,1],[81,13,81,14,1],[82,17,87,19,1],[88,17,88,24,1],[88,26,88,38,1],[88,39,88,41,1],[88,42,88,51,1],[89,17,89,18,1],[90,21,90,56,1],[91,17,91,18,1],[92,17,92,37,1],[94,17,94,80,1],[95,17,95,83,1],[96,17,96,62,1],[97,17,97,53,1],[98,17,98,37,1],[101,17,101,61,1],[103,17,103,69,1],[104,17,104,77,1],[105,13,105,14,1],[107,9,107,10,1],[111,9,111,10,1],[112,13,112,67,1],[113,13,113,55,1],[114,20,114,132,1],[115,20,115,65,1],[116,13,116,14,1],[117,17,117,113,1],[118,17,118,61,1],[119,17,119,37,1],[121,17,121,139,1],[122,17,122,61,1],[123,17,123,37,1],[125,17,125,104,1],[126,17,126,54,1],[127,17,127,53,1],[128,17,128,37,1],[131,17,134,19,1],[135,17,135,55,1],[136,17,136,54,1],[137,17,137,37,1],[139,17,139,81,1],[140,17,140,37,1],[142,17,142,52,1],[145,17,145,62,1],[146,17,146,64,1],[148,17,148,70,1],[149,17,149,55,1],[149,55,149,84,1],[149,84,149,118,1],[149,17,149,118,1],[150,17,150,55,1],[150,55,150,85,1],[150,85,150,120,1],[150,17,150,120,1],[151,13,151,14,1],[153,9,153,10,1],[157,9,157,10,1],[158,13,158,67,1],[159,13,159,55,1],[161,20,161,132,1],[162,13,162,14,1],[163,17,163,107,1],[164,17,164,60,1],[165,17,165,37,1],[166,17,166,62,1],[167,13,167,14,1],[168,20,168,132,1],[169,13,169,14,1],[170,17,170,67,1],[171,17,171,41,1],[172,13,172,14,1],[173,9,173,10,1],[177,9,177,10,1],[178,13,178,67,1],[179,13,179,55,1],[181,20,181,132,1],[182,13,182,14,1],[183,17,183,114,1],[184,17,184,61,1],[185,17,185,114,1],[186,17,186,61,1],[187,17,187,114,1],[188,17,188,61,1],[189,17,189,37,1],[190,17,190,63,1],[191,17,191,63,1],[192,17,192,63,1],[193,13,193,14,1],[194,20,194,132,1],[195,13,195,14,1],[196,17,196,69,1],[197,17,197,42,1],[198,17,198,69,1],[199,17,199,42,1],[200,17,200,69,1],[201,17,201,42,1],[202,17,202,66,1],[203,17,203,59,1],[204,13,204,14,1],[205,9,205,10,1],[209,9,209,10,1],[210,13,210,67,1],[211,13,211,55,1],[213,20,213,132,1],[214,13,214,14,1],[215,17,215,107,1],[216,17,216,60,1],[217,17,217,37,1],[218,13,218,14,1],[219,20,219,132,1],[220,13,220,14,1],[222,17,222,55,1],[223,17,223,37,1],[224,13,224,14,1],[225,20,225,132,1],[226,13,226,14,1],[227,17,227,67,1],[228,17,228,38,1],[229,13,229,14,1],[230,9,230,10,1],[234,9,234,10,1],[235,13,235,67,1],[236,13,236,55,1],[237,20,237,129,1],[238,20,238,65,1],[239,13,239,14,1],[240,17,240,108,1],[241,17,241,60,1],[242,17,242,37,1],[244,17,244,126,1],[245,17,245,53,1],[246,17,246,53,1],[247,17,247,37,1],[249,17,249,69,1],[250,13,250,14,1],[251,9,251,10,1],[255,9,255,10,1],[256,13,256,67,1],[257,13,257,55,1],[260,20,260,129,1],[261,20,261,74,1],[262,13,262,14,1],[263,17,263,104,1],[264,17,264,60,1],[265,17,265,37,1],[267,17,267,120,1],[268,17,268,53,1],[269,17,269,53,1],[270,17,270,37,1],[271,13,271,14,1],[272,20,272,129,1],[273,20,273,74,1],[274,13,274,14,1],[276,17,276,55,1],[277,17,277,37,1],[279,17,279,67,1],[280,17,280,38,1],[282,17,282,62,1],[283,17,283,47,1],[284,17,284,59,1],[285,13,285,14,1],[286,9,286,10,1],[290,9,290,10,1],[292,13,292,67,1],[293,13,293,55,1],[294,20,294,65,1],[295,13,295,14,1],[297,17,297,126,1],[298,17,298,53,1],[299,17,299,37,1],[301,17,301,62,1],[304,17,304,63,1],[305,17,305,65,1],[305,65,305,78,1],[305,78,305,90,1],[305,17,305,90,1],[306,17,306,64,1],[306,64,306,77,1],[306,77,306,89,1],[306,17,306,89,1],[307,17,307,70,1],[308,17,308,71,1],[310,17,310,99,1],[311,17,311,74,1],[312,17,312,64,1],[312,64,312,98,1],[312,98,312,110,1],[312,17,312,110,1],[314,17,314,24,1],[314,26,314,42,1],[314,43,314,45,1],[314,46,314,71,1],[315,17,315,18,1],[316,21,316,70,1],[317,17,317,18,1],[319,17,319,188,1],[320,13,320,14,1],[321,9,321,10,1],[325,9,325,10,1],[327,13,327,67,1],[328,13,328,55,1],[329,20,329,65,1],[330,13,330,14,1],[332,17,332,141,1],[334,17,334,71,1],[338,17,338,76,1],[339,17,339,58,1],[340,17,340,61,1],[342,17,342,66,1],[344,17,344,48,1],[345,17,345,37,1],[347,17,347,66,1],[350,17,350,57,1],[352,17,352,71,1],[355,17,355,63,1],[356,17,356,65,1],[356,65,356,78,1],[356,78,356,90,1],[356,17,356,90,1],[357,17,357,64,1],[357,64,357,77,1],[357,77,357,89,1],[357,17,357,89,1],[358,17,358,70,1],[359,17,359,71,1],[361,17,361,99,1],[362,17,362,74,1],[364,17,364,73,1],[365,17,365,64,1],[366,17,366,65,1],[367,17,367,63,1],[367,63,367,97,1],[367,97,367,101,1],[367,17,367,101,1],[368,13,368,14,1],[370,9,370,10,1],[374,9,374,10,1],[376,13,376,67,1],[377,13,377,55,1],[378,20,378,65,1],[379,13,379,14,1],[381,17,381,74,1],[383,17,383,52,1],[384,13,391,20,1],[392,17,392,53,1],[393,17,393,37,1],[395,17,395,66,1],[398,17,398,63,1],[399,17,399,46,1],[400,17,400,76,1],[401,17,401,64,1],[401,64,401,85,1],[401,85,401,97,1],[401,17,401,97,1],[402,13,402,14,1],[405,9,405,10,1],[410,9,410,10,1],[411,13,434,73,1],[434,73,434,80,1],[434,80,437,53,1],[437,53,444,18,1],[444,18,445,15,1],[411,13,445,15,1],[446,9,446,10,1],[450,9,450,10,1],[452,13,452,67,1],[453,13,453,55,1],[454,20,454,65,1],[455,13,455,14,1],[457,17,457,74,1],[461,17,461,76,1],[462,17,462,58,1],[465,17,465,45,1],[466,17,466,60,1],[466,60,466,79,1],[466,79,466,81,1],[466,17,466,81,1],[467,17,482,20,1],[484,17,484,60,1],[487,17,487,63,1],[488,17,488,61,1],[488,61,488,82,1],[488,82,488,85,1],[488,17,488,85,1],[490,17,490,48,1],[491,17,491,37,1],[493,17,493,46,1],[496,17,496,70,1],[499,17,499,63,1],[500,17,500,46,1],[501,17,501,76,1],[502,17,502,64,1],[502,64,502,85,1],[502,85,502,97,1],[502,17,502,97,1],[503,17,503,24,1],[503,26,503,42,1],[503,43,503,45,1],[503,46,503,71,1],[504,17,504,18,1],[505,21,505,61,1],[506,21,506,56,1],[507,17,507,18,1],[508,13,508,14,1],[509,9,509,10,1],[513,9,513,10,1],[515,13,515,67,1],[516,13,516,55,1],[517,20,517,65,1],[518,13,518,14,1],[520,17,520,80,1],[521,17,521,53,1],[522,17,522,37,1],[524,17,524,67,1],[525,17,525,49,1],[526,17,526,37,1],[528,17,528,64,1],[531,17,531,47,1],[532,13,532,14,1],[533,9,533,10,1],[537,9,537,10,1],[539,13,539,67,1],[540,13,540,55,1],[541,20,541,65,1],[542,13,542,14,1],[543,17,543,75,1],[544,17,544,110,1],[545,17,545,112,1],[547,17,547,48,1],[548,17,548,50,1],[549,17,549,50,1],[550,17,550,37,1],[554,17,554,64,1],[555,17,555,51,1],[556,17,556,37,1],[559,17,559,69,1],[560,17,560,71,1],[561,17,561,71,1],[562,13,562,14,1],[563,9,563,10,1],[567,9,567,10,1],[569,13,569,67,1],[570,13,570,55,1],[571,20,571,65,1],[572,13,572,14,1],[573,17,573,74,1],[574,17,574,124,1],[575,17,575,48,1],[576,17,576,124,1],[577,17,577,48,1],[578,17,578,126,1],[579,17,579,48,1],[580,17,580,37,1],[583,17,583,126,1],[586,17,586,66,1],[587,17,587,73,1],[588,17,588,72,1],[589,17,589,72,1],[590,13,590,14,1],[592,9,592,10,1],[596,9,596,10,1],[598,13,598,67,1],[599,13,599,55,1],[600,20,600,65,1],[601,13,601,14,1],[604,17,604,74,1],[607,17,607,55,1],[608,17,608,81,1],[609,13,609,14,1],[610,9,610,10,1],[614,9,614,10,1],[616,13,616,67,1],[617,13,617,55,1],[618,20,618,65,1],[619,13,619,14,1],[620,17,620,74,1],[621,17,621,135,1],[622,17,622,58,1],[623,17,623,37,1],[626,17,626,67,1],[629,17,629,50,1],[630,17,630,73,1],[631,13,631,14,1],[632,9,632,10,1],[636,9,636,10,1],[638,13,638,67,1],[639,13,639,55,1],[640,20,640,65,1],[641,13,641,14,1],[643,17,643,61,1],[646,17,646,46,1],[647,13,647,14,1],[648,9,648,10,1],[652,9,652,10,1],[654,13,654,67,1],[655,13,655,55,1],[656,20,656,65,1],[657,13,657,14,1],[660,17,660,56,1],[661,17,664,94,1],[667,17,667,58,1],[668,17,668,70,1],[669,13,669,14,1],[670,9,670,10,1],[674,9,674,10,1],[676,13,676,67,1],[677,13,677,55,1],[678,20,678,65,1],[679,13,679,14,1],[680,17,680,66,1],[680,66,680,71,1],[680,71,680,83,1],[680,17,680,83,1],[683,17,683,105,1],[684,17,687,96,1],[690,17,690,58,1],[691,17,691,70,1],[692,13,692,14,1],[693,9,693,10,1],[697,9,697,10,1],[699,13,699,67,1],[700,13,700,55,1],[701,20,701,65,1],[702,13,702,14,1],[705,17,705,68,1],[708,17,708,46,1],[709,13,709,14,1],[710,9,710,10,1],[714,9,714,10,1],[716,13,716,67,1],[717,13,717,55,1],[718,20,718,65,1],[719,13,719,14,1],[720,17,720,74,1],[723,17,723,88,1],[724,17,724,53,1],[725,17,725,37,1],[727,17,727,69,1],[730,17,730,59,1],[730,59,730,83,1],[730,83,730,96,1],[730,17,730,96,1],[731,17,731,104,1],[732,17,732,106,1],[733,13,733,14,1],[734,9,734,10,1],[738,9,738,10,1],[740,13,740,67,1],[741,13,741,55,1],[742,20,742,65,1],[743,13,743,14,1],[746,17,746,70,1],[749,17,749,79,1],[750,17,750,80,1],[751,13,751,14,1],[752,9,752,10,1],[756,9,756,10,1],[758,13,758,67,1],[759,13,759,55,1],[760,20,760,65,1],[761,13,761,14,1],[764,17,764,74,1],[767,17,767,79,1],[768,17,768,80,1],[769,13,769,14,1],[770,9,770,10,1],[774,9,774,10,1],[776,13,776,67,1],[777,13,777,55,1],[778,20,778,65,1],[779,13,779,14,1],[780,17,780,74,1],[783,17,790,23,1],[792,17,792,79,1],[793,17,793,53,1],[794,17,794,37,1],[797,17,797,70,1],[798,17,798,57,1],[799,17,799,76,1],[800,17,800,75,1],[801,17,801,60,1],[801,60,801,81,1],[801,81,801,93,1],[801,17,801,93,1],[802,17,802,62,1],[802,62,802,83,1],[802,83,802,111,1],[802,17,802,111,1],[803,13,803,14,1],[804,9,804,10,1],[808,9,808,10,1],[810,13,810,67,1],[811,13,811,55,1],[812,20,812,65,1],[813,13,813,14,1],[815,17,815,110,1],[816,17,816,129,1],[817,17,817,60,1],[818,17,818,66,1],[819,17,819,37,1],[822,17,822,70,1],[823,17,825,65,1],[825,65,825,86,1],[825,86,826,65,1],[826,65,826,92,1],[826,92,827,23,1],[823,17,827,23,1],[828,17,828,53,1],[829,17,829,37,1],[832,17,832,66,1],[834,17,834,73,1],[835,17,835,66,1],[835,66,835,101,1],[835,101,835,113,1],[835,17,835,113,1],[836,17,836,66,1],[836,66,836,107,1],[836,107,836,119,1],[836,17,836,119,1],[837,13,837,14,1],[838,9,838,10,1],[842,9,842,10,1],[844,13,844,67,1],[845,13,845,55,1],[847,20,847,88,1],[848,13,848,14,1],[849,17,849,74,1],[851,17,851,111,1],[852,17,852,56,1],[853,17,853,37,1],[856,17,856,60,1],[857,17,857,53,1],[858,17,858,37,1],[861,17,861,79,1],[862,17,862,64,1],[862,64,862,85,1],[862,85,862,98,1],[862,17,862,98,1],[863,17,863,59,1],[863,59,863,83,1],[863,83,863,151,1],[863,17,863,151,1],[864,13,864,14,1],[865,9,865,10,1],[869,9,869,10,1],[871,13,871,67,1],[872,13,872,55,1],[874,20,874,88,1],[875,13,875,14,1],[876,17,876,74,1],[878,17,878,111,1],[879,17,879,56,1],[880,17,880,37,1],[883,17,883,75,1],[883,75,883,91,1],[883,91,883,93,1],[883,17,883,93,1],[884,17,884,222,1],[885,17,885,53,1],[886,17,886,37,1],[889,17,889,79,1],[890,17,890,64,1],[890,64,890,87,1],[890,87,890,99,1],[890,17,890,99,1],[891,13,891,14,1],[893,9,893,10,1],[897,9,897,10,1],[899,13,899,67,1],[900,13,900,55,1],[902,20,902,88,1],[903,13,903,14,1],[904,17,904,74,1],[906,17,906,111,1],[907,17,907,56,1],[908,17,908,37,1],[910,17,910,75,1],[910,75,910,91,1],[910,91,910,93,1],[910,17,910,93,1],[911,17,911,222,1],[912,17,912,53,1],[913,17,913,37,1],[916,17,916,65,1],[917,17,917,60,1],[918,17,918,56,1],[919,17,919,37,1],[922,17,922,65,1],[923,17,923,96,1],[924,17,924,79,1],[925,17,925,64,1],[925,64,925,87,1],[925,87,925,99,1],[925,17,925,99,1],[926,13,926,14,1],[927,9,927,10,1],[933,9,933,10,1],[935,13,935,67,1],[936,13,936,55,1],[938,20,938,88,1],[939,13,939,14,1],[940,17,940,74,1],[942,17,942,111,1],[943,17,943,56,1],[944,17,944,37,1],[947,17,947,60,1],[949,17,949,75,1],[949,75,949,91,1],[949,91,949,93,1],[949,17,949,93,1],[950,17,950,223,1],[951,17,951,53,1],[952,17,952,37,1],[955,17,955,65,1],[956,17,956,60,1],[957,17,957,56,1],[958,17,958,37,1],[961,17,961,65,1],[962,17,962,96,1],[963,17,963,59,1],[963,59,963,83,1],[963,83,963,151,1],[963,17,963,151,1],[965,17,965,79,1],[966,17,966,64,1],[966,64,966,87,1],[966,87,966,99,1],[966,17,966,99,1],[967,17,967,64,1],[967,64,967,85,1],[967,85,967,98,1],[967,17,967,98,1],[968,13,968,14,1],[969,9,969,10,1],[972,9,972,10,1],[974,13,974,115,1],[975,13,975,71,1],[978,13,978,94,1],[979,13,979,73,1],[980,9,980,10,1]]);
+    </script>
+  </body>
+</html>

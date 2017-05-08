@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\IO\ViewHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using Umbraco.Core.Models;
+
+namespace Umbraco.Core.IO
+{
+    public class ViewHelper
+    {
+        private readonly IFileSystem _viewFileSystem;
+
+        public ViewHelper(IFileSystem viewFileSystem)
+        {
+            if (viewFileSystem == null) throw new ArgumentNullException(&quot;viewFileSystem&quot;);
+            _viewFileSystem = viewFileSystem;
+        }
+
+        internal bool ViewExists(ITemplate t)
+        {
+            return _viewFileSystem.FileExists(ViewPath(t.Alias));
+        }
+
+        [Obsolete(&quot;This is only used for legacy purposes and will be removed in future versions&quot;)]
+        internal string GetPhysicalFilePath(ITemplate t)
+        {
+            return _viewFileSystem.GetFullPath(ViewPath(t.Alias));
+        }
+
+        internal string GetFileContents(ITemplate t)
+        {
+            string viewContent = &quot;&quot;;
+            string path = ViewPath(t.Alias);
+
+            if (_viewFileSystem.FileExists(path))
+            {
+                using (var tr = new StreamReader(_viewFileSystem.OpenFile(path)))
+                {
+                    viewContent = tr.ReadToEnd();
+                    tr.Close();
+                }
+            }
+
+            return viewContent;
+        }
+
+        public string CreateView(ITemplate t, bool overWrite = false)
+        {
+            string viewContent;
+            string path = ViewPath(t.Alias);
+
+            if (_viewFileSystem.FileExists(path) == false || overWrite)
+            {
+                viewContent = SaveTemplateToFile(t);   
+            }                
+            else
+            {
+                using (var tr = new StreamReader(_viewFileSystem.OpenFile(path)))
+                {
+                    viewContent = tr.ReadToEnd();
+                    tr.Close();
+                }
+            }
+
+            return viewContent;
+        }
+
+        public static string GetDefaultFileContent(string layoutPageAlias = null, string modelClassName = null, string modelNamespace = null, string modelNamespaceAlias = null)
+        {
+            var content = new StringBuilder();
+
+            if (string.IsNullOrWhiteSpace(modelNamespaceAlias))
+                modelNamespaceAlias = &quot;ContentModels&quot;;
+
+            // either
+            // @inherits Umbraco.Web.Mvc.UmbracoTemplatePage
+            // @inherits Umbraco.Web.Mvc.UmbracoTemplatePage&lt;ModelClass&gt;
+            // @inherits Umbraco.Web.Mvc.UmbracoTemplatePage&lt;ContentModels.ModelClass&gt;
+            content.Append(&quot;@inherits Umbraco.Web.Mvc.UmbracoTemplatePage&quot;);
+            if (modelClassName.IsNullOrWhiteSpace() == false)
+            {
+                content.Append(&quot;&lt;&quot;);
+                if (modelNamespace.IsNullOrWhiteSpace() == false)
+                {
+                    content.Append(modelNamespaceAlias);
+                    content.Append(&quot;.&quot;);
+                }
+                content.Append(modelClassName);
+                content.Append(&quot;&gt;&quot;);
+            }
+            content.Append(&quot;\r\n&quot;);
+
+            // if required, add
+            // @using ContentModels = ModelNamespace;
+            if (modelClassName.IsNullOrWhiteSpace() == false &amp;&amp; modelNamespace.IsNullOrWhiteSpace() == false)
+            {
+                content.Append(&quot;@using &quot;);
+                content.Append(modelNamespaceAlias);
+                content.Append(&quot; = &quot;);
+                content.Append(modelNamespace);
+                content.Append(&quot;;\r\n&quot;);
+            }
+
+            // either
+            // Layout = null;
+            // Layout = &quot;layoutPage.cshtml&quot;;
+            content.Append(&quot;@{\r\n\tLayout = &quot;);
+            if (layoutPageAlias.IsNullOrWhiteSpace())
+            {
+                content.Append(&quot;null&quot;);
+            }
+            else
+            {
+                content.Append(&quot;\&quot;&quot;);
+                content.Append(layoutPageAlias);
+                content.Append(&quot;.cshtml\&quot;&quot;);
+            }
+            content.Append(&quot;;\r\n}&quot;);
+            return content.ToString();
+        }
+
+        private string SaveTemplateToFile(ITemplate template)
+        {
+            var design = template.Content.IsNullOrWhiteSpace() ? EnsureInheritedLayout(template) : template.Content;
+            var path = ViewPath(template.Alias);
+
+            var data = Encoding.UTF8.GetBytes(design);
+            var withBom = Encoding.UTF8.GetPreamble().Concat(data).ToArray();
+
+            using (var ms = new MemoryStream(withBom))
+            {
+                _viewFileSystem.AddFile(path, ms, true);
+            }
+
+            return design;
+        }
+
+        public string UpdateViewFile(ITemplate t, string currentAlias = null)
+        {
+            var path = ViewPath(t.Alias);
+
+            if (string.IsNullOrEmpty(currentAlias) == false &amp;&amp; currentAlias != t.Alias)
+            {
+                //then kill the old file.. 
+                var oldFile = ViewPath(currentAlias);
+                if (_viewFileSystem.FileExists(oldFile))
+                    _viewFileSystem.DeleteFile(oldFile);
+            }
+
+            var data = Encoding.UTF8.GetBytes(t.Content);
+            var withBom = Encoding.UTF8.GetPreamble().Concat(data).ToArray();
+
+            using (var ms = new MemoryStream(withBom))
+            {
+                _viewFileSystem.AddFile(path, ms, true);
+            }
+            return t.Content;
+        }
+
+        internal void RemoveViewFile(string alias)
+        {
+            if (string.IsNullOrWhiteSpace(alias) == false)
+            {
+                var file = ViewPath(alias);
+                if (_viewFileSystem.FileExists(file))
+                    _viewFileSystem.DeleteFile(file);
+            }
+        }
+
+        public string ViewPath(string alias)
+        {
+            return _viewFileSystem.GetRelativePath(alias.Replace(&quot; &quot;, &quot;&quot;) + &quot;.cshtml&quot;);
+
+            //return SystemDirectories.MvcViews + &quot;/&quot; + alias.Replace(&quot; &quot;, &quot;&quot;) + &quot;.cshtml&quot;;
+        }
+
+        private string EnsureInheritedLayout(ITemplate template)
+        {
+            string design = template.Content;
+
+            if (string.IsNullOrEmpty(design))
+            {
+                design = GetDefaultFileContent(template.MasterTemplateAlias);
+            }
+
+            return design;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[14,9,14,54,1],[15,9,15,10,1],[16,13,16,40,1],[16,41,16,91,0],[17,13,17,46,1],[18,9,18,10,1],[21,9,21,10,1],[22,13,22,66,1],[23,9,23,10,1],[27,9,27,10,0],[28,13,28,67,0],[29,9,29,10,0],[32,9,32,10,0],[33,13,33,37,0],[34,13,34,45,0],[36,13,36,50,0],[37,13,37,14,0],[38,24,38,81,0],[39,17,39,18,0],[40,21,40,50,0],[41,21,41,32,0],[42,17,42,18,0],[43,13,43,14,0],[45,13,45,32,0],[46,9,46,10,0],[49,9,49,10,1],[51,13,51,45,1],[53,13,53,72,1],[54,13,54,14,1],[55,17,55,53,1],[56,13,56,14,1],[58,13,58,14,0],[59,24,59,81,0],[60,17,60,18,0],[61,21,61,50,0],[62,21,62,32,0],[63,17,63,18,0],[64,13,64,14,0],[66,13,66,32,1],[67,9,67,10,1],[70,9,70,10,1],[71,13,71,47,1],[73,13,73,64,1],[74,17,74,55,1],[80,13,80,77,1],[81,13,81,62,1],[82,13,82,14,1],[83,17,83,37,1],[84,17,84,66,1],[85,17,85,18,1],[86,21,86,57,1],[87,21,87,41,1],[88,17,88,18,1],[89,17,89,48,1],[90,17,90,37,1],[91,13,91,14,1],[92,13,92,36,1],[96,13,96,110,1],[97,13,97,14,1],[98,17,98,43,1],[99,17,99,53,1],[100,17,100,39,1],[101,17,101,48,1],[102,17,102,41,1],[103,13,103,14,1],[108,13,108,49,1],[109,13,109,54,1],[110,13,110,14,1],[111,17,111,40,1],[112,13,112,14,1],[114,13,114,14,1],[115,17,115,38,1],[116,17,116,49,1],[117,17,117,45,1],[118,13,118,14,1],[119,13,119,38,1],[120,13,120,39,1],[121,9,121,10,1],[124,9,124,10,1],[125,13,125,117,1],[126,13,126,49,1],[128,13,128,55,1],[129,13,129,78,1],[131,20,131,54,1],[132,13,132,14,1],[133,17,133,57,1],[134,13,134,14,1],[136,13,136,27,1],[137,9,137,10,1],[140,9,140,10,1],[141,13,141,42,1],[143,13,143,88,1],[144,13,144,14,1],[146,17,146,54,1],[147,17,147,57,1],[148,21,148,57,1],[149,13,149,14,1],[151,13,151,58,1],[152,13,152,78,1],[154,20,154,54,1],[155,13,155,14,1],[156,17,156,57,1],[157,13,157,14,1],[158,13,158,30,1],[159,9,159,10,1],[162,9,162,10,0],[163,13,163,59,0],[164,13,164,14,0],[165,17,165,44,0],[166,17,166,54,0],[167,21,167,54,0],[168,13,168,14,0],[169,9,169,10,0],[172,9,172,10,1],[173,13,173,88,1],[176,9,176,10,1],[179,9,179,10,1],[180,13,180,46,1],[182,13,182,46,1],[183,13,183,14,1],[184,17,184,78,1],[185,13,185,14,1],[187,13,187,27,1],[188,9,188,10,1]]);
+    </script>
+  </body>
+</html>

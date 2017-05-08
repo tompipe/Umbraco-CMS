@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\RepositoryFactory.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using Umbraco.Core.Configuration;
+using System;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence
+{
+    /// &lt;summary&gt;
+    /// Used to instantiate each repository type
+    /// &lt;/summary&gt;
+    public class RepositoryFactory
+    {
+        private readonly ILogger _logger;
+        private readonly ISqlSyntaxProvider _sqlSyntax;
+        private readonly CacheHelper _cacheHelper;
+        private readonly CacheHelper _noCache;
+        private readonly IUmbracoSettingsSection _settings;
+
+        #region Ctors
+
+        public RepositoryFactory(CacheHelper cacheHelper, ILogger logger, ISqlSyntaxProvider sqlSyntax, IUmbracoSettingsSection settings)
+        {
+            if (cacheHelper == null) throw new ArgumentNullException(&quot;cacheHelper&quot;);
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            //if (sqlSyntax == null) throw new ArgumentNullException(&quot;sqlSyntax&quot;);
+            if (settings == null) throw new ArgumentNullException(&quot;settings&quot;);
+
+            _cacheHelper = cacheHelper;            
+
+            //IMPORTANT: We will force the DeepCloneRuntimeCacheProvider to be used here which is a wrapper for the underlying
+            // runtime cache to ensure that anything that can be deep cloned in/out is done so, this also ensures that our tracks
+            // changes entities are reset.
+            if ((_cacheHelper.RuntimeCache is DeepCloneRuntimeCacheProvider) == false)
+            {
+                var origRuntimeCache = cacheHelper.RuntimeCache;
+                _cacheHelper.RuntimeCache = new DeepCloneRuntimeCacheProvider(origRuntimeCache);
+            }
+            //If the factory for isolated cache doesn&#39;t return DeepCloneRuntimeCacheProvider, then ensure it does
+            if (_cacheHelper.IsolatedRuntimeCache.CacheFactory.Method.ReturnType != typeof (DeepCloneRuntimeCacheProvider))
+            {
+                var origFactory = cacheHelper.IsolatedRuntimeCache.CacheFactory;
+                _cacheHelper.IsolatedRuntimeCache.CacheFactory = type =&gt;
+                {
+                    var cache = origFactory(type);
+
+                    //if the result is already a DeepCloneRuntimeCacheProvider then return it, otherwise
+                    //wrap the result with a DeepCloneRuntimeCacheProvider
+                    return cache is DeepCloneRuntimeCacheProvider 
+                        ? cache 
+                        : new DeepCloneRuntimeCacheProvider(cache);
+                };
+            }
+
+            _noCache = CacheHelper.CreateDisabledCacheHelper();
+            _logger = logger;
+            _sqlSyntax = sqlSyntax;
+            _settings = settings;
+        }
+
+        [Obsolete(&quot;Use the ctor specifying all dependencies instead&quot;)]
+        public RepositoryFactory()
+            : this(ApplicationContext.Current.ApplicationCache, LoggerResolver.Current.Logger, SqlSyntaxContext.SqlSyntaxProvider, UmbracoConfig.For.UmbracoSettings())
+        {
+        }
+
+        [Obsolete(&quot;Use the ctor specifying all dependencies instead&quot;)]
+        public RepositoryFactory(CacheHelper cacheHelper)
+            : this(cacheHelper, LoggerResolver.Current.Logger, SqlSyntaxContext.SqlSyntaxProvider, UmbracoConfig.For.UmbracoSettings())
+        {
+        }
+
+        [Obsolete(&quot;Use the ctor specifying all dependencies instead, NOTE: disableAllCache has zero effect&quot;)]        
+        public RepositoryFactory(bool disableAllCache, CacheHelper cacheHelper)
+            : this(cacheHelper, LoggerResolver.Current.Logger, SqlSyntaxContext.SqlSyntaxProvider, UmbracoConfig.For.UmbracoSettings())
+        {
+            if (cacheHelper == null) throw new ArgumentNullException(&quot;cacheHelper&quot;);
+            _cacheHelper = cacheHelper;
+            _noCache = CacheHelper.CreateDisabledCacheHelper();
+        }
+
+        [Obsolete(&quot;Use the ctor specifying all dependencies instead&quot;)]
+        public RepositoryFactory(bool disableAllCache)
+            : this(disableAllCache ? CacheHelper.CreateDisabledCacheHelper() : ApplicationContext.Current.ApplicationCache, LoggerResolver.Current.Logger, SqlSyntaxContext.SqlSyntaxProvider, UmbracoConfig.For.UmbracoSettings())
+        {
+        }
+
+     
+        #endregion
+
+        public virtual IExternalLoginRepository CreateExternalLoginRepository(IDatabaseUnitOfWork uow)
+        {
+            return new ExternalLoginRepository(uow,
+                _cacheHelper,
+                _logger, _sqlSyntax);
+        }
+
+        public virtual IPublicAccessRepository CreatePublicAccessRepository(IDatabaseUnitOfWork uow)
+        {
+            return new PublicAccessRepository(uow,
+                _cacheHelper,
+                _logger, _sqlSyntax);
+        }
+
+        public virtual ITaskRepository CreateTaskRepository(IDatabaseUnitOfWork uow)
+        {
+            return new TaskRepository(uow,
+                _noCache, //never cache
+                _logger, _sqlSyntax);
+        }
+
+        public virtual IAuditRepository CreateAuditRepository(IDatabaseUnitOfWork uow)
+        {
+            return new AuditRepository(uow,
+                _noCache, //never cache
+                _logger, _sqlSyntax);
+        }
+
+        public virtual ITagRepository CreateTagRepository(IDatabaseUnitOfWork uow)
+        {
+            return new TagRepository(
+                uow,
+                _cacheHelper, _logger, _sqlSyntax);
+        }
+
+        public virtual IContentRepository CreateContentRepository(IDatabaseUnitOfWork uow)
+        {
+            return new ContentRepository(
+                uow,
+                _cacheHelper,
+                _logger,
+                _sqlSyntax,
+                CreateContentTypeRepository(uow),
+                CreateTemplateRepository(uow),
+                CreateTagRepository(uow),
+                _settings.Content)
+            {
+                EnsureUniqueNaming = _settings.Content.EnsureUniqueNaming
+            };
+        }
+
+        public virtual IContentTypeRepository CreateContentTypeRepository(IDatabaseUnitOfWork uow)
+        {
+            return new ContentTypeRepository(
+                uow,
+                _cacheHelper,
+                _logger, _sqlSyntax,
+                CreateTemplateRepository(uow));
+        }
+
+        public virtual IDataTypeDefinitionRepository CreateDataTypeDefinitionRepository(IDatabaseUnitOfWork uow)
+        {
+            return new DataTypeDefinitionRepository(
+                uow,
+                _cacheHelper,
+                _logger, _sqlSyntax,
+                CreateContentTypeRepository(uow));
+        }
+
+        public virtual IDictionaryRepository CreateDictionaryRepository(IDatabaseUnitOfWork uow)
+        {
+            return new DictionaryRepository(
+                uow,
+                _cacheHelper,
+                _logger,
+                _sqlSyntax);
+        }
+
+        public virtual ILanguageRepository CreateLanguageRepository(IDatabaseUnitOfWork uow)
+        {
+            return new LanguageRepository(
+                uow,
+                _cacheHelper,
+                _logger, _sqlSyntax);
+        }
+
+        public virtual IMediaRepository CreateMediaRepository(IDatabaseUnitOfWork uow)
+        {
+            return new MediaRepository(
+                uow,
+                _cacheHelper,
+                _logger, _sqlSyntax,
+                CreateMediaTypeRepository(uow),
+                CreateTagRepository(uow),
+                _settings.Content);
+        }
+
+        public virtual IMediaTypeRepository CreateMediaTypeRepository(IDatabaseUnitOfWork uow)
+        {
+            return new MediaTypeRepository(
+                uow,
+                _cacheHelper,
+                _logger, _sqlSyntax);
+        }
+
+        public virtual IRelationRepository CreateRelationRepository(IDatabaseUnitOfWork uow)
+        {
+            return new RelationRepository(
+                uow,
+                _noCache,
+                _logger, _sqlSyntax,
+                CreateRelationTypeRepository(uow));
+        }
+
+        public virtual IRelationTypeRepository CreateRelationTypeRepository(IDatabaseUnitOfWork uow)
+        {
+            return new RelationTypeRepository(
+                uow,
+                _cacheHelper,
+                _logger, _sqlSyntax);
+        }
+
+        public virtual IScriptRepository CreateScriptRepository(IUnitOfWork uow)
+        {
+            return new ScriptRepository(uow, new PhysicalFileSystem(SystemDirectories.Scripts), _settings.Content);
+        }
+
+        internal virtual IPartialViewRepository CreatePartialViewRepository(IUnitOfWork uow)
+        {
+            return new PartialViewRepository(uow);
+        }
+
+        internal virtual IPartialViewRepository CreatePartialViewMacroRepository(IUnitOfWork uow)
+        {
+            return new PartialViewMacroRepository(uow);
+        }
+
+        public virtual IStylesheetRepository CreateStylesheetRepository(IUnitOfWork uow, IDatabaseUnitOfWork db)
+        {
+            return new StylesheetRepository(uow, new PhysicalFileSystem(SystemDirectories.Css));
+        }
+
+        public virtual ITemplateRepository CreateTemplateRepository(IDatabaseUnitOfWork uow)
+        {
+            return new TemplateRepository(uow, 
+                _cacheHelper,
+                _logger, _sqlSyntax,
+                new PhysicalFileSystem(SystemDirectories.Masterpages),
+                new PhysicalFileSystem(SystemDirectories.MvcViews),
+                _settings.Templates);
+        }
+
+        public virtual IMigrationEntryRepository CreateMigrationEntryRepository(IDatabaseUnitOfWork uow)
+        {
+            return new MigrationEntryRepository(
+                uow,
+                _noCache, //never cache
+                _logger, _sqlSyntax);
+        }
+
+        public virtual IServerRegistrationRepository CreateServerRegistrationRepository(IDatabaseUnitOfWork uow)
+        {
+            return new ServerRegistrationRepository(
+                uow,
+                _cacheHelper.StaticCache,
+                _logger, _sqlSyntax);
+        }
+
+        public virtual IUserTypeRepository CreateUserTypeRepository(IDatabaseUnitOfWork uow)
+        {
+            return new UserTypeRepository(
+                uow,
+                //There&#39;s not many user types but we query on users all the time so the result needs to be cached
+                _cacheHelper,
+                _logger, _sqlSyntax);
+        }
+
+        public virtual IUserRepository CreateUserRepository(IDatabaseUnitOfWork uow)
+        {            
+            return new UserRepository(
+                uow,
+                //Need to cache users - we look up user information more than anything in the back office!
+                _cacheHelper,
+                _logger, _sqlSyntax,
+                CreateUserTypeRepository(uow));
+        }
+
+        internal virtual IMacroRepository CreateMacroRepository(IDatabaseUnitOfWork uow)
+        {
+            return new MacroRepository(uow,
+                _cacheHelper,
+                _logger, _sqlSyntax);
+        }
+
+        public virtual IMemberRepository CreateMemberRepository(IDatabaseUnitOfWork uow)
+        {
+            return new MemberRepository(
+                uow,
+                _cacheHelper,
+                _logger, _sqlSyntax,
+                CreateMemberTypeRepository(uow),
+                CreateMemberGroupRepository(uow),
+                CreateTagRepository(uow),
+                _settings.Content);
+        }
+
+        public virtual IMemberTypeRepository CreateMemberTypeRepository(IDatabaseUnitOfWork uow)
+        {
+            return new MemberTypeRepository(uow,
+                _cacheHelper,
+                _logger, _sqlSyntax);
+        }
+
+        public virtual IMemberGroupRepository CreateMemberGroupRepository(IDatabaseUnitOfWork uow)
+        {
+            return new MemberGroupRepository(uow,
+                _cacheHelper,
+                _logger, _sqlSyntax);
+        }
+
+        public virtual IEntityRepository CreateEntityRepository(IDatabaseUnitOfWork uow)
+        {
+            return new EntityRepository(uow);
+        }
+
+        public virtual IDomainRepository CreateDomainRepository(IDatabaseUnitOfWork uow)
+        {
+            return new DomainRepository(uow, _cacheHelper, _logger, _sqlSyntax);
+        }
+
+        public ITaskTypeRepository CreateTaskTypeRepository(IDatabaseUnitOfWork uow)
+        {
+            return new TaskTypeRepository(uow,
+                _noCache, //never cache
+                _logger, _sqlSyntax);
+        }
+
+        internal virtual EntityContainerRepository CreateEntityContainerRepository(IDatabaseUnitOfWork uow, Guid containerObjectType)
+        {
+            return new EntityContainerRepository(
+                uow,
+                _cacheHelper,
+                _logger, _sqlSyntax,
+                containerObjectType);
+        }
+
+        public IRedirectUrlRepository CreateRedirectUrlRepository(IDatabaseUnitOfWork uow)
+        {
+            return new RedirectUrlRepository(
+                uow,
+                _cacheHelper,
+                _logger,
+                _sqlSyntax);
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[27,9,27,138,1],[28,9,28,10,1],[29,13,29,37,1],[29,38,29,85,0],[30,13,30,32,1],[30,33,30,75,0],[32,13,32,34,1],[32,35,32,79,0],[34,13,34,40,1],[39,13,39,87,1],[40,13,40,14,1],[41,17,41,65,1],[42,17,42,97,1],[43,13,43,14,1],[45,13,45,124,1],[46,13,46,14,1],[47,17,47,81,1],[48,17,49,17,1],[49,17,49,18,1],[49,18,50,21,1],[50,21,50,51,1],[50,51,54,21,1],[54,21,56,68,1],[56,68,57,17,1],[57,17,57,18,1],[57,18,57,19,1],[48,17,57,19,1],[58,13,58,14,1],[60,13,60,64,1],[61,13,61,30,1],[62,13,62,36,1],[63,13,63,34,1],[64,9,64,10,1],[68,15,68,168,0],[69,9,69,10,0],[70,9,70,10,0],[74,15,74,136,0],[75,9,75,10,0],[76,9,76,10,0],[80,15,80,136,0],[81,9,81,10,0],[82,13,82,37,0],[82,38,82,85,0],[83,13,83,40,0],[84,13,84,64,0],[85,9,85,10,0],[89,15,89,228,0],[90,9,90,10,0],[91,9,91,10,0],[97,9,97,10,0],[98,13,100,38,0],[101,9,101,10,0],[104,9,104,10,1],[105,13,107,38,1],[108,9,108,10,1],[111,9,111,10,0],[112,13,114,38,0],[115,9,115,10,0],[118,9,118,10,1],[119,13,121,38,1],[122,9,122,10,1],[125,9,125,10,1],[126,13,128,52,1],[129,9,129,10,1],[132,9,132,10,1],[133,13,144,15,1],[145,9,145,10,1],[148,9,148,10,1],[149,13,153,48,1],[154,9,154,10,1],[157,9,157,10,1],[158,13,162,51,1],[163,9,163,10,1],[166,9,166,10,1],[167,13,171,29,1],[172,9,172,10,1],[175,9,175,10,1],[176,13,179,38,1],[180,9,180,10,1],[183,9,183,10,1],[184,13,190,36,1],[191,9,191,10,1],[194,9,194,10,1],[195,13,198,38,1],[199,9,199,10,1],[202,9,202,10,1],[203,13,207,52,1],[208,9,208,10,1],[211,9,211,10,1],[212,13,215,38,1],[216,9,216,10,1],[219,9,219,10,0],[220,13,220,116,0],[221,9,221,10,0],[224,9,224,10,0],[225,13,225,51,0],[226,9,226,10,0],[229,9,229,10,0],[230,13,230,56,0],[231,9,231,10,0],[234,9,234,10,0],[235,13,235,97,0],[236,9,236,10,0],[239,9,239,10,1],[240,13,245,38,1],[246,9,246,10,1],[249,9,249,10,0],[250,13,253,38,0],[254,9,254,10,0],[257,9,257,10,0],[258,13,261,38,0],[262,9,262,10,0],[265,9,265,10,1],[266,13,270,38,1],[271,9,271,10,1],[274,9,274,10,1],[275,13,280,48,1],[281,9,281,10,1],[284,9,284,10,1],[285,13,287,38,1],[288,9,288,10,1],[291,9,291,10,1],[292,13,299,36,1],[300,9,300,10,1],[303,9,303,10,1],[304,13,306,38,1],[307,9,307,10,1],[310,9,310,10,1],[311,13,313,38,1],[314,9,314,10,1],[317,9,317,10,1],[318,13,318,46,1],[319,9,319,10,1],[322,9,322,10,1],[323,13,323,81,1],[324,9,324,10,1],[327,9,327,10,0],[328,13,330,38,0],[331,9,331,10,0],[334,9,334,10,1],[335,13,339,38,1],[340,9,340,10,1],[343,9,343,10,0],[344,13,348,29,0],[349,9,349,10,0]]);
+    </script>
+  </body>
+</html>

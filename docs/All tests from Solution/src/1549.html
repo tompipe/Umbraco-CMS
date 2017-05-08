@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\IO\MasterPageHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using Umbraco.Core.Models;
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Core.IO
+{
+    internal class MasterPageHelper
+    {
+        private readonly IFileSystem _masterPageFileSystem;
+        internal static readonly string DefaultMasterTemplate = SystemDirectories.Umbraco + &quot;/masterpages/default.master&quot;;
+        //private static readonly char[] NewLineChars = Environment.NewLine.ToCharArray();
+
+        public MasterPageHelper(IFileSystem masterPageFileSystem)
+        {
+            if (masterPageFileSystem == null) throw new ArgumentNullException(&quot;masterPageFileSystem&quot;);
+            _masterPageFileSystem = masterPageFileSystem;
+        }
+
+        public bool MasterPageExists(ITemplate t)
+        {
+            return _masterPageFileSystem.FileExists(GetFilePath(t));
+        }
+
+        [Obsolete(&quot;This is only used for legacy purposes and will be removed in future versions&quot;)]
+        internal string GetPhysicalFilePath(ITemplate t)
+        {
+            return _masterPageFileSystem.GetFullPath(GetFilePath(t.Alias));
+        }
+
+        private string GetFilePath(ITemplate t)
+        {
+            return GetFilePath(t.Alias);
+        }
+
+        private string GetFilePath(string alias)
+        {
+            return alias + &quot;.master&quot;;
+        }
+
+        public string CreateMasterPage(ITemplate t, ITemplateRepository templateRepo, bool overWrite = false)
+        {
+            string masterpageContent = &quot;&quot;;
+
+            var filePath = GetFilePath(t);
+            if (_masterPageFileSystem.FileExists(filePath) == false || overWrite)
+            {
+                masterpageContent = t.Content.IsNullOrWhiteSpace() ? CreateDefaultMasterPageContent(t, templateRepo) : t.Content;
+
+                var data = Encoding.UTF8.GetBytes(masterpageContent);
+                var withBom = Encoding.UTF8.GetPreamble().Concat(data).ToArray();
+
+                using (var ms = new MemoryStream(withBom))
+                {
+                    _masterPageFileSystem.AddFile(filePath, ms, true);    
+                }                
+            }
+            else
+            {
+                using (var s = _masterPageFileSystem.OpenFile(filePath))
+                using (var tr = new StreamReader(s, Encoding.UTF8))
+                {
+                    masterpageContent = tr.ReadToEnd();
+                    tr.Close();    
+                }
+            }
+
+            return masterpageContent;
+        }
+
+        //internal string GetFileContents(ITemplate t)
+        //{
+        //    var masterpageContent = &quot;&quot;;
+        //    if (_masterPageFileSystem.FileExists(GetFilePath(t)))
+        //    {
+        //        using (var s = _masterPageFileSystem.OpenFile(GetFilePath(t)))
+        //        using (var tr = new StreamReader(s))
+        //        {
+        //            masterpageContent = tr.ReadToEnd();
+        //            tr.Close();    
+        //        }
+        //    }
+
+        //    return masterpageContent;
+        //}
+
+        public string UpdateMasterPageFile(ITemplate t, string currentAlias, ITemplateRepository templateRepo)
+        {
+            var template = UpdateMasterPageContent(t, currentAlias);
+            UpdateChildTemplates(t, currentAlias, templateRepo);
+            var filePath = GetFilePath(t);
+
+            var data = Encoding.UTF8.GetBytes(template);
+            var withBom = Encoding.UTF8.GetPreamble().Concat(data).ToArray();
+
+            using (var ms = new MemoryStream(withBom))
+            {
+                _masterPageFileSystem.AddFile(filePath, ms, true);
+            }
+            return template;
+        }
+
+        private string CreateDefaultMasterPageContent(ITemplate template, ITemplateRepository templateRepo)
+        {
+            var design = new StringBuilder();
+            design.Append(GetMasterPageHeader(template) + Environment.NewLine);
+
+            if (template.MasterTemplateAlias.IsNullOrWhiteSpace() == false)
+            {
+                var master = templateRepo.Get(template.MasterTemplateAlias);
+                if (master != null)
+                {
+                    foreach (var cpId in GetContentPlaceholderIds(master))
+                    {
+                        design.Append(&quot;&lt;asp:content ContentPlaceHolderId=\&quot;&quot; + cpId + &quot;\&quot; runat=\&quot;server\&quot;&gt;&quot; +
+                                      Environment.NewLine +
+                                      Environment.NewLine +
+                                      &quot;&lt;/asp:content&gt;&quot; +
+                                      Environment.NewLine +
+                                      Environment.NewLine);
+                    }
+
+                    return design.ToString();
+                }
+            }
+
+            design.Append(GetMasterContentElement(template) + Environment.NewLine);
+            design.Append(template.Content + Environment.NewLine);
+            design.Append(&quot;&lt;/asp:Content&gt;&quot; + Environment.NewLine);
+
+            return design.ToString();
+        }
+
+        public static IEnumerable&lt;string&gt; GetContentPlaceholderIds(ITemplate template)
+        {
+            var retVal = new List&lt;string&gt;();
+
+            var mp = template.Content;
+            var path = &quot;&lt;asp:ContentPlaceHolder+(\\s+[a-zA-Z]+\\s*=\\s*(\&quot;([^\&quot;]*)\&quot;|&#39;([^&#39;]*)&#39;))*\\s*/?&gt;&quot;;
+            var r = new Regex(path, RegexOptions.IgnoreCase);
+            var m = r.Match(mp);
+
+            while (m.Success)
+            {
+                var cc = m.Groups[3].Captures;
+                retVal.AddRange(cc.Cast&lt;Capture&gt;().Where(c =&gt; c.Value != &quot;server&quot;).Select(c =&gt; c.Value));
+
+                m = m.NextMatch();
+            }
+
+            return retVal;
+        }
+
+        private static string UpdateMasterPageContent(ITemplate template, string currentAlias)
+        {
+            var masterPageContent = template.Content;
+
+            if (string.IsNullOrEmpty(currentAlias) == false &amp;&amp; currentAlias != template.Alias)
+            {
+                var masterHeader =
+                    masterPageContent.Substring(0, masterPageContent.IndexOf(&quot;%&gt;&quot;, StringComparison.Ordinal) + 2).Trim(
+                        Environment.NewLine.ToCharArray());
+
+                // find the masterpagefile attribute
+                var m = Regex.Matches(masterHeader, &quot;(?&lt;attributeName&gt;\\S*)=\&quot;(?&lt;attributeValue&gt;[^\&quot;]*)\&quot;&quot;,
+                    RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+
+                foreach (Match attributeSet in m)
+                {
+                    if (attributeSet.Groups[&quot;attributeName&quot;].Value.ToLower() == &quot;masterpagefile&quot;)
+                    {
+                        // validate the masterpagefile
+                        var currentMasterPageFile = attributeSet.Groups[&quot;attributeValue&quot;].Value;
+                        var currentMasterTemplateFile = ParentTemplatePath(template);
+
+                        if (currentMasterPageFile != currentMasterTemplateFile)
+                        {
+                            masterPageContent =
+                                masterPageContent.Replace(
+                                    attributeSet.Groups[&quot;attributeName&quot;].Value + &quot;=\&quot;&quot; + currentMasterPageFile + &quot;\&quot;&quot;,
+                                    attributeSet.Groups[&quot;attributeName&quot;].Value + &quot;=\&quot;&quot; + currentMasterTemplateFile +
+                                    &quot;\&quot;&quot;);
+                        }
+                    }
+                }
+            }
+
+            return masterPageContent;
+        }
+
+        private void UpdateChildTemplates(ITemplate template, string currentAlias, ITemplateRepository templateRepo)
+        {
+            //if we have a Old Alias if the alias and therefor the masterpage file name has changed...
+            //so before we save the new masterfile, we&#39;ll clear the old one, so we don&#39;t up with 
+            //Unused masterpage files
+            if (string.IsNullOrEmpty(currentAlias) == false &amp;&amp; currentAlias != template.Alias)
+            {
+                //Ensure that child templates have the right master masterpage file name
+                if (template.IsMasterTemplate)
+                {
+                    var children = templateRepo.GetChildren(template.Id);
+                    foreach (var t in children)
+                        UpdateMasterPageFile(t, null, templateRepo);
+                }
+            }
+        }
+
+
+        //private void SaveDesignToFile(ITemplate t, string currentAlias, string design)
+        //{
+        //    //kill the old file..
+        //    if (string.IsNullOrEmpty(currentAlias) == false &amp;&amp; currentAlias != t.Alias)
+        //    {
+        //        var oldFile =
+        //            IOHelper.MapPath(SystemDirectories.Masterpages + &quot;/&quot; + currentAlias.Replace(&quot; &quot;, &quot;&quot;) + &quot;.master&quot;);
+        //        if (System.IO.File.Exists(oldFile))
+        //            System.IO.File.Delete(oldFile);
+        //    }
+
+        //    // save the file in UTF-8
+        //    System.IO.File.WriteAllText(GetFilePath(t), design, Encoding.UTF8);
+        //}
+
+        //internal static void RemoveMasterPageFile(string alias)
+        //{
+        //    if (string.IsNullOrWhiteSpace(alias) == false)
+        //    {
+        //        string file = IOHelper.MapPath(SystemDirectories.Masterpages + &quot;/&quot; + alias.Replace(&quot; &quot;, &quot;&quot;) + &quot;.master&quot;);
+        //        if (System.IO.File.Exists(file))
+        //            System.IO.File.Delete(file);
+        //    }
+        //}
+
+        //internal string SaveTemplateToFile(ITemplate template, string currentAlias, ITemplateRepository templateRepo)
+        //{
+        //    var masterPageContent = template.Content;
+        //    if (IsMasterPageSyntax(masterPageContent) == false)
+        //        masterPageContent = ConvertToMasterPageSyntax(template);
+
+        //    // Add header to master page if it doesn&#39;t exist
+        //    if (masterPageContent.TrimStart().StartsWith(&quot;&lt;%@&quot;) == false)
+        //    {
+        //        masterPageContent = GetMasterPageHeader(template) + Environment.NewLine + masterPageContent;
+        //    }
+        //    else
+        //    {
+        //        // verify that the masterpage attribute is the same as the masterpage
+        //        var masterHeader =
+        //            masterPageContent.Substring(0, masterPageContent.IndexOf(&quot;%&gt;&quot;, StringComparison.Ordinal) + 2).Trim(NewLineChars);
+
+        //        // find the masterpagefile attribute
+        //        var m = Regex.Matches(masterHeader, &quot;(?&lt;attributeName&gt;\\S*)=\&quot;(?&lt;attributeValue&gt;[^\&quot;]*)\&quot;&quot;,
+        //            RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+
+        //        foreach (Match attributeSet in m)
+        //        {
+        //            if (attributeSet.Groups[&quot;attributeName&quot;].Value.ToLower() == &quot;masterpagefile&quot;)
+        //            {
+        //                // validate the masterpagefile
+        //                var currentMasterPageFile = attributeSet.Groups[&quot;attributeValue&quot;].Value;
+        //                var currentMasterTemplateFile = ParentTemplatePath(template);
+
+        //                if (currentMasterPageFile != currentMasterTemplateFile)
+        //                {
+        //                    masterPageContent =
+        //                        masterPageContent.Replace(
+        //                            attributeSet.Groups[&quot;attributeName&quot;].Value + &quot;=\&quot;&quot; + currentMasterPageFile + &quot;\&quot;&quot;,
+        //                            attributeSet.Groups[&quot;attributeName&quot;].Value + &quot;=\&quot;&quot; + currentMasterTemplateFile +
+        //                            &quot;\&quot;&quot;);
+
+        //                }
+        //            }
+        //        }
+
+        //    }
+
+        //    //we have a Old Alias if the alias and therefor the masterpage file name has changed...
+        //    //so before we save the new masterfile, we&#39;ll clear the old one, so we don&#39;t up with 
+        //    //Unused masterpage files
+        //    if (string.IsNullOrEmpty(currentAlias) == false &amp;&amp; currentAlias != template.Alias)
+        //    {
+
+        //        //Ensure that child templates have the right master masterpage file name
+        //        if (template.IsMasterTemplate)
+        //        {
+        //            var children = templateRepo.GetChildren(template.Id);
+
+        //            foreach (var t in children)
+        //                UpdateMasterPageFile(t, null, templateRepo);
+        //        }
+
+        //        //then kill the old file.. 
+        //        var oldFile = GetFilePath(currentAlias);
+        //        if (_masterPageFileSystem.FileExists(oldFile))
+        //            _masterPageFileSystem.DeleteFile(oldFile);
+        //    }
+
+        //    // save the file in UTF-8
+        //    System.IO.File.WriteAllText(GetFilePath(template), masterPageContent, Encoding.UTF8);
+
+        //    return masterPageContent;
+        //}
+
+        //internal static string ConvertToMasterPageSyntax(ITemplate template)
+        //{
+        //    string masterPageContent = GetMasterContentElement(template) + Environment.NewLine;
+
+        //    masterPageContent += template.Content;
+
+        //    // Parse the design for getitems
+        //    masterPageContent = EnsureMasterPageSyntax(template.Alias, masterPageContent);
+
+        //    // append ending asp:content element
+        //    masterPageContent += Environment.NewLine + &quot;&lt;/asp:Content&gt;&quot; + Environment.NewLine;
+
+        //    return masterPageContent;
+        //}
+
+        public static bool IsMasterPageSyntax(string code)
+        {
+            return Regex.IsMatch(code, @&quot;&lt;%@\s*Master&quot;, RegexOptions.IgnoreCase) ||
+                   code.InvariantContains(&quot;&lt;umbraco:Item&quot;) || code.InvariantContains(&quot;&lt;asp:&quot;) || code.InvariantContains(&quot;&lt;umbraco:Macro&quot;);
+        }
+
+        private static string GetMasterPageHeader(ITemplate template)
+        {
+            return String.Format(&quot;&lt;%@ Master Language=\&quot;C#\&quot; MasterPageFile=\&quot;{0}\&quot; AutoEventWireup=\&quot;true\&quot; %&gt;&quot;, ParentTemplatePath(template)) + Environment.NewLine;
+        }
+
+        private static string ParentTemplatePath(ITemplate template)
+        {
+            var masterTemplate = DefaultMasterTemplate;
+            if (template.MasterTemplateAlias.IsNullOrWhiteSpace() == false)
+                masterTemplate = SystemDirectories.Masterpages + &quot;/&quot; + template.MasterTemplateAlias + &quot;.master&quot;;
+
+            return masterTemplate;
+        }
+
+        private static string GetMasterContentElement(ITemplate template)
+        {
+            if (template.MasterTemplateAlias.IsNullOrWhiteSpace() == false)
+            {
+                string masterAlias = template.MasterTemplateAlias;
+                return
+                    String.Format(&quot;&lt;asp:Content ContentPlaceHolderID=\&quot;{0}ContentPlaceHolder\&quot; runat=\&quot;server\&quot;&gt;&quot;, masterAlias);
+            }
+            else
+                return
+                    String.Format(&quot;&lt;asp:Content ContentPlaceHolderID=\&quot;ContentPlaceHolderDefault\&quot; runat=\&quot;server\&quot;&gt;&quot;);
+
+        }
+
+        //internal static string EnsureMasterPageSyntax(string templateAlias, string masterPageContent)
+        //{
+        //    ReplaceElement(ref masterPageContent, &quot;?UMBRACO_GETITEM&quot;, &quot;umbraco:Item&quot;, true);
+        //    ReplaceElement(ref masterPageContent, &quot;?UMBRACO_GETITEM&quot;, &quot;umbraco:Item&quot;, false);
+
+        //    // Parse the design for macros
+        //    ReplaceElement(ref masterPageContent, &quot;?UMBRACO_MACRO&quot;, &quot;umbraco:Macro&quot;, true);
+        //    ReplaceElement(ref masterPageContent, &quot;?UMBRACO_MACRO&quot;, &quot;umbraco:Macro&quot;, false);
+
+        //    // Parse the design for load childs
+        //    masterPageContent = masterPageContent.Replace(&quot;&lt;?UMBRACO_TEMPLATE_LOAD_CHILD/&gt;&quot;, CreateDefaultPlaceHolder(templateAlias))
+        //        .Replace(&quot;&lt;?UMBRACO_TEMPLATE_LOAD_CHILD /&gt;&quot;, CreateDefaultPlaceHolder(templateAlias));
+        //    // Parse the design for aspnet forms
+        //    GetAspNetMasterPageForm(ref masterPageContent, templateAlias);
+        //    masterPageContent = masterPageContent.Replace(&quot;&lt;/?ASPNET_FORM&gt;&quot;, &quot;&lt;/form&gt;&quot;);
+        //    // Parse the design for aspnet heads
+        //    masterPageContent = masterPageContent.Replace(&quot;&lt;/ASPNET_HEAD&gt;&quot;, String.Format(&quot;&lt;head id=\&quot;{0}Head\&quot; runat=\&quot;server\&quot;&gt;&quot;, templateAlias.Replace(&quot; &quot;, &quot;&quot;)));
+        //    masterPageContent = masterPageContent.Replace(&quot;&lt;/?ASPNET_HEAD&gt;&quot;, &quot;&lt;/head&gt;&quot;);
+        //    return masterPageContent;
+        //}
+
+
+        //private static void GetAspNetMasterPageForm(ref string design, string templateAlias)
+        //{
+        //    var formElement = Regex.Match(design, GetElementRegExp(&quot;?ASPNET_FORM&quot;, false), RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+
+        //    if (string.IsNullOrEmpty(formElement.Value) == false)
+        //    {
+        //        string formReplace = String.Format(&quot;&lt;form id=\&quot;{0}Form\&quot; runat=\&quot;server\&quot;&gt;&quot;, templateAlias.Replace(&quot; &quot;, &quot;&quot;));
+        //        if (formElement.Groups.Count == 0)
+        //        {
+        //            formReplace += &quot;&lt;asp:scriptmanager runat=\&quot;server\&quot;&gt;&lt;/asp:scriptmanager&gt;&quot;;
+        //        }
+        //        design = design.Replace(formElement.Value, formReplace);
+        //    }
+        //}
+
+        //private static string CreateDefaultPlaceHolder(string templateAlias)
+        //{
+        //    return String.Format(&quot;&lt;asp:ContentPlaceHolder ID=\&quot;{0}ContentPlaceHolder\&quot; runat=\&quot;server\&quot;&gt;&lt;/asp:ContentPlaceHolder&gt;&quot;, templateAlias.Replace(&quot; &quot;, &quot;&quot;));
+        //}
+
+        //private static void ReplaceElement(ref string design, string elementName, string newElementName, bool checkForQuotes)
+        //{
+        //    var m =
+        //        Regex.Matches(design, GetElementRegExp(elementName, checkForQuotes),
+        //            RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+
+        //    foreach (Match match in m)
+        //    {
+        //        GroupCollection groups = match.Groups;
+
+        //        // generate new element (compensate for a closing trail on single elements (&quot;/&quot;))
+        //        string elementAttributes = groups[1].Value;
+        //        // test for macro alias
+        //        if (elementName == &quot;?UMBRACO_MACRO&quot;)
+        //        {
+        //            var tags = XmlHelper.GetAttributesFromElement(match.Value);
+        //            if (tags[&quot;macroAlias&quot;] != null)
+        //                elementAttributes = String.Format(&quot; Alias=\&quot;{0}\&quot;&quot;, tags[&quot;macroAlias&quot;]) + elementAttributes;
+        //            else if (tags[&quot;macroalias&quot;] != null)
+        //                elementAttributes = String.Format(&quot; Alias=\&quot;{0}\&quot;&quot;, tags[&quot;macroalias&quot;]) + elementAttributes;
+        //        }
+        //        string newElement = &quot;&lt;&quot; + newElementName + &quot; runat=\&quot;server\&quot; &quot; + elementAttributes.Trim() + &quot;&gt;&quot;;
+        //        if (elementAttributes.EndsWith(&quot;/&quot;))
+        //        {
+        //            elementAttributes = elementAttributes.Substring(0, elementAttributes.Length - 1);
+        //        }
+        //        else if (groups[0].Value.StartsWith(&quot;&lt;/&quot;))
+        //            // It&#39;s a closing element, so generate that instead of a starting element
+        //            newElement = &quot;&lt;/&quot; + newElementName + &quot;&gt;&quot;;
+
+        //        if (checkForQuotes)
+        //        {
+        //            // if it&#39;s inside quotes, we&#39;ll change element attribute quotes to single quotes
+        //            newElement = newElement.Replace(&quot;\&quot;&quot;, &quot;&#39;&quot;);
+        //            newElement = String.Format(&quot;\&quot;{0}\&quot;&quot;, newElement);
+        //        }
+        //        design = design.Replace(match.Value, newElement);
+        //    }
+        //}
+
+        //private static string GetElementRegExp(string elementName, bool checkForQuotes)
+        //{
+        //    if (checkForQuotes)
+        //        return String.Format(&quot;\&quot;&lt;[^&gt;\\s]*\\b{0}(\\b[^&gt;]*)&gt;\&quot;&quot;, elementName);
+        //    else
+        //        return String.Format(&quot;&lt;[^&gt;\\s]*\\b{0}(\\b[^&gt;]*)&gt;&quot;, elementName);
+
+        //}
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[16,9,16,123,1],[19,9,19,66,1],[20,9,20,10,1],[21,13,21,46,1],[21,47,21,103,0],[22,13,22,58,1],[23,9,23,10,1],[26,9,26,10,1],[27,13,27,69,1],[28,9,28,10,1],[32,9,32,10,0],[33,13,33,76,0],[34,9,34,10,0],[37,9,37,10,1],[38,13,38,41,1],[39,9,39,10,1],[42,9,42,10,1],[43,13,43,38,1],[44,9,44,10,1],[47,9,47,10,1],[48,13,48,43,1],[50,13,50,43,1],[51,13,51,82,1],[52,13,52,14,1],[53,17,53,130,1],[55,17,55,70,1],[56,17,56,82,1],[58,24,58,58,1],[59,17,59,18,1],[60,21,60,71,1],[61,17,61,18,1],[62,13,62,14,1],[64,13,64,14,0],[65,24,65,72,0],[66,24,66,67,0],[67,17,67,18,0],[68,21,68,56,0],[69,21,69,32,0],[70,17,70,18,0],[71,13,71,14,0],[73,13,73,38,1],[74,9,74,10,1],[93,9,93,10,1],[94,13,94,69,1],[95,13,95,65,1],[96,13,96,43,1],[98,13,98,57,1],[99,13,99,78,1],[101,20,101,54,1],[102,13,102,14,1],[103,17,103,67,1],[104,13,104,14,1],[105,13,105,29,1],[106,9,106,10,1],[109,9,109,10,1],[110,13,110,46,1],[111,13,111,80,1],[113,13,113,76,1],[114,13,114,14,1],[115,17,115,77,1],[116,17,116,36,1],[117,17,117,18,1],[118,21,118,28,1],[118,30,118,38,0],[118,39,118,41,1],[118,42,118,74,1],[119,21,119,22,0],[120,25,125,60,0],[126,21,126,22,0],[128,21,128,46,1],[130,13,130,14,0],[132,13,132,84,1],[133,13,133,67,1],[134,13,134,67,1],[136,13,136,38,1],[137,9,137,10,1],[140,9,140,10,1],[141,13,141,45,1],[143,13,143,39,1],[144,13,144,107,1],[145,13,145,62,1],[146,13,146,33,1],[148,13,148,30,1],[149,13,149,14,0],[150,17,150,47,0],[151,17,151,63,0],[151,63,151,82,0],[151,82,151,96,0],[151,96,151,103,0],[151,103,151,106,0],[151,17,151,106,0],[153,17,153,35,0],[154,13,154,14,0],[156,13,156,27,1],[157,9,157,10,1],[160,9,160,10,1],[161,13,161,54,1],[163,13,163,95,1],[164,13,164,14,0],[165,17,167,60,0],[170,17,171,85,0],[173,17,173,24,0],[173,26,173,44,0],[173,45,173,47,0],[173,48,173,49,0],[174,17,174,18,0],[175,21,175,98,0],[176,21,176,22,0],[178,25,178,97,0],[179,25,179,86,0],[181,25,181,80,0],[182,25,182,26,0],[183,29,187,43,0],[188,25,188,26,0],[189,21,189,22,0],[190,17,190,18,0],[191,13,191,14,0],[193,13,193,38,1],[194,9,194,10,1],[197,9,197,10,1],[201,13,201,95,1],[202,13,202,14,0],[204,17,204,47,0],[205,17,205,18,0],[206,21,206,74,0],[207,21,207,28,0],[207,30,207,35,0],[207,36,207,38,0],[207,39,207,47,0],[208,25,208,69,0],[209,17,209,18,0],[210,13,210,14,0],[211,9,211,10,1],[325,9,325,10,1],[326,13,327,139,1],[328,9,328,10,1],[331,9,331,10,1],[332,13,332,167,1],[333,9,333,10,1],[336,9,336,10,1],[337,13,337,56,1],[338,13,338,76,1],[339,17,339,113,1],[341,13,341,35,1],[342,9,342,10,1],[345,9,345,10,1],[346,13,346,76,1],[347,13,347,14,0],[348,17,348,67,0],[349,17,350,129,0],[353,17,354,120,1],[356,9,356,10,1]]);
+    </script>
+  </body>
+</html>

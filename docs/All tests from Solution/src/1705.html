@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\TagRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    internal class TagRepository : PetaPocoRepositoryBase&lt;int, ITag&gt;, ITagRepository
+    {
+        internal TagRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax)
+            : base(work, cache, logger, sqlSyntax)
+        {
+        }
+
+        protected override ITag PerformGet(int id)
+        {
+            var sql = GetBaseQuery(false);
+            sql.Where(GetBaseWhereClause(), new { Id = id });
+
+            var tagDto = Database.Fetch&lt;TagDto&gt;(SqlSyntax.SelectTop(sql, 1)).FirstOrDefault();
+            if (tagDto == null)
+                return null;
+
+            var factory = new TagFactory();
+            var entity = factory.BuildEntity(tagDto);
+
+            //on initial construction we don&#39;t want to have dirty properties tracked
+            // http://issues.umbraco.org/issue/U4-1946
+            ((TracksChangesEntityBase)entity).ResetDirtyProperties(false);
+
+            return entity;
+        }
+
+        protected override IEnumerable&lt;ITag&gt; PerformGetAll(params int[] ids)
+        {
+            var sql = GetBaseQuery(false);
+
+            if (ids.Any())
+            {
+                sql.Where(&quot;id in (@ids)&quot;, new {ids = ids});
+
+                //return PerformGetAllOnIds(ids);
+            }
+
+            return ConvertFromDtos(Database.Fetch&lt;TagDto&gt;(sql))
+                .ToArray();// we don&#39;t want to re-iterate again!
+        }
+
+        //private IEnumerable&lt;ITag&gt; PerformGetAllOnIds(params int[] ids)
+        //{
+        //    //TODO: Fix the n+1 query! This one is particularly bad!!!!!!!!
+
+        //    if (ids.Any() == false) yield break;
+        //    foreach (var id in ids)
+        //    {
+        //        yield return Get(id);
+        //    }
+        //}
+
+        private IEnumerable&lt;ITag&gt; ConvertFromDtos(IEnumerable&lt;TagDto&gt; dtos)
+        {
+            var factory = new TagFactory();
+            foreach (var entity in dtos.Select(factory.BuildEntity))
+            {
+                //on initial construction we don&#39;t want to have dirty properties tracked
+                // http://issues.umbraco.org/issue/U4-1946
+                ((TracksChangesEntityBase)entity).ResetDirtyProperties(false);
+                yield return entity;
+            }
+        }
+
+        protected override IEnumerable&lt;ITag&gt; PerformGetByQuery(IQuery&lt;ITag&gt; query)
+        {
+            var sqlClause = GetBaseQuery(false);
+            var translator = new SqlTranslator&lt;ITag&gt;(sqlClause, query);
+            var sql = translator.Translate();
+
+            var dtos = Database.Fetch&lt;TagDto&gt;(sql);
+
+            return ConvertFromDtos(dtos)
+                .ToArray();// we don&#39;t want to re-iterate again!
+
+        }
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+            if (isCount)
+            {
+                sql.Select(&quot;COUNT(*)&quot;).From&lt;TagDto&gt;(SqlSyntax);
+            }
+            else
+            {
+                return GetBaseQuery();
+            }
+            return sql;
+        }
+
+        private Sql GetBaseQuery()
+        {
+            var sql = new Sql();
+            sql.Select(&quot;*&quot;).From&lt;TagDto&gt;(SqlSyntax);
+            return sql;
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            var list = new List&lt;string&gt;
+                {
+                    &quot;DELETE FROM cmsTagRelationship WHERE tagId = @Id&quot;,
+                    &quot;DELETE FROM cmsTags WHERE id = @Id&quot;
+                };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { throw new NotImplementedException(); }
+        }
+
+        protected override void PersistNewItem(ITag entity)
+        {
+            ((Entity)entity).AddingEntity();
+
+            var factory = new TagFactory();
+            var dto = factory.BuildDto(entity);
+
+            var id = Convert.ToInt32(Database.Insert(dto));
+            entity.Id = id;
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(ITag entity)
+        {
+            ((Entity)entity).UpdatingEntity();
+
+            var factory = new TagFactory();
+            var dto = factory.BuildDto(entity);
+
+            Database.Update(dto);
+
+            entity.ResetDirtyProperties();
+        }
+
+        //TODO: Consider caching implications.
+
+        //TODO: We need to add lookups for parentId or path! (i.e. get content in tag group that are descendants of x)
+
+
+        public TaggedEntity GetTaggedEntityByKey(Guid key)
+        {
+            var sql = new Sql()
+                .Select(&quot;cmsTagRelationship.nodeId, cmsPropertyType.Alias, cmsPropertyType.id as propertyTypeId, cmsTags.tag, cmsTags.id as tagId, cmsTags.&quot; + SqlSyntax.GetQuotedColumnName(&quot;group&quot;))
+                .From&lt;TagDto&gt;(SqlSyntax)
+                .InnerJoin&lt;TagRelationshipDto&gt;(SqlSyntax)
+                .On&lt;TagRelationshipDto, TagDto&gt;(SqlSyntax, left =&gt; left.TagId, right =&gt; right.Id)
+                .InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                .On&lt;ContentDto, TagRelationshipDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;PropertyTypeDto&gt;(SqlSyntax)
+                .On&lt;PropertyTypeDto, TagRelationshipDto&gt;(SqlSyntax, left =&gt; left.Id, right =&gt; right.PropertyTypeId)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;NodeDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(dto =&gt; dto.UniqueId == key);
+
+            return CreateTaggedEntityCollection(Database.Fetch&lt;dynamic&gt;(sql)).FirstOrDefault();
+        }
+
+        public TaggedEntity GetTaggedEntityById(int id)
+        {
+            var sql = new Sql()
+                .Select(&quot;cmsTagRelationship.nodeId, cmsPropertyType.Alias, cmsPropertyType.id as propertyTypeId, cmsTags.tag, cmsTags.id as tagId, cmsTags.&quot; + SqlSyntax.GetQuotedColumnName(&quot;group&quot;))
+                .From&lt;TagDto&gt;(SqlSyntax)
+                .InnerJoin&lt;TagRelationshipDto&gt;(SqlSyntax)
+                .On&lt;TagRelationshipDto, TagDto&gt;(SqlSyntax, left =&gt; left.TagId, right =&gt; right.Id)
+                .InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                .On&lt;ContentDto, TagRelationshipDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;PropertyTypeDto&gt;(SqlSyntax)
+                .On&lt;PropertyTypeDto, TagRelationshipDto&gt;(SqlSyntax, left =&gt; left.Id, right =&gt; right.PropertyTypeId)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;NodeDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(dto =&gt; dto.NodeId == id);
+
+            return CreateTaggedEntityCollection(Database.Fetch&lt;dynamic&gt;(sql)).FirstOrDefault();
+        }
+
+        public IEnumerable&lt;TaggedEntity&gt; GetTaggedEntitiesByTagGroup(TaggableObjectTypes objectType, string tagGroup)
+        {
+            var sql = new Sql()
+                .Select(&quot;cmsTagRelationship.nodeId, cmsPropertyType.Alias, cmsPropertyType.id as propertyTypeId, cmsTags.tag, cmsTags.id as tagId, cmsTags.&quot; + SqlSyntax.GetQuotedColumnName(&quot;group&quot;))
+                .From&lt;TagDto&gt;(SqlSyntax)
+                .InnerJoin&lt;TagRelationshipDto&gt;(SqlSyntax)
+                .On&lt;TagRelationshipDto, TagDto&gt;(SqlSyntax, left =&gt; left.TagId, right =&gt; right.Id)
+                .InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                .On&lt;ContentDto, TagRelationshipDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;PropertyTypeDto&gt;(SqlSyntax)
+                .On&lt;PropertyTypeDto, TagRelationshipDto&gt;(SqlSyntax, left =&gt; left.Id, right =&gt; right.PropertyTypeId)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;NodeDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;TagDto&gt;(dto =&gt; dto.Group == tagGroup);
+
+            if (objectType != TaggableObjectTypes.All)
+            {
+                var nodeObjectType = GetNodeObjectType(objectType);
+                sql = sql
+                    .Where&lt;NodeDto&gt;(dto =&gt; dto.NodeObjectType == nodeObjectType);
+            }
+
+            return CreateTaggedEntityCollection(
+                Database.Fetch&lt;dynamic&gt;(sql));
+        }
+
+        public IEnumerable&lt;TaggedEntity&gt; GetTaggedEntitiesByTag(TaggableObjectTypes objectType, string tag, string tagGroup = null)
+        {
+            var sql = new Sql()
+                .Select(&quot;cmsTagRelationship.nodeId, cmsPropertyType.Alias, cmsPropertyType.id as propertyTypeId, cmsTags.tag, cmsTags.id as tagId, cmsTags.&quot; + SqlSyntax.GetQuotedColumnName(&quot;group&quot;))
+                .From&lt;TagDto&gt;(SqlSyntax)
+                .InnerJoin&lt;TagRelationshipDto&gt;(SqlSyntax)
+                .On&lt;TagRelationshipDto, TagDto&gt;(SqlSyntax, left =&gt; left.TagId, right =&gt; right.Id)
+                .InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                .On&lt;ContentDto, TagRelationshipDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;PropertyTypeDto&gt;(SqlSyntax)
+                .On&lt;PropertyTypeDto, TagRelationshipDto&gt;(SqlSyntax, left =&gt; left.Id, right =&gt; right.PropertyTypeId)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;NodeDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;TagDto&gt;(dto =&gt; dto.Tag == tag);
+
+            if (objectType != TaggableObjectTypes.All)
+            {
+                var nodeObjectType = GetNodeObjectType(objectType);
+                sql = sql
+                    .Where&lt;NodeDto&gt;(dto =&gt; dto.NodeObjectType == nodeObjectType);
+            }
+
+            if (tagGroup.IsNullOrWhiteSpace() == false)
+            {
+                sql = sql.Where&lt;TagDto&gt;(dto =&gt; dto.Group == tagGroup);
+            }
+
+            return CreateTaggedEntityCollection(
+                Database.Fetch&lt;dynamic&gt;(sql));
+        }
+
+        private IEnumerable&lt;TaggedEntity&gt; CreateTaggedEntityCollection(IEnumerable&lt;dynamic&gt; dbResult)
+        {
+            foreach (var node in dbResult.GroupBy(x =&gt; (int)x.nodeId))
+            {
+                var properties = new List&lt;TaggedProperty&gt;();
+                foreach (var propertyType in node.GroupBy(x =&gt; new { id = (int)x.propertyTypeId, alias = (string)x.Alias }))
+                {
+                    var tags = propertyType.Select(x =&gt; new Tag((int)x.tagId, (string)x.tag, (string)x.group));
+                    properties.Add(new TaggedProperty(propertyType.Key.id, propertyType.Key.alias, tags));
+                }
+                yield return new TaggedEntity(node.Key, properties);
+            }
+        }
+
+        public IEnumerable&lt;ITag&gt; GetTagsForEntityType(TaggableObjectTypes objectType, string group = null)
+        {
+            var sql = GetTagsQuerySelect(true);
+
+            sql = ApplyRelationshipJoinToTagsQuery(sql);
+            
+            if (objectType != TaggableObjectTypes.All)
+            {
+                var nodeObjectType = GetNodeObjectType(objectType);
+                sql = sql
+                    .Where&lt;NodeDto&gt;(dto =&gt; dto.NodeObjectType == nodeObjectType);
+            }
+
+            sql = ApplyGroupFilterToTagsQuery(sql, group);
+
+            sql = ApplyGroupByToTagsQuery(sql);
+
+            return ExecuteTagsQuery(sql);
+        }
+
+        public IEnumerable&lt;ITag&gt; GetTagsForEntity(int contentId, string group = null)
+        {
+            var sql = GetTagsQuerySelect();
+
+            sql = ApplyRelationshipJoinToTagsQuery(sql);
+
+            sql = sql
+                .Where&lt;NodeDto&gt;(dto =&gt; dto.NodeId == contentId);
+
+            sql = ApplyGroupFilterToTagsQuery(sql, group);
+
+            return ExecuteTagsQuery(sql);
+        }
+
+        public IEnumerable&lt;ITag&gt; GetTagsForEntity(Guid contentId, string group = null)
+        {
+            var sql = GetTagsQuerySelect();
+
+            sql = ApplyRelationshipJoinToTagsQuery(sql);
+
+            sql = sql
+                .Where&lt;NodeDto&gt;(dto =&gt; dto.UniqueId == contentId);
+
+            sql = ApplyGroupFilterToTagsQuery(sql, group);
+
+            return ExecuteTagsQuery(sql);
+        }
+
+        public IEnumerable&lt;ITag&gt; GetTagsForProperty(int contentId, string propertyTypeAlias, string group = null)
+        {
+            var sql = GetTagsQuerySelect();
+
+            sql = ApplyRelationshipJoinToTagsQuery(sql);
+
+            sql = sql
+                .InnerJoin&lt;PropertyTypeDto&gt;(SqlSyntax)
+                .On&lt;PropertyTypeDto, TagRelationshipDto&gt;(SqlSyntax, left =&gt; left.Id, right =&gt; right.PropertyTypeId)
+                .Where&lt;NodeDto&gt;(dto =&gt; dto.NodeId == contentId)
+                .Where&lt;PropertyTypeDto&gt;(dto =&gt; dto.Alias == propertyTypeAlias);
+
+            sql = ApplyGroupFilterToTagsQuery(sql, group);
+
+            return ExecuteTagsQuery(sql);
+        }
+
+        public IEnumerable&lt;ITag&gt; GetTagsForProperty(Guid contentId, string propertyTypeAlias, string group = null)
+        {
+            var sql = GetTagsQuerySelect();
+
+            sql = ApplyRelationshipJoinToTagsQuery(sql);
+
+            sql = sql
+                .InnerJoin&lt;PropertyTypeDto&gt;(SqlSyntax)
+                .On&lt;PropertyTypeDto, TagRelationshipDto&gt;(SqlSyntax, left =&gt; left.Id, right =&gt; right.PropertyTypeId)
+                .Where&lt;NodeDto&gt;(dto =&gt; dto.UniqueId == contentId)
+                .Where&lt;PropertyTypeDto&gt;(dto =&gt; dto.Alias == propertyTypeAlias);
+
+            sql = ApplyGroupFilterToTagsQuery(sql, group);
+
+            return ExecuteTagsQuery(sql);
+        }
+
+        private Sql GetTagsQuerySelect(bool withGrouping = false)
+        {
+            var sql = new Sql();
+
+            if (withGrouping)
+            {
+                sql = sql.Select(&quot;cmsTags.id, cmsTags.tag, cmsTags.&quot; + SqlSyntax.GetQuotedColumnName(&quot;group&quot;) + @&quot;, Count(*) NodeCount&quot;);
+            }
+            else
+            {
+                sql = sql.Select(&quot;DISTINCT cmsTags.*&quot;);
+            }
+
+            return sql;
+        }
+
+        private Sql ApplyRelationshipJoinToTagsQuery(Sql sql)
+        {
+            return sql
+                .From&lt;TagDto&gt;(SqlSyntax)
+                .InnerJoin&lt;TagRelationshipDto&gt;(SqlSyntax)
+                .On&lt;TagRelationshipDto, TagDto&gt;(SqlSyntax, left =&gt; left.TagId, right =&gt; right.Id)
+                .InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                .On&lt;ContentDto, TagRelationshipDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;NodeDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId);
+        }
+
+        private Sql ApplyGroupFilterToTagsQuery(Sql sql, string group)
+        {
+            if (@group.IsNullOrWhiteSpace() == false)
+            {
+                sql = sql.Where&lt;TagDto&gt;(dto =&gt; dto.Group == group);
+            }
+
+            return sql;
+        }
+
+        private Sql ApplyGroupByToTagsQuery(Sql sql)
+        {
+            return sql.GroupBy(new string[] { &quot;cmsTags.id&quot;, &quot;cmsTags.tag&quot;, &quot;cmsTags.&quot; + SqlSyntax.GetQuotedColumnName(&quot;group&quot;) + @&quot;&quot; });
+        }
+
+        private IEnumerable&lt;ITag&gt; ExecuteTagsQuery(Sql sql)
+        {
+            var factory = new TagFactory();
+
+            return Database.Fetch&lt;TagDto&gt;(sql).Select(factory.BuildEntity);
+        }
+
+        /// &lt;summary&gt;
+        /// Assigns the given tags to a content item&#39;s property
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;propertyTypeId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;tags&quot;&gt;The tags to assign&lt;/param&gt;
+        /// &lt;param name=&quot;replaceTags&quot;&gt;
+        /// If set to true, this will replace all tags with the given tags, 
+        /// if false this will append the tags that already exist for the content item
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This can also be used to remove all tags from a property by specifying replaceTags = true and an empty tag list.
+        /// &lt;/remarks&gt;
+        //public void AssignTagsToProperty(int contentId, string propertyTypeAlias, IEnumerable&lt;ITag&gt; tags, bool replaceTags)
+        public void AssignTagsToProperty(int contentId, int propertyTypeId, IEnumerable&lt;ITag&gt; tags, bool replaceTags)
+        {
+            //First we need to ensure there are no duplicates
+            var asArray = tags.Distinct(new TagComparer()).ToArray();
+
+            //we don&#39;t have to do anything if there are no tags assigning and we&#39;re not replacing them
+            if (asArray.Length == 0 &amp;&amp; replaceTags == false)
+            {
+                return;
+            }
+
+            //next check if we&#39;re removing all of the tags
+            if (asArray.Length == 0 &amp;&amp; replaceTags)
+            {
+                Database.Execute(&quot;DELETE FROM cmsTagRelationship WHERE nodeId=&quot; + contentId + &quot; AND propertyTypeId=&quot; + propertyTypeId);
+                return;
+            }
+
+            //ok so now we&#39;re actually assigning tags...
+            //NOTE: There&#39;s some very clever logic in the umbraco.cms.businesslogic.Tags.Tag to insert tags where they don&#39;t exist, 
+            // and assign where they don&#39;t exist which we&#39;ve borrowed here. The queries are pretty zany but work, otherwise we&#39;ll end up 
+            // with quite a few additional queries.
+
+            //do all this in one transaction
+            using (var trans = Database.GetTransaction())
+            {
+                //var factory = new TagFactory();
+
+                var tagSetSql = GetTagSet(asArray);
+
+                //adds any tags found in the collection that aren&#39;t in cmsTag
+                var insertTagsSql = string.Concat(&quot;insert into cmsTags (Tag,&quot;,
+                                                  SqlSyntax.GetQuotedColumnName(&quot;group&quot;),
+                                                  &quot;) &quot;,
+                                                  &quot; select TagSet.Tag, TagSet.&quot;,
+                                                  SqlSyntax.GetQuotedColumnName(&quot;group&quot;),
+                                                  &quot; from &quot;,
+                                                  tagSetSql,
+                                                  &quot; left outer join cmsTags on (TagSet.Tag = cmsTags.Tag and TagSet.&quot;,
+                                                  SqlSyntax.GetQuotedColumnName(&quot;group&quot;),
+                                                  &quot; = cmsTags.&quot;,
+                                                  SqlSyntax.GetQuotedColumnName(&quot;group&quot;),
+                                                  &quot;)&quot;,
+                                                  &quot; where cmsTags.Id is null &quot;);
+                //insert the tags that don&#39;t exist
+                Database.Execute(insertTagsSql);
+
+                if (replaceTags)
+                {
+                    //if we are replacing the tags then remove them first
+                    Database.Execute(&quot;DELETE FROM cmsTagRelationship WHERE nodeId=&quot; + contentId + &quot; AND propertyTypeId=&quot; + propertyTypeId);
+                }
+
+                //adds any tags found in csv that aren&#39;t in tagrelationships
+                var insertTagRelationsSql = string.Concat(&quot;insert into cmsTagRelationship (tagId,nodeId,propertyTypeId) &quot;,
+                                                          &quot;select NewTagsSet.Id, &quot; + contentId + &quot;, &quot; + propertyTypeId + &quot; from  &quot;,
+                                                          &quot;( &quot;,
+                                                          &quot;select NewTags.Id from  &quot;,
+                                                          tagSetSql,
+                                                          &quot; inner join cmsTags as NewTags on (TagSet.Tag = NewTags.Tag and TagSet.&quot;,
+                                                          SqlSyntax.GetQuotedColumnName(&quot;group&quot;),
+                                                          &quot; = NewTags.&quot;,
+                                                          SqlSyntax.GetQuotedColumnName(&quot;group&quot;),
+                                                          &quot;) &quot;,
+                                                          &quot;) as NewTagsSet &quot;,
+                                                          &quot;left outer join cmsTagRelationship &quot;,
+                                                          &quot;on (cmsTagRelationship.TagId = NewTagsSet.Id and cmsTagRelationship.nodeId = &quot;,
+                                                          contentId,
+                                                          &quot; and cmsTagRelationship.propertyTypeId = &quot;,
+                                                          propertyTypeId,
+                                                          &quot;) &quot;,
+                                                          &quot;where cmsTagRelationship.tagId is null &quot;);
+
+                //insert the tags relations that don&#39;t exist
+                Database.Execute(insertTagRelationsSql);
+
+                //GO!
+                trans.Complete();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Removes any of the given tags from the property association
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;propertyTypeId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;tags&quot;&gt;The tags to remove from the property&lt;/param&gt;
+        public void RemoveTagsFromProperty(int contentId, int propertyTypeId, IEnumerable&lt;ITag&gt; tags)
+        {
+            var tagSetSql = GetTagSet(tags);
+
+            var deleteSql = string.Concat(&quot;DELETE FROM cmsTagRelationship WHERE nodeId = &quot;,
+                                          contentId,
+                                          &quot; AND propertyTypeId = &quot;,
+                                          propertyTypeId,
+                                          &quot; AND tagId IN &quot;,
+                                          &quot;(SELECT id FROM cmsTags INNER JOIN &quot;,
+                                          tagSetSql,
+                                          &quot; ON (TagSet.Tag = cmsTags.Tag and TagSet.&quot; + SqlSyntax.GetQuotedColumnName(&quot;group&quot;) + @&quot; = cmsTags.&quot; + SqlSyntax.GetQuotedColumnName(&quot;group&quot;) + @&quot;))&quot;);
+
+            Database.Execute(deleteSql);
+        }
+
+        public void ClearTagsFromProperty(int contentId, int propertyTypeId)
+        {
+            Database.Execute(&quot;DELETE FROM cmsTagRelationship WHERE nodeId = @nodeId AND propertyTypeId = @propertyTypeId&quot;, 
+                new { nodeId = contentId, propertyTypeId = propertyTypeId });
+        }
+
+        public void ClearTagsFromEntity(int contentId)
+        {
+            Database.Execute(&quot;DELETE FROM cmsTagRelationship WHERE nodeId = @nodeId&quot;,
+                new { nodeId = contentId });
+        }
+
+        private Guid GetNodeObjectType(TaggableObjectTypes type)
+        {
+            switch (type)
+            {
+                case TaggableObjectTypes.Content:
+                    return new Guid(Constants.ObjectTypes.Document);
+                case TaggableObjectTypes.Media:
+                    return new Guid(Constants.ObjectTypes.Media);
+                case TaggableObjectTypes.Member:
+                    return new Guid(Constants.ObjectTypes.Member);
+                default:
+                    throw new ArgumentOutOfRangeException(&quot;type&quot;);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This is a clever way to produce an SQL statement like this:
+        /// 
+        ///     (select &#39;Spacesdd&#39; as Tag, &#39;default&#39; as [Group] 
+        ///     union 
+        ///     select &#39;Cool&#39; as Tag, &#39;default&#39; as [Group]
+        ///     ) as TagSet
+        /// 
+        /// This allows us to use the tags to be inserted as a temporary in memory table. 
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;tagsToInsert&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private string GetTagSet(IEnumerable&lt;ITag&gt; tagsToInsert)
+        {
+            //TODO: Fix this query, since this is going to be basically a unique query each time, this will cause some mem usage in peta poco,
+            // and surely there&#39;s a nicer way!
+            //TODO: When we fix, be sure to remove the @ symbol escape
+
+            var array = tagsToInsert
+                .Select(tag =&gt;
+                    string.Format(&quot;select N&#39;{0}&#39; as Tag, &#39;{1}&#39; as &quot; + SqlSyntax.GetQuotedColumnName(&quot;group&quot;) + @&quot;&quot;,
+                        PetaPocoExtensions.EscapeAtSymbols(tag.Text.Replace(&quot;&#39;&quot;, &quot;&#39;&#39;&quot;)), tag.Group))
+                .ToArray();
+            return &quot;(&quot; + string.Join(&quot; union &quot;, array).Replace(&quot;  &quot;, &quot; &quot;) + &quot;) as TagSet&quot;;
+        }
+
+        private class TagComparer : IEqualityComparer&lt;ITag&gt;
+        {
+            public bool Equals(ITag x, ITag y)
+            {
+                return x.Text == y.Text &amp;&amp; x.Group == y.Group;
+            }
+
+            public int GetHashCode(ITag obj)
+            {
+                unchecked
+                {
+                    return (obj.Text.GetHashCode() * 397) ^ obj.Group.GetHashCode();
+                }
+            }
+        }
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[19,15,19,51,1],[20,9,20,10,1],[21,9,21,10,1],[24,9,24,10,0],[25,13,25,43,0],[26,13,26,62,0],[28,13,28,95,0],[29,13,29,32,0],[30,17,30,29,0],[32,13,32,44,0],[33,13,33,54,0],[37,13,37,75,0],[39,13,39,27,0],[40,9,40,10,0],[43,9,43,10,1],[44,13,44,43,1],[46,13,46,27,1],[47,13,47,14,1],[48,17,48,60,1],[51,13,51,14,1],[53,13,54,28,1],[55,9,55,10,1],[81,9,81,10,0],[82,13,82,49,0],[83,13,83,72,0],[84,13,84,46,0],[86,13,86,52,0],[88,13,89,28,0],[91,9,91,10,0],[94,9,94,10,1],[95,13,95,33,1],[96,13,96,25,1],[97,13,97,14,0],[98,17,98,64,0],[99,13,99,14,0],[101,13,101,14,1],[102,17,102,39,1],[104,13,104,24,0],[105,9,105,10,1],[108,9,108,10,1],[109,13,109,33,1],[110,13,110,53,1],[111,13,111,24,1],[112,9,112,10,1],[115,9,115,10,0],[116,13,116,31,0],[117,9,117,10,0],[120,9,120,10,0],[121,13,125,19,0],[126,13,126,25,0],[127,9,127,10,0],[131,17,131,18,0],[131,19,131,55,0],[135,9,135,10,1],[136,13,136,45,1],[138,13,138,44,1],[139,13,139,48,1],[141,13,141,60,1],[142,13,142,28,1],[144,13,144,43,1],[145,9,145,10,1],[148,9,148,10,0],[149,13,149,47,0],[151,13,151,44,0],[152,13,152,48,0],[154,13,154,34,0],[156,13,156,43,0],[157,9,157,10,0],[165,9,165,10,0],[166,13,177,61,0],[179,13,179,96,0],[180,9,180,10,0],[183,9,183,10,0],[184,13,195,58,0],[197,13,197,96,0],[198,9,198,10,0],[201,9,201,10,1],[202,13,213,62,1],[215,13,215,55,1],[216,13,216,14,1],[217,17,217,68,1],[218,17,219,82,1],[220,13,220,14,1],[222,13,223,47,1],[224,9,224,10,1],[227,9,227,10,1],[228,13,239,55,1],[241,13,241,55,1],[242,13,242,14,1],[243,17,243,68,1],[244,17,245,82,1],[246,13,246,14,1],[248,13,248,56,1],[249,13,249,14,0],[250,17,250,71,0],[251,13,251,14,0],[253,13,254,47,1],[255,9,255,10,1],[272,9,272,10,1],[273,13,273,48,1],[275,13,275,57,1],[277,13,277,55,1],[278,13,278,14,1],[279,17,279,68,1],[280,17,281,82,1],[282,13,282,14,1],[284,13,284,59,1],[286,13,286,48,1],[288,13,288,42,1],[289,9,289,10,1],[292,9,292,10,1],[293,13,293,44,1],[295,13,295,57,1],[297,13,298,65,1],[300,13,300,59,1],[302,13,302,42,1],[303,9,303,10,1],[306,9,306,10,1],[307,13,307,44,1],[309,13,309,57,1],[311,13,312,67,1],[314,13,314,59,1],[316,13,316,42,1],[317,9,317,10,1],[320,9,320,10,1],[321,13,321,44,1],[323,13,323,57,1],[325,13,329,80,1],[331,13,331,59,1],[333,13,333,42,1],[334,9,334,10,1],[337,9,337,10,1],[338,13,338,44,1],[340,13,340,57,1],[342,13,346,80,1],[348,13,348,59,1],[350,13,350,42,1],[351,9,351,10,1],[354,9,354,10,1],[355,13,355,33,1],[357,13,357,30,1],[358,13,358,14,1],[359,17,359,138,1],[360,13,360,14,1],[362,13,362,14,1],[363,17,363,56,1],[364,13,364,14,1],[366,13,366,24,1],[367,9,367,10,1],[370,9,370,10,1],[371,13,378,97,1],[379,9,379,10,1],[382,9,382,10,1],[383,13,383,54,1],[384,13,384,14,1],[385,17,385,68,1],[386,13,386,14,1],[388,13,388,24,1],[389,9,389,10,1],[392,9,392,10,1],[393,13,393,137,1],[394,9,394,10,1],[397,9,397,10,1],[398,13,398,44,1],[400,13,400,76,1],[401,9,401,10,1],[419,9,419,10,1],[421,13,421,70,1],[424,13,424,61,1],[425,13,425,14,0],[426,17,426,24,0],[430,13,430,52,1],[431,13,431,14,1],[432,17,432,136,1],[433,17,433,24,1],[442,20,442,57,1],[443,13,443,14,1],[446,17,446,52,1],[449,17,461,81,1],[463,17,463,49,1],[465,17,465,33,1],[466,17,466,18,1],[468,21,468,140,1],[469,17,469,18,1],[472,17,489,102,1],[492,17,492,57,1],[495,17,495,34,1],[496,13,496,14,1],[497,9,497,10,1],[506,9,506,10,1],[507,13,507,45,1],[509,13,516,195,1],[518,13,518,41,1],[519,9,519,10,1],[522,9,522,10,0],[523,13,524,78,0],[525,9,525,10,0],[528,9,528,10,1],[529,13,530,45,1],[531,9,531,10,1],[534,9,534,10,1],[535,13,535,26,1],[538,21,538,69,1],[540,21,540,66,1],[542,21,542,67,0],[544,21,544,67,0],[546,9,546,10,1],[561,9,561,10,1],[566,13,568,21,1],[568,21,569,100,1],[569,100,570,28,1],[566,13,570,28,1],[571,13,571,91,1],[572,9,572,10,1],[577,13,577,14,0],[578,17,578,63,0],[579,13,579,14,0],[582,13,582,14,1],[584,17,584,18,1],[585,21,585,85,1],[587,13,587,14,1]]);
+    </script>
+  </body>
+</html>

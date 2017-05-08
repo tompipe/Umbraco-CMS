@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Migrations\Upgrades\TargetVersionSevenThreeZero\MovePublicAccessXmlDataToDb.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.IO;
+using System.Linq;
+using System.Xml.Linq;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence.SqlSyntax;
+
+namespace Umbraco.Core.Persistence.Migrations.Upgrades.TargetVersionSevenThreeZero
+{
+    [Migration(&quot;7.3.0&quot;, 7, GlobalSettings.UmbracoMigrationName)]
+    public class MovePublicAccessXmlDataToDb : MigrationBase
+    {
+        public MovePublicAccessXmlDataToDb(ISqlSyntaxProvider sqlSyntax, ILogger logger)
+            : base(sqlSyntax, logger)
+        {
+        }
+
+        public override void Up()
+        {
+            //Don&#39;t lookup data if the table doesn&#39;t exist
+            var tables = SqlSyntax.GetTablesInSchema(Context.Database).ToArray();
+            if (tables.InvariantContains(&quot;umbracoAccess&quot;))
+            {
+                //don&#39;t run if data is already there.
+                var dataExists = Context.Database.Fetch&lt;AccessDto&gt;(new Sql().Select(&quot;*&quot;).From&lt;AccessDto&gt;(SqlSyntax));
+                if (dataExists.Any()) return;
+            }
+
+            var xmlFile = IOHelper.MapPath(SystemFiles.AccessXml);
+            
+            if (File.Exists(xmlFile) == false) return;
+
+            using (var fileStream = File.OpenRead(xmlFile))
+            {
+                var xml = XDocument.Load(fileStream);
+
+                foreach (var page in xml.Root.Elements(&quot;page&quot;))
+                {
+                    var pageId = (int?)page.Attribute(&quot;id&quot;);
+                    var loginPageId = (int?)page.Attribute(&quot;loginPage&quot;);
+                    var noRightsPageId = (int?)page.Attribute(&quot;noRightsPage&quot;);
+                    if (pageId.HasValue == false || loginPageId.HasValue == false || noRightsPageId.HasValue == false)
+                        continue;
+
+                    //ensure this page exists!
+                    var umbracoNode = Context.Database.FirstOrDefault&lt;NodeDto&gt;(&quot;WHERE id = @Id&quot;, new { Id = pageId.Value });
+                    if (umbracoNode != null)
+                    {
+                        var loginNode = Context.Database.FirstOrDefault&lt;NodeDto&gt;(&quot;WHERE id = @Id&quot;, new { Id = loginPageId.Value });
+                        if (loginNode != null)
+                        {
+                            var noRightsPage = Context.Database.FirstOrDefault&lt;NodeDto&gt;(&quot;WHERE id = @Id&quot;, new { Id = noRightsPageId.Value });
+                            if (noRightsPage != null)
+                            {
+                                var accessId = Guid.NewGuid();
+                                Insert.IntoTable(&quot;umbracoAccess&quot;).Row(new
+                                {
+                                    id = accessId,
+                                    nodeId = umbracoNode.NodeId,
+                                    loginNodeId = loginNode.NodeId,
+                                    noAccessNodeId = noRightsPage.NodeId,
+                                    createDate = DateTime.Now,
+                                    updateDate = DateTime.Now
+                                });
+
+                                //if a memberId has been specified, then add that as a rule
+                                var memberId = (string)page.Attribute(&quot;memberId&quot;);
+                                if (memberId.IsNullOrWhiteSpace() == false)
+                                {
+                                    Insert.IntoTable(&quot;umbracoAccessRule&quot;).Row(new
+                                    {
+                                        id = Guid.NewGuid(),
+                                        accessId = accessId,
+                                        ruleValue = memberId,
+                                        ruleType = Constants.Conventions.PublicAccess.MemberUsernameRuleType,
+                                        createDate = DateTime.Now,
+                                        updateDate = DateTime.Now
+                                    });
+                                }
+
+                                //now there should be a member group(s) defined here
+                                var memberGroupElements = page.Elements(&quot;group&quot;);
+                                foreach (var memberGroupElement in memberGroupElements)
+                                {
+                                    var memberGroup = (string)memberGroupElement.Attribute(&quot;id&quot;);
+                                    if (memberGroup.IsNullOrWhiteSpace() == false)
+                                    {
+                                        //create a member group rule
+                                        Insert.IntoTable(&quot;umbracoAccessRule&quot;).Row(new
+                                        {
+                                            id = Guid.NewGuid(),
+                                            accessId = accessId,
+                                            ruleValue = memberGroup,
+                                            ruleType = Constants.Conventions.PublicAccess.MemberRoleRuleType,
+                                            createDate = DateTime.Now,
+                                            updateDate = DateTime.Now
+                                        });
+                                    }
+                                }
+
+                            }
+                            else
+                            {
+                                Logger.Warn&lt;AddPublicAccessTables&gt;(&quot;No umbracoNode could be found with id &quot; + noRightsPageId.Value);
+                            }
+                        }
+                        else
+                        {
+                            Logger.Warn&lt;AddPublicAccessTables&gt;(&quot;No umbracoNode could be found with id &quot; + loginPageId.Value);
+                        }
+
+                    }
+                    else
+                    {
+                        Logger.Warn&lt;AddPublicAccessTables&gt;(&quot;No umbracoNode could be found with id &quot; + pageId.Value);
+                    }
+                }
+
+            }
+
+        }
+
+        public override void Down()
+        {
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[17,15,17,38,0],[18,9,18,10,0],[19,9,19,10,0],[22,9,22,10,0],[24,13,24,82,0],[25,13,25,59,0],[26,13,26,14,0],[28,17,28,118,0],[29,17,29,38,0],[29,39,29,46,0],[30,13,30,14,0],[32,13,32,67,0],[34,13,34,47,0],[34,48,34,55,0],[36,20,36,59,0],[37,13,37,14,0],[38,17,38,54,0],[40,17,40,24,0],[40,26,40,34,0],[40,35,40,37,0],[40,38,40,63,0],[41,17,41,18,0],[42,21,42,61,0],[43,21,43,73,0],[44,21,44,79,0],[45,21,45,119,0],[46,25,46,34,0],[49,21,49,125,0],[50,21,50,45,0],[51,21,51,22,0],[52,25,52,132,0],[53,25,53,47,0],[54,25,54,26,0],[55,29,55,142,0],[56,29,56,54,0],[57,29,57,30,0],[58,33,58,63,0],[59,33,67,36,0],[70,33,70,83,0],[71,33,71,76,0],[72,33,72,34,0],[73,37,81,40,0],[82,33,82,34,0],[85,33,85,82,0],[86,33,86,40,0],[86,42,86,64,0],[86,65,86,67,0],[86,68,86,87,0],[87,33,87,34,0],[88,37,88,98,0],[89,37,89,83,0],[90,37,90,38,0],[92,41,100,44,0],[101,37,101,38,0],[102,33,102,34,0],[104,29,104,30,0],[106,29,106,30,0],[107,33,107,133,0],[108,29,108,30,0],[109,25,109,26,0],[111,25,111,26,0],[112,29,112,126,0],[113,25,113,26,0],[115,21,115,22,0],[117,21,117,22,0],[118,25,118,117,0],[119,21,119,22,0],[120,17,120,18,0],[122,13,122,14,0],[124,9,124,10,0],[127,9,127,10,0],[128,9,128,10,0]]);
+    </script>
+  </body>
+</html>

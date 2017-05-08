@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Mvc\UmbracoPageResult.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.IO;
+using System.Web;
+using System.Web.Mvc;
+using System.Web.Routing;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Profiling;
+
+namespace Umbraco.Web.Mvc
+{
+	/// &lt;summary&gt;
+	/// Used by posted forms to proxy the result to the page in which the current URL matches on
+	/// &lt;/summary&gt;
+	public class UmbracoPageResult : ActionResult
+	{
+	    private readonly ProfilingLogger _profilingLogger;
+
+	    public UmbracoPageResult(ProfilingLogger profilingLogger)
+	    {
+	        _profilingLogger = profilingLogger;
+	    }
+
+        [Obsolete(&quot;Use the ctor specifying all depenendencies instead&quot;)]
+	    public UmbracoPageResult()
+            : this(new ProfilingLogger(LoggerResolver.Current.Logger, ProfilerResolver.Current.Profiler))
+	    {
+	        
+	    }
+
+	    public override void ExecuteResult(ControllerContext context)
+		{
+			ResetRouteData(context.RouteData);
+
+            ValidateRouteData(context.RouteData);
+
+			var routeDef = (RouteDefinition)context.RouteData.DataTokens[Umbraco.Core.Constants.Web.UmbracoRouteDefinitionDataToken];
+
+            //Special case, if it is webforms but we&#39;re posting to an MVC surface controller, then we 
+            // need to return the webforms result instead
+		    if (routeDef.PublishedContentRequest.RenderingEngine == RenderingEngine.WebForms)
+		    {
+		        EnsureViewContextForWebForms(context);
+		        var webFormsHandler = RenderRouteHandler.GetWebFormsHandler();
+		        webFormsHandler.ProcessRequest(HttpContext.Current);
+		    }
+		    else
+		    {
+                var factory = ControllerBuilder.Current.GetControllerFactory();
+                context.RouteData.Values[&quot;action&quot;] = routeDef.ActionName;
+                ControllerBase controller = null;
+
+                try
+                {
+                    controller = CreateController(context, factory, routeDef);
+
+                    CopyControllerData(context, controller);
+
+                    ExecuteControllerAction(context, controller);
+                }
+                finally
+                {
+                    CleanupController(controller, factory);
+                }    
+		    }
+		}
+
+        /// &lt;summary&gt;
+        /// Executes the controller action
+        /// &lt;/summary&gt;
+	    private void ExecuteControllerAction(ControllerContext context, IController controller)
+	    {
+            using (_profilingLogger.TraceDuration&lt;UmbracoPageResult&gt;(&quot;Executing Umbraco RouteDefinition controller&quot;, &quot;Finished&quot;))
+	        {
+	            controller.Execute(context.RequestContext);
+	        }
+	    }
+        
+	    /// &lt;summary&gt;
+        /// Since we could be returning the current page from a surface controller posted values in which the routing values are changed, we 
+        /// need to revert these values back to nothing in order for the normal page to render again.
+        /// &lt;/summary&gt;
+        private static void ResetRouteData(RouteData routeData)
+	    {
+            routeData.DataTokens[&quot;area&quot;] = null;
+            routeData.DataTokens[&quot;Namespaces&quot;] = null;
+	    }
+
+        /// &lt;summary&gt;
+        /// Validate that the current page execution is not being handled by the normal umbraco routing system
+        /// &lt;/summary&gt;
+        private static void ValidateRouteData(RouteData routeData)
+        {
+            if (routeData.DataTokens.ContainsKey(Umbraco.Core.Constants.Web.UmbracoRouteDefinitionDataToken) == false)
+            {
+                throw new InvalidOperationException(&quot;Can only use &quot; + typeof(UmbracoPageResult).Name +
+                                                    &quot; in the context of an Http POST when using a SurfaceController form&quot;);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// When POSTing to MVC but rendering in WebForms we need to do some trickery, we&#39;ll create a dummy viewcontext with all of the
+        /// current modelstate, tempdata, viewdata so that if we&#39;re rendering partial view macros within the webforms view, they will
+        /// get all of this merged into them.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;context&quot;&gt;&lt;/param&gt;
+        private static void EnsureViewContextForWebForms(ControllerContext context)
+        {
+            var tempDataDictionary = new TempDataDictionary();
+            tempDataDictionary.Save(context, new SessionStateTempDataProvider());
+            var viewCtx = new ViewContext(context, new DummyView(), new ViewDataDictionary(), tempDataDictionary, new StringWriter());
+
+            viewCtx.ViewData.ModelState.Merge(new ModelStateDictionary(context.Controller.ViewData.ModelState));
+
+            foreach (var d in context.Controller.ViewData)
+                viewCtx.ViewData[d.Key] = d.Value;
+
+            //now we need to add it to the special route tokens so it&#39;s picked up later
+            context.HttpContext.Request.RequestContext.RouteData.DataTokens[Constants.DataTokenCurrentViewContext] = viewCtx;
+        }
+
+        /// &lt;summary&gt;
+        /// Ensure ModelState, ViewData and TempData is copied across
+        /// &lt;/summary&gt;
+        private static void CopyControllerData(ControllerContext context, ControllerBase controller)
+        {
+            controller.ViewData.ModelState.Merge(context.Controller.ViewData.ModelState);
+
+            foreach (var d in context.Controller.ViewData)
+                controller.ViewData[d.Key] = d.Value;
+
+            //We cannot simply merge the temp data because during controller execution it will attempt to &#39;load&#39; temp data
+            // but since it has not been saved, there will be nothing to load and it will revert to nothing, so the trick is 
+            // to Save the state of the temp data first then it will automatically be picked up.
+            // http://issues.umbraco.org/issue/U4-1339
+
+            var targetController = controller as Controller;
+            var sourceController = context.Controller as Controller;
+            if (targetController != null &amp;&amp; sourceController != null)
+            {
+                targetController.TempDataProvider = sourceController.TempDataProvider;
+                targetController.TempData = sourceController.TempData;
+                targetController.TempData.Save(sourceController.ControllerContext, sourceController.TempDataProvider);    
+            }
+            
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a controller using the controller factory
+        /// &lt;/summary&gt;
+        private static ControllerBase CreateController(ControllerContext context, IControllerFactory factory, RouteDefinition routeDef)
+        {
+            var controller = factory.CreateController(context.RequestContext, routeDef.ControllerName) as ControllerBase;
+
+            if (controller == null)
+                throw new InvalidOperationException(&quot;Could not create controller with name &quot; + routeDef.ControllerName + &quot;.&quot;);
+
+            return controller;
+        }
+
+        /// &lt;summary&gt;
+        /// Cleans up the controller by releasing it using the controller factory, and by disposing it.
+        /// &lt;/summary&gt;
+        private static void CleanupController(IController controller, IControllerFactory factory)
+        {
+            if (controller != null)
+                factory.ReleaseController(controller);
+
+            if (controller != null)
+                controller.DisposeIfDisposable();
+        }
+
+	    private class DummyView : IView
+	    {
+	        public void Render(ViewContext viewContext, TextWriter writer)
+	        {
+	        }
+	    }
+	}
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[19,6,19,63,0],[20,6,20,7,0],[21,10,21,45,0],[22,6,22,7,0],[26,15,26,106,0],[27,6,27,7,0],[29,6,29,7,0],[32,3,32,4,0],[33,4,33,38,0],[35,13,35,50,0],[37,4,37,125,0],[41,7,41,88,0],[42,7,42,8,0],[43,11,43,49,0],[44,11,44,73,0],[45,11,45,63,0],[46,7,46,8,0],[48,7,48,8,0],[49,17,49,80,0],[50,17,50,74,0],[51,17,51,50,0],[54,17,54,18,0],[55,21,55,79,0],[57,21,57,61,0],[59,21,59,66,0],[60,17,60,18,0],[62,17,62,18,0],[63,21,63,60,0],[64,17,64,18,0],[65,7,65,8,0],[66,3,66,4,0],[72,6,72,7,0],[73,13,73,130,0],[74,10,74,11,0],[75,14,75,57,0],[76,10,76,11,0],[77,6,77,7,0],[84,6,84,7,0],[85,13,85,49,0],[86,13,86,55,0],[87,6,87,7,0],[93,9,93,10,0],[94,13,94,119,0],[95,13,95,14,0],[96,17,97,124,0],[99,9,99,10,0],[108,9,108,10,0],[109,13,109,63,0],[110,13,110,82,0],[111,13,111,135,0],[113,13,113,113,0],[115,13,115,20,0],[115,22,115,27,0],[115,28,115,30,0],[115,31,115,58,0],[116,17,116,51,0],[119,13,119,126,0],[120,9,120,10,0],[126,9,126,10,0],[127,13,127,90,0],[129,13,129,20,0],[129,22,129,27,0],[129,28,129,30,0],[129,31,129,58,0],[130,17,130,54,0],[137,13,137,61,0],[138,13,138,69,0],[139,13,139,70,0],[140,13,140,14,0],[141,17,141,87,0],[142,17,142,71,0],[143,17,143,119,0],[144,13,144,14,0],[146,9,146,10,0],[152,9,152,10,0],[153,13,153,122,0],[155,13,155,36,0],[156,17,156,127,0],[158,13,158,31,0],[159,9,159,10,0],[165,9,165,10,0],[166,13,166,36,0],[167,17,167,55,0],[169,13,169,36,0],[170,17,170,50,0],[171,9,171,10,0],[176,10,176,11,0],[177,10,177,11,0]]);
+    </script>
+  </body>
+</html>

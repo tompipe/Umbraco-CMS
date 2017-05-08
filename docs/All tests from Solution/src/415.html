@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\uQuery\uQuery.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Web;
+using System.Xml;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Web;
+using umbraco;
+using umbraco.BusinessLogic;
+using umbraco.DataLayer;
+
+namespace umbraco
+{
+	/// &lt;summary&gt;
+	/// uQuery - static helper methods
+	/// &lt;/summary&gt;
+	public static partial class uQuery
+	{
+        /// &lt;summary&gt;
+        /// Unused, please do not use
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Obsolete, For querying the database use the new UmbracoDatabase object ApplicationContext.Current.DatabaseContext.Database&quot;, false)]
+        public static ISqlHelper SqlHelper
+        {
+            get { return Application.SqlHelper; }
+        }
+
+        /// &lt;summary&gt;
+        /// Constructs the XML source from the cmsContentXml table used for Media and Members.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbracoObjectType&quot;&gt;an UmbracoObjectType value&lt;/param&gt;
+        /// &lt;returns&gt;XML built from the cmsContentXml table&lt;/returns&gt;
+        public static XmlDocument GetPublishedXml(UmbracoObjectType umbracoObjectType)
+		{
+			try
+			{
+				var hierarchy = new Dictionary&lt;int, List&lt;int&gt;&gt;();
+				var nodeIndex = new Dictionary&lt;int, XmlNode&gt;();
+				var xmlDoc = new XmlDocument();
+				var sql = &quot;SELECT umbracoNode.id, umbracoNode.parentId, umbracoNode.sortOrder, cmsContentXml.xml FROM umbracoNode INNER JOIN cmsContentXml ON cmsContentXml.nodeId = umbracoNode.id AND umbracoNode.nodeObjectType = @nodeObjectType ORDER BY umbracoNode.level, umbracoNode.sortOrder&quot;;
+
+                using (var sqlHelper = Application.SqlHelper)
+                using (var dr = sqlHelper.ExecuteReader(sql, sqlHelper.CreateParameter(&quot;@nodeObjectType&quot;, umbracoObjectType.GetGuid())))
+				{
+					while (dr.Read())
+					{
+						var currentId = dr.GetInt(&quot;id&quot;);
+						var parentId = dr.GetInt(&quot;parentId&quot;);
+						var xml = dr.GetString(&quot;xml&quot;);
+
+						// and parse it into a DOM node
+						xmlDoc.LoadXml(xml);
+						nodeIndex.Add(currentId, xmlDoc.FirstChild);
+
+						// Build the content hierarchy
+						List&lt;int&gt; children;
+						if (!hierarchy.TryGetValue(parentId, out children))
+						{
+							// No children for this parent, so add one
+							children = new List&lt;int&gt;();
+							hierarchy.Add(parentId, children);
+						}
+
+						children.Add(currentId);
+					}
+
+					// Set top level wrapper element
+					switch (umbracoObjectType)
+					{
+						case UmbracoObjectType.Media:
+							xmlDoc.LoadXml(&quot;&lt;Media id=\&quot;-1\&quot;/&gt;&quot;);
+							break;
+
+						case UmbracoObjectType.Member:
+							xmlDoc.LoadXml(&quot;&lt;Members id=\&quot;-1\&quot;/&gt;&quot;);
+							break;
+
+						default:
+							xmlDoc.LoadXml(&quot;&lt;Nodes id=\&quot;-1\&quot;/&gt;&quot;);
+							break;
+					}
+
+					// Start building the content tree recursively from the root (-1) node
+					GenerateXmlDocument(hierarchy, nodeIndex, -1, xmlDoc.DocumentElement);
+
+					return xmlDoc;
+				}
+			}
+			catch (Exception ex)
+			{
+                LogHelper.Error&lt;UmbracoHelper&gt;(&quot;uQuery error&quot;, ex);
+			}
+
+			return null;
+		}
+
+		/// &lt;summary&gt;
+		/// Checks the Umbraco XML Schema version in use
+		/// &lt;/summary&gt;
+		/// &lt;returns&gt;true if using the old XML schema, else false if using the new XML schema&lt;/returns&gt;
+		public static bool IsLegacyXmlSchema()
+		{
+			var isLegacyXmlSchema = false;
+
+			try
+			{
+				isLegacyXmlSchema = UmbracoConfig.For.UmbracoSettings().Content.UseLegacyXmlSchema;
+			}
+			catch (MissingMethodException)
+			{
+				// Method doesn&#39;t exist so must be using the legacy schema
+				isLegacyXmlSchema = true;
+			}
+
+			return isLegacyXmlSchema;
+		}
+
+		/// &lt;summary&gt;
+		/// build a string array from a csv
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;csv&quot;&gt;string of comma separated values&lt;/param&gt;
+		/// &lt;returns&gt;An array of node ids as string.&lt;/returns&gt;
+		public static string[] GetCsvIds(string csv)
+		{
+			string[] ids = null;
+
+			if (!string.IsNullOrEmpty(csv))
+			{
+				ids = csv.Split(&#39;,&#39;).Select(s =&gt; s.Trim()).ToArray();
+			}
+
+			return ids;
+		}
+
+		/// &lt;summary&gt;
+		/// Gets Ids from known XML fragments (as saved by the MNTP / XPath CheckBoxList)
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;xml&quot;&gt;The Xml&lt;/param&gt;
+		/// &lt;returns&gt;An array of node ids as integer.&lt;/returns&gt;
+		public static int[] GetXmlIds(string xml)
+		{
+			var ids = new List&lt;int&gt;();
+
+			if (!string.IsNullOrEmpty(xml))
+			{
+				using (var xmlReader = XmlReader.Create(new StringReader(xml)))
+				{
+					try
+					{
+						xmlReader.Read();
+
+						// Check name of first element
+						switch (xmlReader.Name)
+						{
+							case &quot;MultiNodePicker&quot;:
+							case &quot;XPathCheckBoxList&quot;:
+							case &quot;CheckBoxTree&quot;:
+
+								// Position on first &lt;nodeId&gt;
+								xmlReader.ReadStartElement();
+
+								while (!xmlReader.EOF)
+								{
+									if (xmlReader.NodeType == XmlNodeType.Element &amp;&amp; xmlReader.Name == &quot;nodeId&quot;)
+									{
+										int id;
+										if (int.TryParse(xmlReader.ReadElementContentAsString(), out id))
+										{
+											ids.Add(id);
+										}
+									}
+									else
+									{
+										// Step the reader on
+										xmlReader.Read();
+									}
+								}
+
+								break;
+						}
+					}
+					catch
+					{
+						// Failed to read as Xml
+					}
+				}
+			}
+
+			return ids.ToArray();
+		}
+
+		/// &lt;summary&gt;
+		/// Gets an Id value from the QueryString
+		/// &lt;/summary&gt;
+		/// &lt;returns&gt;an id as a string or string.empty&lt;/returns&gt;
+		public static string GetIdFromQueryString()
+		{
+			var queryStringId = string.Empty;
+
+			if (!string.IsNullOrEmpty(HttpContext.Current.Request.QueryString[&quot;id&quot;]))
+			{
+				queryStringId = HttpContext.Current.Request.QueryString[&quot;id&quot;];
+			}
+			else if (HttpContext.Current.Request.CurrentExecutionFilePathExtension == &quot;.asmx&quot;
+					&amp;&amp; HttpContext.Current.Request.UrlReferrer != null
+					&amp;&amp; !string.IsNullOrEmpty(HttpContext.Current.Request.UrlReferrer.Query))
+			{
+				// Special case for MNTP CustomTreeService.asmx
+				queryStringId = HttpUtility.ParseQueryString(HttpContext.Current.Request.UrlReferrer.Query)[&quot;id&quot;];
+			}
+
+			return queryStringId;
+		}
+
+		/// &lt;summary&gt;
+		/// Converts a string array into an integer array.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;items&quot;&gt;The string array.&lt;/param&gt;
+		/// &lt;returns&gt;Returns an integer array.&lt;/returns&gt;
+		public static int[] ConvertToIntArray(string[] items)
+		{
+			if (items == null)
+				return new int[] { };
+
+			int n;
+			return items.Select(s =&gt; int.TryParse(s, out n) ? n : 0).ToArray();
+		}
+
+		/// &lt;summary&gt;
+		/// Generates an XML document.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;hierarchy&quot;&gt;The hierarchy.&lt;/param&gt;
+		/// &lt;param name=&quot;nodeIndex&quot;&gt;Index of the node.&lt;/param&gt;
+		/// &lt;param name=&quot;parentId&quot;&gt;The parent id.&lt;/param&gt;
+		/// &lt;param name=&quot;parentNode&quot;&gt;The parent node.&lt;/param&gt;
+		private static void GenerateXmlDocument(IDictionary&lt;int, List&lt;int&gt;&gt; hierarchy, IDictionary&lt;int, XmlNode&gt; nodeIndex, int parentId, XmlNode parentNode)
+		{
+			List&lt;int&gt; children;
+
+			if (hierarchy.TryGetValue(parentId, out children))
+			{
+				var childContainer = uQuery.IsLegacyXmlSchema() || string.IsNullOrEmpty(UmbracoSettings.TEMP_FRIENDLY_XML_CHILD_CONTAINER_NODENAME) ? parentNode : parentNode.SelectSingleNode(UmbracoSettings.TEMP_FRIENDLY_XML_CHILD_CONTAINER_NODENAME);
+
+				if (!uQuery.IsLegacyXmlSchema() &amp;&amp; !string.IsNullOrEmpty(UmbracoSettings.TEMP_FRIENDLY_XML_CHILD_CONTAINER_NODENAME))
+				{
+					if (childContainer == null)
+					{
+						childContainer = xmlHelper.addTextNode(parentNode.OwnerDocument, UmbracoSettings.TEMP_FRIENDLY_XML_CHILD_CONTAINER_NODENAME, string.Empty);
+						parentNode.AppendChild(childContainer);
+					}
+				}
+
+				foreach (int childId in children)
+				{
+					var childNode = nodeIndex[childId];
+
+					if (uQuery.IsLegacyXmlSchema() || string.IsNullOrEmpty(UmbracoSettings.TEMP_FRIENDLY_XML_CHILD_CONTAINER_NODENAME))
+					{
+						parentNode.AppendChild(childNode);
+					}
+					else
+					{
+						childContainer.AppendChild(childNode);
+					}
+
+					// Recursively build the content tree under the current child
+					GenerateXmlDocument(hierarchy, nodeIndex, childId, childNode);
+				}
+			}
+		}
+	}
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[27,17,27,18,0],[27,19,27,48,0],[27,49,27,50,0],[36,3,36,4,0],[38,4,38,5,0],[39,5,39,54,0],[40,5,40,52,0],[41,5,41,36,0],[42,5,42,285,0],[44,24,44,61,0],[45,24,45,136,0],[46,5,46,6,0],[47,6,47,23,0],[48,6,48,7,0],[49,7,49,39,0],[50,7,50,44,0],[51,7,51,37,0],[54,7,54,27,0],[55,7,55,51,0],[59,7,59,58,0],[60,7,60,8,0],[62,8,62,35,0],[63,8,63,42,0],[64,7,64,8,0],[66,7,66,31,0],[67,6,67,7,0],[70,6,70,32,0],[73,8,73,45,0],[74,8,74,14,0],[77,8,77,47,0],[78,8,78,14,0],[81,8,81,45,0],[82,8,82,14,0],[86,6,86,76,0],[88,6,88,20,0],[91,4,91,24,0],[92,4,92,5,0],[93,17,93,68,0],[94,4,94,5,0],[96,4,96,16,0],[97,3,97,4,0],[104,3,104,4,0],[105,4,105,34,0],[108,4,108,5,0],[109,5,109,88,0],[110,4,110,5,0],[111,4,111,34,0],[112,4,112,5,0],[114,5,114,30,0],[115,4,115,5,0],[117,4,117,29,0],[118,3,118,4,0],[126,3,126,4,0],[127,4,127,24,0],[129,4,129,35,0],[130,4,130,5,0],[131,5,131,38,0],[131,38,131,46,0],[131,46,131,58,0],[131,5,131,58,0],[132,4,132,5,0],[134,4,134,15,0],[135,3,135,4,0],[143,3,143,4,0],[144,4,144,30,0],[146,4,146,35,0],[147,4,147,5,0],[148,12,148,67,0],[149,5,149,6,0],[151,6,151,7,0],[152,7,152,24,0],[155,7,155,30,0],[162,9,162,38,0],[164,9,164,31,0],[165,9,165,10,0],[166,10,166,86,0],[167,10,167,11,0],[169,11,169,76,0],[170,11,170,12,0],[171,12,171,24,0],[172,11,172,12,0],[173,10,173,11,0],[175,10,175,11,0],[177,11,177,28,0],[178,10,178,11,0],[179,9,179,10,0],[181,9,181,15,0],[183,6,183,7,0],[184,6,184,11,0],[185,6,185,7,0],[187,6,187,7,0],[188,5,188,6,0],[189,4,189,5,0],[191,4,191,25,0],[192,3,192,4,0],[199,3,199,4,0],[200,4,200,37,0],[202,4,202,77,0],[203,4,203,5,0],[204,5,204,67,0],[205,4,205,5,0],[206,9,208,78,0],[209,4,209,5,0],[211,5,211,103,0],[212,4,212,5,0],[214,4,214,25,0],[215,3,215,4,0],[223,3,223,4,0],[224,4,224,22,0],[225,5,225,26,0],[228,4,228,29,0],[228,29,228,59,0],[228,59,228,71,0],[228,4,228,71,0],[229,3,229,4,0],[239,3,239,4,0],[242,4,242,54,0],[243,4,243,5,0],[244,5,244,240,0],[246,5,246,122,0],[247,5,247,6,0],[248,6,248,33,0],[249,6,249,7,0],[250,7,250,146,0],[251,7,251,46,0],[252,6,252,7,0],[253,5,253,6,0],[255,5,255,12,0],[255,14,255,25,0],[255,26,255,28,0],[255,29,255,37,0],[256,5,256,6,0],[257,6,257,41,0],[259,6,259,121,0],[260,6,260,7,0],[261,7,261,41,0],[262,6,262,7,0],[264,6,264,7,0],[265,7,265,45,0],[266,6,266,7,0],[269,6,269,68,0],[270,5,270,6,0],[271,4,271,5,0],[272,3,272,4,0]]);
+    </script>
+  </body>
+</html>

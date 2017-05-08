@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Cache\FullDataSetRepositoryCachePolicy.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Collections;
+using Umbraco.Core.Models.EntityBase;
+
+namespace Umbraco.Core.Cache
+{
+    /// &lt;summary&gt;
+    /// A caching policy that caches an entire dataset as a single collection
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name=&quot;TEntity&quot;&gt;&lt;/typeparam&gt;
+    /// &lt;typeparam name=&quot;TId&quot;&gt;&lt;/typeparam&gt;
+    internal class FullDataSetRepositoryCachePolicy&lt;TEntity, TId&gt; : RepositoryCachePolicyBase&lt;TEntity, TId&gt;
+        where TEntity : class, IAggregateRoot
+    {
+        private readonly Func&lt;TEntity, TId&gt; _getEntityId;
+        private readonly Func&lt;IEnumerable&lt;TEntity&gt;&gt; _getAllFromRepo;
+        private readonly bool _expires;
+
+        public FullDataSetRepositoryCachePolicy(IRuntimeCacheProvider cache, Func&lt;TEntity, TId&gt; getEntityId, Func&lt;IEnumerable&lt;TEntity&gt;&gt; getAllFromRepo, bool expires)
+            : base(cache)
+        {
+            _getEntityId = getEntityId;
+            _getAllFromRepo = getAllFromRepo;
+            _expires = expires;
+        }
+
+        private bool? _hasZeroCountCache;
+
+
+        protected string GetCacheTypeKey()
+        {
+            return string.Format(&quot;uRepo_{0}_&quot;, typeof(TEntity).Name);
+        }
+
+        public override void CreateOrUpdate(TEntity entity, Action&lt;TEntity&gt; persistMethod)
+        {
+            if (entity == null) throw new ArgumentNullException(&quot;entity&quot;);
+            if (persistMethod == null) throw new ArgumentNullException(&quot;persistMethod&quot;);
+
+            try
+            {
+                persistMethod(entity);
+
+                //set the disposal action                
+                SetCacheAction(() =&gt;
+                {
+                    //Clear all
+                    Cache.ClearCacheItem(GetCacheTypeKey());
+                });
+            }
+            catch
+            {
+                //set the disposal action                
+                SetCacheAction(() =&gt;
+                {
+                    //Clear all
+                    Cache.ClearCacheItem(GetCacheTypeKey());
+                });
+                throw;
+            }
+        }
+
+        public override void Remove(TEntity entity, Action&lt;TEntity&gt; persistMethod)
+        {
+            if (entity == null) throw new ArgumentNullException(&quot;entity&quot;);
+            if (persistMethod == null) throw new ArgumentNullException(&quot;persistMethod&quot;);
+
+            try
+            {
+                persistMethod(entity);
+            }
+            finally
+            {
+                //set the disposal action
+                SetCacheAction(() =&gt;
+                {
+                    //Clear all
+                    Cache.ClearCacheItem(GetCacheTypeKey());
+                });
+            }
+        }
+
+        public override TEntity Get(TId id, Func&lt;TId, TEntity&gt; getFromRepo)
+        {
+            //Force get all with cache
+            var found = GetAll(new TId[] { }, ids =&gt; _getAllFromRepo().WhereNotNull());
+
+            //we don&#39;t have anything in cache (this should never happen), just return from the repo
+            if (found == null) return getFromRepo(id);
+            var entity = found.FirstOrDefault(x =&gt; _getEntityId(x).Equals(id));
+            if (entity == null) return null;
+
+            //We must ensure to deep clone each one out manually since the deep clone list only clones one way
+            return (TEntity)entity.DeepClone();
+        }
+
+        public override TEntity Get(TId id)
+        {
+            //Force get all with cache
+            var found = GetAll(new TId[] { }, ids =&gt; _getAllFromRepo().WhereNotNull());
+
+            //we don&#39;t have anything in cache (this should never happen), just return null
+            if (found == null) return null;
+            var entity = found.FirstOrDefault(x =&gt; _getEntityId(x).Equals(id));
+            if (entity == null) return null;
+
+            //We must ensure to deep clone each one out manually since the deep clone list only clones one way
+            return (TEntity)entity.DeepClone();
+        }
+
+        public override bool Exists(TId id, Func&lt;TId, bool&gt; getFromRepo)
+        {
+            //Force get all with cache
+            var found = GetAll(new TId[] { }, ids =&gt; _getAllFromRepo().WhereNotNull());
+
+            //we don&#39;t have anything in cache (this should never happen), just return from the repo
+            return found == null
+                ? getFromRepo(id)
+                : found.Any(x =&gt; _getEntityId(x).Equals(id));
+        }
+
+        public override TEntity[] GetAll(TId[] ids, Func&lt;TId[], IEnumerable&lt;TEntity&gt;&gt; getFromRepo)
+        {
+            //process getting all including setting the cache callback
+            var result = PerformGetAll(getFromRepo);
+
+            //now that the base result has been calculated, they will all be cached. 
+            // Now we can just filter by ids if they have been supplied
+
+            return (ids.Any()
+                ? result.Where(x =&gt; ids.Contains(_getEntityId(x))).ToArray()
+                : result)
+                //We must ensure to deep clone each one out manually since the deep clone list only clones one way
+                .Select(x =&gt; (TEntity)x.DeepClone())
+                .ToArray();
+        }
+
+        private TEntity[] PerformGetAll(Func&lt;TId[], IEnumerable&lt;TEntity&gt;&gt; getFromRepo)
+        {
+            var allEntities = GetAllFromCache();
+            if (allEntities.Any())
+            {
+                return allEntities;
+            }
+
+            //check the zero count cache
+            if (HasZeroCountCache())
+            {
+                //there is a zero count cache so return an empty list
+                return new TEntity[] { };
+            }
+
+            //we need to do the lookup from the repo
+            var entityCollection = getFromRepo(new TId[] { })
+                //ensure we don&#39;t include any null refs in the returned collection!
+                .WhereNotNull()
+                .ToArray();
+
+            //set the disposal action
+            SetCacheAction(entityCollection);
+
+            return entityCollection;
+        }
+
+        /// &lt;summary&gt;
+        /// For this type of caching policy, we don&#39;t cache individual items
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        protected void SetCacheAction(string cacheKey, TEntity entity)
+        {
+            //No-op
+        }
+
+        /// &lt;summary&gt;
+        /// Sets the action to execute on disposal for an entity collection
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entityCollection&quot;&gt;&lt;/param&gt;
+        protected void SetCacheAction(TEntity[] entityCollection)
+        {
+            //set the disposal action
+            SetCacheAction(() =&gt;
+            {
+                //We want to cache the result as a single collection
+
+                if (_expires)
+                {
+                    Cache.InsertCacheItem(GetCacheTypeKey(), () =&gt; new DeepCloneableList&lt;TEntity&gt;(entityCollection),
+                        timeout: TimeSpan.FromMinutes(5),
+                        isSliding: true);
+                }
+                else
+                {
+                    Cache.InsertCacheItem(GetCacheTypeKey(), () =&gt; new DeepCloneableList&lt;TEntity&gt;(entityCollection));
+                }
+            });
+        }
+
+        /// &lt;summary&gt;
+        /// Looks up the zero count cache, must return null if it doesn&#39;t exist
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected bool HasZeroCountCache()
+        {
+            if (_hasZeroCountCache.HasValue)
+                return _hasZeroCountCache.Value;
+
+            _hasZeroCountCache = Cache.GetCacheItem&lt;DeepCloneableList&lt;TEntity&gt;&gt;(GetCacheTypeKey()) != null;
+            return _hasZeroCountCache.Value;
+        }
+
+        /// &lt;summary&gt;
+        /// This policy will cache the full data set as a single collection
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected TEntity[] GetAllFromCache()
+        {
+            var found = Cache.GetCacheItem&lt;DeepCloneableList&lt;TEntity&gt;&gt;(GetCacheTypeKey());
+
+            //This method will get called before checking for zero count cache, so we&#39;ll just set the flag here
+            _hasZeroCountCache = found != null;
+
+            return found == null ? new TEntity[] { } : found.WhereNotNull().ToArray();
+        }
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,15,22,26,1],[23,9,23,10,1],[24,13,24,40,1],[25,13,25,46,1],[26,13,26,32,1],[27,9,27,10,1],[33,9,33,10,1],[34,13,34,70,1],[35,9,35,10,1],[38,9,38,10,1],[39,13,39,32,1],[39,33,39,75,0],[40,13,40,39,1],[40,40,40,89,0],[43,13,43,14,1],[44,17,44,39,1],[47,17,48,17,1],[48,17,48,18,1],[48,18,50,21,1],[50,21,50,61,1],[50,61,51,17,1],[51,17,51,18,1],[51,18,51,20,1],[47,17,51,20,1],[52,13,52,14,1],[53,13,53,18,1],[54,13,54,14,1],[56,17,57,17,1],[57,17,57,18,1],[57,18,59,21,1],[59,21,59,61,1],[59,61,60,17,1],[60,17,60,18,1],[60,18,60,20,1],[56,17,60,20,1],[61,17,61,23,1],[63,9,63,10,1],[66,9,66,10,1],[67,13,67,32,1],[67,33,67,75,0],[68,13,68,39,1],[68,40,68,89,0],[71,13,71,14,1],[72,17,72,39,1],[73,13,73,14,1],[75,13,75,14,1],[77,17,78,17,1],[78,17,78,18,1],[78,18,80,21,1],[80,21,80,61,1],[80,61,81,17,1],[81,17,81,18,1],[81,18,81,20,1],[77,17,81,20,1],[82,13,82,14,1],[83,9,83,10,1],[86,9,86,10,1],[88,13,88,54,1],[88,54,88,86,1],[88,86,88,88,1],[88,13,88,88,1],[91,13,91,31,1],[91,32,91,55,0],[92,13,92,52,1],[92,52,92,78,1],[92,78,92,80,1],[92,13,92,80,1],[93,13,93,32,1],[93,33,93,45,1],[96,13,96,48,1],[97,9,97,10,1],[100,9,100,10,0],[102,13,102,54,0],[102,54,102,86,0],[102,86,102,88,0],[102,13,102,88,0],[105,13,105,31,0],[105,32,105,44,0],[106,13,106,52,0],[106,52,106,78,0],[106,78,106,80,0],[106,13,106,80,0],[107,13,107,32,0],[107,33,107,45,0],[110,13,110,48,0],[111,9,111,10,0],[114,9,114,10,1],[116,13,116,54,1],[116,54,116,86,1],[116,86,116,88,1],[116,13,116,88,1],[119,13,121,34,1],[121,34,121,60,1],[121,60,121,62,1],[119,13,121,62,1],[122,9,122,10,1],[125,9,125,10,1],[127,13,127,53,1],[132,13,133,37,1],[133,37,133,66,1],[133,66,136,30,1],[136,30,136,52,1],[136,52,137,28,1],[132,13,137,28,1],[138,9,138,10,1],[141,9,141,10,1],[142,13,142,49,1],[143,13,143,35,1],[144,13,144,14,1],[145,17,145,36,1],[149,13,149,37,1],[150,13,150,14,1],[152,17,152,42,1],[156,13,159,28,1],[162,13,162,46,1],[164,13,164,37,1],[165,9,165,10,1],[173,9,173,10,0],[175,9,175,10,0],[182,9,182,10,1],[184,13,185,13,1],[185,13,185,14,1],[185,14,188,17,1],[188,17,188,30,1],[188,30,189,17,1],[189,17,189,18,1],[189,18,190,21,1],[190,21,190,68,1],[190,68,190,116,0],[190,116,192,42,1],[190,21,192,42,1],[192,42,193,17,1],[193,17,193,18,1],[193,18,195,17,1],[195,17,195,18,1],[195,18,196,21,1],[196,21,196,68,1],[196,68,196,116,1],[196,116,196,118,1],[196,21,196,118,1],[196,118,197,17,1],[197,17,197,18,1],[197,18,198,13,1],[198,13,198,14,1],[198,14,198,16,1],[184,13,198,16,1],[199,9,199,10,1],[206,9,206,10,1],[207,13,207,45,1],[208,17,208,49,1],[210,13,210,108,0],[211,13,211,45,0],[212,9,212,10,1],[219,9,219,10,1],[220,13,220,91,1],[223,13,223,48,1],[225,13,225,87,1],[226,9,226,10,1]]);
+    </script>
+  </body>
+</html>

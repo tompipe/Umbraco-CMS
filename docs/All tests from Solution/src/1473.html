@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\ObjectResolution\ManyObjectsResolverBase.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using System.Threading;
+using System.Web;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Core.ObjectResolution
+{
+    /// &lt;summary&gt;
+	/// The base class for all many-objects resolvers.
+	/// &lt;/summary&gt;
+	/// &lt;typeparam name=&quot;TResolver&quot;&gt;The type of the concrete resolver class.&lt;/typeparam&gt;
+	/// &lt;typeparam name=&quot;TResolved&quot;&gt;The type of the resolved objects.&lt;/typeparam&gt;
+	public abstract class ManyObjectsResolverBase&lt;TResolver, TResolved&gt; : ResolverBase&lt;TResolver&gt;
+        where TResolved : class
+        where TResolver : ResolverBase
+    {
+        private Lazy&lt;IEnumerable&lt;TResolved&gt;&gt; _applicationInstances;
+        private readonly ReaderWriterLockSlim _lock = new ReaderWriterLockSlim();
+        private readonly string _httpContextKey;
+        private readonly List&lt;Type&gt; _instanceTypes = new List&lt;Type&gt;();
+        private IEnumerable&lt;TResolved&gt; _sortedValues;
+        private readonly Func&lt;HttpContextBase&gt; _httpContextGetter;
+
+        private int _defaultPluginWeight = 100;
+
+        #region Constructors
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;ManyObjectsResolverBase{TResolver, TResolved}&quot;/&gt; class with an empty list of objects,
+        /// and an optional lifetime scope.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;serviceProvider&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;scope&quot;&gt;The lifetime scope of instantiated objects, default is per Application.&lt;/param&gt;
+        /// &lt;remarks&gt;If &lt;paramref name=&quot;scope&quot;/&gt; is per HttpRequest then there must be a current HttpContext.&lt;/remarks&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;&lt;paramref name=&quot;scope&quot;/&gt; is per HttpRequest but the current HttpContext is null.&lt;/exception&gt;
+        protected ManyObjectsResolverBase(IServiceProvider serviceProvider, ILogger logger, ObjectLifetimeScope scope = ObjectLifetimeScope.Application)
+        {
+            if (serviceProvider == null) throw new ArgumentNullException(&quot;serviceProvider&quot;);
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            CanResolveBeforeFrozen = false;
+            if (scope == ObjectLifetimeScope.HttpRequest)
+                _httpContextGetter = () =&gt; new HttpContextWrapper(HttpContext.Current);
+
+            ServiceProvider = serviceProvider;
+            Logger = logger;
+            LifetimeScope = scope;
+            if (scope == ObjectLifetimeScope.HttpRequest)
+                _httpContextKey = GetType().FullName;
+            _instanceTypes = new List&lt;Type&gt;();
+
+            InitializeAppInstances();
+        }
+
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        [Obsolete(&quot;Use ctor specifying IServiceProvider instead&quot;)]
+        protected ManyObjectsResolverBase(ObjectLifetimeScope scope = ObjectLifetimeScope.Application)
+            : this(new ActivatorServiceProvider(), LoggerResolver.Current.Logger, scope)
+        {
+
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;ManyObjectsResolverBase{TResolver, TResolved}&quot;/&gt; class with an empty list of objects,
+        /// with creation of objects based on an HttpRequest lifetime scope.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;serviceProvider&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;httpContext&quot;&gt;The HttpContextBase corresponding to the HttpRequest.&lt;/param&gt;
+        /// &lt;exception cref=&quot;ArgumentNullException&quot;&gt;&lt;paramref name=&quot;httpContext&quot;/&gt; is &lt;c&gt;null&lt;/c&gt;.&lt;/exception&gt;
+        protected ManyObjectsResolverBase(IServiceProvider serviceProvider, ILogger logger, HttpContextBase httpContext)
+        {
+            if (serviceProvider == null) throw new ArgumentNullException(&quot;serviceProvider&quot;);
+            if (httpContext == null) throw new ArgumentNullException(&quot;httpContext&quot;);
+            CanResolveBeforeFrozen = false;
+            Logger = logger;
+            LifetimeScope = ObjectLifetimeScope.HttpRequest;
+            _httpContextKey = GetType().FullName;
+            ServiceProvider = serviceProvider;
+            _httpContextGetter = () =&gt; httpContext;
+            _instanceTypes = new List&lt;Type&gt;();
+
+            InitializeAppInstances();
+        }
+
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        [Obsolete(&quot;Use ctor specifying IServiceProvider instead&quot;)]
+        protected ManyObjectsResolverBase(HttpContextBase httpContext)
+            : this(new ActivatorServiceProvider(), LoggerResolver.Current.Logger, httpContext)
+        {
+
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;ManyObjectsResolverBase{TResolver, TResolved}&quot;/&gt; class with an initial list of object types,
+        /// and an optional lifetime scope.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;serviceProvider&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The list of object types.&lt;/param&gt;
+        /// &lt;param name=&quot;scope&quot;&gt;The lifetime scope of instantiated objects, default is per Application.&lt;/param&gt;
+        /// &lt;remarks&gt;If &lt;paramref name=&quot;scope&quot;/&gt; is per HttpRequest then there must be a current HttpContext.&lt;/remarks&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;&lt;paramref name=&quot;scope&quot;/&gt; is per HttpRequest but the current HttpContext is null.&lt;/exception&gt;
+        protected ManyObjectsResolverBase(IServiceProvider serviceProvider, ILogger logger, IEnumerable&lt;Type&gt; value, ObjectLifetimeScope scope = ObjectLifetimeScope.Application)
+            : this(serviceProvider, logger, scope)
+        {
+            _instanceTypes = value.ToList();
+        }
+
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        [Obsolete(&quot;Use ctor specifying IServiceProvider instead&quot;)]
+        protected ManyObjectsResolverBase(IEnumerable&lt;Type&gt; value, ObjectLifetimeScope scope = ObjectLifetimeScope.Application)
+            : this(new ActivatorServiceProvider(), LoggerResolver.Current.Logger, value, scope)
+        {
+
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;ManyObjectsResolverBase{TResolver, TResolved}&quot;/&gt; class with an initial list of objects,
+        /// with creation of objects based on an HttpRequest lifetime scope.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;httpContext&quot;&gt;The HttpContextBase corresponding to the HttpRequest.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The list of object types.&lt;/param&gt;
+        /// &lt;exception cref=&quot;ArgumentNullException&quot;&gt;&lt;paramref name=&quot;httpContext&quot;/&gt; is &lt;c&gt;null&lt;/c&gt;.&lt;/exception&gt;
+        [Obsolete(&quot;Use ctor specifying IServiceProvider instead&quot;)]
+        protected ManyObjectsResolverBase(HttpContextBase httpContext, IEnumerable&lt;Type&gt; value)
+            : this(new ActivatorServiceProvider(), LoggerResolver.Current.Logger, httpContext)
+        {
+            _instanceTypes = value.ToList();
+        }
+        #endregion
+
+        private void InitializeAppInstances()
+        {
+            _applicationInstances = new Lazy&lt;IEnumerable&lt;TResolved&gt;&gt;(() =&gt; CreateInstances().ToArray());
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets a value indicating whether the resolver can resolve objects before resolution is frozen.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;This is false by default and is used for some special internal resolvers.&lt;/remarks&gt;
+        internal bool CanResolveBeforeFrozen { get; set; }
+
+        /// &lt;summary&gt;
+        /// Gets the list of types to create instances from.
+        /// &lt;/summary&gt;
+        protected virtual IEnumerable&lt;Type&gt; InstanceTypes
+        {
+            get { return _instanceTypes; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the &lt;see cref=&quot;HttpContextBase&quot;/&gt; used to initialize this object, if any.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;If not null, then &lt;c&gt;LifetimeScope&lt;/c&gt; will be &lt;c&gt;ObjectLifetimeScope.HttpRequest&lt;/c&gt;.&lt;/remarks&gt;
+        protected HttpContextBase CurrentHttpContext
+        {
+            get
+            {
+                var context = _httpContextGetter == null ? null : _httpContextGetter();
+                if (context == null)
+                    throw new InvalidOperationException(&quot;Cannot use this resolver with lifetime &#39;HttpRequest&#39; when there is no current HttpContext. Either use the ctor accepting an HttpContextBase, or use the resolver from within a request exclusively.&quot;);
+                return context;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the service provider used to instantiate objects
+        /// &lt;/summary&gt;
+        public IServiceProvider ServiceProvider { get; private set; }
+
+        public ILogger Logger { get; private set; }
+
+        /// &lt;summary&gt;
+		/// Gets or sets the lifetime scope of resolved objects.
+		/// &lt;/summary&gt;
+		protected ObjectLifetimeScope LifetimeScope { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Gets the resolved object instances, sorted by weight.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;The sorted resolved object instances.&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// &lt;para&gt;The order is based upon the &lt;c&gt;WeightAttribute&lt;/c&gt; and &lt;c&gt;DefaultPluginWeight&lt;/c&gt;.&lt;/para&gt;
+        /// &lt;para&gt;Weights are sorted ascendingly (lowest weights come first).&lt;/para&gt;
+        /// &lt;/remarks&gt;
+        protected IEnumerable&lt;TResolved&gt; GetSortedValues()
+        {
+            if (_sortedValues == null)
+            {
+                var values = Values.ToList();
+                values.Sort((f1, f2) =&gt; GetObjectWeight(f1).CompareTo(GetObjectWeight(f2)));
+                _sortedValues = values;
+            }
+            return _sortedValues;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the default type weight.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Determines the weight of types that do not have a &lt;c&gt;WeightAttribute&lt;/c&gt; set on
+        /// them, when calling &lt;c&gt;GetSortedValues&lt;/c&gt;.&lt;/remarks&gt;
+        protected virtual int DefaultPluginWeight
+        {
+            get { return _defaultPluginWeight; }
+            set { _defaultPluginWeight = value; }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the weight of an object for user with GetSortedValues
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;o&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+		protected virtual int GetObjectWeight(object o)
+        {
+            var type = o.GetType();
+            var attr = type.GetCustomAttribute&lt;WeightAttribute&gt;(true);
+            return attr == null ? DefaultPluginWeight : attr.Weight;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the resolved object instances.
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;&lt;c&gt;CanResolveBeforeFrozen&lt;/c&gt; is false, and resolution is not frozen.&lt;/exception&gt;
+        protected IEnumerable&lt;TResolved&gt; Values
+        {
+            get
+            {
+                using (Resolution.Reader(CanResolveBeforeFrozen))
+                {
+                    // note: we apply .ToArray() to the output of CreateInstance() because that is an IEnumerable that
+                    // comes from the PluginManager we want to be _sure_ that it&#39;s not a Linq of some sort, but the
+                    // instances have actually been instanciated when we return.
+
+                    switch (LifetimeScope)
+                    {
+                        case ObjectLifetimeScope.HttpRequest:
+
+                            // create new instances per HttpContext
+                            if (CurrentHttpContext.Items[_httpContextKey] == null)
+                            {
+                                var instances = CreateInstances().ToArray();
+                                var disposableInstances = instances.OfType&lt;IDisposable&gt;();
+                                //Ensure anything resolved that is IDisposable is disposed when the request termintates
+                                foreach (var disposable in disposableInstances)
+                                {
+                                    CurrentHttpContext.DisposeOnPipelineCompleted(disposable);
+                                }
+                                CurrentHttpContext.Items[_httpContextKey] = instances;
+                            }
+                            return (TResolved[])CurrentHttpContext.Items[_httpContextKey];
+
+                        case ObjectLifetimeScope.Application:
+
+                            return _applicationInstances.Value;
+
+                        case ObjectLifetimeScope.Transient:
+                        default:
+                            // create new instances each time
+                            return CreateInstances().ToArray();
+                    }
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Creates the object instances for the types contained in the types collection.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;A list of objects of type &lt;typeparamref name=&quot;TResolved&quot;/&gt;.&lt;/returns&gt;
+        protected virtual IEnumerable&lt;TResolved&gt; CreateInstances()
+        {
+            return ServiceProvider.CreateInstances&lt;TResolved&gt;(InstanceTypes, Logger);
+        }
+
+        #region Types collection manipulation
+
+        /// &lt;summary&gt;
+        /// Removes a type.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The type to remove.&lt;/param&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;the resolver does not support removing types, or
+        /// the type is not a valid type for the resolver.&lt;/exception&gt;
+        public virtual void RemoveType(Type value)
+        {
+            EnsureSupportsRemove();
+
+            using (Resolution.Configuration)
+            using (var l = new UpgradeableReadLock(_lock))
+            {
+                EnsureCorrectType(value);
+
+                l.UpgradeToWriteLock();
+                _instanceTypes.Remove(value);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Removes a type.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;The type to remove.&lt;/typeparam&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;the resolver does not support removing types, or
+        /// the type is not a valid type for the resolver.&lt;/exception&gt;
+        public void RemoveType&lt;T&gt;()
+            where T : TResolved
+        {
+            RemoveType(typeof(T));
+        }
+
+        /// &lt;summary&gt;
+        /// Adds types.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;types&quot;&gt;The types to add.&lt;/param&gt;
+        /// &lt;remarks&gt;The types are appended at the end of the list.&lt;/remarks&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;the resolver does not support adding types, or
+        /// a type is not a valid type for the resolver, or a type is already in the collection of types.&lt;/exception&gt;
+        protected void AddTypes(IEnumerable&lt;Type&gt; types)
+        {
+            EnsureSupportsAdd();
+
+            using (Resolution.Configuration)
+            using (new WriteLock(_lock))
+            {
+                foreach (var t in types)
+                {
+                    EnsureCorrectType(t);
+                    if (_instanceTypes.Contains(t))
+                    {
+                        throw new InvalidOperationException(string.Format(
+                            &quot;Type {0} is already in the collection of types.&quot;, t.FullName));
+                    }
+                    _instanceTypes.Add(t);
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Adds a type.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The type to add.&lt;/param&gt;
+        /// &lt;remarks&gt;The type is appended at the end of the list.&lt;/remarks&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;the resolver does not support adding types, or
+        /// the type is not a valid type for the resolver, or the type is already in the collection of types.&lt;/exception&gt;
+        public virtual void AddType(Type value)
+        {
+            EnsureSupportsAdd();
+
+            using (Resolution.Configuration)
+            using (var l = new UpgradeableReadLock(_lock))
+            {
+                EnsureCorrectType(value);
+                if (_instanceTypes.Contains(value))
+                {
+                    throw new InvalidOperationException(string.Format(
+                        &quot;Type {0} is already in the collection of types.&quot;, value.FullName));
+                }
+
+                l.UpgradeToWriteLock();
+                _instanceTypes.Add(value);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Adds a type.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;The type to add.&lt;/typeparam&gt;
+        /// &lt;remarks&gt;The type is appended at the end of the list.&lt;/remarks&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;the resolver does not support adding types, or
+        /// the type is not a valid type for the resolver, or the type is already in the collection of types.&lt;/exception&gt;
+        public void AddType&lt;T&gt;()
+            where T : TResolved
+        {
+            AddType(typeof(T));
+        }
+
+        /// &lt;summary&gt;
+        /// Clears the list of types
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;the resolver does not support clearing types.&lt;/exception&gt;
+        public virtual void Clear()
+        {
+            EnsureSupportsClear();
+
+            using (Resolution.Configuration)
+            using (new WriteLock(_lock))
+            {
+                _instanceTypes.Clear();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// WARNING! Do not use this unless you know what you are doing, clear all types registered and instances
+        /// created. Typically only used if a resolver is no longer used in an application and memory is to be GC&#39;d
+        /// &lt;/summary&gt;
+        internal void ResetCollections()
+        {
+            using (new WriteLock(_lock))
+            {
+                _instanceTypes.Clear();
+                _sortedValues = null;
+                _applicationInstances = null;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Inserts a type at the specified index.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;index&quot;&gt;The zero-based index at which the type should be inserted.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The type to insert.&lt;/param&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;the resolver does not support inserting types, or
+        /// the type is not a valid type for the resolver, or the type is already in the collection of types.&lt;/exception&gt;
+        /// &lt;exception cref=&quot;ArgumentOutOfRangeException&quot;&gt;&lt;paramref name=&quot;index&quot;/&gt; is out of range.&lt;/exception&gt;
+        public virtual void InsertType(int index, Type value)
+        {
+            EnsureSupportsInsert();
+
+            using (Resolution.Configuration)
+            using (var l = new UpgradeableReadLock(_lock))
+            {
+                EnsureCorrectType(value);
+                if (_instanceTypes.Contains(value))
+                {
+                    throw new InvalidOperationException(string.Format(
+                        &quot;Type {0} is already in the collection of types.&quot;, value.FullName));
+                }
+
+                l.UpgradeToWriteLock();
+                _instanceTypes.Insert(index, value);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Inserts a type at the beginning of the list.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The type to insert.&lt;/param&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;the resolver does not support inserting types, or
+        /// the type is not a valid type for the resolver, or the type is already in the collection of types.&lt;/exception&gt;
+        public virtual void InsertType(Type value)
+        {
+            InsertType(0, value);
+        }
+
+        /// &lt;summary&gt;
+		/// Inserts a type at the specified index.
+		/// &lt;/summary&gt;
+		/// &lt;typeparam name=&quot;T&quot;&gt;The type to insert.&lt;/typeparam&gt;
+		/// &lt;param name=&quot;index&quot;&gt;The zero-based index at which the type should be inserted.&lt;/param&gt;
+		/// &lt;exception cref=&quot;ArgumentOutOfRangeException&quot;&gt;&lt;paramref name=&quot;index&quot;/&gt; is out of range.&lt;/exception&gt;
+		public void InsertType&lt;T&gt;(int index)
+            where T : TResolved
+        {
+            InsertType(index, typeof(T));
+        }
+
+        /// &lt;summary&gt;
+        /// Inserts a type at the beginning of the list.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;The type to insert.&lt;/typeparam&gt;
+        public void InsertType&lt;T&gt;()
+            where T : TResolved
+        {
+            InsertType(0, typeof(T));
+        }
+
+        /// &lt;summary&gt;
+        /// Inserts a type before a specified, already existing type.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;existingType&quot;&gt;The existing type before which to insert.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The type to insert.&lt;/param&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;the resolver does not support inserting types, or
+        /// one of the types is not a valid type for the resolver, or the existing type is not in the collection,
+        /// or the new type is already in the collection of types.&lt;/exception&gt;
+        public virtual void InsertTypeBefore(Type existingType, Type value)
+        {
+            EnsureSupportsInsert();
+
+            using (Resolution.Configuration)
+            using (var l = new UpgradeableReadLock(_lock))
+            {
+                EnsureCorrectType(existingType);
+                EnsureCorrectType(value);
+                if (_instanceTypes.Contains(existingType) == false)
+                {
+                    throw new InvalidOperationException(string.Format(
+                        &quot;Type {0} is not in the collection of types.&quot;, existingType.FullName));
+                }
+                if (_instanceTypes.Contains(value))
+                {
+                    throw new InvalidOperationException(string.Format(
+                        &quot;Type {0} is already in the collection of types.&quot;, value.FullName));
+                }
+                int index = _instanceTypes.IndexOf(existingType);
+
+                l.UpgradeToWriteLock();
+                _instanceTypes.Insert(index, value);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Inserts a type before a specified, already existing type.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TExisting&quot;&gt;The existing type before which to insert.&lt;/typeparam&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;The type to insert.&lt;/typeparam&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;the resolver does not support inserting types, or
+        /// one of the types is not a valid type for the resolver, or the existing type is not in the collection,
+        /// or the new type is already in the collection of types.&lt;/exception&gt;
+        public void InsertTypeBefore&lt;TExisting, T&gt;()
+            where TExisting : TResolved
+            where T : TResolved
+        {
+            InsertTypeBefore(typeof(TExisting), typeof(T));
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a value indicating whether the specified type is already in the collection of types.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The type to look for.&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether the type is already in the collection of types.&lt;/returns&gt;
+        public virtual bool ContainsType(Type value)
+        {
+            using (new ReadLock(_lock))
+            {
+                return _instanceTypes.Contains(value);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the types in the collection of types.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;The types in the collection of types.&lt;/returns&gt;
+        /// &lt;remarks&gt;Returns an enumeration, the list cannot be modified.&lt;/remarks&gt;
+        public virtual IEnumerable&lt;Type&gt; GetTypes()
+        {
+            Type[] types;
+            using (new ReadLock(_lock))
+            {
+                types = _instanceTypes.ToArray();
+            }
+            return types;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a value indicating whether the specified type is already in the collection of types.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;The type to look for.&lt;/typeparam&gt;
+        /// &lt;returns&gt;A value indicating whether the type is already in the collection of types.&lt;/returns&gt;
+        public bool ContainsType&lt;T&gt;()
+            where T : TResolved
+        {
+            return ContainsType(typeof(T));
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Returns a WriteLock to use when modifying collections
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected WriteLock GetWriteLock()
+        {
+            return new WriteLock(_lock);
+        }
+
+        #region Type utilities
+
+        /// &lt;summary&gt;
+        /// Ensures that a type is a valid type for the resolver.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;The type to test.&lt;/param&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;the type is not a valid type for the resolver.&lt;/exception&gt;
+        protected virtual void EnsureCorrectType(Type value)
+        {
+            if (TypeHelper.IsTypeAssignableFrom&lt;TResolved&gt;(value) == false)
+                throw new InvalidOperationException(string.Format(
+                    &quot;Type {0} is not an acceptable type for resolver {1}.&quot;, value.FullName, GetType().FullName));
+        }
+
+        #endregion
+
+        #region Types collection manipulation support
+
+        /// &lt;summary&gt;
+        /// Ensures that the resolver supports removing types.
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;The resolver does not support removing types.&lt;/exception&gt;
+        protected void EnsureSupportsRemove()
+        {
+            if (SupportsRemove == false)
+                throw new InvalidOperationException(&quot;This resolver does not support removing types&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures that the resolver supports clearing types.
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;The resolver does not support clearing types.&lt;/exception&gt;
+        protected void EnsureSupportsClear()
+        {
+            if (SupportsClear == false)
+                throw new InvalidOperationException(&quot;This resolver does not support clearing types&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures that the resolver supports adding types.
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;The resolver does not support adding types.&lt;/exception&gt;
+        protected void EnsureSupportsAdd()
+        {
+            if (SupportsAdd == false)
+                throw new InvalidOperationException(&quot;This resolver does not support adding new types&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures that the resolver supports inserting types.
+        /// &lt;/summary&gt;
+        /// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;The resolver does not support inserting types.&lt;/exception&gt;
+        protected void EnsureSupportsInsert()
+        {
+            if (SupportsInsert == false)
+                throw new InvalidOperationException(&quot;This resolver does not support inserting new types&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether the resolver supports adding types.
+        /// &lt;/summary&gt;
+		protected virtual bool SupportsAdd
+        {
+            get { return true; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether the resolver supports inserting types.
+        /// &lt;/summary&gt;
+        protected virtual bool SupportsInsert
+        {
+            get { return true; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether the resolver supports clearing types.
+        /// &lt;/summary&gt;
+        protected virtual bool SupportsClear
+        {
+            get { return true; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether the resolver supports removing types.
+        /// &lt;/summary&gt;
+        protected virtual bool SupportsRemove
+        {
+            get { return true; }
+        }
+
+        #endregion
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[21,9,21,82,1],[21,9,21,82,1],[23,9,23,71,1],[23,9,23,71,1],[27,9,27,48,1],[27,9,27,48,1],[40,9,40,153,1],[41,9,41,10,1],[42,13,42,41,1],[42,42,42,93,0],[43,13,43,32,1],[43,33,43,75,0],[44,13,44,44,1],[45,13,45,58,1],[46,17,46,44,0],[46,44,46,87,0],[46,87,46,88,0],[46,17,46,88,0],[48,13,48,47,1],[49,13,49,29,1],[50,13,50,35,1],[51,13,51,58,1],[52,17,52,54,0],[53,13,53,47,1],[55,13,55,38,1],[56,9,56,10,1],[61,15,61,89,0],[62,9,62,10,0],[64,9,64,10,0],[74,9,74,121,1],[75,9,75,10,1],[76,13,76,41,1],[76,42,76,93,0],[77,13,77,37,1],[77,38,77,85,0],[78,13,78,44,1],[79,13,79,29,1],[80,13,80,61,1],[81,13,81,50,1],[82,13,82,47,1],[83,13,83,40,1],[83,40,83,51,1],[83,51,83,52,1],[83,13,83,52,1],[84,13,84,47,1],[86,13,86,38,1],[87,9,87,10,1],[92,15,92,95,0],[93,9,93,10,0],[95,9,95,10,0],[108,15,108,51,1],[109,9,109,10,1],[110,13,110,45,1],[111,9,111,10,1],[116,15,116,96,0],[117,9,117,10,0],[119,9,119,10,0],[130,15,130,95,0],[131,9,131,10,0],[132,13,132,45,0],[133,9,133,10,0],[137,9,137,10,1],[138,13,138,76,1],[138,76,138,103,1],[138,103,138,105,1],[138,13,138,105,1],[139,9,139,10,1],[145,48,145,52,1],[145,53,145,57,1],[152,17,152,18,1],[152,19,152,41,1],[152,42,152,43,1],[162,13,162,14,1],[163,17,163,88,1],[164,17,164,37,1],[165,21,165,256,0],[166,17,166,32,1],[167,13,167,14,1],[173,51,173,55,1],[173,56,173,68,1],[175,33,175,37,1],[175,38,175,50,1],[180,49,180,53,1],[180,54,180,66,1],[191,9,191,10,1],[192,13,192,39,1],[193,13,193,14,1],[194,17,194,46,1],[195,17,195,41,1],[195,41,195,91,1],[195,91,195,93,1],[195,17,195,93,1],[196,17,196,40,1],[197,13,197,14,1],[198,13,198,34,1],[199,9,199,10,1],[208,17,208,18,1],[208,19,208,47,1],[208,48,208,49,1],[209,17,209,18,0],[209,19,209,48,0],[209,49,209,50,0],[218,9,218,10,1],[219,13,219,36,1],[220,13,220,71,1],[221,13,221,69,1],[222,9,222,10,1],[231,13,231,14,1],[232,17,232,66,1],[233,17,233,18,1],[238,21,238,43,1],[243,29,243,83,1],[244,29,244,30,1],[245,33,245,77,1],[246,33,246,91,1],[248,33,248,40,1],[248,42,248,56,0],[248,57,248,59,1],[248,60,248,79,1],[249,33,249,34,0],[250,37,250,95,0],[251,33,251,34,0],[252,33,252,87,1],[253,29,253,30,1],[254,29,254,91,1],[258,29,258,64,1],[263,29,263,64,1],[266,13,266,14,1],[274,9,274,10,1],[275,13,275,86,1],[276,9,276,10,1],[287,9,287,10,1],[288,13,288,36,1],[290,13,290,45,1],[291,20,291,58,1],[292,13,292,14,1],[293,17,293,42,1],[295,17,295,40,1],[296,17,296,46,1],[297,13,297,14,1],[298,9,298,10,1],[308,9,308,10,1],[309,13,309,35,1],[310,9,310,10,1],[320,9,320,10,0],[321,13,321,33,0],[323,13,323,45,0],[324,13,324,41,0],[325,13,325,14,0],[326,17,326,24,0],[326,26,326,31,0],[326,32,326,34,0],[326,35,326,40,0],[327,17,327,18,0],[328,21,328,42,0],[329,21,329,52,0],[330,21,330,22,0],[331,25,332,93,0],[334,21,334,43,0],[335,17,335,18,0],[336,13,336,14,0],[337,9,337,10,0],[347,9,347,10,1],[348,13,348,33,1],[350,13,350,45,1],[351,20,351,58,1],[352,13,352,14,1],[353,17,353,42,1],[354,17,354,52,1],[355,17,355,18,1],[356,21,357,93,1],[360,17,360,40,1],[361,17,361,43,1],[362,13,362,14,1],[363,9,363,10,1],[374,9,374,10,1],[375,13,375,32,1],[376,9,376,10,1],[383,9,383,10,1],[384,13,384,35,1],[386,13,386,45,1],[387,13,387,41,1],[388,13,388,14,1],[389,17,389,40,1],[390,13,390,14,1],[391,9,391,10,1],[398,9,398,10,1],[399,13,399,41,1],[400,13,400,14,1],[401,17,401,40,1],[402,17,402,38,1],[403,17,403,46,1],[404,13,404,14,1],[405,9,405,10,1],[416,9,416,10,1],[417,13,417,36,1],[419,13,419,45,1],[420,20,420,58,1],[421,13,421,14,1],[422,17,422,42,1],[423,17,423,52,1],[424,17,424,18,1],[425,21,426,93,1],[429,17,429,40,1],[430,17,430,53,1],[431,13,431,14,1],[432,9,432,10,1],[441,9,441,10,0],[442,13,442,34,0],[443,9,443,10,0],[453,9,453,10,1],[454,13,454,42,1],[455,9,455,10,1],[463,9,463,10,1],[464,13,464,38,1],[465,9,465,10,1],[476,9,476,10,1],[477,13,477,36,1],[479,13,479,45,1],[480,20,480,58,1],[481,13,481,14,1],[482,17,482,49,1],[483,17,483,42,1],[484,17,484,68,1],[485,17,485,18,1],[486,21,487,96,1],[489,17,489,52,1],[490,17,490,18,1],[491,21,492,93,1],[494,17,494,66,1],[496,17,496,40,1],[497,17,497,53,1],[498,13,498,14,1],[499,9,499,10,1],[512,9,512,10,1],[513,13,513,60,1],[514,9,514,10,1],[522,9,522,10,1],[523,13,523,40,1],[524,13,524,14,1],[525,17,525,55,1],[527,9,527,10,1],[535,9,535,10,0],[537,13,537,40,0],[538,13,538,14,0],[539,17,539,50,0],[540,13,540,14,0],[541,13,541,26,0],[542,9,542,10,0],[551,9,551,10,1],[552,13,552,44,1],[553,9,553,10,1],[562,9,562,10,1],[563,13,563,41,1],[564,9,564,10,1],[574,9,574,10,1],[575,13,575,76,1],[576,17,577,114,1],[578,9,578,10,1],[589,9,589,10,1],[590,13,590,41,1],[591,17,591,102,0],[592,9,592,10,1],[599,9,599,10,1],[600,13,600,40,1],[601,17,601,102,0],[602,9,602,10,1],[609,9,609,10,1],[610,13,610,38,1],[611,17,611,104,0],[612,9,612,10,1],[619,9,619,10,1],[620,13,620,41,1],[621,17,621,107,0],[622,9,622,10,1],[629,17,629,18,1],[629,19,629,31,1],[629,32,629,33,1],[637,17,637,18,1],[637,19,637,31,1],[637,32,637,33,1],[645,17,645,18,1],[645,19,645,31,1],[645,32,645,33,1],[653,17,653,18,1],[653,19,653,31,1],[653,32,653,33,1]]);
+    </script>
+  </body>
+</html>

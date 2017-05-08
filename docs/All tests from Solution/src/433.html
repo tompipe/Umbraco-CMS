@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\template.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Xml;
+using System.Web.Caching;
+using System.Text;
+using System.IO;
+using System.Text.RegularExpressions;
+
+using System.Data;
+using System.Web.UI;
+using System.Collections;
+using System.Collections.Generic;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Configuration;
+using Umbraco.Web;
+using Umbraco.Web.Cache;
+using umbraco.DataLayer;
+using umbraco.BusinessLogic;
+using Umbraco.Core.IO;
+using System.Web;
+
+namespace umbraco
+{
+    /// &lt;summary&gt;
+    /// Holds methods for parsing and building umbraco templates
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;Do not use this class, use Umbraco.Core.Service.IFileService to work with templates&quot;)]
+    public class template
+    {
+        #region private variables
+
+        readonly StringBuilder _templateOutput = new StringBuilder();
+
+        private string _templateDesign = &quot;&quot;;
+        int _masterTemplate = -1;
+        private string _templateName = &quot;&quot;;
+        private string _templateAlias = &quot;&quot;;
+
+        #endregion
+
+        #region public properties
+        public String TemplateContent
+        {
+            set
+            {
+                _templateOutput.Append(value);
+            }
+            get
+            {
+                return _templateOutput.ToString();
+            }
+        }
+
+        public int MasterTemplate
+        {
+            get { return _masterTemplate; }
+        }
+
+        //added fallback to the default template to avoid nasty .net errors. 
+        //This is referenced in /default.aspx.cs during page rendering.
+        public string MasterPageFile
+        {
+            get
+            {
+
+                string file = TemplateAlias.Replace(&quot; &quot;, &quot;&quot;) + &quot;.master&quot;;
+                string path = SystemDirectories.Masterpages + &quot;/&quot; + file;
+
+
+                if (System.IO.File.Exists(IOHelper.MapPath(VirtualPathUtility.ToAbsolute(path))))
+                    return path;
+                else
+                    return SystemDirectories.Umbraco + &quot;/masterPages/default.master&quot;;
+            }
+        }
+
+        //Support for template folders, if a alternative skin folder is requested
+        //we will try to look for template files in another folder
+        public string AlternateMasterPageFile(string templateFolder)
+        {
+            string file = TemplateAlias.Replace(&quot; &quot;, &quot;&quot;) + &quot;.master&quot;;
+            string path = SystemDirectories.Masterpages + &quot;/&quot; + templateFolder + &quot;/&quot; + file;
+
+            //if it doesn&#39;t exists then we return the normal file
+            if (!System.IO.File.Exists(IOHelper.MapPath(VirtualPathUtility.ToAbsolute(path))))
+            {
+
+                string originalPath = IOHelper.MapPath(VirtualPathUtility.ToAbsolute(MasterPageFile));
+                string copyPath = IOHelper.MapPath(VirtualPathUtility.ToAbsolute(path));
+
+                string newFile;
+                using (var fs = new FileStream(originalPath, FileMode.Open, FileAccess.ReadWrite))
+                using (var f = new StreamReader(fs))
+                {
+                    newFile = f.ReadToEnd();                    
+                }
+
+                newFile = newFile.Replace(&quot;MasterPageFile=\&quot;~/masterpages/&quot;, &quot;MasterPageFile=\&quot;&quot;);
+
+                using (var fs = new FileStream(copyPath, FileMode.Create, FileAccess.Write))
+                using (var replacement = new StreamWriter(fs))
+                {
+                    replacement.Write(newFile);
+                }
+            }
+
+            return path;
+
+        }
+
+
+        public string TemplateAlias
+        {
+            get { return _templateAlias; }
+        }
+        #endregion
+
+        #region public methods
+
+        public override string ToString()
+        {
+            return this._templateName;
+        }
+
+        public Control ParseWithControls(page umbPage)
+        {
+            System.Web.HttpContext.Current.Trace.Write(&quot;umbracoTemplate&quot;, &quot;Start parsing&quot;);
+
+            if (System.Web.HttpContext.Current.Items[&quot;macrosAdded&quot;] == null)
+                System.Web.HttpContext.Current.Items.Add(&quot;macrosAdded&quot;, 0);
+
+            StringBuilder tempOutput = _templateOutput;
+
+            Control pageLayout = new Control();
+            Control pageHeader = new Control();
+            Control pageFooter = new Control();
+            Control pageContent = new Control();
+            System.Web.UI.HtmlControls.HtmlForm pageForm = new System.Web.UI.HtmlControls.HtmlForm();
+            System.Web.UI.HtmlControls.HtmlHead pageAspNetHead = new System.Web.UI.HtmlControls.HtmlHead();
+
+            // Find header and footer of page if there is an aspnet-form on page
+            if (_templateOutput.ToString().ToLower().IndexOf(&quot;&lt;?aspnet_form&gt;&quot;) &gt; 0 ||
+                _templateOutput.ToString().ToLower().IndexOf(&quot;&lt;?aspnet_form disablescriptmanager=\&quot;true\&quot;&gt;&quot;) &gt; 0)
+            {
+                pageForm.Attributes.Add(&quot;method&quot;, &quot;post&quot;);
+                pageForm.Attributes.Add(&quot;action&quot;, Convert.ToString(System.Web.HttpContext.Current.Items[&quot;VirtualUrl&quot;]));
+
+                // Find header and footer from tempOutput
+                int aspnetFormTagBegin = tempOutput.ToString().ToLower().IndexOf(&quot;&lt;?aspnet_form&gt;&quot;);
+                int aspnetFormTagLength = 14;
+                int aspnetFormTagEnd = tempOutput.ToString().ToLower().IndexOf(&quot;&lt;/?aspnet_form&gt;&quot;) + 15;
+
+                // check if we should disable the script manager
+                if (aspnetFormTagBegin == -1)
+                {
+                    aspnetFormTagBegin =
+                        _templateOutput.ToString().ToLower().IndexOf(&quot;&lt;?aspnet_form disablescriptmanager=\&quot;true\&quot;&gt;&quot;);
+                    aspnetFormTagLength = 42;
+                }
+                else
+                {
+                    ScriptManager sm = new ScriptManager();
+                    sm.ID = &quot;umbracoScriptManager&quot;;
+                    pageForm.Controls.Add(sm);
+                }
+
+
+                StringBuilder header = new StringBuilder(tempOutput.ToString().Substring(0, aspnetFormTagBegin));
+
+                // Check if there&#39;s an asp.net head element in the header
+                if (header.ToString().ToLower().Contains(&quot;&lt;?aspnet_head&gt;&quot;))
+                {
+                    StringBuilder beforeHeader = new StringBuilder(header.ToString().Substring(0, header.ToString().ToLower().IndexOf(&quot;&lt;?aspnet_head&gt;&quot;)));
+                    header.Remove(0, header.ToString().ToLower().IndexOf(&quot;&lt;?aspnet_head&gt;&quot;) + 14);
+                    StringBuilder afterHeader = new StringBuilder(header.ToString().Substring(header.ToString().ToLower().IndexOf(&quot;&lt;/?aspnet_head&gt;&quot;) + 15, header.Length - header.ToString().ToLower().IndexOf(&quot;&lt;/?aspnet_head&gt;&quot;) - 15));
+                    header.Remove(header.ToString().ToLower().IndexOf(&quot;&lt;/?aspnet_head&gt;&quot;), header.Length - header.ToString().ToLower().IndexOf(&quot;&lt;/?aspnet_head&gt;&quot;));
+
+                    // Find the title from head
+                    MatchCollection matches = Regex.Matches(header.ToString(), @&quot;&lt;title&gt;(.*?)&lt;/title&gt;&quot;, RegexOptions.IgnoreCase | RegexOptions.Multiline);
+                    if (matches.Count &gt; 0)
+                    {
+                        StringBuilder titleText = new StringBuilder();
+                        HtmlTextWriter titleTextTw = new HtmlTextWriter(new System.IO.StringWriter(titleText));
+                        parseStringBuilder(new StringBuilder(matches[0].Groups[1].Value), umbPage).RenderControl(titleTextTw);
+                        pageAspNetHead.Title = titleText.ToString();
+                        header = new StringBuilder(header.ToString().Replace(matches[0].Value, &quot;&quot;));
+                    }
+
+                    pageAspNetHead.Controls.Add(parseStringBuilder(header, umbPage));
+                    pageAspNetHead.ID = &quot;head1&quot;;
+
+                    // build the whole header part
+                    pageHeader.Controls.Add(parseStringBuilder(beforeHeader, umbPage));
+                    pageHeader.Controls.Add(pageAspNetHead);
+                    pageHeader.Controls.Add(parseStringBuilder(afterHeader, umbPage));
+
+                }
+                else
+                    pageHeader.Controls.Add(parseStringBuilder(header, umbPage));
+
+
+                pageFooter.Controls.Add(parseStringBuilder(new StringBuilder(tempOutput.ToString().Substring(aspnetFormTagEnd, tempOutput.Length - aspnetFormTagEnd)), umbPage));
+                tempOutput.Remove(0, aspnetFormTagBegin + aspnetFormTagLength);
+                aspnetFormTagEnd = tempOutput.ToString().ToLower().IndexOf(&quot;&lt;/?aspnet_form&gt;&quot;);
+                tempOutput.Remove(aspnetFormTagEnd, tempOutput.Length - aspnetFormTagEnd);
+
+
+                //throw new ArgumentException(tempOutput.ToString());
+                pageForm.Controls.Add(parseStringBuilder(tempOutput, umbPage));
+
+                pageContent.Controls.Add(pageHeader);
+                pageContent.Controls.Add(pageForm);
+                pageContent.Controls.Add(pageFooter);
+                return pageContent;
+
+            }
+            else
+                return parseStringBuilder(tempOutput, umbPage);
+
+        }
+
+        public Control parseStringBuilder(StringBuilder tempOutput, page umbPage)
+        {
+
+            Control pageContent = new Control();
+
+            bool stop = false;
+            bool debugMode = umbraco.presentation.UmbracoContext.Current.Request.IsDebug;
+
+            while (!stop)
+            {
+                System.Web.HttpContext.Current.Trace.Write(&quot;template&quot;, &quot;Begining of parsing rutine...&quot;);
+                int tagIndex = tempOutput.ToString().ToLower().IndexOf(&quot;&lt;?umbraco&quot;);
+                if (tagIndex &gt; -1)
+                {
+                    String tempElementContent = &quot;&quot;;
+                    pageContent.Controls.Add(new LiteralControl(tempOutput.ToString().Substring(0, tagIndex)));
+
+                    tempOutput.Remove(0, tagIndex);
+
+                    String tag = tempOutput.ToString().Substring(0, tempOutput.ToString().IndexOf(&quot;&gt;&quot;) + 1);
+                    Hashtable attributes = helper.ReturnAttributes(tag);
+
+                    // Check whether it&#39;s a single tag (&lt;?.../&gt;) or a tag with children (&lt;?..&gt;...&lt;/?...&gt;)
+                    if (tag.Substring(tag.Length - 2, 1) != &quot;/&quot; &amp;&amp; tag.IndexOf(&quot; &quot;) &gt; -1)
+                    {
+                        String closingTag = &quot;&lt;/&quot; + (tag.Substring(1, tag.IndexOf(&quot; &quot;) - 1)) + &quot;&gt;&quot;;
+                        // Tag with children are only used when a macro is inserted by the umbraco-editor, in the
+                        // following format: &quot;&lt;?UMBRACO_MACRO ...&gt;&lt;IMG SRC=&quot;...&quot;..&gt;&lt;/?UMBRACO_MACRO&gt;&quot;, so we
+                        // need to delete extra information inserted which is the image-tag and the closing
+                        // umbraco_macro tag
+                        if (tempOutput.ToString().IndexOf(closingTag) &gt; -1)
+                        {
+                            tempOutput.Remove(0, tempOutput.ToString().IndexOf(closingTag));
+                        }
+                    }
+
+
+
+                    System.Web.HttpContext.Current.Trace.Write(&quot;umbTemplate&quot;, &quot;Outputting item: &quot; + tag);
+
+                    // Handle umbraco macro tags
+                    if (tag.ToString().ToLower().IndexOf(&quot;umbraco_macro&quot;) &gt; -1)
+                    {
+                        if (debugMode)
+                            pageContent.Controls.Add(new LiteralControl(&quot;&lt;div title=\&quot;Macro Tag: &#39;&quot; + System.Web.HttpContext.Current.Server.HtmlEncode(tag) + &quot;&#39;\&quot; style=\&quot;border: 1px solid #009;\&quot;&gt;&quot;));
+
+                        // NH: Switching to custom controls for macros
+                        if (UmbracoConfig.For.UmbracoSettings().Templates.UseAspNetMasterPages)
+                        {
+                            umbraco.presentation.templateControls.Macro macroControl = new umbraco.presentation.templateControls.Macro();
+                            macroControl.Alias = helper.FindAttribute(attributes, &quot;macroalias&quot;);
+                            IDictionaryEnumerator ide = attributes.GetEnumerator();
+                            while (ide.MoveNext())
+                                if (macroControl.Attributes[ide.Key.ToString()] == null)
+                                    macroControl.Attributes.Add(ide.Key.ToString(), ide.Value.ToString());
+                            pageContent.Controls.Add(macroControl);
+                        }
+                        else
+                        {
+                            macro tempMacro;
+                            String macroID = helper.FindAttribute(attributes, &quot;macroid&quot;);
+                            if (macroID != String.Empty)
+                                tempMacro = getMacro(macroID);
+                            else
+                                tempMacro = macro.GetMacro(helper.FindAttribute(attributes, &quot;macroalias&quot;));
+
+                            if (tempMacro != null)
+                            {
+
+                                try
+                                {
+                                    Control c = tempMacro.renderMacro(attributes, umbPage.Elements, umbPage.PageID);
+                                    if (c != null)
+                                        pageContent.Controls.Add(c);
+                                    else
+                                        System.Web.HttpContext.Current.Trace.Warn(&quot;Template&quot;, &quot;Result of macro &quot; + tempMacro.Name + &quot; is null&quot;);
+
+                                }
+                                catch (Exception e)
+                                {
+                                    System.Web.HttpContext.Current.Trace.Warn(&quot;Template&quot;, &quot;Error adding macro &quot; + tempMacro.Name, e);
+                                }
+                            }
+                        }
+                        if (debugMode)
+                            pageContent.Controls.Add(new LiteralControl(&quot;&lt;/div&gt;&quot;));
+                    }
+                    else
+                    {
+                        if (tag.ToLower().IndexOf(&quot;umbraco_getitem&quot;) &gt; -1)
+                        {
+
+                            // NH: Switching to custom controls for items
+                            if (UmbracoConfig.For.UmbracoSettings().Templates.UseAspNetMasterPages)
+                            {
+                                umbraco.presentation.templateControls.Item itemControl = new umbraco.presentation.templateControls.Item();
+                                itemControl.Field = helper.FindAttribute(attributes, &quot;field&quot;);
+                                IDictionaryEnumerator ide = attributes.GetEnumerator();
+                                while (ide.MoveNext())
+                                    if (itemControl.Attributes[ide.Key.ToString()] == null)
+                                        itemControl.Attributes.Add(ide.Key.ToString(), ide.Value.ToString());
+                                pageContent.Controls.Add(itemControl);
+                            }
+                            else
+                            {
+                                try
+                                {
+                                    if (helper.FindAttribute(attributes, &quot;nodeId&quot;) != &quot;&quot; &amp;&amp; int.Parse(helper.FindAttribute(attributes, &quot;nodeId&quot;)) != 0)
+                                    {
+                                        cms.businesslogic.Content c = new umbraco.cms.businesslogic.Content(int.Parse(helper.FindAttribute(attributes, &quot;nodeId&quot;)));
+                                        item umbItem = new item(c.getProperty(helper.FindAttribute(attributes, &quot;field&quot;)).Value.ToString(), attributes);
+                                        tempElementContent = umbItem.FieldContent;
+
+                                        // Check if the content is published
+                                        if (c.nodeObjectType == cms.businesslogic.web.Document._objectType)
+                                        {
+                                            try
+                                            {
+                                                cms.businesslogic.web.Document d = (cms.businesslogic.web.Document)c;
+                                                if (!d.Published)
+                                                    tempElementContent = &quot;&quot;;
+                                            }
+                                            catch { }
+                                        }
+
+                                    }
+                                    else
+                                    {
+                                        // NH adds Live Editing test stuff
+                                        item umbItem = new item(umbPage.Elements, attributes);
+                                        //								item umbItem = new item(umbPage.PageElements[helper.FindAttribute(attributes, &quot;field&quot;)].ToString(), attributes);
+                                        tempElementContent = umbItem.FieldContent;
+                                    }
+
+                                    if (debugMode)
+                                        tempElementContent =
+                                            &quot;&lt;div title=\&quot;Field Tag: &#39;&quot; + System.Web.HttpContext.Current.Server.HtmlEncode(tag) + &quot;&#39;\&quot; style=\&quot;border: 1px solid #fc6;\&quot;&gt;&quot; + tempElementContent + &quot;&lt;/div&gt;&quot;;
+                                }
+                                catch (Exception e)
+                                {
+                                    System.Web.HttpContext.Current.Trace.Warn(&quot;umbracoTemplate&quot;, &quot;Error reading element (&quot; + helper.FindAttribute(attributes, &quot;field&quot;) + &quot;)&quot;, e);
+                                }
+                            }
+                        }
+                    }
+                    tempOutput.Remove(0, tempOutput.ToString().IndexOf(&quot;&gt;&quot;) + 1);
+                    tempOutput.Insert(0, tempElementContent);
+                }
+                else
+                {
+                    pageContent.Controls.Add(new LiteralControl(tempOutput.ToString()));
+                    break;
+                }
+
+            }
+
+            return pageContent;
+
+        }
+
+		[Obsolete(&quot;Use Umbraco.Web.Templates.TemplateUtilities.ParseInternalLinks instead&quot;)]
+        public static string ParseInternalLinks(string pageContents)
+		{
+			return Umbraco.Web.Templates.TemplateUtilities.ParseInternalLinks(pageContents);
+		}
+
+        /// &lt;summary&gt;
+        /// Parses the content of the templateOutput stringbuilder, and matches any tags given in the
+        /// XML-file /umbraco/config/umbracoTemplateTags.xml. 
+        /// Replaces the found tags in the StringBuilder object, with &quot;real content&quot;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbPage&quot;&gt;&lt;/param&gt;
+        public void Parse(page umbPage)
+        {
+            System.Web.HttpContext.Current.Trace.Write(&quot;umbracoTemplate&quot;, &quot;Start parsing&quot;);
+
+            // First parse for known umbraco tags
+            // &lt;?UMBRACO_MACRO/&gt; - macros
+            // &lt;?UMBRACO_GETITEM/&gt; - print item from page, level, or recursive
+            MatchCollection tags = Regex.Matches(_templateOutput.ToString(), &quot;&lt;\\?UMBRACO_MACRO[^&gt;]*/&gt;|&lt;\\?UMBRACO_GETITEM[^&gt;]*/&gt;|&lt;\\?(?&lt;tagName&gt;[\\S]*)[^&gt;]*/&gt;&quot;, RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+
+            foreach (Match tag in tags)
+            {
+                Hashtable attributes = helper.ReturnAttributes(tag.Value.ToString());
+
+
+                if (tag.ToString().ToLower().IndexOf(&quot;umbraco_macro&quot;) &gt; -1)
+                {
+                    String macroID = helper.FindAttribute(attributes, &quot;macroid&quot;);
+                    if (macroID != &quot;&quot;)
+                    {
+                        macro tempMacro = getMacro(macroID);
+                        _templateOutput.Replace(tag.Value.ToString(), tempMacro.MacroContent.ToString());
+                    }
+                }
+                else
+                {
+                    if (tag.ToString().ToLower().IndexOf(&quot;umbraco_getitem&quot;) &gt; -1)
+                    {
+                        try
+                        {
+                            String tempElementContent = umbPage.Elements[helper.FindAttribute(attributes, &quot;field&quot;)].ToString();
+                            MatchCollection tempMacros = Regex.Matches(tempElementContent, &quot;&lt;\\?UMBRACO_MACRO(?&lt;attributes&gt;[^&gt;]*)&gt;&lt;img[^&gt;]*&gt;&lt;\\/\\?UMBRACO_MACRO&gt;&quot;, RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+                            foreach (Match tempMacro in tempMacros)
+                            {
+                                Hashtable tempAttributes = helper.ReturnAttributes(tempMacro.Groups[&quot;attributes&quot;].Value.ToString());
+                                String macroID = helper.FindAttribute(tempAttributes, &quot;macroid&quot;);
+                                if (Convert.ToInt32(macroID) &gt; 0)
+                                {
+                                    macro tempContentMacro = getMacro(macroID);
+                                    _templateOutput.Replace(tag.Value.ToString(), tempContentMacro.MacroContent.ToString());
+                                }
+
+                            }
+
+                            _templateOutput.Replace(tag.Value.ToString(), tempElementContent);
+                        }
+                        catch (Exception e)
+                        {
+                            System.Web.HttpContext.Current.Trace.Warn(&quot;umbracoTemplate&quot;, &quot;Error reading element (&quot; + helper.FindAttribute(attributes, &quot;field&quot;) + &quot;)&quot;, e);
+                        }
+                    }
+                }
+            }
+
+            System.Web.HttpContext.Current.Trace.Write(&quot;umbracoTemplate&quot;, &quot;Done parsing&quot;);
+        }
+
+
+
+        #endregion
+
+        #region private methods
+
+        private macro getMacro(String macroID)
+        {
+            System.Web.HttpContext.Current.Trace.Write(&quot;umbracoTemplate&quot;, &quot;Starting macro (&quot; + macroID.ToString() + &quot;)&quot;);
+            return macro.GetMacro(Convert.ToInt16(macroID));
+        }
+
+        private String FindAttribute(Hashtable attributes, String key)
+        {
+            if (attributes[key] != null)
+                return attributes[key].ToString();
+            else
+                return &quot;&quot;;
+        }
+
+
+        #endregion
+        /// &lt;summary&gt;
+        /// Unused, please do not use
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Obsolete, For querying the database use the new UmbracoDatabase object ApplicationContext.Current.DatabaseContext.Database&quot;, false)]
+        protected static ISqlHelper SqlHelper
+        {
+            get { return Application.SqlHelper; }
+        }
+        #region constructors
+
+        public static string GetMasterPageName(int templateID)
+        {
+            return GetMasterPageName(templateID, null);
+        }
+
+        public static string GetMasterPageName(int templateID, string templateFolder)
+        {
+            var t = new template(templateID);
+            
+            return !string.IsNullOrEmpty(templateFolder) 
+                ? t.AlternateMasterPageFile(templateFolder) 
+                : t.MasterPageFile;
+        }
+
+        public template(int templateID)
+        {
+            var tId = templateID;
+
+            var t = ApplicationContext.Current.ApplicationCache.RuntimeCache.GetCacheItem&lt;template&gt;(
+               string.Format(&quot;{0}{1}&quot;, CacheKeys.TemplateFrontEndCacheKey, tId), () =&gt;
+               {
+                   using (var sqlHelper = Application.SqlHelper)
+                   using (var templateData = sqlHelper.ExecuteReader(@&quot;select nodeId, alias, node.parentID as master, text, design
+from cmsTemplate
+inner join umbracoNode node on (node.id = cmsTemplate.nodeId)
+where nodeId = @templateID&quot;,
+                           sqlHelper.CreateParameter(&quot;@templateID&quot;, templateID)))
+                    {
+                       if (templateData.Read())
+                       {
+                           // Get template master and replace content where the template
+                           if (!templateData.IsNull(&quot;master&quot;))
+                               _masterTemplate = templateData.GetInt(&quot;master&quot;);
+                           if (!templateData.IsNull(&quot;alias&quot;))
+                               _templateAlias = templateData.GetString(&quot;alias&quot;);
+                           if (!templateData.IsNull(&quot;text&quot;))
+                               _templateName = templateData.GetString(&quot;text&quot;);
+                           if (!templateData.IsNull(&quot;design&quot;))
+                               _templateDesign = templateData.GetString(&quot;design&quot;);
+                       }
+                    }
+                   return this;
+               });
+
+            if (t == null)
+                throw new InvalidOperationException(&quot;Could not find a tempalte with id &quot; + templateID);
+
+            this._masterTemplate = t._masterTemplate;
+            this._templateAlias = t._templateAlias;
+            this._templateDesign = t._templateDesign;
+            this._masterTemplate = t._masterTemplate;
+            this._templateName = t._templateName;
+
+            // Only check for master on legacy templates - can show error when using master pages.
+            if (!UmbracoConfig.For.UmbracoSettings().Templates.UseAspNetMasterPages)
+            {
+                checkForMaster(tId);
+            }
+                
+        }
+
+        private void checkForMaster(int templateID) {
+            // Get template design
+            if (_masterTemplate != 0 &amp;&amp; _masterTemplate != templateID) {
+                template masterTemplateDesign = new template(_masterTemplate);
+                if (masterTemplateDesign.TemplateContent.IndexOf(&quot;&lt;?UMBRACO_TEMPLATE_LOAD_CHILD/&gt;&quot;) &gt; -1
+                    || masterTemplateDesign.TemplateContent.IndexOf(&quot;&lt;?UMBRACO_TEMPLATE_LOAD_CHILD /&gt;&quot;) &gt; -1) {
+                    _templateOutput.Append(
+                        masterTemplateDesign.TemplateContent.Replace(&quot;&lt;?UMBRACO_TEMPLATE_LOAD_CHILD/&gt;&quot;,
+                        _templateDesign).Replace(&quot;&lt;?UMBRACO_TEMPLATE_LOAD_CHILD /&gt;&quot;, _templateDesign)
+                        );
+                } else
+                    _templateOutput.Append(_templateDesign);
+            } else {
+                if (_masterTemplate == templateID)
+                {
+                    cms.businesslogic.template.Template t = cms.businesslogic.template.Template.GetTemplate(templateID);
+                    string templateName = (t != null) ? t.Text : string.Format(&quot;&#39;Template with id: &#39;{0}&quot;, templateID);
+                    System.Web.HttpContext.Current.Trace.Warn(&quot;template&quot;,
+                        String.Format(&quot;Master template is the same as the current template. It would cause an endless loop! Make sure that the current template &#39;{0}&#39; has another Master Template than itself. You can change this in the template editor under &#39;Settings&#39;&quot;, templateName));
+                    _templateOutput.Append(_templateDesign);
+                }
+            }
+        }
+
+        [Obsolete(&quot;Use ApplicationContext.Current.ApplicationCache.ClearCacheForTemplate instead&quot;)]
+        public static void ClearCachedTemplate(int templateID)
+        {
+            DistributedCache.Instance.RefreshTemplateCache(templateID);
+        }
+
+        public template(String templateContent)
+        {
+            _templateOutput.Append(templateContent);
+            _masterTemplate = 0;
+        }
+
+        #endregion
+    }
+
+    
+
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[32,9,32,70,0],[32,9,32,70,0],[34,9,34,45,0],[34,9,34,45,0],[35,9,35,34,0],[35,9,35,34,0],[36,9,36,43,0],[36,9,36,43,0],[37,9,37,44,0],[37,9,37,44,0],[45,13,45,14,0],[46,17,46,47,0],[47,13,47,14,0],[49,13,49,14,0],[50,17,50,51,0],[51,13,51,14,0],[56,17,56,18,0],[56,19,56,42,0],[56,43,56,44,0],[64,13,64,14,0],[66,17,66,74,0],[67,17,67,74,0],[70,17,70,98,0],[71,21,71,33,0],[73,21,73,86,0],[74,13,74,14,0],[80,9,80,10,0],[81,13,81,70,0],[82,13,82,93,0],[85,13,85,95,0],[86,13,86,14,0],[88,17,88,103,0],[89,17,89,89,0],[92,24,92,98,0],[93,24,93,52,0],[94,17,94,18,0],[95,21,95,45,0],[96,17,96,18,0],[98,17,98,99,0],[100,24,100,92,0],[101,24,101,62,0],[102,17,102,18,0],[103,21,103,48,0],[104,17,104,18,0],[105,13,105,14,0],[107,13,107,25,0],[109,9,109,10,0],[114,17,114,18,0],[114,19,114,41,0],[114,42,114,43,0],[121,9,121,10,0],[122,13,122,39,0],[123,9,123,10,0],[126,9,126,10,0],[127,13,127,92,0],[129,13,129,77,0],[130,17,130,76,0],[132,13,132,56,0],[134,13,134,48,0],[135,13,135,48,0],[136,13,136,48,0],[137,13,137,49,0],[138,13,138,102,0],[139,13,139,108,0],[142,13,143,114,0],[144,13,144,14,0],[145,17,145,59,0],[146,17,146,121,0],[149,17,149,100,0],[150,17,150,46,0],[151,17,151,104,0],[154,17,154,46,0],[155,17,155,18,0],[156,21,157,118,0],[158,21,158,46,0],[159,17,159,18,0],[161,17,161,18,0],[162,21,162,60,0],[163,21,163,52,0],[164,21,164,47,0],[165,17,165,18,0],[168,17,168,114,0],[171,17,171,76,0],[172,17,172,18,0],[173,21,173,155,0],[174,21,174,98,0],[175,21,175,234,0],[176,21,176,163,0],[179,21,179,155,0],[180,21,180,43,0],[181,21,181,22,0],[182,25,182,71,0],[183,25,183,112,0],[184,25,184,127,0],[185,25,185,69,0],[186,25,186,101,0],[187,21,187,22,0],[189,21,189,86,0],[190,21,190,49,0],[193,21,193,88,0],[194,21,194,61,0],[195,21,195,87,0],[197,17,197,18,0],[199,21,199,82,0],[202,17,202,178,0],[203,17,203,80,0],[204,17,204,95,0],[205,17,205,91,0],[209,17,209,80,0],[211,17,211,54,0],[212,17,212,52,0],[213,17,213,54,0],[214,17,214,36,0],[218,17,218,64,0],[220,9,220,10,0],[223,9,223,10,0],[225,13,225,49,0],[227,13,227,31,0],[228,13,228,90,0],[230,13,230,26,0],[231,13,231,14,0],[232,17,232,105,0],[233,17,233,85,0],[234,17,234,35,0],[235,17,235,18,0],[236,21,236,52,0],[237,21,237,112,0],[239,21,239,52,0],[241,21,241,109,0],[242,21,242,73,0],[245,21,245,90,0],[246,21,246,22,0],[247,25,247,99,0],[252,25,252,76,0],[253,25,253,26,0],[254,29,254,93,0],[255,25,255,26,0],[256,21,256,22,0],[260,21,260,106,0],[263,21,263,80,0],[264,21,264,22,0],[265,25,265,39,0],[266,29,266,202,0],[269,25,269,96,0],[270,25,270,26,0],[271,29,271,138,0],[272,29,272,97,0],[273,29,273,84,0],[274,29,274,51,0],[275,33,275,89,0],[276,37,276,107,0],[277,29,277,68,0],[278,25,278,26,0],[280,25,280,26,0],[282,29,282,90,0],[283,29,283,57,0],[284,33,284,63,0],[286,33,286,108,0],[288,29,288,51,0],[289,29,289,30,0],[292,33,292,34,0],[293,37,293,117,0],[294,37,294,51,0],[295,41,295,69,0],[297,41,297,145,0],[299,33,299,34,0],[300,33,300,52,0],[301,33,301,34,0],[302,37,302,134,0],[303,33,303,34,0],[304,29,304,30,0],[305,25,305,26,0],[306,25,306,39,0],[307,29,307,84,0],[308,21,308,22,0],[310,21,310,22,0],[311,25,311,75,0],[312,25,312,26,0],[315,29,315,100,0],[316,29,316,30,0],[317,33,317,139,0],[318,33,318,95,0],[319,33,319,88,0],[320,33,320,55,0],[321,37,321,92,0],[322,41,322,110,0],[323,33,323,71,0],[324,29,324,30,0],[326,29,326,30,0],[328,33,328,34,0],[329,37,329,152,0],[330,37,330,38,0],[331,41,331,164,0],[332,41,332,152,0],[333,41,333,83,0],[336,41,336,108,0],[337,41,337,42,0],[339,45,339,46,0],[340,49,340,118,0],[341,49,341,66,0],[342,53,342,77,0],[343,45,343,46,0],[344,45,344,50,0],[344,51,344,52,0],[344,53,344,54,0],[345,41,345,42,0],[347,37,347,38,0],[349,37,349,38,0],[351,41,351,95,0],[353,41,353,83,0],[354,37,354,38,0],[356,37,356,51,0],[357,41,358,204,0],[359,33,359,34,0],[360,33,360,52,0],[361,33,361,34,0],[362,37,362,178,0],[363,33,363,34,0],[364,29,364,30,0],[365,25,365,26,0],[366,21,366,22,0],[367,21,367,82,0],[368,21,368,62,0],[369,17,369,18,0],[371,17,371,18,0],[372,21,372,89,0],[373,21,373,27,0],[376,13,376,14,0],[378,13,378,32,0],[380,9,380,10,0],[384,3,384,4,0],[385,4,385,84,0],[386,3,386,4,0],[395,9,395,10,0],[396,13,396,92,0],[401,13,401,227,0],[403,13,403,20,0],[403,22,403,31,0],[403,32,403,34,0],[403,35,403,39,0],[404,13,404,14,0],[405,17,405,86,0],[408,17,408,76,0],[409,17,409,18,0],[410,21,410,82,0],[411,21,411,39,0],[412,21,412,22,0],[413,25,413,61,0],[414,25,414,106,0],[415,21,415,22,0],[416,17,416,18,0],[418,17,418,18,0],[419,21,419,82,0],[420,21,420,22,0],[422,25,422,26,0],[423,29,423,128,0],[424,29,424,229,0],[425,29,425,36,0],[425,38,425,53,0],[425,54,425,56,0],[425,57,425,67,0],[426,29,426,30,0],[427,33,427,133,0],[428,33,428,98,0],[429,33,429,66,0],[430,33,430,34,0],[431,37,431,80,0],[432,37,432,125,0],[433,33,433,34,0],[435,29,435,30,0],[437,29,437,95,0],[438,25,438,26,0],[439,25,439,44,0],[440,25,440,26,0],[441,29,441,170,0],[442,25,442,26,0],[443,21,443,22,0],[444,17,444,18,0],[445,13,445,14,0],[447,13,447,91,0],[448,9,448,10,0],[457,9,457,10,0],[458,13,458,122,0],[459,13,459,61,0],[460,9,460,10,0],[463,9,463,10,0],[464,13,464,41,0],[465,17,465,51,0],[467,17,467,27,0],[468,9,468,10,0],[478,17,478,18,0],[478,19,478,48,0],[478,49,478,50,0],[483,9,483,10,0],[484,13,484,56,0],[485,9,485,10,0],[488,9,488,10,0],[489,13,489,46,0],[491,13,493,36,0],[494,9,494,10,0],[496,9,496,40,0],[497,9,497,10,0],[498,13,498,34,0],[500,13,502,16,0],[502,16,502,17,0],[502,17,503,27,0],[503,27,503,64,0],[503,64,504,27,0],[504,27,508,81,0],[508,81,509,21,0],[509,21,509,22,0],[509,22,510,24,0],[510,24,510,48,0],[510,48,511,24,0],[511,24,511,25,0],[511,25,513,28,0],[513,28,513,63,0],[513,63,514,32,0],[514,32,514,80,0],[514,80,515,28,0],[515,28,515,62,0],[515,62,516,32,0],[516,32,516,81,0],[516,81,517,28,0],[517,28,517,61,0],[517,61,518,32,0],[518,32,518,79,0],[518,79,519,28,0],[519,28,519,63,0],[519,63,520,32,0],[520,32,520,83,0],[520,83,521,24,0],[521,24,521,25,0],[521,25,522,21,0],[522,21,522,22,0],[522,22,523,20,0],[523,20,523,32,0],[523,32,524,16,0],[524,16,524,17,0],[524,17,524,19,0],[500,13,524,19,0],[526,13,526,27,0],[527,17,527,104,0],[529,13,529,54,0],[530,13,530,52,0],[531,13,531,54,0],[532,13,532,54,0],[533,13,533,50,0],[536,13,536,85,0],[537,13,537,14,0],[538,17,538,37,0],[539,13,539,14,0],[541,9,541,10,0],[543,53,543,54,0],[545,13,545,71,0],[545,72,545,73,0],[546,17,546,79,0],[547,17,548,110,0],[548,111,548,112,0],[549,21,552,27,0],[553,17,553,18,0],[554,21,554,61,0],[555,13,555,14,0],[555,20,555,21,0],[556,17,556,51,0],[557,17,557,18,0],[558,21,558,121,0],[559,21,559,119,0],[560,21,561,285,0],[562,21,562,61,0],[563,17,563,18,0],[564,13,564,14,0],[565,9,565,10,0],[569,9,569,10,0],[570,13,570,72,0],[571,9,571,10,0],[573,9,573,48,0],[574,9,574,10,0],[575,13,575,53,0],[576,13,576,33,0],[577,9,577,10,0]]);
+    </script>
+  </body>
+</html>

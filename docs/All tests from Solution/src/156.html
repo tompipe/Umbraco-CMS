@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Strings\DefaultShortStringHelperTests.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using Moq;
+using NUnit.Framework;
+using Umbraco.Core;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.ObjectResolution;
+using Umbraco.Core.Strings;
+using Umbraco.Tests.TestHelpers;
+
+namespace Umbraco.Tests.Strings
+{
+    [TestFixture]
+    public class DefaultShortStringHelperTests 
+    {
+        private DefaultShortStringHelper _helper;
+
+        [SetUp]
+        public void Initialize()
+        {
+
+            // NOTE: it is not possible to configure the helper once it has been assigned
+            // to the resolver and resolution has frozen. but, obviously, it is possible
+            // to configure filters and then to alter these filters after resolution has
+            // frozen. beware, nothing is thread-safe in-there!
+
+            // NOTE pre-filters runs _before_ Recode takes place
+            // so there still may be utf8 chars even though you want ascii
+
+            _helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.FileName, new DefaultShortStringHelper.Config
+                {
+                    //PreFilter = ClearFileChars, // done in IsTerm
+                    IsTerm = (c, leading) =&gt; (char.IsLetterOrDigit(c) || c == &#39;_&#39;) &amp;&amp; DefaultShortStringHelper.IsValidFileNameChar(c),
+                    StringType = CleanStringType.LowerCase | CleanStringType.Ascii,
+                    Separator = &#39;-&#39;
+                })
+                .WithConfig(CleanStringType.UrlSegment, new DefaultShortStringHelper.Config
+                {
+                    PreFilter = StripQuotes,
+                    IsTerm = (c, leading) =&gt; char.IsLetterOrDigit(c) || c == &#39;_&#39;,
+                    StringType = CleanStringType.LowerCase | CleanStringType.Ascii,
+                    Separator = &#39;-&#39;
+                })
+                .WithConfig(new CultureInfo(&quot;fr-FR&quot;), CleanStringType.UrlSegment, new DefaultShortStringHelper.Config
+                {
+                    PreFilter = FilterFrenchElisions,
+                    IsTerm = (c, leading) =&gt; leading ? char.IsLetter(c) : (char.IsLetterOrDigit(c) || c == &#39;_&#39;),
+                    StringType = CleanStringType.LowerCase | CleanStringType.Ascii,
+                    Separator = &#39;-&#39;
+                })
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    PreFilter = StripQuotes,
+                    IsTerm = (c, leading) =&gt; leading ? char.IsLetter(c) : char.IsLetterOrDigit(c),
+                    StringType = CleanStringType.UmbracoCase | CleanStringType.Ascii
+                })
+                .WithConfig(new CultureInfo(&quot;fr-FR&quot;), CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    PreFilter = WhiteQuotes,
+                    IsTerm = (c, leading) =&gt; leading ? char.IsLetter(c) : char.IsLetterOrDigit(c),
+                    StringType = CleanStringType.UmbracoCase | CleanStringType.Ascii
+                })
+                .WithConfig(CleanStringType.ConvertCase, new DefaultShortStringHelper.Config
+                {
+                    PreFilter = null,
+                    IsTerm = (c, leading) =&gt; char.IsLetterOrDigit(c) || c == &#39;_&#39;, // letter, digit or underscore
+                    StringType = CleanStringType.Ascii,
+                    BreakTermsOnUpper = true
+                });
+
+            ShortStringHelperResolver.Reset();
+            ShortStringHelperResolver.Current = new ShortStringHelperResolver(_helper);
+            Resolution.Freeze();
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            ShortStringHelperResolver.Reset();
+        }
+
+        static readonly Regex FrenchElisionsRegex = new Regex(&quot;\\b(c|d|j|l|m|n|qu|s|t)(&#39;|\u8217)&quot;, RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static string FilterFrenchElisions(string s)
+        {
+            return FrenchElisionsRegex.Replace(s, &quot;&quot;);
+        }
+
+        private static string StripQuotes(string s)
+        {
+            s = s.ReplaceMany(new Dictionary&lt;string, string&gt; {{&quot;&#39;&quot;, &quot;&quot;}, {&quot;\u8217&quot;, &quot;&quot;}});
+            return s;
+        }
+
+        private static string WhiteQuotes(string s)
+        {
+            s = s.ReplaceMany(new Dictionary&lt;string, string&gt; { { &quot;&#39;&quot;, &quot; &quot; }, { &quot;\u8217&quot;, &quot; &quot; } });
+            return s;
+        }
+
+        [Test]
+        public void U4_4055_4056()
+        {
+            var settings = SettingsForTests.GenerateMockSettings();
+            var contentMock = Mock.Get(settings.RequestHandler);
+            contentMock.Setup(x =&gt; x.CharCollection).Returns(Enumerable.Empty&lt;IChar&gt;());
+            contentMock.Setup(x =&gt; x.ConvertUrlsToAscii).Returns(false);
+            SettingsForTests.ConfigureSettings(settings);
+
+            const string input = &quot;publishedVersion&quot;;
+
+            Assert.AreEqual(&quot;PublishedVersion&quot;, input.ConvertCase(StringAliasCaseType.PascalCase)); // obsolete, use the one below
+            Assert.AreEqual(&quot;PublishedVersion&quot;, input.ToCleanString(CleanStringType.ConvertCase | CleanStringType.PascalCase | CleanStringType.Ascii)); // role, case and code
+        }
+
+        [Test]
+        public void U4_4056()
+        {
+            var settings = SettingsForTests.GenerateMockSettings();
+            var contentMock = Mock.Get(settings.RequestHandler);
+            contentMock.Setup(x =&gt; x.CharCollection).Returns(Enumerable.Empty&lt;IChar&gt;());
+            contentMock.Setup(x =&gt; x.ConvertUrlsToAscii).Returns(false);
+            SettingsForTests.ConfigureSettings(settings);
+
+            const string input = &quot;&#198;&#216;&#197; and &#230;&#248;&#229; and 中文测试 and  אודות האתר and gr&#246;&#223;er БбДдЖж page&quot;;
+
+            var helper = new DefaultShortStringHelper(settings).WithDefaultConfig(); // unicode
+            var output = helper.CleanStringForUrlSegment(input);
+            Assert.AreEqual(&quot;&#230;&#248;&#229;-and-&#230;&#248;&#229;-and-中文测试-and-אודות-האתר-and-gr&#246;&#223;er-ббдджж-page&quot;, output);
+
+            helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.UrlSegment, new DefaultShortStringHelper.Config
+                {
+                    IsTerm = (c, leading) =&gt; char.IsLetterOrDigit(c) || c == &#39;_&#39;,
+                    StringType = CleanStringType.LowerCase | CleanStringType.Ascii, // ascii
+                    Separator = &#39;-&#39;
+                });
+            output = helper.CleanStringForUrlSegment(input);
+            Assert.AreEqual(&quot;aeoa-and-aeoa-and-and-and-grosser-bbddzhzh-page&quot;, output);
+        }
+
+        [Test]
+        public void CleanStringUnderscoreInTerm()
+        {
+            var helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    // underscore is accepted within terms
+                    IsTerm = (c, leading) =&gt; char.IsLetterOrDigit(c) || c == &#39;_&#39;,
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;foo_bar*nil&quot;, helper.CleanString(&quot;foo_bar nil&quot;, CleanStringType.Alias));
+
+            helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    // underscore is not accepted within terms
+                    IsTerm = (c, leading) =&gt; char.IsLetterOrDigit(c),
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;foo*bar*nil&quot;, helper.CleanString(&quot;foo_bar nil&quot;, CleanStringType.Alias));
+        }
+
+        [Test]
+        public void CleanStringLeadingChars()
+        {
+            var helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    // letters and digits are valid leading chars
+                    IsTerm = (c, leading) =&gt; char.IsLetterOrDigit(c),
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;0123foo*bar*543*nil*321&quot;, helper.CleanString(&quot;0123foo_bar 543 nil 321&quot;, CleanStringType.Alias));
+
+            helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    // only letters are valid leading chars
+                    IsTerm = (c, leading) =&gt; leading ? char.IsLetter(c) : char.IsLetterOrDigit(c),
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;foo*bar*543*nil*321&quot;, helper.CleanString(&quot;0123foo_bar 543 nil 321&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*bar*543*nil*321&quot;, helper.CleanString(&quot;0123 foo_bar 543 nil 321&quot;, CleanStringType.Alias));
+
+            helper = new DefaultShortStringHelper(SettingsForTests.GetDefault()).WithDefaultConfig();
+            Assert.AreEqual(&quot;child2&quot;, helper.CleanStringForSafeAlias(&quot;1child2&quot;));
+        }
+
+        [Test]
+        public void CleanStringTermOnUpper()
+        {
+            var helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    // uppercase letter means new term
+                    BreakTermsOnUpper = true,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;foo*Bar&quot;, helper.CleanString(&quot;fooBar&quot;, CleanStringType.Alias));
+
+            helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    // uppercase letter is part of term
+                    BreakTermsOnUpper = false,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;fooBar&quot;, helper.CleanString(&quot;fooBar&quot;, CleanStringType.Alias));
+        }
+
+        [Test]
+        public void CleanStringAcronymOnNonUpper()
+        {
+            var helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    // non-uppercase letter means cut acronym
+                    CutAcronymOnNonUpper = true,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;foo*BAR*Rnil&quot;, helper.CleanString(&quot;foo BARRnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*BA*Rnil&quot;, helper.CleanString(&quot;foo BARnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*BAnil&quot;, helper.CleanString(&quot;foo BAnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*Bnil&quot;, helper.CleanString(&quot;foo Bnil&quot;, CleanStringType.Alias));
+
+            helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    // non-uppercase letter means word
+                    CutAcronymOnNonUpper = false,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;foo*BARRnil&quot;, helper.CleanString(&quot;foo BARRnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*BARnil&quot;, helper.CleanString(&quot;foo BARnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*BAnil&quot;, helper.CleanString(&quot;foo BAnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*Bnil&quot;, helper.CleanString(&quot;foo Bnil&quot;, CleanStringType.Alias));
+        }
+
+        [Test]
+        public void CleanStringGreedyAcronyms()
+        {
+            var helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    CutAcronymOnNonUpper = true,
+                    GreedyAcronyms = true,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;foo*BARR*nil&quot;, helper.CleanString(&quot;foo BARRnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*BAR*nil&quot;, helper.CleanString(&quot;foo BARnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*BA*nil&quot;, helper.CleanString(&quot;foo BAnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*Bnil&quot;, helper.CleanString(&quot;foo Bnil&quot;, CleanStringType.Alias));
+
+            helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    CutAcronymOnNonUpper = true,
+                    GreedyAcronyms = false,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;foo*BAR*Rnil&quot;, helper.CleanString(&quot;foo BARRnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*BA*Rnil&quot;, helper.CleanString(&quot;foo BARnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*BAnil&quot;, helper.CleanString(&quot;foo BAnil&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*Bnil&quot;, helper.CleanString(&quot;foo Bnil&quot;, CleanStringType.Alias));
+        }
+
+        [Test]
+        public void CleanStringWhiteSpace()
+        {
+            var helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;foo&quot;, helper.CleanString(&quot;   foo   &quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;foo*bar&quot;, helper.CleanString(&quot;   foo   bar   &quot;, CleanStringType.Alias));
+        }
+
+        [Test]
+        public void CleanStringSeparator()
+        {
+            var helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;foo*bar&quot;, helper.CleanString(&quot;foo bar&quot;, CleanStringType.Alias));
+
+            helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    Separator = &#39; &#39;
+                });
+            Assert.AreEqual(&quot;foo bar&quot;, helper.CleanString(&quot;foo bar&quot;, CleanStringType.Alias));
+
+            helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged
+                });
+            Assert.AreEqual(&quot;foobar&quot;, helper.CleanString(&quot;foo bar&quot;, CleanStringType.Alias));
+
+            helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    Separator = &#39;文&#39;
+                });
+            Assert.AreEqual(&quot;foo文bar&quot;, helper.CleanString(&quot;foo bar&quot;, CleanStringType.Alias));
+        }
+
+        [Test]
+        public void CleanStringSymbols()
+        {
+            var helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;house*2&quot;, helper.CleanString(&quot;house (2)&quot;, CleanStringType.Alias));
+            
+            // FIXME but for a filename we want to keep them!
+            // FIXME and what about a url?
+        }
+
+        [Test]
+        public void Utf8Surrogates()
+        {
+            // Unicode values between 0x10000 and 0x10FFF are represented by two 16-bit &quot;surrogate&quot; characters
+            const string str = &quot;a\U00010F00z\uA74Ft&quot;;
+            Assert.AreEqual(6, str.Length);
+            Assert.IsTrue(char.IsSurrogate(str[1]));
+            Assert.IsTrue(char.IsHighSurrogate(str[1]));
+            Assert.IsTrue(char.IsSurrogate(str[2]));
+            Assert.IsTrue(char.IsLowSurrogate(str[2]));
+            Assert.AreEqual(&#39;z&#39;, str[3]);
+            Assert.IsFalse(char.IsSurrogate(str[4]));
+            Assert.AreEqual(&#39;\uA74F&#39;, str[4]);
+            Assert.AreEqual(&#39;t&#39;, str[5]);
+
+            Assert.AreEqual(&quot;z&quot;, str.Substring(3, 1));
+            Assert.AreEqual(&quot;\U00010F00&quot;, str.Substring(1, 2));
+
+            var bytes = Encoding.UTF8.GetBytes(str);
+            Assert.AreEqual(10, bytes.Length);
+            Assert.AreEqual(&#39;a&#39;, bytes[0]);
+            // then next string element is two chars (surrogate pair) or 4 bytes, 21 bits of code point
+            Assert.AreEqual(&#39;z&#39;, bytes[5]);
+            // then next string element is one char and 3 bytes, 16 bits of code point
+            Assert.AreEqual(&#39;t&#39;, bytes[9]);
+            //foreach (var b in bytes)
+            //    Debug.Print(&quot;{0:X}&quot;, b);
+
+            Debug.Print(&quot;\U00010B70&quot;);
+        }
+
+        [Test]
+        public void Utf8ToAsciiConverter()
+        {
+            const string str = &quot;a\U00010F00z\uA74Ft&#233;&#244;&quot;;
+            var output = Core.Strings.Utf8ToAsciiConverter.ToAsciiString(str);
+            Assert.AreEqual(&quot;a?zooteo&quot;, output);
+        }
+
+        [Test]
+        public void CleanStringEncoding()
+        {
+            var helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;中文测试&quot;, helper.CleanString(&quot;中文测试&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;l&#233;ger*中文测试*Z&#212;RG&quot;, helper.CleanString(&quot;l&#233;ger 中文测试 Z&#212;RG&quot;, CleanStringType.Alias));
+
+            helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Ascii | CleanStringType.Unchanged,
+                    Separator = &#39;*&#39;
+                });
+            Assert.AreEqual(&quot;&quot;, helper.CleanString(&quot;中文测试&quot;, CleanStringType.Alias));
+            Assert.AreEqual(&quot;leger*ZORG&quot;, helper.CleanString(&quot;l&#233;ger 中文测试 Z&#212;RG&quot;, CleanStringType.Alias));
+        }
+
+        [Test]
+        public void CleanStringDefaultConfig()
+        {
+            var settings = SettingsForTests.GenerateMockSettings();
+            var contentMock = Mock.Get(settings.RequestHandler);
+            contentMock.Setup(x =&gt; x.CharCollection).Returns(Enumerable.Empty&lt;IChar&gt;());
+            contentMock.Setup(x =&gt; x.ConvertUrlsToAscii).Returns(false);
+            SettingsForTests.ConfigureSettings(settings);
+
+            var helper = new DefaultShortStringHelper(settings).WithDefaultConfig();
+
+            const string input = &quot;0123 中文测试 中文测试 l&#233;ger Z&#212;RG (2) a?? *x&quot;;
+
+            var alias = helper.CleanStringForSafeAlias(input);
+            var filename = helper.CleanStringForSafeFileName(input);
+            var segment = helper.CleanStringForUrlSegment(input);
+
+            // umbraco-cased ascii alias, must begin with a proper letter
+            Assert.AreEqual(&quot;legerZORG2AX&quot;, alias, &quot;alias&quot;);
+
+            // lower-cased, utf8 filename, removing illegal filename chars, using dash-separator
+            Assert.AreEqual(&quot;0123-中文测试-中文测试-l&#233;ger-z&#244;rg-2-a-x&quot;, filename, &quot;filename&quot;);
+
+            // lower-cased, utf8 url segment, only letters and digits, using dash-separator
+            Assert.AreEqual(&quot;0123-中文测试-中文测试-l&#233;ger-z&#244;rg-2-a-x&quot;, segment, &quot;segment&quot;);
+        }
+
+        [Test]
+        public void CleanStringCasing()
+        {
+            var helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+                .WithConfig(CleanStringType.Alias, new DefaultShortStringHelper.Config
+                {
+                    StringType = CleanStringType.Utf8 | CleanStringType.Unchanged,
+                    Separator = &#39; &#39;
+                });
+
+            // BBB is an acronym
+            // E is a word (too short to be an acronym)
+            // FF is an acronym
+
+            // FIXME &quot;C&quot; can&#39;t be an acronym
+            // FIXME &quot;DBXreview&quot; = acronym?!
+
+            Assert.AreEqual(&quot;aaa BBB CCc Ddd E FF&quot;, helper.CleanString(&quot;aaa BBB CCc Ddd E FF&quot;, CleanStringType.Alias)); // unchanged
+            Assert.AreEqual(&quot;aaa Bbb Ccc Ddd E FF&quot;, helper.CleanString(&quot;aaa BBB CCc Ddd E FF&quot;, CleanStringType.Alias | CleanStringType.CamelCase));
+            Assert.AreEqual(&quot;Aaa Bbb Ccc Ddd E FF&quot;, helper.CleanString(&quot;aaa BBB CCc Ddd E FF&quot;, CleanStringType.Alias | CleanStringType.PascalCase));
+            Assert.AreEqual(&quot;aaa bbb ccc ddd e ff&quot;, helper.CleanString(&quot;aaa BBB CCc Ddd E FF&quot;, CleanStringType.Alias | CleanStringType.LowerCase));
+            Assert.AreEqual(&quot;AAA BBB CCC DDD E FF&quot;, helper.CleanString(&quot;aaa BBB CCc Ddd E FF&quot;, CleanStringType.Alias | CleanStringType.UpperCase));
+            Assert.AreEqual(&quot;aaa BBB CCc Ddd E FF&quot;, helper.CleanString(&quot;aaa BBB CCc Ddd E FF&quot;, CleanStringType.Alias | CleanStringType.UmbracoCase));
+
+            // MS rules &amp; guidelines:
+            // - Do capitalize both characters of two-character acronyms, except the first word of a camel-cased identifier.
+            //     eg &quot;DBRate&quot; (pascal) or &quot;ioHelper&quot; (camel) - &quot;SpecialDBRate&quot; (pascal) or &quot;specialIOHelper&quot; (camel)
+            // - Do capitalize only the first character of acronyms with three or more characters, except the first word of a camel-cased identifier.
+            //     eg &quot;XmlWriter (pascal) or &quot;htmlReader&quot; (camel) - &quot;SpecialXmlWriter&quot; (pascal) or &quot;specialHtmlReader&quot; (camel)
+            // - Do not capitalize any of the characters of any acronyms, whatever their length, at the beginning of a camel-cased identifier.
+            //     eg &quot;xmlWriter&quot; or &quot;dbWriter&quot; (camel)
+
+            Assert.AreEqual(&quot;aaa BB Ccc&quot;, helper.CleanString(&quot;aaa BB ccc&quot;, CleanStringType.Alias | CleanStringType.CamelCase));
+            Assert.AreEqual(&quot;aa Bb Ccc&quot;, helper.CleanString(&quot;AA bb ccc&quot;, CleanStringType.Alias | CleanStringType.CamelCase));
+            Assert.AreEqual(&quot;aaa Bb Ccc&quot;, helper.CleanString(&quot;AAA bb ccc&quot;, CleanStringType.Alias | CleanStringType.CamelCase));
+            Assert.AreEqual(&quot;db Rate&quot;, helper.CleanString(&quot;DB rate&quot;, CleanStringType.Alias | CleanStringType.CamelCase));
+            Assert.AreEqual(&quot;special DB Rate&quot;, helper.CleanString(&quot;special DB rate&quot;, CleanStringType.Alias | CleanStringType.CamelCase));
+            Assert.AreEqual(&quot;xml Writer&quot;, helper.CleanString(&quot;XML writer&quot;, CleanStringType.Alias | CleanStringType.CamelCase));
+            Assert.AreEqual(&quot;special Xml Writer&quot;, helper.CleanString(&quot;special XML writer&quot;, CleanStringType.Alias | CleanStringType.CamelCase));
+
+            Assert.AreEqual(&quot;Aaa BB Ccc&quot;, helper.CleanString(&quot;aaa BB ccc&quot;, CleanStringType.Alias | CleanStringType.PascalCase));
+            Assert.AreEqual(&quot;AA Bb Ccc&quot;, helper.CleanString(&quot;AA bb ccc&quot;, CleanStringType.Alias | CleanStringType.PascalCase));
+            Assert.AreEqual(&quot;Aaa Bb Ccc&quot;, helper.CleanString(&quot;AAA bb ccc&quot;, CleanStringType.Alias | CleanStringType.PascalCase));
+            Assert.AreEqual(&quot;DB Rate&quot;, helper.CleanString(&quot;DB rate&quot;, CleanStringType.Alias | CleanStringType.PascalCase));
+            Assert.AreEqual(&quot;Special DB Rate&quot;, helper.CleanString(&quot;special DB rate&quot;, CleanStringType.Alias | CleanStringType.PascalCase));
+            Assert.AreEqual(&quot;Xml Writer&quot;, helper.CleanString(&quot;XML writer&quot;, CleanStringType.Alias | CleanStringType.PascalCase));
+            Assert.AreEqual(&quot;Special Xml Writer&quot;, helper.CleanString(&quot;special XML writer&quot;, CleanStringType.Alias | CleanStringType.PascalCase));
+        }
+
+        #region Cases
+        [TestCase(&quot;foo&quot;, &quot;foo&quot;)]
+        [TestCase(&quot;    foo    &quot;, &quot;foo&quot;)]
+        [TestCase(&quot;Foo&quot;, &quot;Foo&quot;)]
+        [TestCase(&quot;FoO&quot;, &quot;FoO&quot;)]
+        [TestCase(&quot;FoO bar&quot;, &quot;FoOBar&quot;)]
+        [TestCase(&quot;FoO bar NIL&quot;, &quot;FoOBarNIL&quot;)]
+        [TestCase(&quot;FoO 33bar 22NIL&quot;, &quot;FoO33bar22NIL&quot;)]
+        [TestCase(&quot;FoO 33bar 22NI&quot;, &quot;FoO33bar22NI&quot;)]
+        [TestCase(&quot;0foo&quot;, &quot;foo&quot;)]
+        [TestCase(&quot;2foo bar&quot;, &quot;fooBar&quot;)]
+        [TestCase(&quot;9FOO&quot;, &quot;FOO&quot;)]
+        [TestCase(&quot;foo-BAR&quot;, &quot;fooBAR&quot;)]
+        [TestCase(&quot;foo-BA-dang&quot;, &quot;fooBADang&quot;)]
+        [TestCase(&quot;foo_BAR&quot;, &quot;fooBAR&quot;)]
+        [TestCase(&quot;foo&#39;BAR&quot;, &quot;fooBAR&quot;)]
+        [TestCase(&quot;saut&#233; dans l&#39;espace&quot;, &quot;sauteDansLespace&quot;)]
+        [TestCase(&quot;foo\&quot;\&quot;bar&quot;, &quot;fooBar&quot;)]
+        [TestCase(&quot;-foo-&quot;, &quot;foo&quot;)]
+        [TestCase(&quot;_foo_&quot;, &quot;foo&quot;)]
+        [TestCase(&quot;sp&#233;cial&quot;, &quot;special&quot;)]
+        [TestCase(&quot;br&#244; d&#235;k &quot;, &quot;broDek&quot;)]
+        [TestCase(&quot;1235br&#244; d&#235;k &quot;, &quot;broDek&quot;)]
+        [TestCase(&quot;汉#字*/漢?字&quot;, &quot;&quot;)]
+        [TestCase(&quot;aa DB cd EFG X KLMN OP qrst&quot;, &quot;aaDBCdEFGXKLMNOPQrst&quot;)]
+        [TestCase(&quot;AA db cd EFG X KLMN OP qrst&quot;, &quot;AADbCdEFGXKLMNOPQrst&quot;)]
+        [TestCase(&quot;AAA db cd EFG X KLMN OP qrst&quot;, &quot;AAADbCdEFGXKLMNOPQrst&quot;)]
+        [TestCase(&quot;4 ways selector&quot;, &quot;waysSelector&quot;)]
+        [TestCase(&quot;WhatIfWeDoItAgain&quot;, &quot;WhatIfWeDoItAgain&quot;)]
+        [TestCase(&quot;whatIfWeDoItAgain&quot;, &quot;whatIfWeDoItAgain&quot;)]
+        [TestCase(&quot;WhatIfWEDOITAgain&quot;, &quot;WhatIfWEDOITAgain&quot;)]
+        [TestCase(&quot;WhatIfWe doItAgain&quot;, &quot;WhatIfWeDoItAgain&quot;)]
+        #endregion
+        public void CleanStringForSafeAlias(string input, string expected)
+        {
+            var output = _helper.CleanStringForSafeAlias(input);
+            Assert.AreEqual(expected, output);
+        }
+
+        //#region Cases
+        //[TestCase(&quot;This is my_little_house so cute.&quot;, &quot;thisIsMyLittleHouseSoCute&quot;, false)]
+        //[TestCase(&quot;This is my_little_house so cute.&quot;, &quot;thisIsMy_little_houseSoCute&quot;, true)]
+        //[TestCase(&quot;This is my_Little_House so cute.&quot;, &quot;thisIsMyLittleHouseSoCute&quot;, false)]
+        //[TestCase(&quot;This is my_Little_House so cute.&quot;, &quot;thisIsMy_Little_HouseSoCute&quot;, true)]
+        //[TestCase(&quot;An UPPER_CASE_TEST to check&quot;, &quot;anUpperCaseTestToCheck&quot;, false)]
+        //[TestCase(&quot;An UPPER_CASE_TEST to check&quot;, &quot;anUpper_case_testToCheck&quot;, true)]
+        //[TestCase(&quot;Trailing_&quot;, &quot;trailing&quot;, false)]
+        //[TestCase(&quot;Trailing_&quot;, &quot;trailing_&quot;, true)]
+        //[TestCase(&quot;_Leading&quot;, &quot;leading&quot;, false)]
+        //[TestCase(&quot;_Leading&quot;, &quot;leading&quot;, true)]
+        //[TestCase(&quot;Repeat___Repeat&quot;, &quot;repeatRepeat&quot;, false)]
+        //[TestCase(&quot;Repeat___Repeat&quot;, &quot;repeat___Repeat&quot;, true)]
+        //[TestCase(&quot;Repeat___repeat&quot;, &quot;repeatRepeat&quot;, false)]
+        //[TestCase(&quot;Repeat___repeat&quot;, &quot;repeat___repeat&quot;, true)]
+        //#endregion
+        //public void CleanStringWithUnderscore(string input, string expected, bool allowUnderscoreInTerm)
+        //{
+        //    var helper = new DefaultShortStringHelper(SettingsForTests.GetDefault())
+        //        .WithConfig(allowUnderscoreInTerm: allowUnderscoreInTerm);
+        //    var output = helper.CleanString(input, CleanStringType.Alias | CleanStringType.Ascii | CleanStringType.CamelCase);
+        //    Assert.AreEqual(expected, output);
+        //}
+
+        #region Cases
+        [TestCase(&quot;Home Page&quot;, &quot;home-page&quot;)]
+        [TestCase(&quot;Shannon&#39;s Home Page!&quot;, &quot;shannons-home-page&quot;)]
+        [TestCase(&quot;#Someones&#39;s Twitter $h1z%n&quot;, &quot;someoness-twitter-h1z-n&quot;)]
+        [TestCase(&quot;R&#228;ksm&#246;rg&#229;s&quot;, &quot;raksmorgas&quot;)]
+        [TestCase(&quot;&#39;em guys-over there, are#goin&#39; a \&quot;little\&quot;bit crazy eh!! :)&quot;, &quot;em-guys-over-there-are-goin-a-little-bit-crazy-eh&quot;)]
+        [TestCase(&quot;汉#字*/漢?字&quot;, &quot;&quot;)]
+        [TestCase(&quot;R&#233;al&#246;sk fix bran#lo&#39;sk&quot;, &quot;realosk-fix-bran-losk&quot;)]
+        [TestCase(&quot;200 ways to be happy&quot;, &quot;200-ways-to-be-happy&quot;)]
+        #endregion
+        public void CleanStringForUrlSegment(string input, string expected)
+        {
+            var output = _helper.CleanStringForUrlSegment(input);
+            Assert.AreEqual(expected, output);
+        }
+
+        #region Cases
+        [TestCase(&quot;ThisIsTheEndMyFriend&quot;, &quot;This Is The End My Friend&quot;)]
+        [TestCase(&quot;ThisIsTHEEndMyFriend&quot;, &quot;This Is THE End My Friend&quot;)]
+        [TestCase(&quot;THISIsTHEEndMyFriend&quot;, &quot;THIS Is THE End My Friend&quot;)]
+        [TestCase(&quot;This33I33sThe33EndMyFriend&quot;, &quot;This33 I33s The33 End My Friend&quot;)] // works!
+        [TestCase(&quot;ThisIsTHEEndMyFriendX&quot;, &quot;This Is THE End My Friend X&quot;)]
+        [TestCase(&quot;ThisIsTHEEndMyFriendXYZ&quot;, &quot;This Is THE End My Friend XYZ&quot;)]
+        [TestCase(&quot;ThisIsTHEEndMyFriendXYZt&quot;, &quot;This Is THE End My Friend XY Zt&quot;)]
+        [TestCase(&quot;Une&#201;l&#233;vation&#192;Partir&quot;, &quot;Une &#201;l&#233;vation &#192; Partir&quot;)]
+        #endregion
+        public void SplitPascalCasing(string input, string expected)
+        {
+            var output = _helper.SplitPascalCasing(input, &#39; &#39;);
+            Assert.AreEqual(expected, output);
+			
+            output = _helper.SplitPascalCasing(input, &#39;*&#39;);
+            expected = expected.Replace(&#39; &#39;, &#39;*&#39;);
+            Assert.AreEqual(expected, output);
+        }
+
+        #region Cases
+        [TestCase(&quot;saut&#233; dans l&#39;espace&quot;, &quot;saute-dans-espace&quot;, &quot;fr-FR&quot;, CleanStringType.UrlSegment | CleanStringType.Ascii | CleanStringType.LowerCase)]
+        [TestCase(&quot;saut&#233; dans l&#39;espace&quot;, &quot;saut&#233;-dans-espace&quot;, &quot;fr-FR&quot;, CleanStringType.UrlSegment | CleanStringType.Utf8 | CleanStringType.LowerCase)]
+        [TestCase(&quot;saut&#233; dans l&#39;espace&quot;, &quot;SauteDansLEspace&quot;, &quot;fr-FR&quot;, CleanStringType.Alias | CleanStringType.Ascii | CleanStringType.PascalCase)]
+        [TestCase(&quot;he doesn&#39;t want&quot;, &quot;he-doesnt-want&quot;, null, CleanStringType.UrlSegment | CleanStringType.Ascii | CleanStringType.LowerCase)]
+        [TestCase(&quot;he doesn&#39;t want&quot;, &quot;heDoesntWant&quot;, null, CleanStringType.Alias | CleanStringType.Ascii | CleanStringType.CamelCase)]
+        #endregion
+        public void CleanStringWithTypeAndCulture(string input, string expected, string culture, CleanStringType stringType)
+        {
+            var cinfo = culture == null ? CultureInfo.InvariantCulture : new CultureInfo(culture);
+
+            // picks the proper config per culture
+            // and overrides some stringType params (ascii...)
+            var output = _helper.CleanString(input, stringType, cinfo);
+            Assert.AreEqual(expected, output);
+        }
+
+        [Test] // can&#39;t do cases with an IDictionary
+        public void ReplaceManyWithCharMap()
+        {
+            const string input = &quot;t&#233;l&#233;visi&#246;n tzv&#226;r &#223;up &amp;nbsp; pof&quot;;
+            const string expected = &quot;television tzvar ssup   pof&quot;;
+            IDictionary&lt;string, string&gt; replacements = new Dictionary&lt;string, string&gt;
+                {
+                    { &quot;&#233;&quot;, &quot;e&quot; },
+                    { &quot;&#246;&quot;, &quot;o&quot; },
+                    { &quot;&#226;&quot;, &quot;a&quot; },
+                    { &quot;&#223;&quot;, &quot;ss&quot; },
+                    { &quot;&amp;nbsp;&quot;, &quot; &quot; },
+                };
+            var output = _helper.ReplaceMany(input, replacements);
+            Assert.AreEqual(expected, output);
+        }
+
+        #region Cases
+        [TestCase(&quot;val$id!ate|this|str&#39;ing&quot;, &quot;$!&#39;&quot;, &#39;-&#39;, &quot;val-id-ate|this|str-ing&quot;)]
+        [TestCase(&quot;val$id!ate|this|str&#39;ing&quot;, &quot;$!&#39;&quot;, &#39;*&#39;, &quot;val*id*ate|this|str*ing&quot;)]
+        #endregion
+        public void ReplaceManyByOneChar(string input, string toReplace, char replacement, string expected)
+        {
+            var output = _helper.ReplaceMany(input, toReplace.ToArray(), replacement);
+            Assert.AreEqual(expected, output);
+        }
+
+        #region Cases
+        [TestCase(&quot;foo.txt&quot;, &quot;foo.txt&quot;)]
+        [TestCase(&quot;foo&quot;, &quot;foo&quot;)]
+        [TestCase(&quot;.txt&quot;, &quot;.txt&quot;)]
+        [TestCase(&quot;nag*dog/poo:xit.txt&quot;, &quot;nag-dog-poo-xit.txt&quot;)]
+        [TestCase(&quot;the dog is in the house.txt&quot;, &quot;the-dog-is-in-the-house.txt&quot;)]
+        [TestCase(&quot;nil.nil.nil.txt&quot;, &quot;nil-nil-nil.txt&quot;)]
+        [TestCase(&quot;taradabum&quot;, &quot;taradabum&quot;)]
+        [TestCase(&quot;tara$$da:b/u&lt;m&quot;, &quot;tara-da-b-u-m&quot;)]
+        [TestCase(&quot;Stra&#223;e Zv&#246;sk&#238;.yop&quot;, &quot;strasse-zvoski.yop&quot;)]
+        [TestCase(&quot;yop.Stra&#223;e Zv&#246;sk&#238;&quot;, &quot;yop.strasse-zvoski&quot;)]
+        [TestCase(&quot;yop.Stra&#223;e Zv&#246;s--k&#238;&quot;, &quot;yop.strasse-zvos-ki&quot;)]
+        [TestCase(&quot;ma--ma---ma.ma-----ma&quot;, &quot;ma-ma-ma.ma-ma&quot;)]
+        #endregion
+        public void CleanStringForSafeFileName(string input, string expected)
+        {
+            var output = _helper.CleanStringForSafeFileName(input);
+            Assert.AreEqual(expected, output);
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,9,25,10,1],[35,13,39,46,1],[39,46,39,134,1],[39,134,46,46,1],[46,46,46,81,1],[46,81,53,46,1],[53,46,53,112,1],[53,112,60,46,1],[60,46,60,98,1],[60,98,66,46,1],[66,46,66,98,1],[66,98,72,46,1],[72,46,72,81,1],[72,81,75,20,1],[35,13,75,20,1],[77,13,77,47,1],[78,13,78,88,1],[79,13,79,33,1],[80,9,80,10,1],[84,9,84,10,1],[85,13,85,47,1],[86,9,86,10,1],[88,9,88,149,1],[91,9,91,10,1],[92,13,92,55,1],[93,9,93,10,1],[96,9,96,10,1],[97,13,97,91,1],[98,13,98,22,1],[99,9,99,10,1],[102,9,102,10,1],[103,13,103,99,1],[104,13,104,22,1],[105,9,105,10,1],[109,9,109,10,1],[110,13,110,68,1],[111,13,111,65,1],[112,13,112,89,1],[113,13,113,73,1],[114,13,114,58,1],[118,13,118,100,1],[119,13,119,152,1],[120,9,120,10,1],[124,9,124,10,1],[125,13,125,68,1],[126,13,126,65,1],[127,13,127,89,1],[128,13,128,73,1],[129,13,129,58,1],[133,13,133,85,1],[134,13,134,65,1],[135,13,135,99,1],[137,13,140,46,1],[140,46,140,81,1],[140,81,143,20,1],[137,13,143,20,1],[144,13,144,61,1],[145,13,145,88,1],[146,9,146,10,1],[150,9,150,10,1],[151,13,155,46,1],[155,46,155,81,1],[155,81,158,20,1],[151,13,158,20,1],[159,13,159,102,1],[161,13,165,46,1],[165,46,165,69,1],[165,69,168,20,1],[161,13,168,20,1],[169,13,169,102,1],[170,9,170,10,1],[174,9,174,10,1],[175,13,179,46,1],[179,46,179,69,1],[179,69,182,20,1],[175,13,182,20,1],[183,13,183,126,1],[185,13,189,46,1],[189,46,189,98,1],[189,98,192,20,1],[185,13,192,20,1],[193,13,193,122,1],[194,13,194,123,1],[196,13,196,102,1],[197,13,197,82,1],[198,9,198,10,1],[202,9,202,10,1],[203,13,210,20,1],[211,13,211,93,1],[213,13,220,20,1],[221,13,221,92,1],[222,9,222,10,1],[226,9,226,10,1],[227,13,234,20,1],[235,13,235,103,1],[236,13,236,101,1],[237,13,237,98,1],[238,13,238,96,1],[240,13,247,20,1],[248,13,248,102,1],[249,13,249,100,1],[250,13,250,98,1],[251,13,251,96,1],[252,9,252,10,1],[256,9,256,10,1],[257,13,264,20,1],[265,13,265,103,1],[266,13,266,101,1],[267,13,267,99,1],[268,13,268,96,1],[270,13,277,20,1],[278,13,278,103,1],[279,13,279,101,1],[280,13,280,98,1],[281,13,281,96,1],[282,9,282,10,1],[286,9,286,10,1],[287,13,292,20,1],[293,13,293,92,1],[294,13,294,102,1],[295,9,295,10,1],[299,9,299,10,1],[300,13,305,20,1],[306,13,306,94,1],[308,13,313,20,1],[314,13,314,94,1],[316,13,320,20,1],[321,13,321,93,1],[323,13,328,20,1],[329,13,329,94,1],[330,9,330,10,1],[334,9,334,10,1],[335,13,340,20,1],[341,13,341,96,1],[345,9,345,10,1],[349,9,349,10,1],[352,13,352,44,1],[353,13,353,53,1],[354,13,354,57,1],[355,13,355,53,1],[356,13,356,56,1],[357,13,357,42,1],[358,13,358,54,1],[359,13,359,47,1],[360,13,360,42,1],[362,13,362,55,1],[363,13,363,64,1],[365,13,365,53,1],[366,13,366,47,1],[367,13,367,44,1],[369,13,369,44,1],[371,13,371,44,1],[375,13,375,39,1],[376,9,376,10,1],[380,9,380,10,1],[382,13,382,79,1],[383,13,383,49,1],[384,9,384,10,1],[388,9,388,10,1],[389,13,394,20,1],[395,13,395,88,1],[396,13,396,110,1],[398,13,403,20,1],[404,13,404,84,1],[405,13,405,105,1],[406,9,406,10,1],[410,9,410,10,1],[411,13,411,68,1],[412,13,412,65,1],[413,13,413,89,1],[414,13,414,73,1],[415,13,415,58,1],[417,13,417,85,1],[421,13,421,63,1],[422,13,422,69,1],[423,13,423,66,1],[426,13,426,61,1],[429,13,429,86,1],[432,13,432,84,1],[433,9,433,10,1],[437,9,437,10,1],[438,13,443,20,1],[452,13,452,120,1],[453,13,453,148,1],[454,13,454,149,1],[455,13,455,148,1],[456,13,456,148,1],[457,13,457,150,1],[467,13,467,128,1],[468,13,468,126,1],[469,13,469,128,1],[470,13,470,122,1],[471,13,471,138,1],[472,13,472,128,1],[473,13,473,144,1],[475,13,475,129,1],[476,13,476,127,1],[477,13,477,129,1],[478,13,478,123,1],[479,13,479,139,1],[480,13,480,129,1],[481,13,481,145,1],[482,9,482,10,1],[518,9,518,10,1],[519,13,519,65,1],[520,13,520,47,1],[521,9,521,10,1],[558,9,558,10,1],[559,13,559,66,1],[560,13,560,47,1],[561,9,561,10,1],[574,9,574,10,1],[575,13,575,64,1],[576,13,576,47,1],[578,13,578,60,1],[579,13,579,51,1],[580,13,580,47,1],[581,9,581,10,1],[591,9,591,10,1],[592,13,592,99,1],[596,13,596,72,1],[597,13,597,47,1],[598,9,598,10,1],[602,9,602,10,1],[605,13,612,19,1],[613,13,613,67,1],[614,13,614,47,1],[615,9,615,10,1],[622,9,622,10,1],[623,13,623,87,1],[624,13,624,47,1],[625,9,625,10,1],[642,9,642,10,1],[643,13,643,68,1],[644,13,644,47,1],[645,9,645,10,1]]);
+    </script>
+  </body>
+</html>

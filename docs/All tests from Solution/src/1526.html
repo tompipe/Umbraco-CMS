@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\LocalizedTextServiceFileSources.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Xml;
+using System.Xml.Linq;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Core.Services
+{
+    /// &lt;summary&gt;
+    /// Exposes the XDocument sources from files for the default localization text service and ensure caching is taken care of
+    /// &lt;/summary&gt;
+    public class LocalizedTextServiceFileSources
+    {
+        private readonly ILogger _logger;
+        private readonly IRuntimeCacheProvider _cache;
+        private readonly IEnumerable&lt;LocalizedTextServiceSupplementaryFileSource&gt; _supplementFileSources;
+        private readonly DirectoryInfo _fileSourceFolder;
+
+        //TODO: See other notes in this class, this is purely a hack because we store 2 letter culture file names that contain 4 letter cultures :(
+        private readonly Dictionary&lt;string, CultureInfo&gt; _twoLetterCultureConverter = new Dictionary&lt;string, CultureInfo&gt;();
+
+        private readonly Lazy&lt;Dictionary&lt;CultureInfo, Lazy&lt;XDocument&gt;&gt;&gt; _xmlSources;
+
+        /// &lt;summary&gt;
+        /// This is used to configure the file sources with the main file sources shipped with Umbraco and also including supplemental/plugin based
+        /// localization files. The supplemental files will be loaded in and merged in after the primary files. 
+        /// The supplemental files must be named with the 4 letter culture name with a hyphen such as : en-AU.xml
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;cache&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;fileSourceFolder&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;supplementFileSources&quot;&gt;&lt;/param&gt;
+        public LocalizedTextServiceFileSources(
+            ILogger logger,
+            IRuntimeCacheProvider cache, 
+            DirectoryInfo fileSourceFolder,
+            IEnumerable&lt;LocalizedTextServiceSupplementaryFileSource&gt; supplementFileSources)           
+        {
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            if (cache == null) throw new ArgumentNullException(&quot;cache&quot;);
+            if (fileSourceFolder == null) throw new ArgumentNullException(&quot;fileSourceFolder&quot;);
+
+            _logger = logger;
+            _cache = cache;
+
+            //Create the lazy source for the _xmlSources
+            _xmlSources = new Lazy&lt;Dictionary&lt;CultureInfo, Lazy&lt;XDocument&gt;&gt;&gt;(() =&gt;
+            {
+                var result = new Dictionary&lt;CultureInfo, Lazy&lt;XDocument&gt;&gt;();
+
+                if (_fileSourceFolder == null) return result;
+
+                foreach (var fileInfo in _fileSourceFolder.GetFiles(&quot;*.xml&quot;))
+                {
+                    var localCopy = fileInfo;
+                    var filename = Path.GetFileNameWithoutExtension(localCopy.FullName).Replace(&quot;_&quot;, &quot;-&quot;);
+
+                    //TODO: Fix this nonsense... would have to wait until v8 to store the language files with their correct
+                    // names instead of storing them as 2 letters but actually having a 4 letter culture. wtf. So now, we
+                    // need to check if the file is 2 letters, then open it to try to find it&#39;s 4 letter culture, then use that
+                    // if it&#39;s successful. We&#39;re going to assume (though it seems assuming in the legacy logic is never a great idea)
+                    // that any 4 letter file is named with the actual culture that it is!
+                    CultureInfo culture = null;
+                    if (filename.Length == 2)
+                    {
+                        //we need to open the file to see if we can read it&#39;s &#39;real&#39; culture, we&#39;ll use XmlReader since we don&#39;t
+                        //want to load in the entire doc into mem just to read a single value
+                        using (var fs = fileInfo.OpenRead())
+                        using (var reader = XmlReader.Create(fs))
+                        {
+                            if (reader.IsStartElement())
+                            {
+                                if (reader.Name == &quot;language&quot;)
+                                {
+                                    if (reader.MoveToAttribute(&quot;culture&quot;))
+                                    {
+                                        var cultureVal = reader.Value;
+                                        try
+                                        {
+                                            culture = CultureInfo.GetCultureInfo(cultureVal);
+                                            //add to the tracked dictionary
+                                            _twoLetterCultureConverter[filename] = culture;
+                                        }
+                                        catch (CultureNotFoundException)
+                                        {
+                                            LogHelper.Warn&lt;LocalizedTextServiceFileSources&gt;(
+                                                string.Format(&quot;The culture {0} found in the file {1} is not a valid culture&quot;, cultureVal, fileInfo.FullName));
+                                            //If the culture in the file is invalid, we&#39;ll just hope the file name is a valid culture below, otherwise
+                                            // an exception will be thrown.
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (culture == null)
+                    {
+                        culture = CultureInfo.GetCultureInfo(filename);
+                    }
+
+                    //get the lazy value from cache                
+                    result[culture] = new Lazy&lt;XDocument&gt;(() =&gt; _cache.GetCacheItem&lt;XDocument&gt;(
+                        string.Format(&quot;{0}-{1}&quot;, typeof(LocalizedTextServiceFileSources).Name, culture.Name), () =&gt;
+                        {
+                            XDocument xdoc;
+
+                            //load in primary
+                            using (var fs = localCopy.OpenRead())
+                            {
+                                xdoc = XDocument.Load(fs);
+                            }
+
+                            //load in supplementary
+                            MergeSupplementaryFiles(culture, xdoc);
+
+                            return xdoc;
+                        }, isSliding: true, timeout: TimeSpan.FromMinutes(10), dependentFiles: new[] { localCopy.FullName }));
+                }
+                return result;
+            });
+
+            if (fileSourceFolder.Exists == false)
+            {
+                LogHelper.Warn&lt;LocalizedTextServiceFileSources&gt;(&quot;The folder does not exist: {0}, therefore no sources will be discovered&quot;, () =&gt; fileSourceFolder.FullName);
+            }
+            else
+            {
+                _fileSourceFolder = fileSourceFolder;
+                _supplementFileSources = supplementFileSources;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;cache&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;fileSourceFolder&quot;&gt;&lt;/param&gt;
+        public LocalizedTextServiceFileSources(ILogger logger, IRuntimeCacheProvider cache, DirectoryInfo fileSourceFolder)
+            : this(logger, cache, fileSourceFolder, Enumerable.Empty&lt;LocalizedTextServiceSupplementaryFileSource&gt;())
+        {
+            
+        }
+
+        /// &lt;summary&gt;
+        /// returns all xml sources for all culture files found in the folder
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IDictionary&lt;CultureInfo, Lazy&lt;XDocument&gt;&gt; GetXmlSources()
+        {
+            return _xmlSources.Value;
+        }
+
+        //TODO: See other notes in this class, this is purely a hack because we store 2 letter culture file names that contain 4 letter cultures :(
+        public Attempt&lt;CultureInfo&gt; TryConvert2LetterCultureTo4Letter(string twoLetterCulture)
+        {
+            if (twoLetterCulture.Length != 2) return Attempt&lt;CultureInfo&gt;.Fail();
+
+            //This needs to be resolved before continuing so that the _twoLetterCultureConverter cache is initialized
+            var resolved = _xmlSources.Value;
+
+            return _twoLetterCultureConverter.ContainsKey(twoLetterCulture)
+                ? Attempt.Succeed(_twoLetterCultureConverter[twoLetterCulture])
+                : Attempt&lt;CultureInfo&gt;.Fail();
+        }
+
+        //TODO: See other notes in this class, this is purely a hack because we store 2 letter culture file names that contain 4 letter cultures :(
+        public Attempt&lt;string&gt; TryConvert4LetterCultureTo2Letter(CultureInfo culture)
+        {
+            if (culture == null) throw new ArgumentNullException(&quot;culture&quot;);
+
+            //This needs to be resolved before continuing so that the _twoLetterCultureConverter cache is initialized
+            var resolved = _xmlSources.Value;
+
+            return _twoLetterCultureConverter.Values.Contains(culture)
+                ? Attempt.Succeed(culture.Name.Substring(0, 2))
+                : Attempt&lt;string&gt;.Fail();
+        }
+
+        private void MergeSupplementaryFiles(CultureInfo culture, XDocument xMasterDoc)
+        {
+            if (xMasterDoc.Root == null) return;
+            if (_supplementFileSources != null)
+            {
+                //now load in suplementary
+                var found = _supplementFileSources.Where(x =&gt;
+                {
+                    var fileName = Path.GetFileName(x.File.FullName);
+                    return fileName.InvariantStartsWith(culture.Name) &amp;&amp; fileName.InvariantEndsWith(&quot;.xml&quot;);
+                });
+                
+                foreach (var supplementaryFile in found)
+                {
+                    using (var fs = supplementaryFile.File.OpenRead())
+                    {
+                        XDocument xChildDoc;
+                        try
+                        {
+                            xChildDoc = XDocument.Load(fs);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.Error&lt;LocalizedTextServiceFileSources&gt;(&quot;Could not load file into XML &quot; + supplementaryFile.File.FullName, ex);
+                            continue;
+                        }
+
+                        if (xChildDoc.Root == null) continue;
+                        foreach (var xArea in xChildDoc.Root.Elements(&quot;area&quot;)
+                            .Where(x =&gt; ((string)x.Attribute(&quot;alias&quot;)).IsNullOrWhiteSpace() == false))
+                        {
+                            var areaAlias = (string)xArea.Attribute(&quot;alias&quot;);
+
+                            var areaFound = xMasterDoc.Root.Elements(&quot;area&quot;).FirstOrDefault(x =&gt; ((string)x.Attribute(&quot;alias&quot;)) == areaAlias);
+                            if (areaFound == null)
+                            {
+                                //add the whole thing
+                                xMasterDoc.Root.Add(xArea);
+                            }
+                            else
+                            {
+                                MergeChildKeys(xArea, areaFound, supplementaryFile.OverwriteCoreKeys);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private void MergeChildKeys(XElement source, XElement destination, bool overwrite)
+        {
+            if (destination == null) throw new ArgumentNullException(&quot;destination&quot;);
+            if (source == null) throw new ArgumentNullException(&quot;source&quot;);
+
+            //merge in the child elements
+            foreach (var key in source.Elements(&quot;key&quot;)
+                .Where(x =&gt; ((string)x.Attribute(&quot;alias&quot;)).IsNullOrWhiteSpace() == false))
+            {
+                var keyAlias = (string)key.Attribute(&quot;alias&quot;);
+                var keyFound = destination.Elements(&quot;key&quot;).FirstOrDefault(x =&gt; ((string)x.Attribute(&quot;alias&quot;)) == keyAlias);
+                if (keyFound == null)
+                {
+                    //append, it doesn&#39;t exist
+                    destination.Add(key);
+                }
+                else if (overwrite)
+                {
+                    //overwrite
+                    keyFound.Value = key.Value;
+                }
+            }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,9,24,125,1],[37,9,41,92,1],[42,9,42,10,1],[43,13,43,32,1],[43,33,43,75,0],[44,13,44,31,1],[44,32,44,73,0],[45,13,45,42,1],[45,43,45,95,0],[47,13,47,30,1],[48,13,48,28,1],[51,13,52,13,1],[52,13,52,14,1],[52,14,53,17,1],[53,17,53,77,1],[53,77,55,17,1],[55,17,55,47,1],[55,47,55,48,1],[55,48,55,62,1],[55,62,57,17,1],[57,17,57,24,0],[57,24,57,26,1],[57,26,57,38,0],[57,38,57,39,1],[57,39,57,41,0],[57,41,57,42,1],[57,42,57,77,0],[57,77,58,17,1],[58,17,58,18,0],[58,18,59,21,1],[59,21,59,46,0],[59,46,60,21,1],[60,21,60,107,0],[60,107,67,21,1],[67,21,67,48,0],[67,48,68,21,1],[68,21,68,46,0],[68,46,69,21,1],[69,21,69,22,0],[69,22,72,32,1],[72,32,72,60,0],[72,60,73,32,1],[73,32,73,65,0],[73,65,74,25,1],[74,25,74,26,0],[74,26,75,29,1],[75,29,75,57,0],[75,57,76,29,1],[76,29,76,30,0],[76,30,77,33,1],[77,33,77,63,0],[77,63,78,33,1],[78,33,78,34,0],[78,34,79,37,1],[79,37,79,75,0],[79,75,80,37,1],[80,37,80,38,0],[80,38,81,41,1],[81,41,81,71,0],[81,71,83,41,1],[83,41,83,42,0],[83,42,84,45,1],[84,45,84,94,0],[84,94,86,45,1],[86,45,86,92,0],[86,92,87,41,1],[87,41,87,42,0],[87,42,88,41,1],[88,41,88,73,0],[88,73,89,41,1],[89,41,89,42,0],[89,42,90,45,1],[90,45,91,159,0],[91,159,94,41,1],[94,41,94,42,0],[94,42,95,37,1],[95,37,95,38,0],[95,38,96,33,1],[96,33,96,34,0],[96,34,97,29,1],[97,29,97,30,0],[97,30,98,25,1],[98,25,98,26,0],[98,26,99,21,1],[99,21,99,22,0],[99,22,100,21,1],[100,21,100,41,0],[100,41,101,21,1],[101,21,101,22,0],[101,22,102,25,1],[102,25,102,72,0],[102,72,103,21,1],[103,21,103,22,0],[103,22,106,21,1],[106,21,106,65,0],[106,65,108,25,0],[108,25,108,26,0],[108,26,112,36,0],[112,36,112,65,0],[112,65,113,29,0],[113,29,113,30,0],[113,30,114,33,0],[114,33,114,59,0],[114,59,115,29,0],[115,29,115,30,0],[115,30,118,29,0],[118,29,118,68,0],[118,68,120,29,0],[120,29,120,41,0],[120,41,121,25,0],[121,25,121,26,0],[121,26,121,125,0],[106,65,121,125,0],[121,125,121,127,0],[106,21,121,127,0],[121,127,122,17,1],[122,17,122,18,0],[122,18,123,17,1],[123,17,123,31,0],[123,31,124,13,1],[124,13,124,14,1],[124,14,124,16,1],[51,13,124,16,1],[126,13,126,50,1],[127,13,127,14,1],[128,17,128,146,1],[128,146,128,171,0],[128,171,128,173,1],[128,17,128,173,1],[129,13,129,14,1],[131,13,131,14,0],[132,17,132,54,0],[133,17,133,64,0],[134,13,134,14,0],[135,9,135,10,1],[144,15,144,117,0],[145,9,145,10,0],[147,9,147,10,0],[154,9,154,10,1],[155,13,155,38,1],[156,9,156,10,1],[160,9,160,10,1],[161,13,161,46,1],[161,47,161,82,0],[164,13,164,46,1],[166,13,168,47,1],[169,9,169,10,1],[173,9,173,10,0],[174,13,174,33,0],[174,34,174,77,0],[177,13,177,46,0],[179,13,181,42,0],[182,9,182,10,0],[185,9,185,10,0],[186,13,186,41,0],[186,42,186,49,0],[187,13,187,48,0],[188,13,188,14,0],[190,17,191,17,0],[191,17,191,18,0],[191,18,192,21,0],[192,21,192,70,0],[192,70,193,21,0],[193,21,193,109,0],[193,109,194,17,0],[194,17,194,18,0],[194,18,194,20,0],[190,17,194,20,0],[196,17,196,24,0],[196,26,196,47,0],[196,48,196,50,0],[196,51,196,56,0],[197,17,197,18,0],[198,28,198,70,0],[199,21,199,22,0],[202,25,202,26,0],[203,29,203,60,0],[204,25,204,26,0],[205,25,205,45,0],[206,25,206,26,0],[207,29,207,147,0],[208,29,208,38,0],[211,25,211,52,0],[211,53,211,62,0],[212,25,212,32,0],[212,34,212,43,0],[212,44,212,46,0],[212,47,213,41,0],[213,41,213,101,0],[213,101,213,102,0],[212,47,213,102,0],[214,25,214,26,0],[215,29,215,78,0],[217,29,217,98,0],[217,98,217,141,0],[217,141,217,143,0],[217,29,217,143,0],[218,29,218,51,0],[219,29,219,30,0],[221,33,221,60,0],[222,29,222,30,0],[224,29,224,30,0],[225,33,225,103,0],[226,29,226,30,0],[227,25,227,26,0],[228,21,228,22,0],[229,17,229,18,0],[230,13,230,14,0],[231,9,231,10,0],[234,9,234,10,0],[235,13,235,37,0],[235,38,235,85,0],[236,13,236,32,0],[236,33,236,75,0],[239,13,239,20,0],[239,22,239,29,0],[239,30,239,32,0],[239,33,240,29,0],[240,29,240,89,0],[240,89,240,90,0],[239,33,240,90,0],[241,13,241,14,0],[242,17,242,63,0],[243,17,243,80,0],[243,80,243,122,0],[243,122,243,124,0],[243,17,243,124,0],[244,17,244,38,0],[245,17,245,18,0],[247,21,247,42,0],[248,17,248,18,0],[249,22,249,36,0],[250,17,250,18,0],[252,21,252,48,0],[253,17,253,18,0],[254,13,254,14,0],[255,9,255,10,0]]);
+    </script>
+  </body>
+</html>

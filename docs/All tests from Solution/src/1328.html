@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Editors\PackageInstallController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Threading.Tasks;
+using System.Web.Http;
+using System.Xml;
+using umbraco;
+using umbraco.cms.businesslogic.packager;
+using umbraco.cms.businesslogic.packager.repositories;
+using umbraco.cms.presentation.Trees;
+using umbraco.presentation.developer.packages;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Services;
+using Umbraco.Web.Models;
+using Umbraco.Web.Models.ContentEditing;
+using Umbraco.Web.Mvc;
+using Umbraco.Web.UI;
+using Umbraco.Web.WebApi;
+using Umbraco.Web.WebApi.Filters;
+using File = System.IO.File;
+using Notification = Umbraco.Web.Models.ContentEditing.Notification;
+using Version = System.Version;
+
+namespace Umbraco.Web.Editors
+{
+    /// &lt;summary&gt;
+    /// A controller used for installing packages and managing all of the data in the packages section in the back office
+    /// &lt;/summary&gt;
+    [PluginController(&quot;UmbracoApi&quot;)]
+    [UmbracoApplicationAuthorize(Core.Constants.Applications.Developer)]
+    public class PackageInstallController : UmbracoAuthorizedJsonController
+    {
+        /// &lt;summary&gt;
+        /// This checks if this package &amp; version is alraedy installed
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;name&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;version&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpPost]
+        public IHttpActionResult ValidateInstalled(string name, string version)
+        {
+            var validate = ValidateInstalledInternal(name, version);
+            if (validate == false)
+                return BadRequest();
+            return Ok();
+        }
+
+        [HttpPost]
+        public IHttpActionResult Uninstall(int packageId)
+        {
+            var pack = InstalledPackage.GetById(packageId);
+            if (pack == null) return NotFound();
+
+            PerformUninstall(pack);
+
+            //now get all other packages by this name since we&#39;ll uninstall all versions
+            foreach (var installed in InstalledPackage.GetAllInstalledPackages()
+                .Where(x =&gt; x.Data.Name == pack.Data.Name &amp;&amp; x.Data.Id != pack.Data.Id))
+            {
+                //remove from teh xml
+                installed.Delete(Security.GetUserId());
+            }
+
+            return Ok();
+        }
+
+        /// &lt;summary&gt;
+        /// SORRY :( I didn&#39;t have time to put this in a service somewhere - the old packager did this all manually too
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pack&quot;&gt;&lt;/param&gt;
+        protected void PerformUninstall(InstalledPackage pack)
+        {
+            if (pack == null) throw new ArgumentNullException(&quot;pack&quot;);
+
+            var refreshCache = false;
+            
+            //Uninstall templates
+            foreach (var item in pack.Data.Templates.ToArray())
+            {
+                int nId;
+                if (int.TryParse(item, out nId) == false) continue;
+                var found = Services.FileService.GetTemplate(nId);
+                if (found != null)
+                {
+                    ApplicationContext.Services.FileService.DeleteTemplate(found.Alias, Security.GetUserId());
+                }
+                pack.Data.Templates.Remove(nId.ToString());
+            }
+
+            //Uninstall macros
+            foreach (var item in pack.Data.Macros.ToArray())
+            {
+                int nId;
+                if (int.TryParse(item, out nId) == false) continue;
+                var macro = Services.MacroService.GetById(nId);
+                if (macro != null)
+                {
+                    Services.MacroService.Delete(macro);
+                }                    
+                pack.Data.Macros.Remove(nId.ToString());
+            }
+
+            //Remove Document Types
+            var contentTypes = new List&lt;IContentType&gt;();
+            var contentTypeService = Services.ContentTypeService;
+            foreach (var item in pack.Data.Documenttypes.ToArray())
+            {
+                int nId;
+                if (int.TryParse(item, out nId) == false) continue;
+                var contentType = contentTypeService.GetContentType(nId);
+                if (contentType == null) continue;
+                contentTypes.Add(contentType);
+                pack.Data.Documenttypes.Remove(nId.ToString(CultureInfo.InvariantCulture));
+                // refresh content cache when document types are removed
+                refreshCache = true;
+            }
+
+            //Order the DocumentTypes before removing them
+            if (contentTypes.Any())
+            {
+                var orderedTypes = from contentType in contentTypes
+                    orderby contentType.ParentId descending, contentType.Id descending
+                    select contentType;
+                foreach (var contentType in orderedTypes)
+                {
+                    contentTypeService.Delete(contentType);
+                }
+            }
+
+            //Remove Dictionary items
+            foreach (var item in pack.Data.DictionaryItems.ToArray())
+            {
+                int nId;
+                if (int.TryParse(item, out nId) == false) continue;
+                var di = Services.LocalizationService.GetDictionaryItemById(nId);
+                if (di != null)
+                {
+                    Services.LocalizationService.Delete(di);
+                }                    
+                pack.Data.DictionaryItems.Remove(nId.ToString());
+            }
+
+            //Remove Data types
+            foreach (var item in pack.Data.DataTypes.ToArray())
+            {
+                int nId;
+                if (int.TryParse(item, out nId) == false) continue;
+                var dtd = Services.DataTypeService.GetDataTypeDefinitionById(nId);
+                if (dtd != null)
+                {
+                    Services.DataTypeService.Delete(dtd);
+                }                    
+                pack.Data.DataTypes.Remove(nId.ToString());
+            }
+
+            pack.Save();
+
+            // uninstall actions
+            //TODO: We should probably report errors to the UI!! 
+            // This never happened before though, but we should do something now
+            if (pack.Data.Actions.IsNullOrWhiteSpace() == false)
+            {
+                try
+                {
+                    var actionsXml = new XmlDocument();
+                    actionsXml.LoadXml(&quot;&lt;Actions&gt;&quot; + pack.Data.Actions + &quot;&lt;/Actions&gt;&quot;);
+
+                    LogHelper.Debug&lt;installedPackage&gt;(&quot;executing undo actions: {0}&quot;, () =&gt; actionsXml.OuterXml);
+
+                    foreach (XmlNode n in actionsXml.DocumentElement.SelectNodes(&quot;//Action&quot;))
+                    {
+                        try
+                        {
+                            global::umbraco.cms.businesslogic.packager.PackageAction
+                                .UndoPackageAction(pack.Data.Name, n.Attributes[&quot;alias&quot;].Value, n);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogHelper.Error&lt;installedPackage&gt;(&quot;An error occurred running undo actions&quot;, ex);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.Error&lt;installedPackage&gt;(&quot;An error occurred running undo actions&quot;, ex);
+                }
+            }
+
+            //moved remove of files here so custom package actions can still undo
+            //Remove files
+            foreach (var item in pack.Data.Files.ToArray())
+            {
+                //here we need to try to find the file in question as most packages does not support the tilde char
+                var file = IOHelper.FindFile(item);
+                if (file != null)
+                {
+                    if (file.StartsWith(&quot;/&quot;) == false)
+                        file = string.Format(&quot;/{0}&quot;, file);
+
+                    var filePath = IOHelper.MapPath(file);
+                    if (File.Exists(filePath))
+                    {
+                        File.Delete(filePath);
+                        
+                    }
+                }
+                pack.Data.Files.Remove(file);
+            }
+            pack.Save();
+            pack.Delete(Security.GetUserId());
+            
+            //TODO: Legacy - probably not needed
+            if (refreshCache)
+            {
+                library.RefreshContent();
+            }            
+            TreeDefinitionCollection.Instance.ReRegisterTrees();
+            global::umbraco.BusinessLogic.Actions.Action.ReRegisterActionsAndHandlers();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all installed packages - only shows their latest versions
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;InstalledPackageModel&gt; GetInstalled()
+        {
+            return InstalledPackage.GetAllInstalledPackages()
+                .GroupBy(
+                    //group by name
+                    x =&gt; x.Data.Name,
+                    //select the package with a parsed version
+                    pck =&gt;
+                    {
+                        Version pckVersion;
+                        return Version.TryParse(pck.Data.Version, out pckVersion)
+                            ? new {package = pck, version = pckVersion}
+                            : new {package = pck, version = new Version(0, 0, 0)};
+                    })
+                .Select(grouping =&gt;
+                {
+                    //get the max version for the package
+                    var maxVersion = grouping.Max(x =&gt; x.version);
+                    //only return the first package with this version
+                    return grouping.First(x =&gt; x.version == maxVersion).package;
+                })
+                .Select(pack =&gt; new InstalledPackageModel
+                {
+                    Name = pack.Data.Name,
+                    Id = pack.Data.Id,
+                    Author = pack.Data.Author,
+                    Version = pack.Data.Version,
+                    Url = pack.Data.Url,
+                    License = pack.Data.License,
+                    LicenseUrl = pack.Data.LicenseUrl,
+                    Files = pack.Data.Files,
+                    IconUrl = pack.Data.IconUrl
+                })
+                .ToList();
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes a created package
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;packageId&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpPost]
+        [HttpDelete]
+        public IHttpActionResult DeleteCreatedPackage(int packageId)
+        {
+            var package = CreatedPackage.GetById(packageId);
+            if (package == null)
+                return NotFound();
+
+            package.Delete();
+
+            return Ok();
+        }
+
+        private void PopulateFromPackageData(LocalPackageInstallModel model)
+        {
+            var ins = new global::umbraco.cms.businesslogic.packager.Installer(Security.CurrentUser.Id);
+            //this will load in all the metadata too
+            var tempDir = ins.Import(model.ZipFilePath, false);
+
+            model.TemporaryDirectoryPath = Path.Combine(SystemDirectories.Data, tempDir);
+            model.Name = ins.Name;
+            model.Author = ins.Author;
+            model.AuthorUrl = ins.AuthorUrl;
+            model.IconUrl = ins.IconUrl;
+            model.License = ins.License;
+            model.LicenseUrl = ins.LicenseUrl;
+            model.ReadMe = ins.ReadMe;
+            model.ConflictingMacroAliases = ins.ConflictingMacroAliases;
+            model.ConflictingStyleSheetNames = ins.ConflictingStyleSheetNames;
+            model.ConflictingTemplateAliases = ins.ConflictingTemplateAliases;
+            model.ContainsBinaryFileErrors = ins.ContainsBinaryFileErrors;
+            model.ContainsLegacyPropertyEditors = ins.ContainsLegacyPropertyEditors;
+            model.ContainsMacroConflict = ins.ContainsMacroConflict;
+            model.ContainsStyleSheetConflicts = ins.ContainsStyleSheeConflicts;
+            model.ContainsTemplateConflicts = ins.ContainsTemplateConflicts;
+            model.ContainsUnsecureFiles = ins.ContainsUnsecureFiles;
+            model.Url = ins.Url;
+            model.Version = ins.Version;
+
+            model.UmbracoVersion = ins.RequirementsType == RequirementsType.Strict
+                ? string.Format(&quot;{0}.{1}.{2}&quot;, ins.RequirementsMajor, ins.RequirementsMinor, ins.RequirementsPatch)
+                : string.Empty;
+            
+            //now we need to check for version comparison
+            model.IsCompatible = true;
+            if (ins.RequirementsType == RequirementsType.Strict)
+            {
+                var packageMinVersion = new System.Version(ins.RequirementsMajor, ins.RequirementsMinor, ins.RequirementsPatch);
+                if (UmbracoVersion.Current &lt; packageMinVersion)
+                {
+                    model.IsCompatible = false;
+                }
+            }
+        }
+
+        private bool ValidateInstalledInternal(string name, string version)
+        {
+            var allInstalled = InstalledPackage.GetAllInstalledPackages();
+            var found = allInstalled.FirstOrDefault(x =&gt;
+            {
+                if (x.Data.Name != name) return false;
+                //match the exact version
+                if (x.Data.Version == version)
+                {
+                    return true;
+                }
+                //now try to compare the versions
+                Version installed;
+                Version selected;
+                if (Version.TryParse(x.Data.Version, out installed) &amp;&amp; Version.TryParse(version, out selected))
+                {
+                    if (installed &gt;= selected) return true;
+                }
+                return false;
+            });
+            if (found != null)
+            {
+                //this package is already installed
+                return false;
+            }
+            return true;
+        }
+
+        [HttpPost]
+        [FileUploadCleanupFilter(false)]
+        public async Task&lt;LocalPackageInstallModel&gt; UploadLocalPackage()
+        {
+            if (Request.Content.IsMimeMultipartContent() == false)
+            {
+                throw new HttpResponseException(HttpStatusCode.UnsupportedMediaType);
+            }
+
+            var root = IOHelper.MapPath(&quot;~/App_Data/TEMP/FileUploads&quot;);
+            //ensure it exists
+            Directory.CreateDirectory(root);
+            var provider = new MultipartFormDataStreamProvider(root);
+
+            var result = await Request.Content.ReadAsMultipartAsync(provider);
+
+            //must have a file
+            if (result.FileData.Count == 0)
+            {
+                throw new HttpResponseException(Request.CreateResponse(HttpStatusCode.NotFound));
+            }
+
+            //TODO: App/Tree Permissions?
+            var model = new LocalPackageInstallModel
+            {
+                PackageGuid = Guid.NewGuid()
+            };
+
+            //get the files
+            foreach (var file in result.FileData)
+            {
+                var fileName = file.Headers.ContentDisposition.FileName.Trim(new[] { &#39;\&quot;&#39; });
+                var ext = fileName.Substring(fileName.LastIndexOf(&#39;.&#39;) + 1).ToLower();
+
+                //TODO: Only allow .zip
+                if (ext.InvariantEquals(&quot;zip&quot;) || ext.InvariantEquals(&quot;umb&quot;))
+                {
+                    //TODO: Currently it has to be here, it&#39;s not ideal but that&#39;s the way it is right now
+                    var packageTempDir = IOHelper.MapPath(SystemDirectories.Data);
+                    
+                    //ensure it&#39;s there
+                    Directory.CreateDirectory(packageTempDir);
+
+                    //copy it - must always be &#39;.umb&#39; for the installer thing to work
+                    //the file name must be a GUID - this is what the packager expects (strange yes)
+                    //because essentially this is creating a temporary package Id that will be used
+                    //for unpacking/installing/etc...
+                    model.ZipFilePath = model.PackageGuid + &quot;.umb&quot;;
+                    var packageTempFileLocation = Path.Combine(packageTempDir, model.ZipFilePath);
+                    File.Copy(file.LocalFileName, packageTempFileLocation, true);
+
+                    //Populate the model from the metadata in the package file (zip file)
+                    PopulateFromPackageData(model);
+
+                    var validate = ValidateInstalledInternal(model.Name, model.Version);
+                    
+                    if (validate == false)
+                    {
+                        //this package is already installed
+                        throw new HttpResponseException(Request.CreateNotificationValidationErrorResponse(
+                            Services.TextService.Localize(&quot;packager/packageAlreadyInstalled&quot;)));                        
+                    }
+                    
+                }
+                else
+                {
+                    model.Notifications.Add(new Notification(
+                        Services.TextService.Localize(&quot;speechBubbles/operationFailedHeader&quot;),
+                        Services.TextService.Localize(&quot;media/disallowedFileType&quot;),
+                        SpeechBubbleIcon.Warning));
+                }
+                
+            }
+
+            return model;
+
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the package from Our to install
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;packageGuid&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpGet]
+        public LocalPackageInstallModel Fetch(string packageGuid)
+        {
+            //Default path
+            string path = Path.Combine(&quot;packages&quot;, packageGuid + &quot;.umb&quot;);
+            if (File.Exists(IOHelper.MapPath(Path.Combine(SystemDirectories.Data, path))) == false)
+            {
+                //our repo guid
+                using (var our = Repository.getByGuid(&quot;65194810-1f85-11dd-bd0b-0800200c9a66&quot;))
+                {
+                    path = our.fetch(packageGuid, Security.CurrentUser.Id);    
+                }
+            }
+
+            var model = new LocalPackageInstallModel
+            {
+                PackageGuid = Guid.Parse(packageGuid),
+                RepositoryGuid = Guid.Parse(&quot;65194810-1f85-11dd-bd0b-0800200c9a66&quot;),
+                ZipFilePath = path
+            };
+
+            //Populate the model from the metadata in the package file (zip file)
+            PopulateFromPackageData(model);
+
+            var validate = ValidateInstalledInternal(model.Name, model.Version);
+
+            if (validate == false)
+            {
+                //this package is already installed
+                throw new HttpResponseException(Request.CreateNotificationValidationErrorResponse(
+                    Services.TextService.Localize(&quot;packager/packageAlreadyInstalled&quot;)));
+            }
+
+            return model;
+        }
+
+        /// &lt;summary&gt;
+        /// Extracts the package zip and gets the packages information
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpPost]
+        public PackageInstallModel Import(PackageInstallModel model)
+        {
+            var ins = new global::umbraco.cms.businesslogic.packager.Installer(Security.CurrentUser.Id);
+
+            var tempPath = ins.Import(model.ZipFilePath);
+            //now we need to check for version comparison
+            if (ins.RequirementsType == RequirementsType.Strict)
+            {
+                var packageMinVersion = new System.Version(ins.RequirementsMajor, ins.RequirementsMinor, ins.RequirementsPatch);
+                if (UmbracoVersion.Current &lt; packageMinVersion)
+                {
+                    throw new HttpResponseException(Request.CreateNotificationValidationErrorResponse(
+                        Services.TextService.Localize(&quot;packager/targetVersionMismatch&quot;, new[] {packageMinVersion.ToString()})));
+                }
+            }
+
+            model.TemporaryDirectoryPath = Path.Combine(SystemDirectories.Data, tempPath);
+            model.Id = ins.CreateManifest( IOHelper.MapPath(model.TemporaryDirectoryPath), model.PackageGuid.ToString(), model.RepositoryGuid.ToString());
+
+            return model;
+        }
+
+        /// &lt;summary&gt;
+        /// Installs the package files
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpPost]
+        public PackageInstallModel InstallFiles(PackageInstallModel model)
+        {
+            var ins = new global::umbraco.cms.businesslogic.packager.Installer(Security.CurrentUser.Id);
+            ins.LoadConfig(IOHelper.MapPath(model.TemporaryDirectoryPath));
+            ins.InstallFiles(model.Id, IOHelper.MapPath(model.TemporaryDirectoryPath));
+            return model;
+        }
+
+        /// &lt;summary&gt;
+        /// Installs the packages data/business logic
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpPost]
+        public PackageInstallModel InstallData(PackageInstallModel model)
+        {
+            var ins = new global::umbraco.cms.businesslogic.packager.Installer(Security.CurrentUser.Id);
+            ins.LoadConfig(IOHelper.MapPath(model.TemporaryDirectoryPath));
+            ins.InstallBusinessLogic(model.Id, IOHelper.MapPath(model.TemporaryDirectoryPath));
+            return model;
+        }
+
+        /// &lt;summary&gt;
+        /// Cleans up the package installation
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpPost]
+        public PackageInstallResult CleanUp(PackageInstallModel model)
+        {
+            var ins = new global::umbraco.cms.businesslogic.packager.Installer(Security.CurrentUser.Id);
+            var tempDir = IOHelper.MapPath(model.TemporaryDirectoryPath);
+            ins.LoadConfig(IOHelper.MapPath(model.TemporaryDirectoryPath));
+            ins.InstallCleanUp(model.Id, IOHelper.MapPath(model.TemporaryDirectoryPath));
+
+            var clientDependencyConfig = new Umbraco.Core.Configuration.ClientDependencyConfiguration(ApplicationContext.ProfilingLogger.Logger);
+            var clientDependencyUpdated = clientDependencyConfig.IncreaseVersionNumber();
+
+            //clear the tree cache - we&#39;ll do this here even though the browser will reload, but just in case it doesn&#39;t can&#39;t hurt.
+            //these bits are super old, but cant find another way to do this currently
+            global::umbraco.cms.presentation.Trees.TreeDefinitionCollection.Instance.ReRegisterTrees();
+            global::umbraco.BusinessLogic.Actions.Action.ReRegisterActionsAndHandlers();
+
+
+            var redirectUrl = &quot;&quot;;
+            if (ins.Control.IsNullOrWhiteSpace() == false)
+            {
+                redirectUrl = string.Format(&quot;/developer/framed/{0}&quot;,
+                    Uri.EscapeDataString(
+                        string.Format(&quot;/umbraco/developer/Packages/installer.aspx?installing=custominstaller&amp;dir={0}&amp;pId={1}&amp;customControl={2}&amp;customUrl={3}&quot;, tempDir, model.Id, ins.Control, ins.Url)));
+            }
+
+            return new PackageInstallResult
+            {
+                Id = model.Id,
+                ZipFilePath = model.ZipFilePath,
+                PackageGuid = model.PackageGuid,
+                RepositoryGuid = model.RepositoryGuid,
+                TemporaryDirectoryPath = model.TemporaryDirectoryPath,
+                PostInstallationPath = redirectUrl
+            };
+
+        }
+
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[49,9,49,10,0],[50,13,50,69,0],[51,13,51,35,0],[52,17,52,37,0],[53,13,53,25,0],[54,9,54,10,0],[58,9,58,10,0],[59,13,59,60,0],[60,13,60,30,0],[60,31,60,49,0],[62,13,62,36,0],[65,13,65,20,0],[65,22,65,35,0],[65,36,65,38,0],[65,39,66,29,0],[66,29,66,87,0],[66,87,66,88,0],[65,39,66,88,0],[67,13,67,14,0],[69,17,69,56,0],[70,13,70,14,0],[72,13,72,25,0],[73,9,73,10,0],[80,9,80,10,0],[81,13,81,30,0],[81,31,81,71,0],[83,13,83,38,0],[86,13,86,20,0],[86,22,86,30,0],[86,31,86,33,0],[86,34,86,63,0],[87,13,87,14,0],[89,17,89,58,0],[89,59,89,68,0],[90,17,90,67,0],[91,17,91,35,0],[92,17,92,18,0],[93,21,93,111,0],[94,17,94,18,0],[95,17,95,60,0],[96,13,96,14,0],[99,13,99,20,0],[99,22,99,30,0],[99,31,99,33,0],[99,34,99,60,0],[100,13,100,14,0],[102,17,102,58,0],[102,59,102,68,0],[103,17,103,64,0],[104,17,104,35,0],[105,17,105,18,0],[106,21,106,57,0],[107,17,107,18,0],[108,17,108,57,0],[109,13,109,14,0],[112,13,112,57,0],[113,13,113,66,0],[114,13,114,20,0],[114,22,114,30,0],[114,31,114,33,0],[114,34,114,67,0],[115,13,115,14,0],[117,17,117,58,0],[117,59,117,68,0],[118,17,118,74,0],[119,17,119,41,0],[119,42,119,51,0],[120,17,120,47,0],[121,17,121,92,0],[123,17,123,37,0],[124,13,124,14,0],[127,13,127,36,0],[128,13,128,14,0],[129,17,130,29,0],[130,29,130,49,0],[130,49,130,62,0],[130,62,130,76,0],[130,76,131,40,0],[129,17,131,40,0],[132,17,132,24,0],[132,26,132,41,0],[132,42,132,44,0],[132,45,132,57,0],[133,17,133,18,0],[134,21,134,60,0],[135,17,135,18,0],[136,13,136,14,0],[139,13,139,20,0],[139,22,139,30,0],[139,31,139,33,0],[139,34,139,69,0],[140,13,140,14,0],[142,17,142,58,0],[142,59,142,68,0],[143,17,143,82,0],[144,17,144,32,0],[145,17,145,18,0],[146,21,146,61,0],[147,17,147,18,0],[148,17,148,66,0],[149,13,149,14,0],[152,13,152,20,0],[152,22,152,30,0],[152,31,152,33,0],[152,34,152,63,0],[153,13,153,14,0],[155,17,155,58,0],[155,59,155,68,0],[156,17,156,83,0],[157,17,157,33,0],[158,17,158,18,0],[159,21,159,58,0],[160,17,160,18,0],[161,17,161,60,0],[162,13,162,14,0],[164,13,164,25,0],[169,13,169,65,0],[170,13,170,14,0],[172,17,172,18,0],[173,21,173,56,0],[174,21,174,88,0],[176,21,176,92,0],[176,92,176,111,0],[176,111,176,113,0],[176,21,176,113,0],[178,21,178,28,0],[178,30,178,39,0],[178,40,178,42,0],[178,43,178,93,0],[179,21,179,22,0],[181,25,181,26,0],[182,29,183,100,0],[184,25,184,26,0],[185,25,185,45,0],[186,25,186,26,0],[187,29,187,109,0],[188,25,188,26,0],[189,21,189,22,0],[190,17,190,18,0],[191,17,191,37,0],[192,17,192,18,0],[193,21,193,101,0],[194,17,194,18,0],[195,13,195,14,0],[199,13,199,20,0],[199,22,199,30,0],[199,31,199,33,0],[199,34,199,59,0],[200,13,200,14,0],[202,17,202,52,0],[203,17,203,34,0],[204,17,204,18,0],[205,21,205,55,0],[206,25,206,60,0],[208,21,208,59,0],[209,21,209,47,0],[210,21,210,22,0],[211,25,211,47,0],[213,21,213,22,0],[214,17,214,18,0],[215,17,215,46,0],[216,13,216,14,0],[217,13,217,25,0],[218,13,218,47,0],[221,13,221,30,0],[222,13,222,14,0],[223,17,223,42,0],[224,13,224,14,0],[225,13,225,65,0],[226,13,226,89,0],[227,9,227,10,0],[234,9,234,10,0],[235,13,238,26,0],[238,26,238,37,0],[238,37,241,21,0],[241,21,241,22,0],[241,22,243,25,0],[243,25,245,83,0],[245,83,246,21,0],[246,21,246,22,0],[246,22,248,17,0],[248,17,248,18,0],[248,18,250,21,0],[250,21,250,56,0],[250,56,250,65,0],[250,65,250,67,0],[250,21,250,67,0],[250,67,252,21,0],[252,21,252,48,0],[252,48,252,71,0],[252,71,252,81,0],[252,21,252,81,0],[252,81,253,17,0],[253,17,253,18,0],[253,18,254,33,0],[254,33,265,18,0],[265,18,266,27,0],[235,13,266,27,0],[267,9,267,10,0],[277,9,277,10,0],[278,13,278,61,0],[279,13,279,33,0],[280,17,280,35,0],[282,13,282,30,0],[284,13,284,25,0],[285,9,285,10,0],[288,9,288,10,0],[289,13,289,105,0],[291,13,291,64,0],[293,13,293,90,0],[294,13,294,35,0],[295,13,295,39,0],[296,13,296,45,0],[297,13,297,41,0],[298,13,298,41,0],[299,13,299,47,0],[300,13,300,39,0],[301,13,301,73,0],[302,13,302,79,0],[303,13,303,79,0],[304,13,304,75,0],[305,13,305,85,0],[306,13,306,69,0],[307,13,307,80,0],[308,13,308,77,0],[309,13,309,69,0],[310,13,310,33,0],[311,13,311,41,0],[313,13,315,32,0],[318,13,318,39,0],[319,13,319,65,0],[320,13,320,14,0],[321,17,321,129,0],[322,17,322,64,0],[323,17,323,18,0],[324,21,324,48,0],[325,17,325,18,0],[326,13,326,14,0],[327,9,327,10,0],[330,9,330,10,0],[331,13,331,75,0],[332,13,333,13,0],[333,13,333,14,0],[333,14,334,17,0],[334,17,334,41,0],[334,41,334,42,0],[334,42,334,55,0],[334,55,336,17,0],[336,17,336,47,0],[336,47,337,17,0],[337,17,337,18,0],[337,18,338,21,0],[338,21,338,33,0],[338,33,343,17,0],[343,17,343,112,0],[343,112,344,17,0],[344,17,344,18,0],[344,18,345,21,0],[345,21,345,47,0],[345,47,345,48,0],[345,48,345,60,0],[345,60,346,17,0],[346,17,346,18,0],[346,18,347,17,0],[347,17,347,30,0],[347,30,348,13,0],[348,13,348,14,0],[348,14,348,16,0],[332,13,348,16,0],[349,13,349,31,0],[350,13,350,14,0],[352,17,352,30,0],[354,13,354,25,0],[355,9,355,10,0],[360,9,360,10,0],[361,13,361,67,0],[362,13,362,14,0],[363,17,363,86,0],[366,13,366,72,0],[368,13,368,45,0],[369,13,369,70,0],[371,13,371,79,0],[374,13,374,44,0],[375,13,375,14,0],[376,17,376,98,0],[380,13,383,15,0],[386,13,386,20,0],[386,22,386,30,0],[386,31,386,33,0],[386,34,386,49,0],[387,13,387,14,0],[388,17,388,94,0],[389,17,389,87,0],[392,17,392,78,0],[393,17,393,18,0],[395,21,395,83,0],[398,21,398,63,0],[404,21,404,68,0],[405,21,405,99,0],[406,21,406,82,0],[409,21,409,52,0],[411,21,411,89,0],[413,21,413,43,0],[414,21,414,22,0],[416,25,417,97,0],[420,17,420,18,0],[422,17,422,18,0],[423,21,426,52,0],[427,17,427,18,0],[429,13,429,14,0],[431,13,431,26,0],[433,9,433,10,0],[442,9,442,10,0],[444,13,444,74,0],[445,13,445,100,0],[446,13,446,14,0],[448,24,448,94,0],[449,17,449,18,0],[450,21,450,76,0],[451,17,451,18,0],[452,13,452,14,0],[454,13,459,15,0],[462,13,462,44,0],[464,13,464,81,0],[466,13,466,35,0],[467,13,467,14,0],[469,17,470,89,0],[473,13,473,26,0],[474,9,474,10,0],[483,9,483,10,0],[484,13,484,105,0],[486,13,486,58,0],[488,13,488,65,0],[489,13,489,14,0],[490,17,490,129,0],[491,17,491,64,0],[492,17,492,18,0],[493,21,494,129,0],[496,13,496,14,0],[498,13,498,91,0],[499,13,499,155,0],[501,13,501,26,0],[502,9,502,10,0],[511,9,511,10,0],[512,13,512,105,0],[513,13,513,76,0],[514,13,514,88,0],[515,13,515,26,0],[516,9,516,10,0],[525,9,525,10,0],[526,13,526,105,0],[527,13,527,76,0],[528,13,528,96,0],[529,13,529,26,0],[530,9,530,10,0],[539,9,539,10,0],[540,13,540,105,0],[541,13,541,74,0],[542,13,542,76,0],[543,13,543,90,0],[545,13,545,146,0],[546,13,546,90,0],[550,13,550,104,0],[551,13,551,89,0],[554,13,554,34,0],[555,13,555,59,0],[556,13,556,14,0],[557,17,559,203,0],[560,13,560,14,0],[562,13,570,15,0],[572,9,572,10,0]]);
+    </script>
+  </body>
+</html>

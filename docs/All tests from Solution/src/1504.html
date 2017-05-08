@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\ContentTypeServiceExtensions.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Models;
+
+namespace Umbraco.Core.Services
+{
+    public static class ContentTypeServiceExtensions
+    {
+        /// &lt;summary&gt;
+        /// Returns the available composite content types for a given content type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;allContentTypes&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;filterContentTypes&quot;&gt;
+        /// This is normally an empty list but if additional content type aliases are passed in, any content types containing those aliases will be filtered out
+        /// along with any content types that have matching property types that are included in the filtered content types
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;ctService&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;source&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;filterPropertyTypes&quot;&gt;
+        /// This is normally an empty list but if additional property type aliases are passed in, any content types that have these aliases will be filtered out.
+        /// This is required because in the case of creating/modifying a content type because new property types being added to it are not yet persisted so cannot
+        /// be looked up via the db, they need to be passed in.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static ContentTypeAvailableCompositionsResults GetAvailableCompositeContentTypes(this IContentTypeService ctService,
+            IContentTypeComposition source,
+            IContentTypeComposition[] allContentTypes,
+            string[] filterContentTypes = null,
+            string[] filterPropertyTypes = null)
+        {            
+            filterContentTypes = filterContentTypes == null
+                ? new string[] { }
+                : filterContentTypes.Where(x =&gt; x.IsNullOrWhiteSpace() == false).ToArray();
+
+            filterPropertyTypes = filterPropertyTypes == null
+                ? new string[] {}
+                : filterPropertyTypes.Where(x =&gt; x.IsNullOrWhiteSpace() == false).ToArray();
+
+            //create the full list of property types to use as the filter
+            //this is the combination of all property type aliases found in the content types passed in for the filter
+            //as well as the specific property types passed in for the filter
+            filterPropertyTypes = allContentTypes
+                    .Where(c =&gt; filterContentTypes.InvariantContains(c.Alias))
+                    .SelectMany(c =&gt; c.PropertyTypes)
+                    .Select(c =&gt; c.Alias)
+                    .Union(filterPropertyTypes)
+                    .ToArray();
+
+            var sourceId = source != null ? source.Id : 0;
+                        
+            // find out if any content type uses this content type
+            var isUsing = allContentTypes.Where(x =&gt; x.ContentTypeComposition.Any(y =&gt; y.Id == sourceId)).ToArray();
+            if (isUsing.Length &gt; 0)
+            {
+                //if already in use a composition, do not allow any composited types
+                return new ContentTypeAvailableCompositionsResults();
+            }
+
+            // if it is not used then composition is possible
+            // hashset guarantees unicity on Id
+            var list = new HashSet&lt;IContentTypeComposition&gt;(new DelegateEqualityComparer&lt;IContentTypeComposition&gt;(
+                (x, y) =&gt; x.Id == y.Id,
+                x =&gt; x.Id));
+
+            // usable types are those that are top-level
+            var usableContentTypes = allContentTypes
+                .Where(x =&gt; x.ContentTypeComposition.Any() == false).ToArray();
+            foreach (var x in usableContentTypes)
+                list.Add(x);
+            
+            // indirect types are those that we use, directly or indirectly
+            var indirectContentTypes = GetDirectOrIndirect(source).ToArray();
+            foreach (var x in indirectContentTypes)
+                list.Add(x);
+
+            //At this point we have a list of content types that &#39;could&#39; be compositions
+            
+            //now we&#39;ll filter this list based on the filters requested
+            var filtered = list                
+                .Where(x =&gt;
+                {
+                    //need to filter any content types that are included in this list
+                    return filterContentTypes.Any(c =&gt; c.InvariantEquals(x.Alias)) == false;
+                })
+                .Where(x =&gt;
+                {
+                    //need to filter any content types that have matching property aliases that are included in this list                    
+                    //ensure that we don&#39;t return if there&#39;s any overlapping property aliases from the filtered ones specified
+                    return filterPropertyTypes.Intersect(
+                        x.PropertyTypes.Select(p =&gt; p.Alias), 
+                        StringComparer.InvariantCultureIgnoreCase).Any() == false;
+                })
+                .OrderBy(x =&gt; x.Name)                
+                .ToList();
+
+            //get ancestor ids - we will filter all ancestors
+            var ancestors = GetAncestors(source, allContentTypes);
+            var ancestorIds = ancestors.Select(x =&gt; x.Id).ToArray();
+
+            //now we can create our result based on what is still available and the ancestors
+            var result = list
+                //not itself
+                .Where(x =&gt; x.Id != sourceId)
+                .OrderBy(x =&gt; x.Name)
+                .Select(composition =&gt; filtered.Contains(composition)
+                ? new ContentTypeAvailableCompositionsResult(composition, ancestorIds.Contains(composition.Id) == false)
+                : new ContentTypeAvailableCompositionsResult(composition, false)).ToList();
+
+            return new ContentTypeAvailableCompositionsResults(ancestors, result);
+        }
+
+        private static IContentTypeComposition[] GetAncestors(IContentTypeComposition ctype, IContentTypeComposition[] allContentTypes)
+        {
+            if (ctype == null) return new IContentTypeComposition[] {};
+            var ancestors = new List&lt;IContentTypeComposition&gt;();
+            var parentId = ctype.ParentId;
+            while (parentId &gt; 0)
+            {
+                var parent = allContentTypes.FirstOrDefault(x =&gt; x.Id == parentId);
+                if (parent != null)
+                {
+                    ancestors.Add(parent);
+                    parentId = parent.ParentId;
+                }
+                else
+                {
+                    parentId = -1;
+                }
+            }
+            return ancestors.ToArray();
+        }
+
+        /// &lt;summary&gt;
+        /// Get those that we use directly
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ctype&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private static IEnumerable&lt;IContentTypeComposition&gt; GetDirectOrIndirect(IContentTypeComposition ctype)
+        {
+            if (ctype == null) return Enumerable.Empty&lt;IContentTypeComposition&gt;();
+
+            // hashset guarantees unicity on Id
+            var all = new HashSet&lt;IContentTypeComposition&gt;(new DelegateEqualityComparer&lt;IContentTypeComposition&gt;(
+                (x, y) =&gt; x.Id == y.Id,
+                x =&gt; x.Id));
+
+            var stack = new Stack&lt;IContentTypeComposition&gt;();
+            
+            foreach (var x in ctype.ContentTypeComposition)
+                stack.Push(x);
+
+            while (stack.Count &gt; 0)
+            {
+                var x = stack.Pop();
+                all.Add(x);
+                foreach (var y in x.ContentTypeComposition)
+                    stack.Push(y);
+            }
+
+            return all;
+        }
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[31,9,31,10,1],[32,13,34,49,1],[34,49,34,80,1],[34,80,34,92,1],[32,13,34,92,1],[36,13,38,50,1],[38,50,38,81,1],[38,81,38,93,1],[36,13,38,93,1],[43,13,44,33,1],[44,33,44,78,1],[44,78,45,38,1],[45,38,45,53,1],[45,53,46,34,1],[46,34,46,41,1],[46,41,48,32,1],[43,13,48,32,1],[50,13,50,59,1],[53,13,53,54,1],[53,54,53,88,1],[53,88,53,104,1],[53,104,53,105,1],[53,54,53,105,1],[53,105,53,117,1],[53,13,53,117,1],[54,13,54,36,1],[55,13,55,14,1],[57,17,57,70,1],[62,13,63,27,1],[63,27,63,39,1],[63,39,64,22,1],[64,22,64,26,1],[64,26,64,29,1],[62,13,64,29,1],[67,13,68,29,1],[68,29,68,68,1],[68,68,68,80,1],[67,13,68,80,1],[69,13,69,20,1],[69,22,69,27,1],[69,28,69,30,1],[69,31,69,49,1],[70,17,70,29,1],[73,13,73,78,1],[74,13,74,20,1],[74,22,74,27,1],[74,28,74,30,1],[74,31,74,51,1],[75,17,75,29,1],[80,13,82,17,1],[82,17,82,18,1],[82,18,84,21,1],[84,21,84,56,1],[84,56,84,82,1],[84,82,84,93,1],[84,21,84,93,1],[84,93,85,17,1],[85,17,85,18,1],[85,18,87,17,1],[87,17,87,18,1],[87,18,90,21,1],[90,21,91,53,1],[91,53,91,60,1],[91,60,92,83,1],[90,21,92,83,1],[92,83,93,17,1],[93,17,93,18,1],[93,18,94,31,1],[94,31,94,37,1],[94,37,95,27,1],[80,13,95,27,1],[98,13,98,67,1],[99,13,99,53,1],[99,53,99,57,0],[99,57,99,69,1],[99,13,99,69,1],[102,13,104,29,1],[104,29,104,45,1],[104,45,105,31,1],[105,31,105,37,1],[105,37,106,40,1],[106,40,108,81,1],[108,81,108,92,1],[102,13,108,92,1],[110,13,110,83,1],[111,9,111,10,1],[114,9,114,10,1],[115,13,115,31,1],[115,32,115,72,0],[116,13,116,65,1],[117,13,117,43,1],[118,13,118,33,1],[119,13,119,14,0],[120,17,120,66,0],[120,66,120,82,0],[120,82,120,84,0],[120,17,120,84,0],[121,17,121,36,0],[122,17,122,18,0],[123,21,123,43,0],[124,21,124,48,0],[125,17,125,18,0],[127,17,127,18,0],[128,21,128,35,0],[129,17,129,18,0],[130,13,130,14,0],[131,13,131,40,1],[132,9,132,10,1],[140,9,140,10,1],[141,13,141,31,1],[141,32,141,83,0],[144,13,145,27,1],[145,27,145,39,0],[145,39,146,22,1],[146,22,146,26,1],[146,26,146,29,1],[144,13,146,29,1],[148,13,148,62,1],[150,13,150,20,1],[150,22,150,27,1],[150,28,150,30,1],[150,31,150,59,1],[151,17,151,31,1],[153,13,153,36,1],[154,13,154,14,1],[155,17,155,37,1],[156,17,156,28,1],[157,17,157,24,1],[157,26,157,31,1],[157,32,157,34,1],[157,35,157,59,1],[158,21,158,35,1],[159,13,159,14,1],[161,13,161,24,1],[162,9,162,10,1]]);
+    </script>
+  </body>
+</html>

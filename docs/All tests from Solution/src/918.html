@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Security\Identity\AppBuilderExtensions.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Threading;
+using System.Web;
+using Microsoft.AspNet.Identity;
+using Microsoft.AspNet.Identity.Owin;
+using Microsoft.Owin;
+using Microsoft.Owin.Extensions;
+using Microsoft.Owin.Logging;
+using Microsoft.Owin.Security;
+using Microsoft.Owin.Security.Cookies;
+using Owin;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.Identity;
+using Umbraco.Core.Security;
+using Constants = Umbraco.Core.Constants;
+
+namespace Umbraco.Web.Security.Identity
+{
+    public static class AppBuilderExtensions
+    {
+        /// &lt;summary&gt;
+        /// Called at the end of configuring middleware
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// This could be used for something else in the future - maybe to inform Umbraco that middleware is done/ready, but for
+        /// now this is used to raise the custom event
+        /// 
+        /// This is an extension method in case developer entirely replace the UmbracoDefaultOwinStartup class, in which case they will
+        /// need to ensure they call this extension method in their startup class.
+        /// 
+        /// TODO: Move this method in v8, it doesn&#39;t belong in this namespace/extension class
+        /// &lt;/remarks&gt;
+        public static void FinalizeMiddlewareConfiguration(this IAppBuilder app)
+        {
+            UmbracoDefaultOwinStartup.OnMiddlewareConfigured(new OwinMiddlewareConfiguredEventArgs(app));
+        }
+
+        /// &lt;summary&gt;
+        /// Sets the OWIN logger to use Umbraco&#39;s logging system
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// TODO: Move this method in v8, it doesn&#39;t belong in this namespace/extension class
+        /// &lt;/remarks&gt;
+        public static void SetUmbracoLoggerFactory(this IAppBuilder app)
+        {
+            app.SetLoggerFactory(new OwinLoggerFactory());
+        }
+        
+        /// &lt;summary&gt;
+        /// Configure Default Identity User Manager for Umbraco
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;appContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userMembershipProvider&quot;&gt;&lt;/param&gt;
+        public static void ConfigureUserManagerForUmbracoBackOffice(this IAppBuilder app,
+            ApplicationContext appContext,
+            MembershipProviderBase userMembershipProvider)
+        {
+            if (appContext == null) throw new ArgumentNullException(&quot;appContext&quot;);
+            if (userMembershipProvider == null) throw new ArgumentNullException(&quot;userMembershipProvider&quot;);
+
+            //Configure Umbraco user manager to be created per request
+            app.CreatePerOwinContext&lt;BackOfficeUserManager&gt;(
+                (options, owinContext) =&gt; BackOfficeUserManager.Create(
+                    options,
+                    appContext.Services.UserService,
+                    appContext.Services.ExternalLoginService,
+                    userMembershipProvider));
+            
+            app.SetBackOfficeUserManagerType&lt;BackOfficeUserManager, BackOfficeIdentityUser&gt;();
+
+            //Create a sign in manager per request
+            app.CreatePerOwinContext&lt;BackOfficeSignInManager&gt;((options, context) =&gt; BackOfficeSignInManager.Create(options, context, app.CreateLogger&lt;BackOfficeSignInManager&gt;()));
+        }
+
+        /// &lt;summary&gt;
+        /// Configure a custom UserStore with the Identity User Manager for Umbraco
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;appContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userMembershipProvider&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;customUserStore&quot;&gt;&lt;/param&gt;
+        public static void ConfigureUserManagerForUmbracoBackOffice(this IAppBuilder app,
+            ApplicationContext appContext,
+            MembershipProviderBase userMembershipProvider,
+            BackOfficeUserStore customUserStore)
+        {
+            if (appContext == null) throw new ArgumentNullException(&quot;appContext&quot;);
+            if (userMembershipProvider == null) throw new ArgumentNullException(&quot;userMembershipProvider&quot;);
+            if (customUserStore == null) throw new ArgumentNullException(&quot;customUserStore&quot;);
+
+            //Configure Umbraco user manager to be created per request
+            app.CreatePerOwinContext&lt;BackOfficeUserManager&gt;(
+                (options, owinContext) =&gt; BackOfficeUserManager.Create(
+                    options,
+                    customUserStore,
+                    userMembershipProvider));
+
+            app.SetBackOfficeUserManagerType&lt;BackOfficeUserManager, BackOfficeIdentityUser&gt;();
+
+            //Create a sign in manager per request
+            app.CreatePerOwinContext&lt;BackOfficeSignInManager&gt;((options, context) =&gt; BackOfficeSignInManager.Create(options, context, app.CreateLogger(typeof(BackOfficeSignInManager).FullName)));
+        }
+
+        /// &lt;summary&gt;
+        /// Configure a custom BackOfficeUserManager for Umbraco
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;appContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userManager&quot;&gt;&lt;/param&gt;
+        public static void ConfigureUserManagerForUmbracoBackOffice&lt;TManager, TUser&gt;(this IAppBuilder app,
+            ApplicationContext appContext,
+            Func&lt;IdentityFactoryOptions&lt;TManager&gt;, IOwinContext, TManager&gt; userManager)
+            where TManager : BackOfficeUserManager&lt;TUser&gt;
+            where TUser : BackOfficeIdentityUser
+        {
+            if (appContext == null) throw new ArgumentNullException(&quot;appContext&quot;);
+            if (userManager == null) throw new ArgumentNullException(&quot;userManager&quot;);
+
+            //Configure Umbraco user manager to be created per request
+            app.CreatePerOwinContext&lt;TManager&gt;(userManager);
+
+            app.SetBackOfficeUserManagerType&lt;TManager, TUser&gt;();
+
+            //Create a sign in manager per request
+            app.CreatePerOwinContext&lt;BackOfficeSignInManager&gt;(
+                (options, context) =&gt; BackOfficeSignInManager.Create(options, context, app.CreateLogger(typeof(BackOfficeSignInManager).FullName)));
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures that the UmbracoBackOfficeAuthenticationMiddleware is assigned to the pipeline
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;appContext&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// By default this will be configured to execute on PipelineStage.Authenticate
+        /// &lt;/remarks&gt;
+        public static IAppBuilder UseUmbracoBackOfficeCookieAuthentication(this IAppBuilder app, ApplicationContext appContext)
+        {
+            return app.UseUmbracoBackOfficeCookieAuthentication(appContext, PipelineStage.Authenticate);
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures that the UmbracoBackOfficeAuthenticationMiddleware is assigned to the pipeline
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;appContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;stage&quot;&gt;
+        /// Configurable pipeline stage
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IAppBuilder UseUmbracoBackOfficeCookieAuthentication(this IAppBuilder app, ApplicationContext appContext, PipelineStage stage)
+        {
+            //Create the default options and provider
+            var authOptions = app.CreateUmbracoCookieAuthOptions();
+
+            authOptions.Provider = new BackOfficeCookieAuthenticationProvider
+            {
+                // Enables the application to validate the security stamp when the user 
+                // logs in. This is a security feature which is used when you 
+                // change a password or add an external login to your account.  
+                OnValidateIdentity = SecurityStampValidator
+                    .OnValidateIdentity&lt;BackOfficeUserManager, BackOfficeIdentityUser, int&gt;(
+                        TimeSpan.FromMinutes(30),
+                        (manager, user) =&gt; user.GenerateUserIdentityAsync(manager),
+                        identity =&gt; identity.GetUserId&lt;int&gt;()),
+
+            };
+
+            return app.UseUmbracoBackOfficeCookieAuthentication(appContext, authOptions, stage);
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures that the UmbracoBackOfficeAuthenticationMiddleware is assigned to the pipeline
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;appContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;cookieOptions&quot;&gt;Custom auth cookie options can be specified to have more control over the cookie authentication logic&lt;/param&gt;
+        /// &lt;param name=&quot;stage&quot;&gt;
+        /// Configurable pipeline stage
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IAppBuilder UseUmbracoBackOfficeCookieAuthentication(this IAppBuilder app, ApplicationContext appContext, CookieAuthenticationOptions cookieOptions, PipelineStage stage)
+        {
+            if (app == null) throw new ArgumentNullException(&quot;app&quot;);
+            if (appContext == null) throw new ArgumentNullException(&quot;appContext&quot;);
+            if (cookieOptions == null) throw new ArgumentNullException(&quot;cookieOptions&quot;);
+            if (cookieOptions.Provider == null) throw new ArgumentNullException(&quot;cookieOptions.Provider&quot;);
+            if ((cookieOptions.Provider is BackOfficeCookieAuthenticationProvider) == false) throw new ArgumentException(&quot;The cookieOptions.Provider must be of type &quot; + typeof(BackOfficeCookieAuthenticationProvider));
+            
+            app.UseUmbracoBackOfficeCookieAuthenticationInternal(cookieOptions, appContext, stage);
+
+            //don&#39;t apply if app is not ready
+            if (appContext.IsUpgrading || appContext.IsConfigured)
+            {
+                var getSecondsOptions = app.CreateUmbracoCookieAuthOptions(
+                    //This defines the explicit path read cookies from for this middleware
+                    new[] {string.Format(&quot;{0}/backoffice/UmbracoApi/Authentication/GetRemainingTimeoutSeconds&quot;, GlobalSettings.Path)});
+                getSecondsOptions.Provider = cookieOptions.Provider;
+
+                //This is a custom middleware, we need to return the user&#39;s remaining logged in seconds
+                app.Use&lt;GetUserSecondsMiddleWare&gt;(
+                    getSecondsOptions,
+                    UmbracoConfig.For.UmbracoSettings().Security,
+                    app.CreateLogger&lt;GetUserSecondsMiddleWare&gt;());
+            }
+
+            return app;
+        }
+
+        private static bool _markerSet = false;
+
+        /// &lt;summary&gt;
+        /// This registers the exact type of the user manager in owin so we can extract it
+        /// when required in order to extract the user manager instance
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TManager&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;typeparam name=&quot;TUser&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// This is required because a developer can specify a custom user manager and due to generic types the key name will registered
+        /// differently in the owin context
+        /// &lt;/remarks&gt; 
+        private static void SetBackOfficeUserManagerType&lt;TManager, TUser&gt;(this IAppBuilder app)
+            where TManager : BackOfficeUserManager&lt;TUser&gt;
+            where TUser : BackOfficeIdentityUser
+        {
+            if (_markerSet) throw new InvalidOperationException(&quot;The back office user manager marker has already been set, only one back office user manager can be configured&quot;);
+
+            //on each request set the user manager getter - 
+            // this is required purely because Microsoft.Owin.IOwinContext is super inflexible with it&#39;s Get since it can only be
+            // a generic strongly typed instance
+            app.Use((context, func) =&gt;
+            {
+                context.Set(BackOfficeUserManager.OwinMarkerKey, new BackOfficeUserManagerMarker&lt;TManager, TUser&gt;());
+                return func();
+            });            
+        }
+
+        private static void UseUmbracoBackOfficeCookieAuthenticationInternal(this IAppBuilder app, CookieAuthenticationOptions options, ApplicationContext appContext, PipelineStage stage)
+        {
+            if (app == null)
+            {
+                throw new ArgumentNullException(&quot;app&quot;);
+            }
+
+            //First the normal cookie middleware
+            app.Use(typeof(CookieAuthenticationMiddleware), app, options);
+            //don&#39;t apply if app isnot ready
+            if (appContext.IsUpgrading || appContext.IsConfigured)
+            {
+                //Then our custom middlewares
+                app.Use(typeof(ForceRenewalCookieAuthenticationMiddleware), app, options, new SingletonUmbracoContextAccessor());
+                app.Use(typeof(FixWindowsAuthMiddlware));                
+            }
+
+            //Marks all of the above middlewares to execute on Authenticate
+            app.UseStageMarker(stage);            
+        }
+
+
+        /// &lt;summary&gt;
+        /// Ensures that the cookie middleware for validating external logins is assigned to the pipeline with the correct
+        /// Umbraco back office configuration
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;appContext&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// By default this will be configured to execute on PipelineStage.Authenticate
+        /// &lt;/remarks&gt;
+        public static IAppBuilder UseUmbracoBackOfficeExternalCookieAuthentication(this IAppBuilder app, ApplicationContext appContext)
+        {
+            return app.UseUmbracoBackOfficeExternalCookieAuthentication(appContext, PipelineStage.Authenticate);
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures that the cookie middleware for validating external logins is assigned to the pipeline with the correct
+        /// Umbraco back office configuration
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;appContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;stage&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IAppBuilder UseUmbracoBackOfficeExternalCookieAuthentication(this IAppBuilder app, ApplicationContext appContext, PipelineStage stage)
+        {
+            if (app == null) throw new ArgumentNullException(&quot;app&quot;);
+            if (appContext == null) throw new ArgumentNullException(&quot;appContext&quot;);
+
+            app.UseCookieAuthentication(new CookieAuthenticationOptions
+            {
+                AuthenticationType = Constants.Security.BackOfficeExternalAuthenticationType,
+                AuthenticationMode = AuthenticationMode.Passive,
+                CookieName = Constants.Security.BackOfficeExternalCookieName,
+                ExpireTimeSpan = TimeSpan.FromMinutes(5),
+                //Custom cookie manager so we can filter requests
+                CookieManager = new BackOfficeCookieManager(new SingletonUmbracoContextAccessor()),
+                CookiePath = &quot;/&quot;,
+                CookieSecure = GlobalSettings.UseSSL ? CookieSecureOption.Always : CookieSecureOption.SameAsRequest,
+                CookieHttpOnly = true,
+                CookieDomain = UmbracoConfig.For.UmbracoSettings().Security.AuthCookieDomain
+            }, stage);
+
+            return app;
+        }
+
+        /// &lt;summary&gt;
+        /// In order for preview to work this needs to be called
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;appContext&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This ensures that during a preview request that the back office use is also Authenticated and that the back office Identity
+        /// is added as a secondary identity to the current IPrincipal so it can be used to Authorize the previewed document.
+        /// &lt;/remarks&gt;
+        /// &lt;remarks&gt;
+        /// By default this will be configured to execute on PipelineStage.PostAuthenticate
+        /// &lt;/remarks&gt;
+        public static IAppBuilder UseUmbracoPreviewAuthentication(this IAppBuilder app, ApplicationContext appContext)
+        {
+            return app.UseUmbracoPreviewAuthentication(appContext, PipelineStage.PostAuthenticate);
+        }
+
+        /// &lt;summary&gt;
+        /// In order for preview to work this needs to be called
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;appContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;stage&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This ensures that during a preview request that the back office use is also Authenticated and that the back office Identity
+        /// is added as a secondary identity to the current IPrincipal so it can be used to Authorize the previewed document.
+        /// &lt;/remarks&gt;
+        public static IAppBuilder UseUmbracoPreviewAuthentication(this IAppBuilder app, ApplicationContext appContext, PipelineStage stage)
+        {
+            //don&#39;t apply if app isnot ready
+            if (appContext.IsConfigured)
+            {
+                var authOptions = app.CreateUmbracoCookieAuthOptions();                
+                app.Use(typeof(PreviewAuthenticationMiddleware),  authOptions);
+
+                //This middleware must execute at least on PostAuthentication, by default it is on Authorize
+                // The middleware needs to execute after the RoleManagerModule executes which is during PostAuthenticate, 
+                // currently I&#39;ve had 100% success with ensuring this fires after RoleManagerModule even if this is set
+                // to PostAuthenticate though not sure if that&#39;s always a guarantee so by default it&#39;s Authorize.
+                if (stage &lt; PipelineStage.PostAuthenticate)
+                {
+                    throw new InvalidOperationException(&quot;The stage specified for UseUmbracoPreviewAuthentication must be greater than or equal to &quot; + PipelineStage.PostAuthenticate);
+                }
+
+                
+                app.UseStageMarker(stage);
+            }
+
+            return app;
+        }
+
+        public static void SanitizeThreadCulture(this IAppBuilder app)
+        {
+            Thread.CurrentThread.SanitizeThreadCulture();
+        }
+
+        /// &lt;summary&gt;
+        /// Create the default umb cookie auth options
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;explicitPaths&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static UmbracoBackOfficeCookieAuthOptions CreateUmbracoCookieAuthOptions(this IAppBuilder app, string[] explicitPaths = null)
+        {
+            var authOptions = new UmbracoBackOfficeCookieAuthOptions(
+                explicitPaths,
+                UmbracoConfig.For.UmbracoSettings().Security,
+                GlobalSettings.TimeOutInMinutes,
+                GlobalSettings.UseSSL);
+            return authOptions;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[41,9,41,10,0],[42,13,42,106,0],[43,9,43,10,0],[53,9,53,10,0],[54,13,54,59,0],[55,9,55,10,0],[66,9,66,10,0],[67,13,67,36,0],[67,37,67,83,0],[68,13,68,48,0],[68,49,68,107,0],[71,13,72,43,0],[72,43,76,44,0],[76,44,76,46,0],[71,13,76,46,0],[78,13,78,95,0],[81,13,81,85,0],[81,85,81,178,0],[81,178,81,180,0],[81,13,81,180,0],[82,9,82,10,0],[95,9,95,10,0],[96,13,96,36,0],[96,37,96,83,0],[97,13,97,48,0],[97,49,97,107,0],[98,13,98,41,0],[98,42,98,93,0],[101,13,102,43,0],[102,43,105,44,0],[105,44,105,46,0],[101,13,105,46,0],[107,13,107,95,0],[110,13,110,85,0],[110,85,110,193,0],[110,193,110,195,0],[110,13,110,195,0],[111,9,111,10,0],[124,9,124,10,0],[125,13,125,36,0],[125,37,125,83,0],[126,13,126,37,0],[126,38,126,85,0],[129,13,129,61,0],[131,13,131,65,0],[134,13,135,39,0],[135,39,135,147,0],[135,147,135,149,0],[134,13,135,149,0],[136,9,136,10,0],[148,9,148,10,0],[149,13,149,105,0],[150,9,150,10,0],[162,9,162,10,0],[164,13,164,68,0],[166,13,174,44,0],[174,44,174,83,0],[174,83,175,37,0],[175,37,175,62,0],[175,62,177,15,0],[166,13,177,15,0],[179,13,179,97,0],[180,9,180,10,0],[193,9,193,10,0],[194,13,194,29,0],[194,30,194,69,0],[195,13,195,36,0],[195,37,195,83,0],[196,13,196,39,0],[196,40,196,89,0],[197,13,197,48,0],[197,49,197,107,0],[198,13,198,93,0],[198,94,198,218,0],[200,13,200,100,0],[203,13,203,67,0],[204,13,204,14,0],[205,17,207,136,0],[208,17,208,69,0],[211,17,214,67,0],[215,13,215,14,0],[217,13,217,24,0],[218,9,218,10,0],[220,9,220,48,0],[236,9,236,10,0],[237,13,237,28,0],[237,29,237,178,0],[242,13,243,13,0],[243,13,243,14,0],[243,14,244,17,0],[244,17,244,118,0],[244,118,245,17,0],[245,17,245,31,0],[245,31,246,13,0],[246,13,246,14,0],[246,14,246,16,0],[242,13,246,16,0],[247,9,247,10,0],[250,9,250,10,0],[251,13,251,29,0],[252,13,252,14,0],[253,17,253,56,0],[257,13,257,75,0],[259,13,259,67,0],[260,13,260,14,0],[262,17,262,130,0],[263,17,263,58,0],[264,13,264,14,0],[267,13,267,39,0],[268,9,268,10,0],[282,9,282,10,0],[283,13,283,113,0],[284,9,284,10,0],[295,9,295,10,0],[296,13,296,29,0],[296,30,296,69,0],[297,13,297,36,0],[297,37,297,83,0],[299,13,311,23,0],[313,13,313,24,0],[314,9,314,10,0],[330,9,330,10,0],[331,13,331,100,0],[332,9,332,10,0],[346,9,346,10,0],[348,13,348,41,0],[349,13,349,14,0],[350,17,350,72,0],[351,17,351,80,0],[357,17,357,60,0],[358,17,358,18,0],[359,21,359,183,0],[363,17,363,43,0],[364,13,364,14,0],[366,13,366,24,0],[367,9,367,10,0],[370,9,370,10,0],[371,13,371,58,0],[372,9,372,10,0],[381,9,381,10,0],[382,13,386,40,0],[387,13,387,32,0],[388,9,388,10,0]]);
+    </script>
+  </body>
+</html>

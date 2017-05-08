@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\IO\FileSystemProviderManager.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using Umbraco.Core.CodeAnnotations;
+using Umbraco.Core.Configuration;
+
+namespace Umbraco.Core.IO
+{	
+    public class FileSystemProviderManager
+    {
+        private readonly FileSystemProvidersSection _config;
+
+        #region Singleton
+
+        private static readonly FileSystemProviderManager Instance = new FileSystemProviderManager();
+
+        public static FileSystemProviderManager Current
+        {
+            get { return Instance; }
+        }
+
+        #endregion
+
+        #region Constructors
+
+        internal FileSystemProviderManager()
+        {
+            _config = (FileSystemProvidersSection)ConfigurationManager.GetSection(&quot;umbracoConfiguration/FileSystemProviders&quot;);
+        }
+
+        #endregion
+
+		/// &lt;summary&gt;
+		/// used to cache the lookup of how to construct this object so we don&#39;t have to reflect each time.
+		/// &lt;/summary&gt;
+		private class ProviderConstructionInfo
+		{
+			public object[] Parameters { get; set; }
+			public ConstructorInfo Constructor { get; set; }
+			public string ProviderAlias { get; set; }
+		}
+
+		private readonly ConcurrentDictionary&lt;string, ProviderConstructionInfo&gt; _providerLookup = new ConcurrentDictionary&lt;string, ProviderConstructionInfo&gt;();
+		private readonly ConcurrentDictionary&lt;Type, string&gt; _wrappedProviderLookup = new ConcurrentDictionary&lt;Type, string&gt;(); 
+
+        /// &lt;summary&gt;
+        /// Returns the underlying (non-typed) file system provider for the alias specified
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// It is recommended to use the typed GetFileSystemProvider method instead to get a strongly typed provider instance.
+        /// &lt;/remarks&gt;
+        public IFileSystem GetUnderlyingFileSystemProvider(string alias)
+        {
+			//either get the constructor info from cache or create it and add to cache
+	        var ctorInfo = _providerLookup.GetOrAdd(alias, s =&gt;
+		        {
+			        var providerConfig = _config.Providers[s];
+			        if (providerConfig == null)
+				        throw new ArgumentException(string.Format(&quot;No provider found with the alias &#39;{0}&#39;&quot;, s));
+
+			        var providerType = Type.GetType(providerConfig.Type);
+			        if (providerType == null)
+				        throw new InvalidOperationException(string.Format(&quot;Could not find type &#39;{0}&#39;&quot;, providerConfig.Type));
+
+			        if (providerType.IsAssignableFrom(typeof (IFileSystem)))
+				        throw new InvalidOperationException(string.Format(&quot;The type &#39;{0}&#39; does not implement IFileSystem&quot;, providerConfig.Type));
+
+			        var paramCount = providerConfig.Parameters != null ? providerConfig.Parameters.Count : 0;
+			        var constructor = providerType.GetConstructors()
+				        .SingleOrDefault(x =&gt; x.GetParameters().Count() == paramCount
+				                              &amp;&amp; x.GetParameters().All(y =&gt; providerConfig.Parameters.AllKeys.Contains(y.Name)));
+			        if (constructor == null)
+				        throw new InvalidOperationException(string.Format(&quot;Could not find constructor for type &#39;{0}&#39; which accepts {1} parameters&quot;, providerConfig.Type, paramCount));
+
+			        var parameters = new object[paramCount];
+			        for (var i = 0; i &lt; paramCount; i++)
+				        parameters[i] = providerConfig.Parameters[providerConfig.Parameters.AllKeys[i]].Value;			
+
+			        //return the new constructor info class to cache so we don&#39;t have to do this again.
+			        return new ProviderConstructionInfo()
+				        {
+					        Constructor = constructor,
+					        Parameters = parameters,
+					        ProviderAlias = s
+				        };
+		        });
+
+			var fs = (IFileSystem)ctorInfo.Constructor.Invoke(ctorInfo.Parameters);
+	        return fs;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the strongly typed file system provider
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TProviderTypeFilter&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public TProviderTypeFilter GetFileSystemProvider&lt;TProviderTypeFilter&gt;()
+			where TProviderTypeFilter : FileSystemWrapper
+        {
+			//get the alias for the type from cache or look it up and add it to the cache, then we don&#39;t have to reflect each time
+	        var alias = _wrappedProviderLookup.GetOrAdd(typeof (TProviderTypeFilter), fsType =&gt;
+		        {
+					//validate the ctor
+					var constructor = fsType.GetConstructors()
+						.SingleOrDefault(x =&gt;
+										 x.GetParameters().Count() == 1 &amp;&amp; TypeHelper.IsTypeAssignableFrom&lt;IFileSystem&gt;(x.GetParameters().Single().ParameterType));
+					if (constructor == null)
+						throw new InvalidOperationException(&quot;The type of &quot; + fsType + &quot; must inherit from FileSystemWrapper and must have a constructor that accepts one parameter of type &quot; + typeof(IFileSystem));
+
+					var attr =
+						(FileSystemProviderAttribute)fsType.GetCustomAttributes(typeof(FileSystemProviderAttribute), false).
+							SingleOrDefault();
+
+					if (attr == null)
+						throw new InvalidOperationException(string.Format(&quot;The provider type filter &#39;{0}&#39; is missing the required FileSystemProviderAttribute&quot;, typeof(FileSystemProviderAttribute).FullName));
+
+			        return attr.Alias;
+		        });
+			
+            var innerFs = GetUnderlyingFileSystemProvider(alias);
+	        var outputFs = Activator.CreateInstance(typeof (TProviderTypeFilter), innerFs);
+	        return (TProviderTypeFilter)outputFs;
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[19,9,19,102,1],[23,17,23,18,1],[23,19,23,35,1],[23,36,23,37,1],[30,9,30,45,1],[31,9,31,10,1],[32,13,32,127,1],[33,9,33,10,1],[42,33,42,37,1],[42,38,42,42,1],[43,41,43,45,1],[43,46,43,50,1],[44,34,44,38,0],[44,39,44,43,1],[47,3,47,154,1],[48,3,48,121,1],[59,9,59,10,1],[61,10,62,11,1],[62,11,62,12,1],[62,12,63,12,1],[63,12,63,54,1],[63,54,64,12,1],[64,12,64,39,1],[64,39,65,13,1],[65,13,65,101,0],[65,101,67,12,1],[67,12,67,65,1],[67,65,68,12,1],[68,12,68,37,1],[68,37,69,13,1],[69,13,69,114,0],[69,114,71,12,1],[71,12,71,68,1],[71,68,72,13,1],[72,13,72,134,0],[72,134,74,12,1],[74,12,74,101,1],[74,101,75,12,1],[75,12,76,35,1],[76,35,77,65,1],[77,65,77,115,1],[77,115,77,116,1],[76,35,77,116,1],[77,116,77,118,1],[75,12,77,118,1],[77,118,78,12,1],[78,12,78,36,1],[78,36,79,13,1],[79,13,79,171,0],[79,171,81,12,1],[81,12,81,52,1],[81,52,82,17,1],[82,17,82,26,1],[82,26,82,28,1],[82,28,82,42,1],[82,42,82,44,1],[82,44,82,47,1],[82,47,83,13,1],[83,13,83,99,1],[83,99,86,12,1],[86,12,91,15,1],[91,15,92,11,1],[92,11,92,12,1],[92,12,92,14,1],[61,10,92,14,1],[94,4,94,75,1],[95,10,95,20,1],[96,9,96,10,1],[105,9,105,10,1],[107,10,108,11,1],[108,11,108,12,1],[108,12,110,6,1],[110,6,112,12,1],[112,12,112,132,1],[112,132,112,134,1],[110,6,112,134,1],[112,134,113,6,1],[113,6,113,30,1],[113,30,114,7,1],[114,7,114,195,1],[114,195,116,6,1],[116,6,118,26,1],[118,26,120,6,1],[120,6,120,23,1],[120,23,121,7,1],[121,7,121,190,0],[121,190,123,12,1],[123,12,123,30,1],[123,30,124,11,1],[124,11,124,12,1],[124,12,124,14,1],[107,10,124,14,1],[126,13,126,66,1],[127,10,127,89,1],[128,10,128,47,1],[129,9,129,10,1]]);
+    </script>
+  </body>
+</html>

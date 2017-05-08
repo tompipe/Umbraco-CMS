@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Routing\NiceUrlProviderTests.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using Moq;
+using NUnit.Framework;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Web.PublishedCache.XmlPublishedCache;
+using Umbraco.Web.Routing;
+
+namespace Umbraco.Tests.Routing
+{
+    [DatabaseTestBehavior(DatabaseBehavior.NewDbFileAndSchemaPerFixture)]
+	[TestFixture]
+	public class NiceUrlProviderTests : BaseRoutingTest
+	{
+        protected override void FreezeResolution()
+        {
+            SiteDomainHelperResolver.Current = new SiteDomainHelperResolver(new SiteDomainHelper());
+
+            base.FreezeResolution();
+        }
+
+	    private IUmbracoSettingsSection _umbracoSettings;
+
+        public override void Initialize()
+        {
+            base.Initialize();
+
+            //generate new mock settings and assign so we can configure in individual tests
+            _umbracoSettings = SettingsForTests.GenerateMockSettings();
+            SettingsForTests.ConfigureSettings(_umbracoSettings);
+        }
+
+		/// &lt;summary&gt;
+		/// This checks that when we retrieve a NiceUrl for multiple items that there are no issues with cache overlap
+		/// and that they are all cached correctly.
+        /// &lt;/summary&gt;
+		[Test]
+		public void Ensure_Cache_Is_Correct()
+		{
+			var routingContext = GetRoutingContext(&quot;/test&quot;, 1111);
+		    SettingsForTests.UseDirectoryUrls = true;
+		    SettingsForTests.HideTopLevelNodeFromPath = false;
+
+            var requestHandlerMock = Mock.Get(_umbracoSettings.RequestHandler);
+            requestHandlerMock.Setup(x =&gt; x.AddTrailingSlash).Returns(false);// (cached routes have none)
+
+			var samples = new Dictionary&lt;int, string&gt; {
+				{ 1046, &quot;/home&quot; },
+				{ 1173, &quot;/home/sub1&quot; },
+				{ 1174, &quot;/home/sub1/sub2&quot; },
+				{ 1176, &quot;/home/sub1/sub-3&quot; },
+				{ 1177, &quot;/home/sub1/custom-sub-1&quot; },
+				{ 1178, &quot;/home/sub1/custom-sub-2&quot; },
+				{ 1175, &quot;/home/sub-2&quot; },
+				{ 1172, &quot;/test-page&quot; }
+			};
+
+			foreach (var sample in samples)
+			{
+				var result = routingContext.UrlProvider.GetUrl(sample.Key);
+				Assert.AreEqual(sample.Value, result);
+			}
+
+			var randomSample = new KeyValuePair&lt;int, string&gt;(1177, &quot;/home/sub1/custom-sub-1&quot;);
+			for (int i = 0; i &lt; 5; i++)
+			{
+				var result = routingContext.UrlProvider.GetUrl(randomSample.Key);
+				Assert.AreEqual(randomSample.Value, result);
+			}
+
+            var cache = routingContext.UmbracoContext.ContentCache.InnerCache as PublishedContentCache;
+            if (cache == null) throw new Exception(&quot;Unsupported IPublishedContentCache, only the Xml one is supported.&quot;);
+
+            var cachedRoutes = cache.RoutesCache.GetCachedRoutes();
+            Assert.AreEqual(8, cachedRoutes.Count);
+
+            foreach (var sample in samples)
+            {
+                Assert.IsTrue(cachedRoutes.ContainsKey(sample.Key));
+                Assert.AreEqual(sample.Value, cachedRoutes[sample.Key]);
+            }
+
+            var cachedIds = cache.RoutesCache.GetCachedIds();
+            Assert.AreEqual(0, cachedIds.Count);
+        }
+
+		// test hideTopLevelNodeFromPath false
+		[TestCase(1046, &quot;/home/&quot;)]
+		[TestCase(1173, &quot;/home/sub1/&quot;)]
+		[TestCase(1174, &quot;/home/sub1/sub2/&quot;)]
+		[TestCase(1176, &quot;/home/sub1/sub-3/&quot;)]
+		[TestCase(1177, &quot;/home/sub1/custom-sub-1/&quot;)]
+		[TestCase(1178, &quot;/home/sub1/custom-sub-2/&quot;)]
+		[TestCase(1175, &quot;/home/sub-2/&quot;)]
+		[TestCase(1172, &quot;/test-page/&quot;)]
+		public void Get_Nice_Url_Not_Hiding_Top_Level(int nodeId, string niceUrlMatch)
+		{
+			var routingContext = GetRoutingContext(&quot;/test&quot;, 1111);
+
+		    SettingsForTests.UseDirectoryUrls = true;
+		    SettingsForTests.HideTopLevelNodeFromPath = false;
+            var requestMock = Mock.Get(_umbracoSettings.RequestHandler);
+            requestMock.Setup(x =&gt; x.UseDomainPrefixes).Returns(false);
+
+			var result = routingContext.UrlProvider.GetUrl(nodeId);
+			Assert.AreEqual(niceUrlMatch, result);
+		}
+
+		// no need for umbracoUseDirectoryUrls test = should be handled by UriUtilityTests
+
+		// test hideTopLevelNodeFromPath true
+		[TestCase(1046, &quot;/&quot;)]
+		[TestCase(1173, &quot;/sub1/&quot;)]
+		[TestCase(1174, &quot;/sub1/sub2/&quot;)]
+		[TestCase(1176, &quot;/sub1/sub-3/&quot;)]
+		[TestCase(1177, &quot;/sub1/custom-sub-1/&quot;)]
+		[TestCase(1178, &quot;/sub1/custom-sub-2/&quot;)]
+		[TestCase(1175, &quot;/sub-2/&quot;)]
+		[TestCase(1172, &quot;/test-page/&quot;)] // not hidden because not first root
+		public void Get_Nice_Url_Hiding_Top_Level(int nodeId, string niceUrlMatch)
+		{
+			var routingContext = GetRoutingContext(&quot;/test&quot;, 1111);
+
+            SettingsForTests.UseDirectoryUrls = true;
+            SettingsForTests.HideTopLevelNodeFromPath = true;
+            var requestMock = Mock.Get(_umbracoSettings.RequestHandler);
+            requestMock.Setup(x =&gt; x.UseDomainPrefixes).Returns(false);
+
+			var result = routingContext.UrlProvider.GetUrl(nodeId);
+			Assert.AreEqual(niceUrlMatch, result);
+		}
+
+		[Test]
+		public void Get_Nice_Url_Relative_Or_Absolute()
+		{
+            SettingsForTests.UseDirectoryUrls = true;
+            SettingsForTests.HideTopLevelNodeFromPath = false;
+            var requestMock = Mock.Get(_umbracoSettings.RequestHandler);
+            requestMock.Setup(x =&gt; x.UseDomainPrefixes).Returns(false);
+
+            var routingContext = GetRoutingContext(&quot;http://example.com/test&quot;, 1111, umbracoSettings: _umbracoSettings);
+
+
+
+			Assert.AreEqual(&quot;/home/sub1/custom-sub-1/&quot;, routingContext.UrlProvider.GetUrl(1177));
+
+            requestMock.Setup(x =&gt; x.UseDomainPrefixes).Returns(true);
+			Assert.AreEqual(&quot;http://example.com/home/sub1/custom-sub-1/&quot;, routingContext.UrlProvider.GetUrl(1177));
+
+            requestMock.Setup(x =&gt; x.UseDomainPrefixes).Returns(false);
+			routingContext.UrlProvider.Mode = UrlProviderMode.Absolute;
+			Assert.AreEqual(&quot;http://example.com/home/sub1/custom-sub-1/&quot;, routingContext.UrlProvider.GetUrl(1177));
+		}
+
+		[Test]
+		public void Get_Nice_Url_Unpublished()
+		{
+			var routingContext = GetRoutingContext(&quot;http://example.com/test&quot;, 1111);
+
+            SettingsForTests.UseDirectoryUrls = true;
+            SettingsForTests.HideTopLevelNodeFromPath = false;
+
+            //mock the Umbraco settings that we need
+            var requestMock = Mock.Get(_umbracoSettings.RequestHandler);
+            requestMock.Setup(x =&gt; x.UseDomainPrefixes).Returns(false);
+
+			Assert.AreEqual(&quot;#&quot;, routingContext.UrlProvider.GetUrl(999999));
+
+            requestMock.Setup(x =&gt; x.UseDomainPrefixes).Returns(true);
+
+            Assert.AreEqual(&quot;#&quot;, routingContext.UrlProvider.GetUrl(999999));
+
+            requestMock.Setup(x =&gt; x.UseDomainPrefixes).Returns(false);
+
+			routingContext.UrlProvider.Mode = UrlProviderMode.Absolute;
+
+            Assert.AreEqual(&quot;#&quot;, routingContext.UrlProvider.GetUrl(999999));
+		}
+	}
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[17,9,17,10,1],[18,13,18,101,1],[20,13,20,37,1],[21,9,21,10,1],[26,9,26,10,1],[27,13,27,31,1],[30,13,30,72,1],[31,13,31,66,1],[32,9,32,10,1],[40,3,40,4,1],[41,4,41,58,1],[42,7,42,48,1],[43,7,43,57,1],[45,13,45,80,1],[46,13,46,78,1],[48,4,57,6,1],[59,4,59,11,1],[59,13,59,23,1],[59,24,59,26,1],[59,27,59,34,1],[60,4,60,5,1],[61,5,61,64,1],[62,5,62,43,1],[63,4,63,5,1],[65,4,65,86,1],[66,9,66,18,1],[66,20,66,25,1],[66,27,66,30,1],[67,4,67,5,1],[68,5,68,70,1],[69,5,69,49,1],[70,4,70,5,1],[72,13,72,104,1],[73,13,73,31,1],[73,32,73,122,0],[75,13,75,68,1],[76,13,76,52,1],[78,13,78,20,1],[78,22,78,32,1],[78,33,78,35,1],[78,36,78,43,1],[79,13,79,14,1],[80,17,80,69,1],[81,17,81,73,1],[82,13,82,14,1],[84,13,84,62,1],[85,13,85,49,1],[86,9,86,10,1],[98,3,98,4,1],[99,4,99,58,1],[101,7,101,48,1],[102,7,102,57,1],[103,13,103,73,1],[104,13,104,72,1],[106,4,106,59,1],[107,4,107,42,1],[108,3,108,4,1],[122,3,122,4,1],[123,4,123,58,1],[125,13,125,54,1],[126,13,126,62,1],[127,13,127,73,1],[128,13,128,72,1],[130,4,130,59,1],[131,4,131,42,1],[132,3,132,4,1],[136,3,136,4,1],[137,13,137,54,1],[138,13,138,63,1],[139,13,139,73,1],[140,13,140,72,1],[142,13,142,120,1],[146,4,146,89,1],[148,13,148,71,1],[149,4,149,107,1],[151,13,151,72,1],[152,4,152,63,1],[153,4,153,107,1],[154,3,154,4,1],[158,3,158,4,1],[159,4,159,76,1],[161,13,161,54,1],[162,13,162,63,1],[165,13,165,73,1],[166,13,166,72,1],[168,4,168,68,1],[170,13,170,71,1],[172,13,172,77,1],[174,13,174,72,1],[176,4,176,63,1],[178,13,178,77,1],[179,3,179,4,1]]);
+    </script>
+  </body>
+</html>

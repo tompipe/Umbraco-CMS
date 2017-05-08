@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Dependencies\NuGet.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Xml.Serialization;
+using NUnit.Framework;
+using Umbraco.Tests.TestHelpers;
+
+namespace Umbraco.Tests.Dependencies
+{
+    [TestFixture]
+    public class NuGet
+    {
+        [Test]
+        public void NuGet_Package_Versions_Are_The_Same_In_All_Package_Config_Files()
+        {
+            var packagesAndVersions = GetNuGetPackagesInSolution();
+            Assert.IsTrue(packagesAndVersions.Any());
+
+            var failTest = false;
+            foreach (var package in packagesAndVersions.OrderBy(x =&gt; x.ConfigFilePath))
+            {
+                var matchingPackages = packagesAndVersions.Where(x =&gt; string.Equals(x.PackageName, package.PackageName, StringComparison.InvariantCultureIgnoreCase));
+                foreach (var matchingPackage in matchingPackages)
+                {
+                    if (package.PackageVersion == matchingPackage.PackageVersion)
+                        continue;
+
+                    Debug.WriteLine(&quot;Package &#39;{0}&#39; with version {1} in {2} doesn&#39;t match with version {3} in {4}&quot;,
+                        package.PackageName, package.PackageVersion, package.ConfigFilePath,
+                        matchingPackage.PackageVersion, matchingPackage.ConfigFilePath);
+                    failTest = true;
+                }
+            }
+
+            Assert.IsFalse(failTest);
+        }
+
+        [Test]
+        public void NuSpec_File_Matches_Installed_Dependencies()
+        {
+            var solutionDirectory = GetSolutionDirectory();
+            Assert.NotNull(solutionDirectory);
+            Assert.NotNull(solutionDirectory.Parent);
+
+            var nuSpecPath = solutionDirectory.Parent.FullName + &quot;\\build\\NuSpecs\\&quot;;
+            Assert.IsTrue(Directory.Exists(nuSpecPath));
+
+            var packagesAndVersions = GetNuGetPackagesInSolution();
+            var failTest = false;
+
+            var nuSpecFiles = Directory.GetFiles(nuSpecPath);
+            foreach (var fileName in nuSpecFiles.Where(x =&gt; x.EndsWith(&quot;nuspec&quot;)))
+            {
+                var serializer = new XmlSerializer(typeof(NuSpec));
+                using (var reader = new StreamReader(fileName))
+                {
+                    var nuspec = (NuSpec)serializer.Deserialize(reader);
+                    var dependencies = nuspec.MetaData.dependencies;
+
+                    //UmbracoCms.Core has version &quot;[$version$]&quot; - ignore
+                    foreach (var dependency in dependencies.Where(x =&gt; x.Id != &quot;UmbracoCms.Core&quot;))
+                    {
+                        var dependencyVersionRange = dependency.Version.Replace(&quot;[&quot;, string.Empty).Replace(&quot;(&quot;, string.Empty).Split(&#39;,&#39;);
+                        var dependencyMinimumVersion = dependencyVersionRange.First().Trim();
+                        
+                        var matchingPackages = packagesAndVersions.Where(x =&gt; string.Equals(x.PackageName, dependency.Id,
+                                        StringComparison.InvariantCultureIgnoreCase)).ToList();
+                        if (matchingPackages.Any() == false)
+                            continue;
+
+                        // NuGet_Package_Versions_Are_The_Same_In_All_Package_Config_Files test 
+                        // guarantees that all packages have one version, solutionwide, so it&#39;s okay to take First() here
+                        if (dependencyMinimumVersion != matchingPackages.First().PackageVersion)
+                        {
+                            Debug.WriteLine(&quot;NuSpec dependency &#39;{0}&#39; with minimum version {1} in doesn&#39;t match with version {2} in the solution&quot;,
+                                dependency.Id, dependencyMinimumVersion, matchingPackages.First().PackageVersion);
+                            failTest = true;
+                        }
+                    }
+                }
+            }
+
+            Assert.IsFalse(failTest);
+        }
+
+        private List&lt;PackageVersionMatcher&gt; GetNuGetPackagesInSolution()
+        {
+            var packagesAndVersions = new List&lt;PackageVersionMatcher&gt;();
+            var solutionDirectory = GetSolutionDirectory();
+            if (solutionDirectory == null)
+                return packagesAndVersions;
+
+            var packageConfigFiles = new List&lt;FileInfo&gt;();
+            var packageDirectories =
+                solutionDirectory.GetDirectories().Where(x =&gt;
+                            x.Name.StartsWith(&quot;Umbraco.Tests&quot;) == false &amp;&amp;
+                            x.Name.StartsWith(&quot;Umbraco.MSBuild.Tasks&quot;) == false).ToArray();
+
+            foreach (var directory in packageDirectories)
+            {
+                var packagesFiles = directory.EnumerateFiles(&quot;packages.config&quot;);
+                packageConfigFiles.AddRange(packagesFiles);
+            }
+
+            foreach (var file in packageConfigFiles)
+            {
+                //read all and de-duplicate packages
+                var serializer = new XmlSerializer(typeof(PackageConfigEntries));
+                using (var reader = new StreamReader(file.FullName))
+                {
+                    var packages = (PackageConfigEntries)serializer.Deserialize(reader);
+                    packagesAndVersions.AddRange(packages.Package.Select(package =&gt;
+                        new PackageVersionMatcher
+                        {
+                            PackageName = package.Id,
+                            PackageVersion = package.Version,
+                            ConfigFilePath = file.FullName
+                        }));
+                }
+            }
+            return packagesAndVersions;
+        }
+
+        private DirectoryInfo GetSolutionDirectory()
+        {
+            var testsDirectory = new FileInfo(TestHelper.MapPathForTest(&quot;~/&quot;));
+            if (testsDirectory.Directory == null)
+                return null;
+            if (testsDirectory.Directory.Parent == null || testsDirectory.Directory.Parent.Parent == null)
+                return null;
+            var solutionDirectory = testsDirectory.Directory.Parent.Parent.Parent;
+            return solutionDirectory;
+        }
+    }
+
+    public class PackageVersionMatcher
+    {
+        public string ConfigFilePath { get; set; }
+        public string PackageName { get; set; }
+        public string PackageVersion { get; set; }
+    }
+
+    [XmlType(AnonymousType = true)]
+    [XmlRoot(Namespace = &quot;&quot;, IsNullable = false, ElementName = &quot;packages&quot;)]
+    public class PackageConfigEntries
+    {
+        [XmlElement(&quot;package&quot;)]
+        public PackagesPackage[] Package { get; set; }
+    }
+
+    [XmlType(AnonymousType = true, TypeName = &quot;package&quot;)]
+    public class PackagesPackage
+    {
+        [XmlAttribute(AttributeName = &quot;id&quot;)]
+        public string Id { get; set; }
+
+        [XmlAttribute(AttributeName = &quot;version&quot;)]
+        public string Version { get; set; }
+    }
+    
+
+    [XmlType(AnonymousType = true, Namespace = &quot;http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd&quot;)]
+    [XmlRoot(Namespace = &quot;http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd&quot;, IsNullable = false, ElementName = &quot;package&quot;)]
+    public class NuSpec
+    {
+        [XmlElement(&quot;metadata&quot;)]
+        public Metadata MetaData { get; set; }
+    }
+    
+    [XmlType(AnonymousType = true, Namespace = &quot;http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd&quot;, TypeName = &quot;metadata&quot;)]
+    public class Metadata
+    {
+        [XmlArrayItem(&quot;dependency&quot;, IsNullable = false)]
+        //TODO: breaks when renamed to capital D
+        public Dependency[] dependencies { get; set; }
+    }
+
+    [XmlType(AnonymousType = true, Namespace = &quot;http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd&quot;, TypeName = &quot;dependencies&quot;)]
+    public class Dependency
+    {
+        [XmlAttribute(AttributeName = &quot;id&quot;)]
+        public string Id { get; set; }
+        
+        [XmlAttribute(AttributeName = &quot;version&quot;)]
+        public string Version { get; set; }
+    }
+
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[17,9,17,10,1],[18,13,18,68,1],[19,13,19,54,1],[21,13,21,34,1],[22,13,22,20,1],[22,22,22,33,1],[22,34,22,36,1],[22,37,22,70,1],[22,70,22,86,1],[22,86,22,87,1],[22,37,22,87,1],[23,13,23,14,1],[24,17,24,71,1],[24,71,24,165,1],[24,165,24,167,1],[24,17,24,167,1],[25,17,25,24,1],[25,26,25,45,1],[25,46,25,48,1],[25,49,25,65,1],[26,17,26,18,1],[27,21,27,82,1],[28,25,28,34,1],[30,21,32,89,0],[33,21,33,37,0],[34,17,34,18,0],[35,13,35,14,1],[37,13,37,38,1],[38,9,38,10,1],[42,9,42,10,1],[43,13,43,60,1],[44,13,44,47,1],[45,13,45,54,1],[47,13,47,87,1],[48,13,48,57,1],[50,13,50,68,1],[51,13,51,34,1],[53,13,53,62,1],[54,13,54,20,1],[54,22,54,34,1],[54,35,54,37,1],[54,38,54,61,1],[54,61,54,81,1],[54,81,54,82,1],[54,38,54,82,1],[55,13,55,14,1],[56,17,56,68,1],[57,24,57,63,1],[58,17,58,18,1],[59,21,59,73,1],[60,21,60,69,1],[63,21,63,28,1],[63,30,63,44,1],[63,45,63,47,1],[63,48,63,72,1],[63,72,63,97,1],[63,97,63,98,1],[63,48,63,98,1],[64,21,64,22,1],[65,25,65,138,1],[66,25,66,94,1],[68,25,68,79,1],[68,79,69,85,1],[69,85,69,96,1],[68,25,69,96,1],[70,25,70,61,1],[71,29,71,38,1],[75,25,75,97,1],[76,25,76,26,0],[77,29,78,115,0],[79,29,79,45,0],[80,25,80,26,0],[81,21,81,22,1],[82,17,82,18,1],[83,13,83,14,1],[85,13,85,38,1],[86,9,86,10,1],[89,9,89,10,1],[90,13,90,73,1],[91,13,91,60,1],[92,13,92,43,1],[93,17,93,44,0],[95,13,95,59,1],[96,13,98,29,1],[98,29,99,80,1],[99,80,99,92,1],[96,13,99,92,1],[101,13,101,20,1],[101,22,101,35,1],[101,36,101,38,1],[101,39,101,57,1],[102,13,102,14,1],[103,17,103,81,1],[104,17,104,60,1],[105,13,105,14,1],[107,13,107,20,1],[107,22,107,30,1],[107,31,107,33,1],[107,34,107,52,1],[108,13,108,14,1],[110,17,110,82,1],[111,24,111,68,1],[112,17,112,18,1],[113,21,113,89,1],[114,21,115,25,1],[115,25,120,26,1],[120,26,120,29,1],[114,21,120,29,1],[121,17,121,18,1],[122,13,122,14,1],[123,13,123,40,1],[124,9,124,10,1],[127,9,127,10,1],[128,13,128,80,1],[129,13,129,50,1],[130,17,130,29,0],[131,13,131,107,1],[132,17,132,29,0],[133,13,133,83,1],[134,13,134,38,1],[135,9,135,10,1],[140,40,140,44,1],[140,45,140,49,1],[141,37,141,41,1],[141,42,141,46,1],[142,40,142,44,1],[142,45,142,49,1],[150,44,150,48,1],[150,49,150,53,1],[157,28,157,32,1],[157,33,157,37,1],[160,33,160,37,1],[160,38,160,42,1],[169,36,169,40,1],[169,41,169,45,1],[177,44,177,48,1],[177,49,177,53,1],[184,28,184,32,1],[184,33,184,37,1],[187,33,187,37,1],[187,38,187,42,1]]);
+    </script>
+  </body>
+</html>

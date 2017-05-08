@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\helper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Web;
+using Umbraco.Core;
+using Umbraco.Core.CodeAnnotations;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Profiling;
+using umbraco.BusinessLogic;
+using System.Xml;
+using umbraco.presentation;
+
+namespace umbraco
+{
+    /// &lt;summary&gt;
+    /// Summary description for helper.
+    /// &lt;/summary&gt;
+    public class helper
+    {
+        public static bool IsNumeric(string Number)
+        {
+            int result;
+            return int.TryParse(Number, out result);
+        }
+
+        public static User GetCurrentUmbracoUser()
+        {
+            return umbraco.BasePages.UmbracoEnsuredPage.CurrentUser;
+        }
+
+		[Obsolete(&quot;This method has been superceded. Use the extension method for HttpRequest or HttpRequestBase method: GetItemAsString instead.&quot;)]
+        public static string Request(string text)
+		{
+			if (HttpContext.Current == null)
+				return string.Empty;
+
+            if (HttpContext.Current.Request[text.ToLower()] != null)
+				if (HttpContext.Current.Request[text] != string.Empty)
+					return HttpContext.Current.Request[text];
+            
+            return String.Empty;
+        }
+
+		[Obsolete(&quot;Has been superceded by Umbraco.Core.XmlHelper.GetAttributesFromElement&quot;)]
+        public static Hashtable ReturnAttributes(String tag)
+		{
+			var h = new Hashtable();
+            foreach(var i in Umbraco.Core.XmlHelper.GetAttributesFromElement(tag))
+            {
+            	h.Add(i.Key, i.Value);
+            }
+			return h;
+		}
+
+        public static String FindAttribute(IDictionary attributes, String key)
+        {
+            return FindAttribute(null, attributes, key);
+        }
+
+        public static String FindAttribute(IDictionary pageElements, IDictionary attributes, String key)
+        {
+            // fix for issue 14862: lowercase for case insensitive matching
+            key = key.ToLower();
+
+            string attributeValue = string.Empty;
+            if (attributes[key] != null)
+                attributeValue = attributes[key].ToString();
+
+            attributeValue = parseAttribute(pageElements, attributeValue);
+            return attributeValue;
+        }
+
+        /// &lt;summary&gt;
+        /// This method will parse the attribute value to look for some special syntax such as
+        ///     [@requestKey]
+        ///     [%sessionKey]
+        ///     [#pageElement]
+        ///     [$recursiveValue]
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pageElements&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;attributeValue&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// You can even apply fallback&#39;s separated by comma&#39;s like:
+        /// 
+        ///     [@requestKey],[%sessionKey]
+        /// 
+        /// &lt;/remarks&gt;
+        public static string parseAttribute(IDictionary pageElements, string attributeValue)
+        {
+            // Check for potential querystring/cookie variables
+            // SD: not sure why we are checking for len 3 here?
+            if (attributeValue.Length &gt; 3 &amp;&amp; attributeValue.StartsWith(&quot;[&quot;))
+            {
+                var attributeValueSplit = (attributeValue).Split(&#39;,&#39;);
+
+                attributeValueSplit = attributeValueSplit.Select(x =&gt; x.Trim()).ToArray();
+
+                // before proceeding, we don&#39;t want to process anything here unless each item starts/ends with a [ ]
+                // this is because the attribute value could actually just be a json array like [1,2,3] which we don&#39;t want to parse
+                //
+                // however, the last one can be a literal, must take care of this!
+                // so here, don&#39;t check the last one, which can be just anything
+                if (attributeValueSplit.Take(attributeValueSplit.Length - 1).All(x =&gt; 
+                    //must end with [
+                    x.EndsWith(&quot;]&quot;) &amp;&amp;
+                    //must start with [ and a special char
+                    (x.StartsWith(&quot;[@&quot;) || x.StartsWith(&quot;[%&quot;) || x.StartsWith(&quot;[#&quot;) || x.StartsWith(&quot;[$&quot;))) == false)
+                {
+                    return attributeValue;
+                }
+
+                foreach (var attributeValueItem in attributeValueSplit)
+                {
+                    attributeValue = attributeValueItem;
+                    var trimmedValue = attributeValue.Trim();
+
+                    // Check for special variables (always in square-brackets like [name])
+                    if (trimmedValue.StartsWith(&quot;[&quot;) &amp;&amp;
+                        trimmedValue.EndsWith(&quot;]&quot;))
+                    {
+                        attributeValue = trimmedValue;
+
+                        // find key name
+                        var keyName = attributeValue.Substring(2, attributeValue.Length - 3);
+                        var keyType = attributeValue.Substring(1, 1);
+
+                        switch (keyType)
+                        {
+                            case &quot;@&quot;:
+                                attributeValue = HttpContext.Current.Request[keyName];
+                                break;
+                            case &quot;%&quot;:
+                                attributeValue = StateHelper.GetSessionValue&lt;string&gt;(keyName);
+                                if (String.IsNullOrEmpty(attributeValue))
+                                    attributeValue = StateHelper.GetCookieValue(keyName);
+                                break;
+                            case &quot;#&quot;:
+                                if (pageElements[keyName] != null)
+                                    attributeValue = pageElements[keyName].ToString();
+                                else
+                                    attributeValue = &quot;&quot;;
+                                break;
+                            case &quot;$&quot;:
+                                if (pageElements[keyName] != null &amp;&amp; pageElements[keyName].ToString() != string.Empty)
+                                {
+                                    attributeValue = pageElements[keyName].ToString();
+                                }
+                                else
+                                {
+                                    // reset attribute value in case no value has been found on parents
+                                    attributeValue = String.Empty;
+                                    XmlDocument umbracoXML = presentation.UmbracoContext.Current.GetXml();
+
+                                    String[] splitpath = (String[])pageElements[&quot;splitpath&quot;];
+                                    for (int i = 0; i &lt; splitpath.Length - 1; i++)
+                                    {
+                                        XmlNode element = umbracoXML.GetElementById(splitpath[splitpath.Length - i - 1].ToString());
+                                        if (element == null)
+                                            continue;
+                                        string xpath = UmbracoConfig.For.UmbracoSettings().Content.UseLegacyXmlSchema ? &quot;./data [@alias = &#39;{0}&#39;]&quot; : &quot;{0}&quot;;
+                                        XmlNode currentNode = element.SelectSingleNode(string.Format(xpath,
+                                            keyName));
+                                        if (currentNode != null &amp;&amp; currentNode.FirstChild != null &amp;&amp;
+                                           !string.IsNullOrEmpty(currentNode.FirstChild.Value) &amp;&amp;
+                                           !string.IsNullOrEmpty(currentNode.FirstChild.Value.Trim()))
+                                        {
+                                            HttpContext.Current.Trace.Write(&quot;parameter.recursive&quot;, &quot;Item loaded from &quot; + splitpath[splitpath.Length - i - 1]);
+                                            attributeValue = currentNode.FirstChild.Value;
+                                            break;
+                                        }
+                                    }
+                                }
+                                break;
+                        }
+
+                        if (attributeValue != null)
+                        {
+                            attributeValue = attributeValue.Trim();
+                            if (attributeValue != string.Empty)
+                                break;
+                        }
+                        else
+                            attributeValue = string.Empty;
+                    }
+                }
+            }
+
+            return attributeValue;
+        }
+
+        [UmbracoWillObsolete(&quot;We should really obsolete that one.&quot;)]
+        public static string SpaceCamelCasing(string text)
+        {
+            return text.SplitPascalCasing().ToFirstUpperInvariant();
+        }
+
+        [Obsolete(&quot;Use umbraco.presentation.UmbracContext.Current.GetBaseUrl()&quot;)]
+        public static string GetBaseUrl(HttpContext Context)
+        {
+            return Context.Request.Url.GetLeftPart(UriPartial.Authority);
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,9,22,10,0],[24,13,24,53,0],[25,9,25,10,0],[28,9,28,10,0],[29,13,29,69,0],[30,9,30,10,0],[34,3,34,4,0],[35,4,35,36,0],[36,5,36,25,0],[38,13,38,69,0],[39,5,39,59,0],[40,6,40,47,0],[42,13,42,33,0],[43,9,43,10,0],[47,3,47,4,0],[48,4,48,28,0],[49,13,49,20,0],[49,21,49,26,0],[49,27,49,29,0],[49,30,49,82,0],[50,13,50,14,0],[51,14,51,36,0],[52,13,52,14,0],[53,4,53,13,0],[54,3,54,4,0],[57,9,57,10,0],[58,13,58,57,0],[59,9,59,10,0],[62,9,62,10,0],[64,13,64,33,0],[66,13,66,50,0],[67,13,67,41,0],[68,17,68,61,0],[70,13,70,75,0],[71,13,71,35,0],[72,9,72,10,0],[91,9,91,10,0],[94,13,94,77,0],[95,13,95,14,0],[96,17,96,71,0],[98,17,98,71,0],[98,71,98,79,0],[98,79,98,91,0],[98,17,98,91,0],[105,17,107,21,0],[107,21,109,107,0],[109,107,109,118,0],[105,17,109,118,0],[110,17,110,18,0],[111,21,111,43,0],[114,17,114,24,0],[114,26,114,48,0],[114,49,114,51,0],[114,52,114,71,0],[115,17,115,18,0],[116,21,116,57,0],[117,21,117,62,0],[120,21,121,52,0],[122,21,122,22,0],[123,25,123,55,0],[126,25,126,94,0],[127,25,127,70,0],[129,25,129,41,0],[132,33,132,87,0],[133,33,133,39,0],[135,33,135,95,0],[136,33,136,74,0],[137,37,137,90,0],[138,33,138,39,0],[140,33,140,67,0],[141,37,141,87,0],[143,37,143,57,0],[144,33,144,39,0],[146,33,146,119,0],[147,33,147,34,0],[148,37,148,87,0],[149,33,149,34,0],[151,33,151,34,0],[153,37,153,67,0],[154,37,154,107,0],[156,37,156,94,0],[157,42,157,51,0],[157,53,157,77,0],[157,79,157,82,0],[158,37,158,38,0],[159,41,159,133,0],[160,41,160,61,0],[161,45,161,54,0],[162,41,162,155,0],[163,41,164,55,0],[165,41,167,103,0],[168,41,168,42,0],[169,45,169,159,0],[170,45,170,91,0],[171,45,171,51,0],[173,37,173,38,0],[174,33,174,34,0],[175,33,175,39,0],[178,25,178,52,0],[179,25,179,26,0],[180,29,180,68,0],[181,29,181,64,0],[182,33,182,39,0],[183,25,183,26,0],[185,29,185,59,0],[186,21,186,22,0],[187,17,187,18,0],[188,13,188,14,0],[190,13,190,35,0],[191,9,191,10,0],[195,9,195,10,0],[196,13,196,69,0],[197,9,197,10,0],[201,9,201,10,0],[202,13,202,74,0],[203,9,203,10,0]]);
+    </script>
+  </body>
+</html>

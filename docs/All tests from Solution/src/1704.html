@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\MacroRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.Relators;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    internal class MacroRepository : PetaPocoRepositoryBase&lt;int, IMacro&gt;, IMacroRepository
+    {
+
+        public MacroRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax)
+            : base(work, cache, logger, sqlSyntax)
+        {
+        }
+
+        protected override IMacro PerformGet(int id)
+        {
+            var sql = GetBaseQuery(false);
+            sql.Where(GetBaseWhereClause(), new { Id = id });
+
+            var macroDto = Database.Fetch&lt;MacroDto, MacroPropertyDto, MacroDto&gt;(new MacroPropertyRelator().Map, sql).FirstOrDefault();
+            if (macroDto == null)
+                return null;
+
+            var factory = new MacroFactory();
+            var entity = factory.BuildEntity(macroDto);
+
+            //on initial construction we don&#39;t want to have dirty properties tracked
+            // http://issues.umbraco.org/issue/U4-1946
+            ((TracksChangesEntityBase)entity).ResetDirtyProperties(false);
+
+            return entity;
+        }
+
+        protected override IEnumerable&lt;IMacro&gt; PerformGetAll(params int[] ids)
+        {
+            if (ids.Any())
+            {
+                return PerformGetAllOnIds(ids);
+            }
+
+            var sql = GetBaseQuery(false);
+
+            return ConvertFromDtos(Database.Fetch&lt;MacroDto, MacroPropertyDto, MacroDto&gt;(new MacroPropertyRelator().Map, sql))
+                .ToArray();// we don&#39;t want to re-iterate again!
+        }
+
+        private IEnumerable&lt;IMacro&gt; PerformGetAllOnIds(params int[] ids)
+        {
+            if (ids.Any() == false) yield break;
+            foreach (var id in ids)
+            {
+                yield return Get(id);
+            }
+        }
+
+        private IEnumerable&lt;IMacro&gt; ConvertFromDtos(IEnumerable&lt;MacroDto&gt; dtos)
+        {
+            var factory = new MacroFactory();
+            foreach (var entity in dtos.Select(factory.BuildEntity))
+            {
+                //on initial construction we don&#39;t want to have dirty properties tracked
+                // http://issues.umbraco.org/issue/U4-1946
+                ((TracksChangesEntityBase)entity).ResetDirtyProperties(false);
+
+                yield return entity;
+            }
+        }
+
+        protected override IEnumerable&lt;IMacro&gt; PerformGetByQuery(IQuery&lt;IMacro&gt; query)
+        {
+            var sqlClause = GetBaseQuery(false);
+            var translator = new SqlTranslator&lt;IMacro&gt;(sqlClause, query);
+            var sql = translator.Translate();
+
+            var dtos = Database.Fetch&lt;MacroDto, MacroPropertyDto, MacroDto&gt;(new MacroPropertyRelator().Map, sql);
+
+            foreach (var dto in dtos)
+            {
+                yield return Get(dto.Id);
+            }
+        }
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+            if (isCount)
+            {
+                sql.Select(&quot;COUNT(*)&quot;).From&lt;MacroDto&gt;();
+            }
+            else
+            {
+                return GetBaseQuery();
+            }
+            return sql;
+        }
+
+        private static Sql GetBaseQuery()
+        {
+            var sql = new Sql();
+            sql.Select(&quot;*&quot;)
+               .From&lt;MacroDto&gt;()
+               .LeftJoin&lt;MacroPropertyDto&gt;()
+               .On&lt;MacroDto, MacroPropertyDto&gt;(left =&gt; left.Id, right =&gt; right.Macro);
+            return sql;
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;cmsMacro.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            var list = new List&lt;string&gt;
+                {
+                    &quot;DELETE FROM cmsMacroProperty WHERE macro = @Id&quot;,
+                    &quot;DELETE FROM cmsMacro WHERE id = @Id&quot;                           
+                };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { throw new NotImplementedException(); }
+        }
+
+        protected override void PersistNewItem(IMacro entity)
+        {
+            ((Entity)entity).AddingEntity();
+
+            var factory = new MacroFactory();
+            var dto = factory.BuildDto(entity);
+
+            var id = Convert.ToInt32(Database.Insert(dto));
+            entity.Id = id;
+
+            foreach (var propDto in dto.MacroPropertyDtos)
+            {
+                //need to set the id explicitly here
+                propDto.Macro = id;
+                var propId = Convert.ToInt32(Database.Insert(propDto));
+                entity.Properties[propDto.Alias].Id = propId;
+            }
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(IMacro entity)
+        {
+            ((Entity)entity).UpdatingEntity();
+
+            var factory = new MacroFactory();
+            var dto = factory.BuildDto(entity);
+
+            Database.Update(dto);
+
+            //update the properties if they&#39;ve changed
+            var macro = (Macro)entity;
+            if (macro.IsPropertyDirty(&quot;Properties&quot;) || macro.Properties.Any(x =&gt; x.IsDirty()))
+            {
+                //now we need to delete any props that have been removed
+                foreach (var propAlias in macro.RemovedProperties)
+                {
+                    //delete the property
+                    Database.Delete&lt;MacroPropertyDto&gt;(&quot;WHERE macro=@macroId AND macroPropertyAlias=@propAlias&quot;,
+                        new { macroId = macro.Id, propAlias = propAlias });
+                }
+
+                //for any that exist on the object, we need to determine if we need to update or insert
+                foreach (var propDto in dto.MacroPropertyDtos)
+                {
+                    if (macro.AddedProperties.Contains(propDto.Alias))
+                    {
+                        //we need to insert since this was added  and re-assign the new id
+                        var propId = Convert.ToInt32(Database.Insert(propDto));
+                        macro.Properties[propDto.Alias].Id = propId;
+                    }
+                    else
+                    {
+                        //This will only work if the Alias hasn&#39;t been changed
+                        if (macro.Properties.ContainsKey(propDto.Alias))
+                        {
+                            //only update if it&#39;s dirty
+                            if (macro.Properties[propDto.Alias].IsDirty())
+                            {
+                                Database.Update(propDto);
+                            }
+                        }
+                        else
+                        {
+                            var property = macro.Properties.FirstOrDefault(x =&gt; x.Id == propDto.Id);
+                            if (property != null &amp;&amp; property.IsDirty())
+                            {
+                                Database.Update(propDto);
+                            }
+                        }
+                    }
+                }
+
+                
+            }
+
+            entity.ResetDirtyProperties();
+        }
+
+        //public IEnumerable&lt;IMacro&gt; GetAll(params string[] aliases)
+        //{
+        //    if (aliases.Any())
+        //    {
+        //        var q = new Query&lt;IMacro&gt;();
+        //        foreach (var alias in aliases)
+        //        {
+        //            q.Where(macro =&gt; macro.Alias == alias);
+        //        }
+
+        //        var wheres = string.Join(&quot; OR &quot;, q.WhereClauses());
+        //    }
+        //    else
+        //    {
+        //        return GetAll(new int[] {});
+        //    }
+            
+        //}
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[21,15,21,51,1],[22,9,22,10,1],[23,9,23,10,1],[26,9,26,10,1],[27,13,27,43,1],[28,13,28,62,1],[30,13,30,135,1],[31,13,31,34,1],[32,17,32,29,1],[34,13,34,46,1],[35,13,35,56,1],[39,13,39,75,1],[41,13,41,27,1],[42,9,42,10,1],[45,9,45,10,1],[46,13,46,27,1],[47,13,47,14,0],[48,17,48,48,0],[51,13,51,43,1],[53,13,54,28,1],[55,9,55,10,1],[94,9,94,10,1],[95,13,95,33,1],[96,13,96,25,1],[97,13,97,14,1],[98,17,98,57,1],[99,13,99,14,1],[101,13,101,14,1],[102,17,102,39,1],[104,13,104,24,1],[105,9,105,10,1],[108,9,108,10,1],[109,13,109,33,1],[110,13,113,87,1],[114,13,114,24,1],[115,9,115,10,1],[118,9,118,10,1],[119,13,119,40,1],[120,9,120,10,1],[123,9,123,10,1],[124,13,128,19,1],[129,13,129,25,1],[130,9,130,10,1],[134,17,134,18,0],[134,19,134,55,0],[138,9,138,10,1],[139,13,139,45,1],[141,13,141,46,1],[142,13,142,48,1],[144,13,144,60,1],[145,13,145,28,1],[147,13,147,20,1],[147,22,147,33,1],[147,34,147,36,1],[147,37,147,58,1],[148,13,148,14,1],[150,17,150,36,1],[151,17,151,72,1],[152,17,152,62,1],[153,13,153,14,1],[155,13,155,43,1],[156,9,156,10,1],[159,9,159,10,1],[160,13,160,47,1],[162,13,162,46,1],[163,13,163,48,1],[165,13,165,34,1],[168,13,168,39,1],[169,13,169,82,1],[169,82,169,93,0],[169,93,169,95,1],[169,13,169,95,1],[170,13,170,14,1],[172,17,172,24,1],[172,26,172,39,1],[172,40,172,42,1],[172,43,172,66,1],[173,17,173,18,1],[175,21,176,76,1],[177,17,177,18,1],[180,17,180,24,1],[180,26,180,37,1],[180,38,180,40,1],[180,41,180,62,1],[181,17,181,18,1],[182,21,182,71,1],[183,21,183,22,1],[185,25,185,80,1],[186,25,186,69,1],[187,21,187,22,1],[189,21,189,22,1],[191,25,191,73,1],[192,25,192,26,1],[194,29,194,75,1],[195,29,195,30,1],[196,33,196,58,1],[197,29,197,30,1],[198,25,198,26,1],[200,25,200,26,1],[201,29,201,81,1],[201,81,201,99,1],[201,99,201,101,1],[201,29,201,101,1],[202,29,202,72,1],[203,29,203,30,1],[204,33,204,58,1],[205,29,205,30,1],[206,25,206,26,1],[207,21,207,22,1],[208,17,208,18,1],[211,13,211,14,1],[213,13,213,43,1],[214,9,214,10,1]]);
+    </script>
+  </body>
+</html>

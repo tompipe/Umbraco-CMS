@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\UmbracoExamine\UmbracoExamineSearcher.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.IO;
+using System.Linq;
+using System.Security;
+using System.Web;
+using System.Web.Compilation;
+using Examine;
+using Examine.LuceneEngine.Config;
+using Examine.Providers;
+using Examine.SearchCriteria;
+using Lucene.Net.Index;
+using Lucene.Net.Store;
+using Umbraco.Core;
+using UmbracoExamine.Config;
+using Examine.LuceneEngine;
+using Examine.LuceneEngine.Providers;
+using Examine.LuceneEngine.SearchCriteria;
+using Lucene.Net.Analysis;
+using Umbraco.Core.Logging;
+using UmbracoExamine.LocalStorage;
+
+
+namespace UmbracoExamine
+{
+    /// &lt;summary&gt;
+    /// An Examine searcher which uses Lucene.Net as the 
+    /// &lt;/summary&gt;
+    public class UmbracoExamineSearcher : LuceneSearcher
+    {
+
+        private volatile Lucene.Net.Store.Directory _localTempDirectory;
+        private static readonly object Locker = new object();
+        private string _localTempPath = null;
+        private LocalStorageType _localStorageType = LocalStorageType.Sync;
+
+        #region Constructors
+
+        /// &lt;summary&gt;
+        /// Default constructor
+        /// &lt;/summary&gt;
+        public UmbracoExamineSearcher()
+            : base()
+        {
+        }
+
+        private string _name;
+
+        /// &lt;summary&gt;
+        /// we override name because we need to manually set it if !CanInitialize() 
+        /// since we cannot call base.Initialize in that case.
+        /// &lt;/summary&gt;
+        public override string Name
+        {
+            get { return _name; }
+        }
+        
+        /// &lt;summary&gt;
+        /// Constructor to allow for creating an indexer at runtime
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;indexPath&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;analyzer&quot;&gt;&lt;/param&gt;
+
+        public UmbracoExamineSearcher(DirectoryInfo indexPath, Analyzer analyzer)
+            : base(indexPath, analyzer)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor to allow for creating an indexer at runtime
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;luceneDirectory&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;analyzer&quot;&gt;&lt;/param&gt;
+        public UmbracoExamineSearcher(Lucene.Net.Store.Directory luceneDirectory, Analyzer analyzer)
+            : base(luceneDirectory, analyzer)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Creates an NRT searcher
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;writer&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;analyzer&quot;&gt;&lt;/param&gt;
+        public UmbracoExamineSearcher(IndexWriter writer, Analyzer analyzer) 
+            : base(writer, analyzer)
+        {
+        }
+
+        #endregion
+
+        public override void Initialize(string name, System.Collections.Specialized.NameValueCollection config)
+        {
+            if (name == null) throw new ArgumentNullException(&quot;name&quot;);
+
+            //ensure name is set
+            _name = name;
+
+            //We need to check if we actually can initialize, if not then don&#39;t continue
+            if (CanInitialize() == false)
+            {
+                return;
+            }
+
+            base.Initialize(name, config);
+
+            //NOTES: useTempStorage is obsolete, tempStorageDirectory is obsolete, both have been superceded by Examine Core&#39;s IDirectoryFactory
+            //       tempStorageDirectory never actually got finished in Umbraco Core but accidentally got shipped (it&#39;s only enabled on the searcher
+            //       and not the indexer). So this whole block is just legacy
+
+            //detect if a dir factory has been specified, if so then useTempStorage will not be used (deprecated)
+            if (config != null &amp;&amp; config[&quot;directoryFactory&quot;] == null &amp;&amp; config[&quot;useTempStorage&quot;] != null)
+            {
+                //Use the temp storage directory which will store the index in the local/codegen folder, this is useful
+                // for websites that are running from a remove file server and file IO latency becomes an issue
+                var attemptUseTempStorage = config[&quot;useTempStorage&quot;].TryConvertTo&lt;LocalStorageType&gt;();
+                if (attemptUseTempStorage)
+                {
+                    //this is the default
+                    ILocalStorageDirectory localStorageDir = new CodeGenLocalStorageDirectory();
+                    if (config[&quot;tempStorageDirectory&quot;] != null)
+                    {
+                        //try to get the type
+                        var dirType = BuildManager.GetType(config[&quot;tempStorageDirectory&quot;], false);
+                        if (dirType != null)
+                        {
+                            try
+                            {
+                                localStorageDir = (ILocalStorageDirectory)Activator.CreateInstance(dirType);
+                            }
+                            catch (Exception ex)
+                            {
+                                LogHelper.Error&lt;UmbracoExamineSearcher&gt;(
+                                    string.Format(&quot;Could not create a temp storage location of type {0}, reverting to use the &quot; + typeof(CodeGenLocalStorageDirectory).FullName, dirType),
+                                    ex);
+                            }
+                        }
+                    }
+                    var indexSet = IndexSets.Instance.Sets[IndexSetName];
+                    var configuredPath = indexSet.IndexPath;
+                    var tempPath = localStorageDir.GetLocalStorageDirectory(config, configuredPath);
+                    if (tempPath == null) throw new InvalidOperationException(&quot;Could not resolve a temp location from the &quot; + localStorageDir.GetType() + &quot; specified&quot;);
+                    _localTempPath = tempPath.FullName;
+                    _localStorageType = attemptUseTempStorage.Result;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Used for unit tests
+        /// &lt;/summary&gt;
+        internal static bool? DisableInitializationCheck = null;
+
+        /// &lt;summary&gt;
+        /// Returns true if the Umbraco application is in a state that we can initialize the examine indexes
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+
+        protected bool CanInitialize()
+        {
+            //check the DisableInitializationCheck and ensure that it is not set to true
+            if (!DisableInitializationCheck.HasValue || !DisableInitializationCheck.Value)
+            {
+                //We need to check if we actually can initialize, if not then don&#39;t continue
+                if (ApplicationContext.Current == null
+                    || !ApplicationContext.Current.IsConfigured
+                    || !ApplicationContext.Current.DatabaseContext.IsDatabaseConfigured)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Override in order to set the nodeTypeAlias field name of the underlying SearchCriteria to __NodeTypeAlias
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;defaultOperation&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override ISearchCriteria CreateSearchCriteria(string type, BooleanOperation defaultOperation)
+        {
+            var criteria = base.CreateSearchCriteria(type, defaultOperation) as LuceneSearchCriteria;
+            criteria.NodeTypeAliasField = UmbracoContentIndexer.NodeTypeAliasFieldName;
+            return criteria;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a list of fields to search on, this will also exclude the IndexPathFieldName and node type alias
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected internal override string[] GetSearchFields()
+        {
+            var fields = base.GetSearchFields();
+            return fields
+                .Where(x =&gt; x != UmbracoContentIndexer.IndexPathFieldName)
+                .Where(x =&gt; x != UmbracoContentIndexer.NodeTypeAliasFieldName)
+                .ToArray();
+        }
+
+        protected override IndexReader OpenNewReader()
+        {
+            var directory = GetLuceneDirectory();
+            return IndexReader.Open(
+                directory, 
+                //DeletePolicyTracker.Current.GetPolicy(directory), 
+                true);
+        }
+
+        protected override Lucene.Net.Store.Directory GetLuceneDirectory()
+        {
+            //local temp storage is not enabled, just return the default
+            if (_localTempPath == null) return base.GetLuceneDirectory();
+
+            //local temp storage is enabled, configure the local directory instance
+            if (_localTempDirectory == null)
+            {
+                lock (Locker)
+                {
+                    if (_localTempDirectory == null)
+                    {
+                        switch (_localStorageType)
+                        {
+                            case LocalStorageType.Sync:
+                                var fsDir = base.GetLuceneDirectory() as FSDirectory;
+                                if (fsDir != null)
+                                {
+                                    _localTempDirectory = LocalTempStorageDirectoryTracker.Current.GetDirectory(
+                                        new DirectoryInfo(_localTempPath),
+                                        fsDir);
+                                }
+                                else
+                                {
+                                    return base.GetLuceneDirectory();
+                                }
+                                break;
+                            case LocalStorageType.LocalOnly:
+                                _localTempDirectory = DirectoryTracker.Current.GetDirectory(new DirectoryInfo(_localTempPath));
+                                break;
+                            default:
+                                throw new ArgumentOutOfRangeException();
+                        }
+
+
+                    }
+                }
+            }
+
+            return _localTempDirectory;
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[32,9,32,62,1],[33,9,33,46,1],[33,9,33,46,0],[33,9,33,46,0],[33,9,33,46,0],[34,9,34,76,1],[34,9,34,76,0],[34,9,34,76,0],[34,9,34,76,0],[42,15,42,21,0],[43,9,43,10,0],[44,9,44,10,0],[54,17,54,18,0],[54,19,54,32,0],[54,33,54,34,0],[64,15,64,40,0],[65,9,65,10,0],[66,9,66,10,0],[74,15,74,46,0],[75,9,75,10,0],[76,9,76,10,0],[84,15,84,37,1],[85,9,85,10,1],[86,9,86,10,1],[91,9,91,10,0],[92,13,92,30,0],[92,31,92,71,0],[95,13,95,26,0],[98,13,98,42,0],[99,13,99,14,0],[100,17,100,24,0],[103,13,103,43,0],[110,13,110,106,0],[111,13,111,14,0],[114,17,114,103,0],[115,17,115,43,0],[116,17,116,18,0],[118,21,118,97,0],[119,21,119,64,0],[120,21,120,22,0],[122,25,122,99,0],[123,25,123,45,0],[124,25,124,26,0],[126,29,126,30,0],[127,33,127,109,0],[128,29,128,30,0],[129,29,129,49,0],[130,29,130,30,0],[131,33,133,41,0],[134,29,134,30,0],[135,25,135,26,0],[136,21,136,22,0],[137,21,137,74,0],[138,21,138,61,0],[139,21,139,101,0],[140,21,140,42,0],[140,43,140,169,0],[141,21,141,56,0],[142,21,142,70,0],[143,17,143,18,0],[144,13,144,14,0],[145,9,145,10,0],[150,9,150,65,1],[158,9,158,10,0],[160,13,160,91,0],[161,13,161,14,0],[163,17,165,89,0],[166,17,166,18,0],[167,21,167,34,0],[169,13,169,14,0],[170,13,170,25,0],[171,9,171,10,0],[180,9,180,10,1],[181,13,181,102,1],[182,13,182,88,1],[183,13,183,29,1],[184,9,184,10,1],[191,9,191,10,1],[192,13,192,49,1],[193,13,194,29,1],[194,29,194,74,1],[194,74,195,29,1],[195,29,195,78,1],[195,78,196,28,1],[193,13,196,28,1],[197,9,197,10,1],[200,9,200,10,0],[201,13,201,50,0],[202,13,205,23,0],[206,9,206,10,0],[209,9,209,10,1],[211,13,211,40,1],[211,41,211,74,1],[214,13,214,45,0],[215,13,215,14,0],[216,17,216,30,0],[217,17,217,18,0],[218,21,218,53,0],[219,21,219,22,0],[220,25,220,51,0],[223,33,223,86,0],[224,33,224,51,0],[225,33,225,34,0],[226,37,228,48,0],[229,33,229,34,0],[231,33,231,34,0],[232,37,232,70,0],[234,33,234,39,0],[236,33,236,128,0],[237,33,237,39,0],[239,33,239,73,0],[243,21,243,22,0],[244,17,244,18,0],[245,13,245,14,0],[247,13,247,40,0],[248,9,248,10,1]]);
+    </script>
+  </body>
+</html>

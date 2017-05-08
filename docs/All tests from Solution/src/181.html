@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Services\ThreadSafetyServiceTest.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using NUnit.Framework;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Publishing;
+using Umbraco.Core.Services;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Tests.TestHelpers.Entities;
+using umbraco.editorControls.tinyMCE3;
+using umbraco.interfaces;
+using Umbraco.Core.Events;
+
+namespace Umbraco.Tests.Services
+{
+    [DatabaseTestBehavior(DatabaseBehavior.NewDbFileAndSchemaPerTest)]
+	[TestFixture, RequiresSTA]
+	public class ThreadSafetyServiceTest : BaseDatabaseFactoryTest
+	{
+		private PerThreadPetaPocoUnitOfWorkProvider _uowProvider;
+		private PerThreadDatabaseFactory _dbFactory;
+
+		[SetUp]
+		public override void Initialize()
+		{            
+			base.Initialize();
+			
+			//we need to use our own custom IDatabaseFactory for the DatabaseContext because we MUST ensure that 
+			//a Database instance is created per thread, whereas the default implementation which will work in an HttpContext
+			//threading environment, or a single apartment threading environment will not work for this test because 
+			//it is multi-threaded.
+			_dbFactory = new PerThreadDatabaseFactory(Logger);
+			//overwrite the local object
+            ApplicationContext.DatabaseContext = new DatabaseContext(_dbFactory, Logger, new SqlCeSyntaxProvider(), Constants.DatabaseProviders.SqlCe);
+
+            //disable cache
+		    var cacheHelper = CacheHelper.CreateDisabledCacheHelper();
+
+			//here we are going to override the ServiceContext because normally with our test cases we use a 
+			//global Database object but this is NOT how it should work in the web world or in any multi threaded scenario.
+			//we need a new Database object for each thread.
+            var repositoryFactory = new RepositoryFactory(cacheHelper, Logger, SqlSyntax, SettingsForTests.GenerateMockSettings());
+			_uowProvider = new PerThreadPetaPocoUnitOfWorkProvider(_dbFactory);
+		    var evtMsgs = new TransientMessagesFactory();
+		    ApplicationContext.Services = new ServiceContext(
+                repositoryFactory,
+                _uowProvider, 
+                new FileUnitOfWorkProvider(), 
+                new PublishingStrategy(evtMsgs, Logger), 
+                cacheHelper, 
+                Logger,
+                evtMsgs);
+
+			CreateTestData();
+		}
+
+		[TearDown]
+		public override void TearDown()
+		{
+			_error = null;
+
+			//dispose!
+			_dbFactory.Dispose();
+			_uowProvider.Dispose();
+
+			base.TearDown();
+		}
+
+		/// &lt;summary&gt;
+		/// Used to track exceptions during multi-threaded tests, volatile so that it is not locked in CPU registers.
+		/// &lt;/summary&gt;
+		private volatile Exception _error = null;
+
+		private const int MaxThreadCount = 20;
+
+		[Test]
+		public void Ensure_All_Threads_Execute_Successfully_Content_Service()
+		{
+			//we will mimick the ServiceContext in that each repository in a service (i.e. ContentService) is a singleton
+			var contentService = (ContentService)ServiceContext.ContentService;
+			
+			var threads = new List&lt;Thread&gt;();
+			
+			Debug.WriteLine(&quot;Starting test...&quot;);
+
+			for (var i = 0; i &lt; MaxThreadCount; i++)
+			{
+				var t = new Thread(() =&gt;
+					{
+						try
+						{
+							Debug.WriteLine(&quot;Created content on thread: &quot; + Thread.CurrentThread.ManagedThreadId);							
+							
+							//create 2 content items
+
+                            string name1 = &quot;test&quot; + Guid.NewGuid();
+							var content1 = contentService.CreateContent(name1, -1, &quot;umbTextpage&quot;, 0);
+							
+							Debug.WriteLine(&quot;Saving content1 on thread: &quot; + Thread.CurrentThread.ManagedThreadId);
+							contentService.Save(content1);
+
+							Thread.Sleep(100); //quick pause for maximum overlap!
+
+                            string name2 = &quot;test&quot; + Guid.NewGuid();
+							var content2 = contentService.CreateContent(name2, -1, &quot;umbTextpage&quot;, 0);
+							Debug.WriteLine(&quot;Saving content2 on thread: &quot; + Thread.CurrentThread.ManagedThreadId);
+							contentService.Save(content2);	
+						}
+						catch(Exception e)
+						{														
+							_error = e;
+						}						
+					});
+				threads.Add(t);
+			}
+
+			//start all threads
+			threads.ForEach(x =&gt; x.Start());
+
+			//wait for all to complete
+			threads.ForEach(x =&gt; x.Join());
+
+			//kill them all
+			threads.ForEach(x =&gt; x.Abort());
+
+			if (_error == null)
+			{
+				//now look up all items, there should be 40!
+				var items = contentService.GetRootContent();
+				Assert.AreEqual(40, items.Count());
+			}
+			else
+			{
+			    throw new Exception(&quot;Error!&quot;, _error);
+			}
+			
+		}
+
+		[Test]
+		public void Ensure_All_Threads_Execute_Successfully_Media_Service()
+		{
+			//we will mimick the ServiceContext in that each repository in a service (i.e. ContentService) is a singleton
+			var mediaService = (MediaService)ServiceContext.MediaService;
+
+			var threads = new List&lt;Thread&gt;();
+
+			Debug.WriteLine(&quot;Starting test...&quot;);
+
+			for (var i = 0; i &lt; MaxThreadCount; i++)
+			{
+				var t = new Thread(() =&gt;
+				{
+					try
+					{
+						Debug.WriteLine(&quot;Created content on thread: &quot; + Thread.CurrentThread.ManagedThreadId);
+
+						//create 2 content items
+
+                        string name1 = &quot;test&quot; + Guid.NewGuid();
+					    var folder1 = mediaService.CreateMedia(name1, -1, Constants.Conventions.MediaTypes.Folder, 0);
+						Debug.WriteLine(&quot;Saving folder1 on thread: &quot; + Thread.CurrentThread.ManagedThreadId);
+						mediaService.Save(folder1, 0);
+
+						Thread.Sleep(100); //quick pause for maximum overlap!
+
+                        string name = &quot;test&quot; + Guid.NewGuid();
+                        var folder2 = mediaService.CreateMedia(name, -1, Constants.Conventions.MediaTypes.Folder, 0);
+						Debug.WriteLine(&quot;Saving folder2 on thread: &quot; + Thread.CurrentThread.ManagedThreadId);
+						mediaService.Save(folder2, 0);
+					}
+					catch (Exception e)
+					{
+						_error = e;
+					}
+				});
+				threads.Add(t);
+			}
+
+			//start all threads
+			threads.ForEach(x =&gt; x.Start());
+
+			//wait for all to complete
+			threads.ForEach(x =&gt; x.Join());
+
+			//kill them all
+			threads.ForEach(x =&gt; x.Abort());
+
+			if (_error == null)
+			{
+				//now look up all items, there should be 40!
+				var items = mediaService.GetRootMedia();
+				Assert.AreEqual(40, items.Count());
+			}
+			else
+			{
+				Assert.Fail(&quot;ERROR! &quot; + _error);
+			}
+
+		}
+		
+		public void CreateTestData()
+		{
+			//Create and Save ContentType &quot;umbTextpage&quot; -&gt; 1045
+			ContentType contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbTextpage&quot;, &quot;Textpage&quot;);
+			contentType.Key = new Guid(&quot;1D3A8E6E-2EA9-4CC1-B229-1AEE19821522&quot;);
+			ServiceContext.ContentTypeService.Save(contentType);			
+		}
+
+		/// &lt;summary&gt;
+		/// Creates a Database object per thread, this mimics the web context which is per HttpContext and is required for the multi-threaded test
+		/// &lt;/summary&gt;
+		internal class PerThreadDatabaseFactory : DisposableObject, IDatabaseFactory
+		{
+		    private readonly ILogger _logger;
+
+		    public PerThreadDatabaseFactory(ILogger logger)
+		    {
+		        _logger = logger;
+		    }
+
+		    private readonly ConcurrentDictionary&lt;int, UmbracoDatabase&gt; _databases = new ConcurrentDictionary&lt;int, UmbracoDatabase&gt;(); 
+
+			public UmbracoDatabase CreateDatabase()
+			{
+				var db = _databases.GetOrAdd(
+                    Thread.CurrentThread.ManagedThreadId,
+                    i =&gt; new UmbracoDatabase(Umbraco.Core.Configuration.GlobalSettings.UmbracoConnectionName, _logger));
+				return db;
+			}
+
+			protected override void DisposeResources()
+			{
+				//dispose the databases
+				_databases.ForEach(x =&gt; x.Value.Dispose());
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// Creates a UOW with a Database object per thread
+		/// &lt;/summary&gt;
+		internal class PerThreadPetaPocoUnitOfWorkProvider : DisposableObject, IDatabaseUnitOfWorkProvider
+		{
+			private readonly PerThreadDatabaseFactory _dbFactory;
+
+			public PerThreadPetaPocoUnitOfWorkProvider(PerThreadDatabaseFactory dbFactory)
+			{
+				_dbFactory = dbFactory;
+			}
+
+			public IDatabaseUnitOfWork GetUnitOfWork()
+			{
+				//Create or get a database instance for this thread.
+				var db = _dbFactory.CreateDatabase();
+				return new PetaPocoUnitOfWork(db);
+			}
+
+			protected override void DisposeResources()
+			{
+				//dispose the databases
+				_dbFactory.Dispose();
+			}
+		}
+
+	}
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[34,3,34,4,1],[35,4,35,22,1],[41,4,41,54,1],[43,13,43,152,1],[46,7,46,65,1],[51,13,51,132,1],[52,4,52,71,1],[53,7,53,52,1],[54,7,61,26,1],[63,4,63,21,1],[64,3,64,4,1],[68,3,68,4,1],[69,4,69,18,1],[72,4,72,25,1],[73,4,73,27,1],[75,4,75,20,1],[76,3,76,4,1],[81,3,81,44,1],[87,3,87,4,1],[89,4,89,71,1],[91,4,91,37,1],[93,4,93,40,1],[95,9,95,18,1],[95,20,95,38,1],[95,40,95,43,1],[96,4,96,5,1],[97,5,98,6,1],[98,6,98,7,1],[98,7,100,7,1],[100,7,100,8,1],[100,8,101,8,1],[101,8,101,94,1],[101,94,105,29,1],[105,29,105,68,1],[105,68,106,8,1],[106,8,106,81,1],[106,81,108,8,1],[108,8,108,94,1],[108,94,109,8,1],[109,8,109,38,1],[109,38,111,8,1],[111,8,111,26,1],[111,26,113,29,1],[113,29,113,68,1],[113,68,114,8,1],[114,8,114,81,1],[114,81,115,8,1],[115,8,115,94,1],[115,94,116,8,1],[116,8,116,38,1],[116,38,117,7,1],[117,7,117,8,1],[117,8,118,7,1],[118,7,118,25,0],[118,25,119,7,1],[119,7,119,8,0],[119,8,120,8,1],[120,8,120,19,0],[120,19,121,7,1],[121,7,121,8,0],[121,8,122,6,1],[122,6,122,7,1],[122,7,122,9,1],[97,5,122,9,1],[123,5,123,20,1],[124,4,124,5,1],[127,4,127,25,1],[127,25,127,34,1],[127,34,127,36,1],[127,4,127,36,1],[130,4,130,25,1],[130,25,130,33,1],[130,33,130,35,1],[130,4,130,35,1],[133,4,133,25,1],[133,25,133,34,1],[133,34,133,36,1],[133,4,133,36,1],[135,4,135,23,1],[136,4,136,5,1],[138,5,138,49,1],[139,5,139,40,1],[140,4,140,5,1],[142,4,142,5,0],[143,8,143,46,0],[146,3,146,4,1],[150,3,150,4,1],[152,4,152,65,1],[154,4,154,37,1],[156,4,156,40,1],[158,9,158,18,1],[158,20,158,38,1],[158,40,158,43,1],[159,4,159,5,1],[160,5,161,5,1],[161,5,161,6,1],[161,6,163,6,1],[163,6,163,7,1],[163,7,164,7,1],[164,7,164,93,1],[164,93,168,25,1],[168,25,168,64,1],[168,64,169,10,1],[169,10,169,104,1],[169,104,170,7,1],[170,7,170,92,1],[170,92,171,7,1],[171,7,171,37,1],[171,37,173,7,1],[173,7,173,25,1],[173,25,175,25,1],[175,25,175,63,1],[175,63,176,25,1],[176,25,176,118,1],[176,118,177,7,1],[177,7,177,92,1],[177,92,178,7,1],[178,7,178,37,1],[178,37,179,6,1],[179,6,179,7,1],[179,7,180,6,1],[180,6,180,25,0],[180,25,181,6,1],[181,6,181,7,0],[181,7,182,7,1],[182,7,182,18,0],[182,18,183,6,1],[183,6,183,7,0],[183,7,184,5,1],[184,5,184,6,1],[184,6,184,8,1],[160,5,184,8,1],[185,5,185,20,1],[186,4,186,5,1],[189,4,189,25,1],[189,25,189,34,1],[189,34,189,36,1],[189,4,189,36,1],[192,4,192,25,1],[192,25,192,33,1],[192,33,192,35,1],[192,4,192,35,1],[195,4,195,25,1],[195,25,195,34,1],[195,34,195,36,1],[195,4,195,36,1],[197,4,197,23,1],[198,4,198,5,1],[200,5,200,45,1],[201,5,201,40,1],[202,4,202,5,1],[204,4,204,5,0],[205,5,205,37,0],[206,4,206,5,0],[208,3,208,4,1],[211,3,211,4,1],[213,4,213,100,1],[214,4,214,71,1],[215,4,215,56,1],[216,3,216,4,1],[225,7,225,54,1],[226,7,226,8,1],[227,11,227,28,1],[228,7,228,8,1],[230,7,230,129,1],[233,4,233,5,1],[234,5,236,26,1],[236,26,236,119,1],[236,119,236,121,1],[234,5,236,121,1],[237,5,237,15,1],[238,4,238,5,1],[241,4,241,5,1],[243,5,243,29,1],[243,29,243,46,1],[243,46,243,48,1],[243,5,243,48,1],[244,4,244,5,1],[254,4,254,82,1],[255,4,255,5,1],[256,5,256,28,1],[257,4,257,5,1],[260,4,260,5,1],[262,5,262,42,1],[263,5,263,39,1],[264,4,264,5,1],[267,4,267,5,1],[269,5,269,26,1],[270,4,270,5,1]]);
+    </script>
+  </body>
+</html>

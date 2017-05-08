@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\ExpressionHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
+
+namespace Umbraco.Core
+{
+	/// &lt;summary&gt;
+	/// A set of helper methods for dealing with expressions
+	/// &lt;/summary&gt;
+	/// &lt;remarks&gt;&lt;/remarks&gt;
+	internal static class ExpressionHelper
+	{
+		private static readonly ConcurrentDictionary&lt;LambdaExpressionCacheKey, PropertyInfo&gt; PropertyInfoCache = new ConcurrentDictionary&lt;LambdaExpressionCacheKey, PropertyInfo&gt;();
+
+		/// &lt;summary&gt;
+		/// Gets a &lt;see cref=&quot;PropertyInfo&quot;/&gt; object from an expression.
+		/// &lt;/summary&gt;
+		/// &lt;typeparam name=&quot;TSource&quot;&gt;The type of the source.&lt;/typeparam&gt;
+		/// &lt;typeparam name=&quot;TProperty&quot;&gt;The type of the property.&lt;/typeparam&gt;
+		/// &lt;param name=&quot;source&quot;&gt;The source.&lt;/param&gt;
+		/// &lt;param name=&quot;propertyLambda&quot;&gt;The property lambda.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		/// &lt;remarks&gt;&lt;/remarks&gt;
+		public static PropertyInfo GetPropertyInfo&lt;TSource, TProperty&gt;(this TSource source, Expression&lt;Func&lt;TSource, TProperty&gt;&gt; propertyLambda)
+		{
+			return GetPropertyInfo(propertyLambda);
+		}
+
+		/// &lt;summary&gt;
+		/// Gets a &lt;see cref=&quot;PropertyInfo&quot;/&gt; object from an expression.
+		/// &lt;/summary&gt;
+		/// &lt;typeparam name=&quot;TSource&quot;&gt;The type of the source.&lt;/typeparam&gt;
+		/// &lt;typeparam name=&quot;TProperty&quot;&gt;The type of the property.&lt;/typeparam&gt;
+		/// &lt;param name=&quot;propertyLambda&quot;&gt;The property lambda.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		/// &lt;remarks&gt;&lt;/remarks&gt;
+		public static PropertyInfo GetPropertyInfo&lt;TSource, TProperty&gt;(Expression&lt;Func&lt;TSource, TProperty&gt;&gt; propertyLambda)
+		{
+			return PropertyInfoCache.GetOrAdd(
+				new LambdaExpressionCacheKey(propertyLambda),
+				x =&gt;
+					{
+						var type = typeof(TSource);
+
+						var member = propertyLambda.Body as MemberExpression;
+						if (member == null)
+						{
+							if (propertyLambda.Body.GetType().Name == &quot;UnaryExpression&quot;)
+							{
+								// The expression might be for some boxing, e.g. representing a value type like HiveId as an object
+								// in which case the expression will be Convert(x.MyProperty)
+								var unary = propertyLambda.Body as UnaryExpression;
+								if (unary != null)
+								{
+									var boxedMember = unary.Operand as MemberExpression;
+									if (boxedMember == null)
+										throw new ArgumentException(&quot;The type of property could not be infered, try specifying the type parameters explicitly. This can happen if you have tried to access PropertyInfo where the property&#39;s return type is a value type, but the expression is trying to convert it to an object&quot;);
+									else member = boxedMember;
+								}
+							}
+							else throw new ArgumentException(string.Format(&quot;Expression &#39;{0}&#39; refers to a method, not a property.&quot;, propertyLambda));
+						}
+
+
+						var propInfo = member.Member as PropertyInfo;
+						if (propInfo == null)
+							throw new ArgumentException(string.Format(
+								&quot;Expression &#39;{0}&#39; refers to a field, not a property.&quot;,
+								propertyLambda));
+
+						if (type != propInfo.ReflectedType &amp;&amp;
+						    !type.IsSubclassOf(propInfo.ReflectedType))
+							throw new ArgumentException(string.Format(
+								&quot;Expresion &#39;{0}&#39; refers to a property that is not from type {1}.&quot;,
+								propertyLambda,
+								type));
+
+						return propInfo;
+					});
+		}
+
+        public static MemberInfo FindProperty(LambdaExpression lambdaExpression)
+        {
+            Expression expressionToCheck = lambdaExpression;
+
+            bool done = false;
+
+            while (!done)
+            {
+                switch (expressionToCheck.NodeType)
+                {
+                    case ExpressionType.Convert:
+                        expressionToCheck = ((UnaryExpression)expressionToCheck).Operand;
+                        break;
+                    case ExpressionType.Lambda:
+                        expressionToCheck = ((LambdaExpression)expressionToCheck).Body;
+                        break;
+                    case ExpressionType.MemberAccess:
+                        var memberExpression = ((MemberExpression)expressionToCheck);
+
+                        if (memberExpression.Expression.NodeType != ExpressionType.Parameter &amp;&amp;
+                            memberExpression.Expression.NodeType != ExpressionType.Convert)
+                        {
+                            throw new ArgumentException(string.Format(&quot;Expression &#39;{0}&#39; must resolve to top-level member and not any child object&#39;s properties. Use a custom resolver on the child type or the AfterMap option instead.&quot;, lambdaExpression), &quot;lambdaExpression&quot;);
+                        }
+
+                        MemberInfo member = memberExpression.Member;
+
+                        return member;
+                    default:
+                        done = true;
+                        break;
+                }
+            }
+
+            throw new Exception(&quot;Configuration for members is only supported for top-level individual members on a type.&quot;);
+        }
+
+		public static IDictionary&lt;string, object&gt; GetMethodParams&lt;T1, T2&gt;(Expression&lt;Func&lt;T1, T2&gt;&gt; fromExpression)
+		{
+			if (fromExpression == null) return null;
+			var body = fromExpression.Body as MethodCallExpression;
+			if (body == null)
+				return new Dictionary&lt;string, object&gt;();
+
+			var rVal = new Dictionary&lt;string, object&gt;();
+			var parameters = body.Method.GetParameters().Select(x =&gt; x.Name).ToArray();
+			var i = 0;
+			foreach (var argument in body.Arguments)
+			{
+				var lambda = Expression.Lambda(argument, fromExpression.Parameters);
+				var d = lambda.Compile();
+				var value = d.DynamicInvoke(new object[1]);
+				rVal.Add(parameters[i], value);
+				i++;
+			}
+			return rVal;
+		}
+
+		/// &lt;summary&gt;
+		/// Gets a &lt;see cref=&quot;MethodInfo&quot;/&gt; from an &lt;see cref=&quot;Expression{Action{T}}&quot;/&gt; provided it refers to a method call.
+		/// &lt;/summary&gt;
+		/// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+		/// &lt;param name=&quot;fromExpression&quot;&gt;From expression.&lt;/param&gt;
+		/// &lt;returns&gt;The &lt;see cref=&quot;MethodInfo&quot;/&gt; or null if &lt;paramref name=&quot;fromExpression&quot;/&gt; is null or cannot be converted to &lt;see cref=&quot;MethodCallExpression&quot;/&gt;.&lt;/returns&gt;
+		/// &lt;remarks&gt;&lt;/remarks&gt;
+		public static MethodInfo GetMethodInfo&lt;T&gt;(Expression&lt;Action&lt;T&gt;&gt; fromExpression)
+		{
+			if (fromExpression == null) return null;
+			var body = fromExpression.Body as MethodCallExpression;
+			return body != null ? body.Method : null;
+		}
+
+		/// &lt;summary&gt;
+		/// Gets the method info.
+		/// &lt;/summary&gt;
+		/// &lt;typeparam name=&quot;TReturn&quot;&gt;The return type of the method.&lt;/typeparam&gt;
+		/// &lt;param name=&quot;fromExpression&quot;&gt;From expression.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		public static MethodInfo GetMethodInfo&lt;TReturn&gt;(Expression&lt;Func&lt;TReturn&gt;&gt; fromExpression)
+		{
+			if (fromExpression == null) return null;
+			var body = fromExpression.Body as MethodCallExpression;
+			return body != null ? body.Method : null;
+		}
+
+		/// &lt;summary&gt;
+		/// Gets the method info.
+		/// &lt;/summary&gt;
+		/// &lt;typeparam name=&quot;T1&quot;&gt;The type of the 1.&lt;/typeparam&gt;
+		/// &lt;typeparam name=&quot;T2&quot;&gt;The type of the 2.&lt;/typeparam&gt;
+		/// &lt;param name=&quot;fromExpression&quot;&gt;From expression.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		public static MethodInfo GetMethodInfo&lt;T1, T2&gt;(Expression&lt;Func&lt;T1, T2&gt;&gt; fromExpression)
+		{
+			if (fromExpression == null) return null;
+
+            MethodCallExpression me;
+            switch (fromExpression.Body.NodeType)
+            {
+                case ExpressionType.Convert:
+                case ExpressionType.ConvertChecked:
+                    var ue = fromExpression.Body as UnaryExpression;
+                    me = ((ue != null) ? ue.Operand : null) as MethodCallExpression;
+                    break;
+                default:
+                    me = fromExpression.Body as MethodCallExpression;
+                    break;
+            }
+
+            return me != null ? me.Method : null;
+		}
+
+		/// &lt;summary&gt;
+		/// Gets a &lt;see cref=&quot;MethodInfo&quot;/&gt; from an &lt;see cref=&quot;Expression&quot;/&gt; provided it refers to a method call.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;expression&quot;&gt;The expression.&lt;/param&gt;
+		/// &lt;returns&gt;The &lt;see cref=&quot;MethodInfo&quot;/&gt; or null if &lt;paramref name=&quot;expression&quot;/&gt; cannot be converted to &lt;see cref=&quot;MethodCallExpression&quot;/&gt;.&lt;/returns&gt;
+		/// &lt;remarks&gt;&lt;/remarks&gt;
+		public static MethodInfo GetMethod(Expression expression)
+		{
+			if (expression == null) return null;
+			return IsMethod(expression) ? (((MethodCallExpression)expression).Method) : null;
+		}
+
+		/// &lt;summary&gt;
+		/// Gets a &lt;see cref=&quot;MemberInfo&quot;/&gt; from an &lt;see cref=&quot;Expression{Func{T, TReturn}}&quot;/&gt; provided it refers to member access.
+		/// &lt;/summary&gt;
+		/// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+		/// &lt;typeparam name=&quot;TReturn&quot;&gt;The type of the return.&lt;/typeparam&gt;
+		/// &lt;param name=&quot;fromExpression&quot;&gt;From expression.&lt;/param&gt;
+		/// &lt;returns&gt;The &lt;see cref=&quot;MemberInfo&quot;/&gt; or null if &lt;paramref name=&quot;fromExpression&quot;/&gt; cannot be converted to &lt;see cref=&quot;MemberExpression&quot;/&gt;.&lt;/returns&gt;
+		/// &lt;remarks&gt;&lt;/remarks&gt;
+		public static MemberInfo GetMemberInfo&lt;T, TReturn&gt;(Expression&lt;Func&lt;T, TReturn&gt;&gt; fromExpression)
+		{
+			if (fromExpression == null) return null;
+			var body = fromExpression.Body as MemberExpression;
+			return body != null ? body.Member : null;
+		}
+
+		/// &lt;summary&gt;
+		/// Determines whether the MethodInfo is the same based on signature, not based on the equality operator or HashCode.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;left&quot;&gt;The left.&lt;/param&gt;
+		/// &lt;param name=&quot;right&quot;&gt;The right.&lt;/param&gt;
+		/// &lt;returns&gt;
+		///   &lt;c&gt;true&lt;/c&gt; if [is method signature equal to] [the specified left]; otherwise, &lt;c&gt;false&lt;/c&gt;.
+		/// &lt;/returns&gt;
+		/// &lt;remarks&gt;
+		/// This is useful for comparing Expression methods that may contain different generic types
+		/// &lt;/remarks&gt;
+		public static bool IsMethodSignatureEqualTo(this MethodInfo left, MethodInfo right)
+		{
+			if (left.Equals(right))
+				return true;
+			if (left.DeclaringType != right.DeclaringType)
+				return false;
+			if (left.Name != right.Name)
+				return false;
+			var leftParams = left.GetParameters();
+			var rightParams = right.GetParameters();
+			if (leftParams.Length != rightParams.Length)
+				return false;
+			for (int i = 0; i &lt; leftParams.Length; i++)
+			{
+				//if they are delegate parameters, then assume they match as they could be anything
+				if (typeof(Delegate).IsAssignableFrom(leftParams[i].ParameterType) &amp;&amp; typeof(Delegate).IsAssignableFrom(rightParams[i].ParameterType))
+					continue;
+				//if they are not delegates, then compare the types
+				if (leftParams[i].ParameterType != rightParams[i].ParameterType)
+					return false;
+			}
+			if (left.ReturnType != right.ReturnType)
+				return false;
+			return true;
+		}
+
+		/// &lt;summary&gt;
+		/// Gets a &lt;see cref=&quot;MemberInfo&quot;/&gt; from an &lt;see cref=&quot;Expression&quot;/&gt; provided it refers to member access.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;expression&quot;&gt;The expression.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		/// &lt;remarks&gt;&lt;/remarks&gt;
+		public static MemberInfo GetMember(Expression expression)
+		{
+			if (expression == null) return null;
+			return IsMember(expression) ? (((MemberExpression)expression).Member) : null;
+		}
+
+		/// &lt;summary&gt;
+		/// Gets a &lt;see cref=&quot;MethodInfo&quot;/&gt; from a &lt;see cref=&quot;Delegate&quot;/&gt;
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;fromMethodGroup&quot;&gt;From method group.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		/// &lt;remarks&gt;&lt;/remarks&gt;
+		public static MethodInfo GetStaticMethodInfo(Delegate fromMethodGroup)
+		{
+			if (fromMethodGroup == null) throw new ArgumentNullException(&quot;fromMethodGroup&quot;);
+
+
+			return fromMethodGroup.Method;
+		}
+
+		///// &lt;summary&gt;
+		///// Formats an unhandled item for representing the expression as a string.
+		///// &lt;/summary&gt;
+		///// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+		///// &lt;param name=&quot;unhandledItem&quot;&gt;The unhandled item.&lt;/param&gt;
+		///// &lt;returns&gt;&lt;/returns&gt;
+		///// &lt;remarks&gt;&lt;/remarks&gt;
+		//public static string FormatUnhandledItem&lt;T&gt;(T unhandledItem) where T : class
+		//{
+		//    if (unhandledItem == null) throw new ArgumentNullException(&quot;unhandledItem&quot;);
+
+
+		//    var itemAsExpression = unhandledItem as Expression;
+		//    return itemAsExpression != null
+		//               ? FormattingExpressionTreeVisitor.Format(itemAsExpression)
+		//               : unhandledItem.ToString();
+		//}
+
+		/// &lt;summary&gt;
+		/// Determines whether the specified expression is a method.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;expression&quot;&gt;The expression.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;c&gt;true&lt;/c&gt; if the specified expression is method; otherwise, &lt;c&gt;false&lt;/c&gt;.&lt;/returns&gt;
+		/// &lt;remarks&gt;&lt;/remarks&gt;
+		public static bool IsMethod(Expression expression)
+		{
+			return expression != null &amp;&amp; typeof(MethodCallExpression).IsAssignableFrom(expression.GetType());
+		}
+
+
+
+
+
+		/// &lt;summary&gt;
+		/// Determines whether the specified expression is a member.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;expression&quot;&gt;The expression.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;c&gt;true&lt;/c&gt; if the specified expression is member; otherwise, &lt;c&gt;false&lt;/c&gt;.&lt;/returns&gt;
+		/// &lt;remarks&gt;&lt;/remarks&gt;
+		public static bool IsMember(Expression expression)
+		{
+			return expression != null &amp;&amp; typeof(MemberExpression).IsAssignableFrom(expression.GetType());
+		}
+
+		/// &lt;summary&gt;
+		/// Determines whether the specified expression is a constant.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;expression&quot;&gt;The expression.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;c&gt;true&lt;/c&gt; if the specified expression is constant; otherwise, &lt;c&gt;false&lt;/c&gt;.&lt;/returns&gt;
+		/// &lt;remarks&gt;&lt;/remarks&gt;
+		public static bool IsConstant(Expression expression)
+		{
+			return expression != null &amp;&amp; typeof(ConstantExpression).IsAssignableFrom(expression.GetType());
+		}
+
+		/// &lt;summary&gt;
+		/// Gets the first value from the supplied arguments of an expression, for those arguments that can be cast to &lt;see cref=&quot;ConstantExpression&quot;/&gt;.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;arguments&quot;&gt;The arguments.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		/// &lt;remarks&gt;&lt;/remarks&gt;
+		public static object GetFirstValueFromArguments(IEnumerable&lt;Expression&gt; arguments)
+		{
+			if (arguments == null) return false;
+			return
+				arguments.Where(x =&gt; typeof(ConstantExpression).IsAssignableFrom(x.GetType())).Cast
+					&lt;ConstantExpression&gt;().Select(x =&gt; x.Value).DefaultIfEmpty(null).FirstOrDefault();
+		}
+	}
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[16,3,16,175,1],[28,3,28,4,0],[29,4,29,43,0],[30,3,30,4,0],[41,3,41,4,1],[42,4,45,6,1],[45,6,45,7,1],[45,7,46,7,1],[46,7,46,34,1],[46,34,48,7,1],[48,7,48,60,1],[48,60,49,7,1],[49,7,49,26,1],[49,26,50,7,1],[50,7,50,8,0],[50,8,51,8,1],[51,8,51,68,0],[51,68,52,8,1],[52,8,52,9,0],[52,9,55,9,1],[55,9,55,60,0],[55,60,56,9,1],[56,9,56,27,0],[56,27,57,9,1],[57,9,57,10,0],[57,10,58,10,1],[58,10,58,62,0],[58,62,59,10,1],[59,10,59,34,0],[59,34,60,11,1],[60,11,60,295,0],[60,295,61,15,1],[61,15,61,36,0],[61,36,62,9,1],[62,9,62,10,0],[62,10,63,8,1],[63,8,63,9,0],[63,9,64,13,1],[64,13,64,128,0],[64,128,65,7,1],[65,7,65,8,0],[65,8,68,7,1],[68,7,68,52,1],[68,52,69,7,1],[69,7,69,28,1],[69,28,70,8,1],[70,8,72,26,0],[72,26,74,7,1],[74,7,75,54,1],[75,54,76,8,1],[76,8,79,16,0],[79,16,81,7,1],[81,7,81,23,1],[81,23,82,6,1],[82,6,82,7,1],[82,7,82,9,1],[42,4,82,9,1],[83,3,83,4,1],[86,9,86,10,1],[87,13,87,61,1],[89,13,89,31,1],[91,13,91,26,1],[92,13,92,14,1],[93,17,93,52,1],[96,25,96,90,1],[97,25,97,31,1],[99,25,99,88,1],[100,25,100,31,1],[102,25,102,86,1],[104,25,105,92,1],[106,25,106,26,0],[107,29,107,274,0],[110,25,110,69,1],[112,25,112,39,1],[114,25,114,37,0],[115,25,115,31,0],[117,13,117,14,1],[119,13,119,124,0],[120,9,120,10,1],[123,3,123,4,0],[124,4,124,31,0],[124,32,124,44,0],[125,4,125,59,0],[126,4,126,21,0],[127,5,127,45,0],[129,4,129,48,0],[130,4,130,61,0],[130,61,130,67,0],[130,67,130,79,0],[130,4,130,79,0],[131,4,131,14,0],[132,4,132,11,0],[132,13,132,25,0],[132,26,132,28,0],[132,29,132,43,0],[133,4,133,5,0],[134,5,134,73,0],[135,5,135,30,0],[136,5,136,48,0],[137,5,137,36,0],[138,5,138,9,0],[139,4,139,5,0],[140,4,140,16,0],[141,3,141,4,0],[151,3,151,4,0],[152,4,152,31,0],[152,32,152,44,0],[153,4,153,59,0],[154,4,154,45,0],[155,3,155,4,0],[164,3,164,4,0],[165,4,165,31,0],[165,32,165,44,0],[166,4,166,59,0],[167,4,167,45,0],[168,3,168,4,0],[178,3,178,4,0],[179,4,179,31,0],[179,32,179,44,0],[182,13,182,50,0],[186,21,186,69,0],[187,21,187,85,0],[188,21,188,27,0],[190,21,190,70,0],[191,21,191,27,0],[194,13,194,50,0],[195,3,195,4,0],[204,3,204,4,0],[205,4,205,27,0],[205,28,205,40,0],[206,4,206,85,0],[207,3,207,4,0],[218,3,218,4,1],[219,4,219,31,1],[219,32,219,44,0],[220,4,220,55,1],[221,4,221,45,1],[222,3,222,4,1],[236,3,236,4,0],[237,4,237,27,0],[238,5,238,17,0],[239,4,239,50,0],[240,5,240,18,0],[241,4,241,32,0],[242,5,242,18,0],[243,4,243,42,0],[244,4,244,44,0],[245,4,245,48,0],[246,5,246,18,0],[247,9,247,18,0],[247,20,247,41,0],[247,43,247,46,0],[248,4,248,5,0],[250,5,250,139,0],[251,6,251,15,0],[253,5,253,69,0],[254,6,254,19,0],[255,4,255,5,0],[256,4,256,44,0],[257,5,257,18,0],[258,4,258,16,0],[259,3,259,4,0],[268,3,268,4,0],[269,4,269,27,0],[269,28,269,40,0],[270,4,270,81,0],[271,3,271,4,0],[280,3,280,4,0],[281,4,281,32,0],[281,33,281,84,0],[284,4,284,34,0],[285,3,285,4,0],[312,3,312,4,0],[313,4,313,101,0],[314,3,314,4,0],[327,3,327,4,0],[328,4,328,97,0],[329,3,329,4,0],[338,3,338,4,0],[339,4,339,99,0],[340,3,340,4,0],[349,3,349,4,0],[350,4,350,26,0],[350,27,350,40,0],[351,4,352,26,0],[352,26,352,82,0],[352,82,353,41,0],[353,41,353,48,0],[353,48,353,88,0],[351,4,353,88,0],[354,3,354,4,0]]);
+    </script>
+  </body>
+</html>

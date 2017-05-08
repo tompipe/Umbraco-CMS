@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\CoreBootManager.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Web;
+using AutoMapper;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Events;
+using Umbraco.Core.Exceptions;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.Mapping;
+using Umbraco.Core.Models.PublishedContent;
+using Umbraco.Core.ObjectResolution;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Mappers;
+using Umbraco.Core.Persistence.Migrations;
+using Umbraco.Core.Persistence.Migrations.Upgrades.TargetVersionSix;
+using Umbraco.Core.Persistence.Migrations.Upgrades.TargetVersionSixZeroOne;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Profiling;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Core.PropertyEditors.ValueConverters;
+using Umbraco.Core.Publishing;
+using Umbraco.Core.Macros;
+using Umbraco.Core.Manifest;
+using Umbraco.Core.Services;
+using Umbraco.Core.Sync;
+using Umbraco.Core.Strings;
+using IntegerValidator = Umbraco.Core.PropertyEditors.IntegerValidator;
+using MigrationsVersionFourNineZero = Umbraco.Core.Persistence.Migrations.Upgrades.TargetVersionFourNineZero;
+
+namespace Umbraco.Core
+{
+    /// &lt;summary&gt;
+    /// A bootstrapper for the Umbraco application which initializes all objects for the Core of the application
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// This does not provide any startup functionality relating to web objects
+    /// &lt;/remarks&gt;
+    public class CoreBootManager : IBootManager
+    {
+        protected ProfilingLogger ProfilingLogger { get; private set; }
+        private DisposableTimer _timer;
+        private bool _isInitialized = false;
+        private bool _isStarted = false;
+        private bool _isComplete = false;
+        private readonly IServiceProvider _serviceProvider = new ActivatorServiceProvider();
+        private readonly UmbracoApplicationBase _umbracoApplication;
+        protected ApplicationContext ApplicationContext { get; private set; }
+        protected CacheHelper ApplicationCache { get; private set; }
+        protected PluginManager PluginManager { get; private set; }
+
+        protected UmbracoApplicationBase UmbracoApplication
+        {
+            get { return _umbracoApplication; }
+        }
+
+        protected IServiceProvider ServiceProvider
+        {
+            get { return _serviceProvider; }
+        }
+
+        public CoreBootManager(UmbracoApplicationBase umbracoApplication)
+        {
+            if (umbracoApplication == null) throw new ArgumentNullException(&quot;umbracoApplication&quot;);
+            _umbracoApplication = umbracoApplication;
+        }
+
+        internal CoreBootManager(UmbracoApplicationBase umbracoApplication, ProfilingLogger logger)
+        {
+            if (umbracoApplication == null) throw new ArgumentNullException(&quot;umbracoApplication&quot;);
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            _umbracoApplication = umbracoApplication;
+            ProfilingLogger = logger;
+        }
+
+        public virtual IBootManager Initialize()
+        {
+            if (_isInitialized)
+                throw new InvalidOperationException(&quot;The boot manager has already been initialized&quot;);
+
+            InitializeLoggerResolver();
+            InitializeProfilerResolver();
+
+            ProfilingLogger = ProfilingLogger?? new ProfilingLogger(LoggerResolver.Current.Logger, ProfilerResolver.Current.Profiler);
+
+            _timer = ProfilingLogger.TraceDuration&lt;CoreBootManager&gt;(
+                string.Format(&quot;Umbraco {0} application starting on {1}&quot;, UmbracoVersion.GetSemanticVersion().ToSemanticString(), NetworkHelper.MachineName),
+                &quot;Umbraco application startup complete&quot;);
+
+            ApplicationCache = CreateApplicationCache();
+
+            //create and set the plugin manager (I&#39;d much prefer to not use this singleton anymore but many things are using it unfortunately and
+            // the way that it is setup, there must only ever be one per app so without IoC it would be hard to make this not a singleton)
+            PluginManager = new PluginManager(ServiceProvider, ApplicationCache.RuntimeCache, ProfilingLogger);
+            PluginManager.Current = PluginManager;
+
+            //Create the legacy prop-eds mapping
+            LegacyPropertyEditorIdToAliasConverter.CreateMappingsForCoreEditors();
+            LegacyParameterEditorAliasConverter.CreateMappingsForCoreEditors();
+
+            //create database and service contexts for the app context
+            var dbFactory = new DefaultDatabaseFactory(GlobalSettings.UmbracoConnectionName, ProfilingLogger.Logger);
+            Database.Mapper = new PetaPocoMapper();
+
+            var dbContext = new DatabaseContext(
+                dbFactory,
+                ProfilingLogger.Logger,
+                SqlSyntaxProviders.CreateDefault(ProfilingLogger.Logger));
+
+            //initialize the DatabaseContext
+            dbContext.Initialize();
+
+            //get the service context
+            var serviceContext = CreateServiceContext(dbContext, dbFactory);
+
+            //set property and singleton from response
+            ApplicationContext.Current = ApplicationContext = CreateApplicationContext(dbContext, serviceContext);
+
+            InitializeApplicationEventsResolver();
+
+            InitializeResolvers();
+
+            InitializeModelMappers();
+
+            using (ProfilingLogger.DebugDuration&lt;CoreBootManager&gt;(
+                string.Format(&quot;Executing {0} IApplicationEventHandler.OnApplicationInitialized&quot;, ApplicationEventsResolver.Current.ApplicationEventHandlers.Count()),
+                &quot;Finished executing IApplicationEventHandler.OnApplicationInitialized&quot;))
+	        {
+                //now we need to call the initialize methods
+                ApplicationEventsResolver.Current.ApplicationEventHandlers
+                    .ForEach(x =&gt;
+                    {
+                        try
+                        {
+                            using (ProfilingLogger.DebugDuration&lt;CoreBootManager&gt;(string.Format(&quot;Executing {0} in ApplicationInitialized&quot;, x.GetType())))
+                            {
+                                x.OnApplicationInitialized(UmbracoApplication, ApplicationContext);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            ProfilingLogger.Logger.Error&lt;CoreBootManager&gt;(&quot;An error occurred running OnApplicationInitialized for handler &quot; + x.GetType(), ex);
+                            throw;
+                        }
+                    });
+	        }
+
+            _isInitialized = true;
+
+            return this;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and returns the service context for the app
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dbContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dbFactory&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected virtual ServiceContext CreateServiceContext(DatabaseContext dbContext, IDatabaseFactory dbFactory)
+        {
+            //default transient factory
+            var msgFactory = new TransientMessagesFactory();
+            return new ServiceContext(
+                new RepositoryFactory(ApplicationCache, ProfilingLogger.Logger, dbContext.SqlSyntax, UmbracoConfig.For.UmbracoSettings()),
+                new PetaPocoUnitOfWorkProvider(dbFactory),
+                new FileUnitOfWorkProvider(),
+                new PublishingStrategy(msgFactory, ProfilingLogger.Logger),
+                ApplicationCache,
+                ProfilingLogger.Logger,
+                msgFactory);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and returns the application context for the app
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dbContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;serviceContext&quot;&gt;&lt;/param&gt;
+        protected virtual ApplicationContext CreateApplicationContext(DatabaseContext dbContext, ServiceContext serviceContext)
+        {
+            //create the ApplicationContext
+            return new ApplicationContext(dbContext, serviceContext, ApplicationCache, ProfilingLogger);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and returns the CacheHelper for the app
+        /// &lt;/summary&gt;
+        protected virtual CacheHelper CreateApplicationCache()
+        {
+            var cacheHelper = new CacheHelper(
+                //we need to have the dep clone runtime cache provider to ensure
+                //all entities are cached properly (cloned in and cloned out)
+                new DeepCloneRuntimeCacheProvider(new ObjectCacheRuntimeCacheProvider()),
+                new StaticCacheProvider(),
+                //we have no request based cache when not running in web-based context
+                new NullCacheProvider(),
+                new IsolatedRuntimeCache(type =&gt;
+                    //we need to have the dep clone runtime cache provider to ensure
+                    //all entities are cached properly (cloned in and cloned out)
+                    new DeepCloneRuntimeCacheProvider(new ObjectCacheRuntimeCacheProvider())));
+
+            return cacheHelper;
+        }
+
+        /// &lt;summary&gt;
+        /// This method allows for configuration of model mappers
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Model mappers MUST be defined on ApplicationEventHandler instances with the interface IMapperConfiguration.
+        /// This allows us to search for less types on startup.
+        /// &lt;/remarks&gt;
+        protected void InitializeModelMappers()
+        {
+            Mapper.Initialize(configuration =&gt;
+                {
+                    foreach (var m in ApplicationEventsResolver.Current.ApplicationEventHandlers.OfType&lt;IMapperConfiguration&gt;())
+                    {
+                        m.ConfigureMappings(configuration, ApplicationContext);
+                    }
+                });
+        }
+
+        /// &lt;summary&gt;
+        /// Special method to initialize the LoggerResolver
+        /// &lt;/summary&gt;
+        protected virtual void InitializeLoggerResolver()
+        {
+            LoggerResolver.Current = new LoggerResolver(ProfilingLogger == null ? Logger.CreateWithDefaultLog4NetConfiguration() : ProfilingLogger.Logger)
+            {
+                //This is another special resolver that needs to be resolvable before resolution is frozen
+                //since it is used for profiling the application startup
+                CanResolveBeforeFrozen = true
+            };
+        }
+
+        /// &lt;summary&gt;
+        /// Special method to initialize the ProfilerResolver
+        /// &lt;/summary&gt;
+        protected virtual void InitializeProfilerResolver()
+        {
+            //By default we&#39;ll initialize the Log profiler (in the web project, we&#39;ll override with the web profiler)
+            ProfilerResolver.Current = new ProfilerResolver(ProfilingLogger == null ? new LogProfiler(LoggerResolver.Current.Logger) : ProfilingLogger.Profiler)
+            {
+                //This is another special resolver that needs to be resolvable before resolution is frozen
+                //since it is used for profiling the application startup
+                CanResolveBeforeFrozen = true
+            };
+        }
+
+        /// &lt;summary&gt;
+        /// Special method to initialize the ApplicationEventsResolver and any modifications required for it such
+        /// as adding custom types to the resolver.
+        /// &lt;/summary&gt;
+        protected virtual void InitializeApplicationEventsResolver()
+        {
+            //find and initialize the application startup handlers, we need to initialize this resolver here because
+            //it is a special resolver where they need to be instantiated first before any other resolvers in order to bind to
+            //events and to call their events during bootup.
+            //ApplicationStartupHandler.RegisterHandlers();
+            //... and set the special flag to let us resolve before frozen resolution
+            ApplicationEventsResolver.Current = new ApplicationEventsResolver(
+                ServiceProvider,
+                ProfilingLogger.Logger,
+                PluginManager.ResolveApplicationStartupHandlers())
+            {
+                CanResolveBeforeFrozen = true
+            };
+        }
+
+        /// &lt;summary&gt;
+        /// Special method to extend the use of Umbraco by enabling the consumer to overwrite
+        /// the absolute path to the root of an Umbraco site/solution, which is used for stuff
+        /// like Umbraco.Core.IO.IOHelper.MapPath etc.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;rootPath&quot;&gt;Absolute&lt;/param&gt;
+        protected virtual void InitializeApplicationRootPath(string rootPath)
+        {
+            IOHelper.SetRootDirectory(rootPath);
+        }
+
+        /// &lt;summary&gt;
+        /// Fires after initialization and calls the callback to allow for customizations to occur &amp;
+        /// Ensure that the OnApplicationStarting methods of the IApplicationEvents are called
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;afterStartup&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual IBootManager Startup(Action&lt;ApplicationContext&gt; afterStartup)
+        {
+            if (_isStarted)
+                throw new InvalidOperationException(&quot;The boot manager has already been initialized&quot;);
+
+            using (ProfilingLogger.DebugDuration&lt;CoreBootManager&gt;(
+                string.Format(&quot;Executing {0} IApplicationEventHandler.OnApplicationStarting&quot;, ApplicationEventsResolver.Current.ApplicationEventHandlers.Count()),
+                &quot;Finished executing IApplicationEventHandler.OnApplicationStarting&quot;))
+		    {
+		        //call OnApplicationStarting of each application events handler
+		        ApplicationEventsResolver.Current.ApplicationEventHandlers
+		            .ForEach(x =&gt;
+		            {
+		                try
+		                {
+		                    using (ProfilingLogger.DebugDuration&lt;CoreBootManager&gt;(string.Format(&quot;Executing {0} in ApplicationStarting&quot;, x.GetType())))
+		                    {
+		                        x.OnApplicationStarting(UmbracoApplication, ApplicationContext);
+		                    }
+		                }
+		                catch (Exception ex)
+		                {
+                            ProfilingLogger.Logger.Error&lt;CoreBootManager&gt;(&quot;An error occurred running OnApplicationStarting for handler &quot; + x.GetType(), ex);
+		                    throw;
+		                }
+		            });
+		    }
+
+		    if (afterStartup != null)
+            {
+                afterStartup(ApplicationContext.Current);
+            }
+
+            _isStarted = true;
+
+            return this;
+        }
+
+        /// &lt;summary&gt;
+        /// Fires after startup and calls the callback once customizations are locked
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;afterComplete&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual IBootManager Complete(Action&lt;ApplicationContext&gt; afterComplete)
+        {
+            if (_isComplete)
+                throw new InvalidOperationException(&quot;The boot manager has already been completed&quot;);
+
+            FreezeResolution();
+
+            //Here we need to make sure the db can be connected to
+		    EnsureDatabaseConnection();
+
+
+            //This is a special case for the user service, we need to tell it if it&#39;s an upgrade, if so we need to ensure that
+            // exceptions are bubbled up if a user is attempted to be persisted during an upgrade (i.e. when they auth to login)
+            ((UserService) ApplicationContext.Services.UserService).IsUpgrading = true;
+
+
+            using (ProfilingLogger.DebugDuration&lt;CoreBootManager&gt;(
+                string.Format(&quot;Executing {0} IApplicationEventHandler.OnApplicationStarted&quot;, ApplicationEventsResolver.Current.ApplicationEventHandlers.Count()),
+                &quot;Finished executing IApplicationEventHandler.OnApplicationStarted&quot;))
+            {
+                //call OnApplicationStarting of each application events handler
+                ApplicationEventsResolver.Current.ApplicationEventHandlers
+                    .ForEach(x =&gt;
+                    {
+                        try
+                        {
+                            using (ProfilingLogger.DebugDuration&lt;CoreBootManager&gt;(string.Format(&quot;Executing {0} in ApplicationStarted&quot;, x.GetType())))
+                            {
+                                x.OnApplicationStarted(UmbracoApplication, ApplicationContext);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            ProfilingLogger.Logger.Error&lt;CoreBootManager&gt;(&quot;An error occurred running OnApplicationStarted for handler &quot; + x.GetType(), ex);
+                            throw;
+                        }
+                    });
+            }
+
+            //Now, startup all of our legacy startup handler
+            ApplicationEventsResolver.Current.InstantiateLegacyStartupHandlers();
+
+            if (afterComplete != null)
+            {
+                afterComplete(ApplicationContext.Current);
+            }
+
+            _isComplete = true;
+
+            // we&#39;re ready to serve content!
+            ApplicationContext.IsReady = true;
+
+            //stop the timer and log the output
+            _timer.Dispose();
+            return this;
+		}
+
+        /// &lt;summary&gt;
+        /// We cannot continue if the db cannot be connected to
+        /// &lt;/summary&gt;
+        private void EnsureDatabaseConnection()
+        {
+            if (ApplicationContext.IsConfigured == false) return;
+            if (ApplicationContext.DatabaseContext.IsDatabaseConfigured == false) return;
+
+            //try now
+            if (ApplicationContext.DatabaseContext.CanConnect)
+                return;
+
+            var currentTry = 0;
+            while (currentTry &lt; 5)
+            {
+                //first wait, then retry
+                Thread.Sleep(1000);
+
+                if (ApplicationContext.DatabaseContext.CanConnect)
+                    break;
+
+                currentTry++;
+            }
+
+            if (currentTry == 5)
+            {
+                throw new UmbracoStartupFailedException(&quot;Umbraco cannot start. A connection string is configured but Umbraco cannot connect to the database.&quot;);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Freeze resolution to not allow Resolvers to be modified
+        /// &lt;/summary&gt;
+        protected virtual void FreezeResolution()
+        {
+            Resolution.Freeze();
+        }
+
+        /// &lt;summary&gt;
+        /// Create the resolvers
+        /// &lt;/summary&gt;
+        protected virtual void InitializeResolvers()
+        {
+            var builder = new ManifestBuilder(
+                ApplicationCache.RuntimeCache,
+                new ManifestParser(new DirectoryInfo(IOHelper.MapPath(&quot;~/App_Plugins&quot;)), ApplicationCache.RuntimeCache));
+
+            PropertyEditorResolver.Current = new PropertyEditorResolver(ServiceProvider, ProfilingLogger.Logger, () =&gt; PluginManager.ResolvePropertyEditors(), builder);
+            ParameterEditorResolver.Current = new ParameterEditorResolver(ServiceProvider, ProfilingLogger.Logger, () =&gt; PluginManager.ResolveParameterEditors(), builder);
+
+            //setup the validators resolver with our predefined validators
+            ValidatorsResolver.Current = new ValidatorsResolver(
+                ServiceProvider, ProfilingLogger.Logger, new[]
+                {
+                    new Lazy&lt;Type&gt;(() =&gt; typeof (RequiredManifestValueValidator)),
+                    new Lazy&lt;Type&gt;(() =&gt; typeof (RegexValidator)),
+                    new Lazy&lt;Type&gt;(() =&gt; typeof (DelimitedManifestValueValidator)),
+                    new Lazy&lt;Type&gt;(() =&gt; typeof (EmailValidator)),
+                    new Lazy&lt;Type&gt;(() =&gt; typeof (IntegerValidator)),
+                    new Lazy&lt;Type&gt;(() =&gt; typeof (DecimalValidator)),
+                });
+
+            //by default we&#39;ll use the db server registrar unless the developer has the legacy
+            // dist calls enabled, in which case we&#39;ll use the config server registrar
+            if (UmbracoConfig.For.UmbracoSettings().DistributedCall.Enabled)
+            {
+                ServerRegistrarResolver.Current = new ServerRegistrarResolver(new ConfigServerRegistrar());
+            }
+            else if (&quot;true&quot;.InvariantEquals(ConfigurationManager.AppSettings[&quot;umbracoDisableElectionForSingleServer&quot;]))
+            {
+                ServerRegistrarResolver.Current = new ServerRegistrarResolver(new SingleServerRegistrar());
+            }
+            else
+            {
+                ServerRegistrarResolver.Current = new ServerRegistrarResolver(
+                    new DatabaseServerRegistrar(
+                        new Lazy&lt;IServerRegistrationService&gt;(() =&gt; ApplicationContext.Services.ServerRegistrationService),
+                        new DatabaseServerRegistrarOptions()));
+            }
+
+            //by default we&#39;ll use the database server messenger with default options (no callbacks),
+            // this will be overridden in the web startup
+            ServerMessengerResolver.Current = new ServerMessengerResolver(
+                new DatabaseServerMessenger(ApplicationContext, true, new DatabaseServerMessengerOptions()));
+
+            MappingResolver.Current = new MappingResolver(
+                ServiceProvider, ProfilingLogger.Logger,
+                () =&gt; PluginManager.ResolveAssignedMapperTypes());
+
+
+            //RepositoryResolver.Current = new RepositoryResolver(
+            //    new RepositoryFactory(ApplicationCache));
+
+            CacheRefreshersResolver.Current = new CacheRefreshersResolver(
+                ServiceProvider, ProfilingLogger.Logger,
+                () =&gt; PluginManager.ResolveCacheRefreshers());
+
+            DataTypesResolver.Current = new DataTypesResolver(
+                ServiceProvider, ProfilingLogger.Logger,
+                () =&gt; PluginManager.ResolveDataTypes());
+
+            MacroFieldEditorsResolver.Current = new MacroFieldEditorsResolver(
+                ServiceProvider, ProfilingLogger.Logger,
+                () =&gt; PluginManager.ResolveMacroRenderings());
+
+            PackageActionsResolver.Current = new PackageActionsResolver(
+                ServiceProvider, ProfilingLogger.Logger,
+                () =&gt; PluginManager.ResolvePackageActions());
+
+            ActionsResolver.Current = new ActionsResolver(
+                ServiceProvider, ProfilingLogger.Logger,
+                () =&gt; PluginManager.ResolveActions());
+
+            //the database migration objects
+            MigrationResolver.Current = new MigrationResolver(
+                ProfilingLogger.Logger,
+                () =&gt; PluginManager.ResolveTypes&lt;IMigration&gt;());
+
+            // todo: remove once we drop IPropertyEditorValueConverter support.
+            PropertyEditorValueConvertersResolver.Current = new PropertyEditorValueConvertersResolver(
+                ServiceProvider, ProfilingLogger.Logger,
+                PluginManager.ResolvePropertyEditorValueConverters());
+
+            // need to filter out the ones we dont want!!
+            PropertyValueConvertersResolver.Current = new PropertyValueConvertersResolver(
+                ServiceProvider, ProfilingLogger.Logger,
+                PluginManager.ResolveTypes&lt;IPropertyValueConverter&gt;());
+
+            // use the new DefaultShortStringHelper
+            ShortStringHelperResolver.Current = new ShortStringHelperResolver(
+                //new LegacyShortStringHelper());
+                new DefaultShortStringHelper(UmbracoConfig.For.UmbracoSettings()).WithDefaultConfig());
+
+            UrlSegmentProviderResolver.Current = new UrlSegmentProviderResolver(
+                ServiceProvider, ProfilingLogger.Logger,
+                typeof(DefaultUrlSegmentProvider));
+
+            // by default, no factory is activated
+            PublishedContentModelFactoryResolver.Current = new PublishedContentModelFactoryResolver();
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[47,53,47,57,1],[47,58,47,70,1],[49,9,49,45,0],[49,9,49,45,1],[50,9,50,41,0],[50,9,50,41,1],[51,9,51,42,1],[51,9,51,42,0],[52,9,52,93,1],[52,9,52,93,0],[54,59,54,63,1],[54,64,54,76,1],[55,50,55,54,1],[55,55,55,67,1],[56,49,56,53,1],[56,54,56,66,1],[60,17,60,18,1],[60,19,60,46,1],[60,47,60,48,1],[65,17,65,18,1],[65,19,65,43,1],[65,44,65,45,1],[68,9,68,74,0],[69,9,69,10,0],[70,13,70,44,0],[70,45,70,99,0],[71,13,71,54,0],[72,9,72,10,0],[74,9,74,100,1],[75,9,75,10,1],[76,13,76,44,1],[76,45,76,99,0],[77,13,77,32,1],[77,33,77,75,0],[78,13,78,54,1],[79,13,79,38,1],[80,9,80,10,1],[83,9,83,10,1],[84,13,84,32,1],[85,17,85,102,0],[87,13,87,40,1],[88,13,88,42,1],[90,13,90,135,1],[92,13,94,57,1],[96,13,96,57,1],[100,13,100,112,1],[101,13,101,51,1],[104,13,104,83,1],[105,13,105,80,1],[108,13,108,118,1],[109,13,109,52,1],[111,13,114,75,1],[117,13,117,36,1],[120,13,120,77,1],[123,13,123,115,1],[125,13,125,51,1],[127,13,127,35,1],[129,13,129,38,1],[131,13,133,89,1],[134,10,134,11,1],[136,17,138,21,1],[138,21,138,22,1],[138,22,140,25,1],[140,25,140,26,1],[140,26,141,29,1],[141,29,141,154,1],[141,154,142,29,1],[142,29,142,30,1],[142,30,143,33,1],[143,33,143,100,1],[143,100,144,29,1],[144,29,144,30,1],[144,30,145,25,1],[145,25,145,26,1],[145,26,146,25,1],[146,25,146,45,0],[146,45,147,25,1],[147,25,147,26,0],[147,26,148,29,1],[148,29,148,160,0],[148,160,149,29,1],[149,29,149,35,0],[149,35,151,21,1],[151,21,151,22,1],[151,22,151,24,1],[136,17,151,24,1],[152,10,152,11,1],[154,13,154,35,1],[156,13,156,25,1],[157,9,157,10,1],[166,9,166,10,1],[168,13,168,61,1],[169,13,176,29,1],[177,9,177,10,1],[185,9,185,10,1],[187,13,187,105,1],[188,9,188,10,1],[194,9,194,10,1],[195,13,205,21,1],[205,21,205,93,0],[205,93,205,96,1],[195,13,205,96,1],[207,13,207,32,1],[208,9,208,10,1],[218,9,218,10,1],[219,13,220,17,1],[220,17,220,18,1],[220,18,221,21,1],[221,21,221,28,1],[221,28,221,30,1],[221,30,221,35,0],[221,35,221,36,1],[221,36,221,38,1],[221,38,221,39,1],[221,39,221,128,1],[221,128,222,21,1],[222,21,222,22,0],[222,22,223,25,1],[223,25,223,80,0],[223,80,224,21,1],[224,21,224,22,0],[224,22,225,17,1],[225,17,225,18,1],[225,18,225,20,1],[219,13,225,20,1],[226,9,226,10,1],[232,9,232,10,0],[233,13,238,15,0],[239,9,239,10,0],[245,9,245,10,0],[247,13,252,15,0],[253,9,253,10,0],[260,9,260,10,0],[266,13,272,15,0],[273,9,273,10,0],[282,9,282,10,0],[283,13,283,49,0],[284,9,284,10,0],[293,9,293,10,1],[294,13,294,28,1],[295,17,295,102,0],[297,13,299,86,1],[300,7,300,8,1],[302,11,304,15,1],[304,15,304,16,1],[304,16,306,19,1],[306,19,306,20,1],[306,20,307,23,1],[307,23,307,145,1],[307,145,308,23,1],[308,23,308,24,1],[308,24,309,27,1],[309,27,309,91,1],[309,91,310,23,1],[310,23,310,24,1],[310,24,311,19,1],[311,19,311,20,1],[311,20,312,19,1],[312,19,312,39,0],[312,39,313,19,1],[313,19,313,20,0],[313,20,314,29,1],[314,29,314,157,0],[314,157,315,23,1],[315,23,315,29,0],[315,29,317,15,1],[317,15,317,16,1],[317,16,317,18,1],[302,11,317,18,1],[318,7,318,8,1],[320,7,320,32,1],[321,13,321,14,1],[322,17,322,58,1],[323,13,323,14,1],[325,13,325,31,1],[327,13,327,25,1],[328,9,328,10,1],[336,9,336,10,1],[337,13,337,29,1],[338,17,338,100,0],[340,13,340,32,1],[343,7,343,34,1],[348,13,348,88,1],[351,13,353,85,1],[354,13,354,14,1],[356,17,358,21,1],[358,21,358,22,1],[358,22,360,25,1],[360,25,360,26,1],[360,26,361,29,1],[361,29,361,150,1],[361,150,362,29,1],[362,29,362,30,1],[362,30,363,33,1],[363,33,363,96,1],[363,96,364,29,1],[364,29,364,30,1],[364,30,365,25,1],[365,25,365,26,1],[365,26,366,25,1],[366,25,366,45,0],[366,45,367,25,1],[367,25,367,26,0],[367,26,368,29,1],[368,29,368,156,0],[368,156,369,29,1],[369,29,369,35,0],[369,35,371,21,1],[371,21,371,22,1],[371,22,371,24,1],[356,17,371,24,1],[372,13,372,14,1],[375,13,375,82,1],[377,13,377,39,1],[378,13,378,14,1],[379,17,379,59,1],[380,13,380,14,1],[382,13,382,32,1],[385,13,385,47,1],[388,13,388,30,1],[389,13,389,25,1],[390,3,390,4,1],[396,9,396,10,1],[397,13,397,58,1],[397,59,397,66,0],[398,13,398,82,1],[398,83,398,90,1],[401,13,401,63,0],[402,17,402,24,0],[404,13,404,32,0],[405,13,405,35,0],[406,13,406,14,0],[408,17,408,36,0],[410,17,410,67,0],[411,21,411,27,0],[413,17,413,30,0],[414,13,414,14,0],[416,13,416,33,0],[417,13,417,14,0],[418,17,418,160,0],[420,9,420,10,1],[426,9,426,10,1],[427,13,427,33,1],[428,9,428,10,1],[434,9,434,10,1],[435,13,437,122,1],[439,13,439,120,1],[439,120,439,158,0],[439,158,439,169,1],[439,13,439,169,1],[440,13,440,122,1],[440,122,440,161,0],[440,161,440,172,1],[440,13,440,172,1],[443,13,446,42,1],[446,42,446,81,0],[446,81,447,42,1],[447,42,447,65,0],[447,65,448,42,1],[448,42,448,82,0],[448,82,449,42,1],[449,42,449,65,0],[449,65,450,42,1],[450,42,450,67,0],[450,67,451,42,1],[451,42,451,67,0],[451,67,452,20,1],[443,13,452,20,1],[456,13,456,77,1],[457,13,457,14,0],[458,17,458,108,0],[459,13,459,14,0],[460,18,460,120,1],[461,13,461,14,0],[462,17,462,108,0],[463,13,463,14,0],[465,13,465,14,1],[466,17,468,68,1],[468,68,468,121,0],[468,121,469,64,1],[466,17,469,64,1],[470,13,470,14,1],[474,13,475,110,1],[477,13,479,23,1],[479,23,479,65,0],[479,65,479,67,1],[477,13,479,67,1],[485,13,487,23,1],[487,23,487,61,0],[487,61,487,63,1],[485,13,487,63,1],[489,13,491,23,1],[491,23,491,55,0],[491,55,491,57,1],[489,13,491,57,1],[493,13,495,23,1],[495,23,495,61,0],[495,61,495,63,1],[493,13,495,63,1],[497,13,499,23,1],[499,23,499,60,0],[499,60,499,62,1],[497,13,499,62,1],[501,13,503,23,1],[503,23,503,53,0],[503,53,503,55,1],[501,13,503,55,1],[506,13,508,23,1],[508,23,508,63,0],[508,63,508,65,1],[506,13,508,65,1],[511,13,513,71,1],[516,13,518,72,1],[521,13,523,104,1],[525,13,527,52,1],[530,13,530,103,1],[531,9,531,10,1]]);
+    </script>
+  </body>
+</html>

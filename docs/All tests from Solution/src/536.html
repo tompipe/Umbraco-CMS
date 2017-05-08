@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\requestModule.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Threading;
+using System.Web;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using umbraco.BusinessLogic;
+using System.Collections.Generic;
+using umbraco.BusinessLogic.Utils;
+using umbraco.businesslogic;
+using umbraco.cms.businesslogic.cache;
+using System.Web.Caching;
+using Umbraco.Core.IO;
+using umbraco.interfaces;
+
+
+namespace umbraco.presentation
+{
+	/// &lt;summary&gt;
+	/// Summary description for requestModule.
+	/// &lt;/summary&gt;
+	[Obsolete(&quot;This class is not used anymore and will be removed from the codebase in future versions.&quot;)]
+	public class requestModule : IHttpModule
+	{
+		protected static Timer publishingTimer;
+		protected static Timer pingTimer;
+
+		private HttpApplication mApp;
+		private IContainer components = null;
+
+	    private readonly IList&lt;IApplicationStartupHandler&gt; startupHandlers = new List&lt;IApplicationStartupHandler&gt;(); 
+
+		/// &lt;summary&gt;True if the module is currently handling an error.&lt;/summary&gt;
+		private static object handlingError = false;
+		/// &lt;summary&gt;List of errors that occurred since the last error was being handled.&lt;/summary&gt;
+		private List&lt;Exception&gt; unhandledErrors = new List&lt;Exception&gt;();
+
+		public const string ORIGINAL_URL_CXT_KEY = &quot;umbOriginalUrl&quot;;
+
+		private static string LOG_SCRUBBER_TASK_NAME = &quot;ScrubLogs&quot;;
+		private static CacheItemRemovedCallback OnCacheRemove = null;
+
+		protected void ApplicationStart(HttpApplication HttpApp)
+		{
+			//starting the application. Application doesn&#39;t support HttpContext in integrated mode (standard mode on IIS7) 
+			//So everything is moved to beginRequest.
+		}
+
+		protected void Application_PostResolveRequestCache(object sender, EventArgs e)
+		{
+			// process rewrite here so forms authentication can Authorize based on url before the original url is discarded
+			this.UmbracoRewrite(sender, e);
+		}
+
+		protected void Application_AuthorizeRequest(object sender, EventArgs e)
+		{
+			// nothing needs to be done here
+		}
+
+		protected void Application_PreRequestHandlerExecute(object sender, EventArgs e)
+		{
+
+			HttpContext context = mApp.Context;
+			//httpContext.RewritePath( (string) httpContext.Items[ORIGINAL_URL_CXT_KEY] + &quot;?&quot; + httpContext.Request.QueryString );
+		}
+
+		/// &lt;summary&gt;
+		/// Handles the BeginRequest event of the Application control.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;sender&quot;&gt;The source of the event.&lt;/param&gt;
+		/// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+		protected void Application_BeginRequest(Object sender, EventArgs e)
+		{
+		   
+			HttpApplication app = (HttpApplication)sender;
+
+			//first time init, starts timers, and sets httpContext
+			InitializeApplication(app);
+
+			// grab the original url before anything modifies  it
+			HttpContext httpContext = mApp.Context;
+			httpContext.Items[ORIGINAL_URL_CXT_KEY] = rewrite404Url(httpContext.Request.Url.AbsolutePath, httpContext.Request.Url.Query, false);
+
+			// create the Umbraco context
+			UmbracoContext.Current = new UmbracoContext(httpContext);
+
+			// rewrite will happen after authorization
+		}
+
+		protected string rewrite404Url(string url, string querystring, bool returnQuery)
+		{
+			// adding endswith and contains checks to ensure support for custom 404 messages (only 404 parse directory and aspx requests)
+			if (querystring.StartsWith(&quot;?404&quot;) &amp;&amp; (!querystring.Contains(&quot;.&quot;) || querystring.EndsWith(&quot;.aspx&quot;) || querystring.Contains(&quot;.aspx&amp;&quot;)))
+			{
+				Uri u = new Uri(querystring.Substring(5, querystring.Length - 5));
+				string path = u.AbsolutePath;
+				if (returnQuery)
+				{
+					return u.Query;
+				}
+				else
+				{
+					return path;
+				}
+			}
+
+			if (returnQuery)
+			{
+				return querystring;
+			}
+			else
+			{
+				return url;
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// Performs path rewriting.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;sender&quot;&gt;The source of the event.&lt;/param&gt;
+		/// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+		protected void UmbracoRewrite(Object sender, EventArgs e)
+		{
+			HttpContext context = mApp.Context;
+			string path = rewrite404Url(context.Request.Path.ToLower(), context.Request.Url.Query, false);
+			string query = String.Empty;
+
+			if (GlobalSettings.UseDirectoryUrls)
+			{
+				// zb-00017 #29930 : do not change url casing when rewriting
+				string requestPath = context.Request.Path; // not lowercased
+				int asmxPos = path.IndexOf(&quot;.asmx/&quot;);
+				if (asmxPos &gt;= 0)
+					context.RewritePath(path.Substring(0, asmxPos + 5),
+										requestPath.Substring(asmxPos + 5),
+										context.Request.QueryString.ToString());
+			}
+
+			if (path.IndexOf(&quot;.aspx&quot;) &gt; -1 || path.IndexOf(&#39;.&#39;) == -1)
+			{
+				// validate configuration
+				if (mApp.Application[&quot;umbracoNeedConfiguration&quot;] == null)
+					mApp.Application[&quot;umbracoNeedConfiguration&quot;] = !GlobalSettings.Configured;
+
+				if (!GlobalSettings.IsReservedPathOrUrl(path))
+				{
+					// redirect if Umbraco needs configuration
+					Nullable&lt;bool&gt; needsConfiguration = (Nullable&lt;bool&gt;)mApp.Application[&quot;umbracoNeedConfiguration&quot;];
+
+					if (needsConfiguration.HasValue &amp;&amp; needsConfiguration.Value)
+					{
+						string url = SystemDirectories.Install;
+						string meh = IOHelper.ResolveUrl(url);
+						string installUrl = string.Format(&quot;{0}/default.aspx?redir=true&amp;url={1}&quot;, IOHelper.ResolveUrl( SystemDirectories.Install ), context.Request.Path.ToLower());
+						context.Response.Redirect(installUrl, true);
+					}
+
+					// show splash?
+                    else if (UmbracoConfig.For.UmbracoSettings().Content.EnableSplashWhileLoading &amp;&amp; content.Instance.isInitializing)
+						context.RewritePath(string.Format(&quot;{0}/splashes/booting.aspx&quot;, SystemDirectories.Config));
+					// rewrite page path
+					else
+					{
+						string receivedQuery = rewrite404Url(context.Request.Path.ToLower(), context.Request.Url.Query, true);
+						if (receivedQuery.Length &gt; 0)
+						{
+							// Clean umbPage from querystring, caused by .NET 2.0 default Auth Controls
+							if (receivedQuery.IndexOf(&quot;umbPage&quot;) &gt; 0)
+							{
+								int ampPos = receivedQuery.IndexOf(&#39;&amp;&#39;);
+								// query contains no ampersand?
+								if (ampPos &lt; 0)
+								{
+									// no ampersand means no original query string
+									query = String.Empty;
+									// ampersand would occur past then end the of received query
+									ampPos = receivedQuery.Length;
+								}
+								else
+								{
+									// original query string past ampersand
+									query = receivedQuery.Substring(ampPos + 1,
+																	receivedQuery.Length - ampPos - 1);
+								}
+								// get umbPage out of query string (9 = &quot;&amp;umbPage&quot;.Length() + 1)
+								path = receivedQuery.Substring(9, ampPos - 9); //this will fail if there are &lt; 9 characters before the &amp;umbPage query string
+							}
+							else
+							{
+								// strip off question mark
+								query = receivedQuery.Substring(1);
+							}
+						}
+
+						// Add questionmark to query string if it&#39;s not empty
+						if (!String.IsNullOrEmpty(query))
+							query = &quot;?&quot; + query;
+
+						// save original URL
+						context.Items[&quot;UmbPage&quot;] = path;
+						context.Items[&quot;VirtualUrl&quot;] = String.Format(&quot;{0}{1}&quot;, path, query);
+						// rewrite to the new URL
+						context.RewritePath(string.Format(&quot;{0}/default.aspx{2}&quot;,
+														  SystemDirectories.Root, path, query));
+					}
+				}
+			}
+		}
+
+
+		/// &lt;summary&gt;
+		/// Handles the Error event of the Application control.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;sender&quot;&gt;The source of the event.&lt;/param&gt;
+		/// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+		protected void Application_Error(Object sender, EventArgs e)
+		{
+			// return immediately if an error is already been handled, to avoid infinite recursion
+			if ((bool)handlingError)
+			{
+				lock (unhandledErrors)
+				{
+					unhandledErrors.Add(mApp.Server.GetLastError());
+				}
+				return;
+			}
+			// make sure only one thread at a time can handle an error
+			lock (handlingError)
+			{
+				Debug.Assert(!(bool)handlingError, &quot;Two errors are being handled at the same time.&quot;);
+				handlingError = true;
+
+				// make sure handlingError always gets set to false
+				try
+				{
+					if (GlobalSettings.Configured)
+					{
+						// log the error
+						// zb-00017 #29930 : could have been cleared, though: take care, .GetLastError() may return null
+						Exception ex = mApp.Server.GetLastError();
+						if (ex != null)
+							ex = ex.InnerException;
+
+						string error;
+						if (mApp.Context.Request != null)
+							error = string.Format(&quot;At {0} (Referred by: {1}): {2}&quot;,
+												  mApp.Context.Request.RawUrl,
+												  mApp.Context.Request.UrlReferrer,
+												  ex);
+						else
+							error = &quot;No Context available -&gt; &quot;
+									+ ex;
+
+						// Hide error if getting the user throws an error (e.g. corrupt / blank db)
+						User staticUser = null;
+						try
+						{
+							User.GetCurrent();
+						}
+						catch
+						{
+						}
+
+                        LogHelper.Debug&lt;requestModule&gt;(error);
+
+						Trace.TraceError(error);
+						lock (unhandledErrors)
+						{
+							if (unhandledErrors.Count &gt; 0)
+								Trace.TraceError(&quot;New errors occurred while an error was being handled. The error handler Application_Error possibly raised another error, but was protected against an infinite loop.&quot;);
+							foreach (Exception unhandledError in unhandledErrors)
+								Trace.TraceError(unhandledError.StackTrace);
+						}
+					}
+				}
+				finally
+				{
+					// clear unhandled errors
+					lock (unhandledErrors)
+					{
+						unhandledErrors.Clear();
+					}
+					// flag we&#39;re done with the error handling
+					handlingError = false;
+				}
+			}
+		}
+
+		#region IHttpModule Members
+
+		///&lt;summary&gt;
+		///Initializes a module and prepares it to handle requests.
+		///&lt;/summary&gt;
+		///
+		///&lt;param name=&quot;httpContext&quot;&gt;An &lt;see cref=&quot;T:System.Web.HttpApplication&quot;&gt;&lt;/see&gt; that provides access to the methods, properties, and events common to all application objects within an ASP.NET application &lt;/param&gt;
+		public void Init(HttpApplication context)
+		{
+			InitializeComponent();
+
+			ApplicationStart(context);
+			context.BeginRequest += new EventHandler(Application_BeginRequest);
+			context.AuthorizeRequest += new EventHandler(Application_AuthorizeRequest);
+
+			// Alex Norcliffe - 2010 02 - Changed this behaviour as it disables OutputCaching due to Rewrite happening too early in the chain
+			// context.PostAuthorizeRequest += new EventHandler(Application_PostAuthorizeRequest);
+			context.PostResolveRequestCache += new EventHandler(Application_PostResolveRequestCache);
+
+			context.PreRequestHandlerExecute += new EventHandler(Application_PreRequestHandlerExecute);
+
+			// Alex Norcliffe - 2010 06 - Added a check at the end of the page lifecycle to see if we should persist Xml cache to disk
+			// (a replacement for all those parallel Async methods launching ThreadPool threads)
+			context.PostRequestHandlerExecute += new EventHandler(context_PostRequestHandlerExecute);
+			context.Error += new EventHandler(Application_Error);
+			mApp = context;
+		}
+
+		void context_PostRequestHandlerExecute(object sender, EventArgs e)
+		{
+            //if (content.Instance.IsXmlQueuedForPersistenceToFile)
+            //{
+            //    content.Instance.PersistXmlToFile();
+            //}
+		}
+
+
+
+
+		private void InitializeComponent()
+		{
+			components = new Container();
+		}
+
+		///&lt;summary&gt;
+		///Disposes of the resources (other than memory) used by the module that implements &lt;see cref=&quot;T:System.Web.IHttpModule&quot;&gt;&lt;/see&gt;.
+		///&lt;/summary&gt;
+		///
+		public void Dispose()
+		{
+		}
+
+
+		//this makes sure that times and other stuff is started on the first request, instead of depending on
+		// application_start, which was inteded for being a httpContext-agnostic state.
+		private static bool s_InitializedAlready = false;
+		private static Object s_lock = new Object();
+		// Initialize only on the first request
+		public void InitializeApplication(HttpApplication HttpApp)
+		{
+			if (s_InitializedAlready)
+				return;
+
+			lock (s_lock)
+			{
+				if (s_InitializedAlready)
+					return;
+
+				// Perform first-request initialization here ...
+
+				try
+				{
+                    LogHelper.Info&lt;requestModule&gt;(string.Format(&quot;Application started at {0}&quot;, DateTime.Now));
+
+                    if (UmbracoConfig.For.UmbracoSettings().Logging.AutoCleanLogs)
+					{
+						AddTask(LOG_SCRUBBER_TASK_NAME, GetLogScrubbingInterval());
+					}
+				}
+				catch
+				{
+				}
+
+                // Trigger startup handlers
+			    ApplicationStartupHandler.RegisterHandlers();
+
+			    // Check for configured key, checking for currentversion to ensure that a request with
+				// no httpcontext don&#39;t set the whole app in configure mode
+                if (UmbracoVersion.Current != null &amp;&amp; !GlobalSettings.Configured)
+				{
+					HttpApp.Application[&quot;umbracoNeedConfiguration&quot;] = true;
+				}
+
+				/* This section is needed on start-up because timer objects
+				* might initialize before these are initialized without a traditional
+				* request, and therefore lacks information on application paths */
+
+				/* Initialize SECTION END */
+
+				// add current default url
+				HttpApp.Application[&quot;umbracoUrl&quot;] = string.Format(&quot;{0}:{1}{2}&quot;, HttpApp.Context.Request.ServerVariables[&quot;SERVER_NAME&quot;], HttpApp.Context.Request.ServerVariables[&quot;SERVER_PORT&quot;], IOHelper.ResolveUrl( SystemDirectories.Umbraco ));
+
+				// Start ping / keepalive timer
+				pingTimer = new Timer(new TimerCallback(keepAliveService.PingUmbraco), HttpApp.Context, 60000, 300000);
+
+				// Start publishingservice
+				publishingTimer = new Timer(new TimerCallback(publishingService.CheckPublishing), HttpApp.Context, 30000, 60000);
+
+				//Find Applications and event handlers and hook-up the events
+				//BusinessLogic.Application.RegisterIApplications();
+
+				//define the base settings for the dependency loader to use the global path settings
+				//if (!CompositeDependencyHandler.HandlerFileName.StartsWith(GlobalSettings_Path))
+				//    CompositeDependencyHandler.HandlerFileName = GlobalSettings_Path + &quot;/&quot; + CompositeDependencyHandler.HandlerFileName;
+				
+				// Backwards compatibility - set the path and URL type for ClientDependency 1.5.1 [LK]
+				ClientDependency.Core.CompositeFiles.Providers.XmlFileMapper.FileMapVirtualFolder = &quot;~/App_Data/TEMP/ClientDependency&quot;;
+				ClientDependency.Core.CompositeFiles.Providers.BaseCompositeFileProcessingProvider.UrlTypeDefault = ClientDependency.Core.CompositeFiles.Providers.CompositeUrlType.Base64QueryStrings;
+
+				// init done... 
+				s_InitializedAlready = true;
+
+			}
+
+		}
+
+		#endregion
+
+		#region Inteval tasks
+		private static int GetLogScrubbingInterval()
+		{
+			int interval = 24 * 60 * 60; //24 hours
+			try
+			{
+                if (UmbracoConfig.For.UmbracoSettings().Logging.CleaningMiliseconds &gt; -1)
+					interval = UmbracoConfig.For.UmbracoSettings().Logging.CleaningMiliseconds;
+			}
+			catch (Exception)
+			{
+                LogHelper.Info&lt;requestModule&gt;(&quot;Unable to locate a log scrubbing interval. Defaulting to 24 hours&quot;);
+			}
+			return interval;
+		}
+
+		private static int GetLogScrubbingMaximumAge()
+		{
+			int maximumAge = 24 * 60 * 60;
+			try
+			{
+				if (UmbracoConfig.For.UmbracoSettings().Logging.MaxLogAge &gt; -1)
+                    maximumAge = UmbracoConfig.For.UmbracoSettings().Logging.MaxLogAge;
+			}
+			catch (Exception)
+			{
+                LogHelper.Info&lt;requestModule&gt;(&quot;Unable to locate a log scrubbing maximum age. Defaulting to 24 hours&quot;);
+			}
+			return maximumAge;
+
+		}
+
+		private void AddTask(string name, int seconds)
+		{
+			OnCacheRemove = new CacheItemRemovedCallback(CacheItemRemoved);
+			HttpRuntime.Cache.Insert(name, seconds, null,
+				DateTime.Now.AddSeconds(seconds), System.Web.Caching.Cache.NoSlidingExpiration,
+				CacheItemPriority.NotRemovable, OnCacheRemove);
+		}
+
+		public void CacheItemRemoved(string k, object v, CacheItemRemovedReason r)
+		{
+			if (k.Equals(LOG_SCRUBBER_TASK_NAME))
+			{
+				ScrubLogs();
+			}
+			AddTask(k, Convert.ToInt32(v));
+		}
+
+		private static void ScrubLogs()
+		{
+			Log.CleanLogs(GetLogScrubbingMaximumAge());
+		}
+
+		#endregion
+	}
+
+
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[30,3,30,40,0],[32,6,32,114,0],[35,3,35,47,0],[37,3,37,67,0],[41,3,41,62,0],[42,3,42,64,0],[45,3,45,4,0],[48,3,48,4,0],[51,3,51,4,0],[53,4,53,35,0],[54,3,54,4,0],[57,3,57,4,0],[59,3,59,4,0],[62,3,62,4,0],[64,4,64,39,0],[66,3,66,4,0],[74,3,74,4,0],[76,4,76,50,0],[79,4,79,31,0],[82,4,82,43,0],[83,4,83,136,0],[86,4,86,61,0],[89,3,89,4,0],[92,3,92,4,0],[94,4,94,138,0],[95,4,95,5,0],[96,5,96,71,0],[97,5,97,34,0],[98,5,98,21,0],[99,5,99,6,0],[100,6,100,21,0],[103,5,103,6,0],[104,6,104,18,0],[108,4,108,20,0],[109,4,109,5,0],[110,5,110,24,0],[113,4,113,5,0],[114,5,114,16,0],[116,3,116,4,0],[124,3,124,4,0],[125,4,125,39,0],[126,4,126,98,0],[127,4,127,32,0],[129,4,129,40,0],[130,4,130,5,0],[132,5,132,47,0],[133,5,133,42,0],[134,5,134,22,0],[135,6,137,51,0],[138,4,138,5,0],[140,4,140,62,0],[141,4,141,5,0],[143,5,143,62,0],[144,6,144,80,0],[146,5,146,51,0],[147,5,147,6,0],[149,6,149,103,0],[151,6,151,66,0],[152,6,152,7,0],[153,7,153,46,0],[154,7,154,45,0],[155,7,155,162,0],[156,7,156,51,0],[157,6,157,7,0],[160,26,160,134,0],[161,7,161,97,0],[164,6,164,7,0],[165,7,165,109,0],[166,7,166,36,0],[167,7,167,8,0],[169,8,169,49,0],[170,8,170,9,0],[171,9,171,49,0],[173,9,173,24,0],[174,9,174,10,0],[176,10,176,31,0],[178,10,178,40,0],[179,9,179,10,0],[181,9,181,10,0],[183,10,184,53,0],[185,9,185,10,0],[187,9,187,55,0],[188,8,188,9,0],[190,8,190,9,0],[192,9,192,44,0],[193,8,193,9,0],[194,7,194,8,0],[197,7,197,40,0],[198,8,198,28,0],[201,7,201,39,0],[202,7,202,74,0],[204,7,205,55,0],[206,6,206,7,0],[207,5,207,6,0],[208,4,208,5,0],[209,3,209,4,0],[218,3,218,4,0],[220,4,220,28,0],[221,4,221,5,0],[222,5,222,27,0],[223,5,223,6,0],[224,6,224,54,0],[225,5,225,6,0],[226,5,226,12,0],[229,4,229,24,0],[230,4,230,5,0],[231,5,231,90,0],[232,5,232,26,0],[236,5,236,6,0],[237,6,237,36,0],[238,6,238,7,0],[241,7,241,49,0],[242,7,242,22,0],[243,8,243,31,0],[246,7,246,40,0],[247,8,250,19,0],[252,8,253,15,0],[256,7,256,30,0],[258,7,258,8,0],[259,8,259,26,0],[260,7,260,8,0],[261,7,261,12,0],[262,7,262,8,0],[263,7,263,8,0],[265,25,265,63,0],[267,7,267,31,0],[268,7,268,29,0],[269,7,269,8,0],[270,8,270,38,0],[271,9,271,194,0],[272,8,272,15,0],[272,17,272,41,0],[272,42,272,44,0],[272,45,272,60,0],[273,9,273,53,0],[274,7,274,8,0],[275,6,275,7,0],[276,5,276,6,0],[278,5,278,6,0],[280,6,280,28,0],[281,6,281,7,0],[282,7,282,31,0],[283,6,283,7,0],[285,6,285,28,0],[286,5,286,6,0],[287,4,287,5,0],[288,3,288,4,0],[298,3,298,4,0],[299,4,299,26,0],[301,4,301,30,0],[302,4,302,71,0],[303,4,303,79,0],[307,4,307,93,0],[309,4,309,95,0],[313,4,313,93,0],[314,4,314,57,0],[315,4,315,19,0],[316,3,316,4,0],[319,3,319,4,0],[324,3,324,4,0],[330,3,330,4,0],[331,4,331,33,0],[332,3,332,4,0],[339,3,339,4,0],[340,3,340,4,0],[345,3,345,52,0],[346,3,346,47,0],[349,3,349,4,0],[350,4,350,29,0],[351,5,351,12,0],[353,4,353,17,0],[354,4,354,5,0],[355,5,355,30,0],[356,6,356,13,0],[361,5,361,6,0],[362,21,362,110,0],[364,21,364,83,0],[365,6,365,7,0],[366,7,366,66,0],[367,6,367,7,0],[368,5,368,6,0],[369,5,369,10,0],[370,5,370,6,0],[371,5,371,6,0],[374,8,374,53,0],[378,17,378,82,0],[379,5,379,6,0],[380,6,380,61,0],[381,5,381,6,0],[390,5,390,231,0],[393,5,393,108,0],[396,5,396,118,0],[406,5,406,124,0],[407,5,407,188,0],[410,5,410,33,0],[412,4,412,5,0],[414,3,414,4,0],[420,3,420,4,0],[421,4,421,32,0],[423,4,423,5,0],[424,17,424,90,0],[425,6,425,81,0],[426,4,426,5,0],[427,4,427,21,0],[428,4,428,5,0],[429,17,429,116,0],[430,4,430,5,0],[431,4,431,20,0],[432,3,432,4,0],[435,3,435,4,0],[436,4,436,34,0],[438,4,438,5,0],[439,5,439,68,0],[440,21,440,88,0],[441,4,441,5,0],[442,4,442,21,0],[443,4,443,5,0],[444,17,444,119,0],[445,4,445,5,0],[446,4,446,22,0],[448,3,448,4,0],[451,3,451,4,0],[452,4,452,67,0],[453,4,455,52,0],[456,3,456,4,0],[459,3,459,4,0],[460,4,460,41,0],[461,4,461,5,0],[462,5,462,17,0],[463,4,463,5,0],[464,4,464,35,0],[465,3,465,4,0],[468,3,468,4,0],[469,4,469,47,0],[470,3,470,4,0]]);
+    </script>
+  </body>
+</html>

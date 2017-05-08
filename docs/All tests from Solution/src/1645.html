@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\UmbracoDatabase.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Common;
+using System.Linq;
+using System.Text;
+using StackExchange.Profiling;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Persistence.SqlSyntax;
+
+namespace Umbraco.Core.Persistence
+{
+    /// &lt;summary&gt;
+    /// Represents the Umbraco implementation of the PetaPoco Database object
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// Currently this object exists for &#39;future proofing&#39; our implementation. By having our own inheritied implementation we
+    /// can then override any additional execution (such as additional loggging, functionality, etc...) that we need to without breaking compatibility since we&#39;ll always be exposing
+    /// this object instead of the base PetaPoco database object.
+    /// &lt;/remarks&gt;
+    public class UmbracoDatabase : Database, IDisposeOnRequestEnd
+    {
+        private readonly ILogger _logger;
+        private readonly Guid _instanceId = Guid.NewGuid();
+        private bool _enableCount;
+
+        /// &lt;summary&gt;
+        /// Used for testing
+        /// &lt;/summary&gt;
+        internal Guid InstanceId
+        {
+            get { return _instanceId; }
+        }
+
+        /// &lt;summary&gt;
+        /// Generally used for testing, will output all SQL statements executed to the logger
+        /// &lt;/summary&gt;
+        internal bool EnableSqlTrace { get; set; }
+
+        /// &lt;summary&gt;
+        /// Used for testing
+        /// &lt;/summary&gt;
+        internal void EnableSqlCount()
+        {
+            _enableCount = true;
+        }
+
+        /// &lt;summary&gt;
+        /// Used for testing
+        /// &lt;/summary&gt;
+        internal void DisableSqlCount()
+        {
+            _enableCount = false;
+            SqlCount = 0;
+        }
+
+        /// &lt;summary&gt;
+        /// Used for testing
+        /// &lt;/summary&gt;
+        internal int SqlCount { get; private set; }
+
+        [Obsolete(&quot;Use the other constructor specifying an ILogger instead&quot;)]
+        public UmbracoDatabase(IDbConnection connection)
+            : this(connection, LoggerResolver.Current.Logger)
+        {
+        }
+
+        [Obsolete(&quot;Use the other constructor specifying an ILogger instead&quot;)]
+        public UmbracoDatabase(string connectionString, string providerName)
+            : this(connectionString, providerName, LoggerResolver.Current.Logger)
+        {
+        }
+
+        [Obsolete(&quot;Use the other constructor specifying an ILogger instead&quot;)]
+        public UmbracoDatabase(string connectionString, DbProviderFactory provider)
+            : this(connectionString, provider, LoggerResolver.Current.Logger)
+        {
+        }
+
+        [Obsolete(&quot;Use the other constructor specifying an ILogger instead&quot;)]
+        public UmbracoDatabase(string connectionStringName)
+            : this(connectionStringName, LoggerResolver.Current.Logger)
+        {
+        }
+
+        public UmbracoDatabase(IDbConnection connection, ILogger logger)
+            : base(connection)
+        {
+            _logger = logger;
+            EnableSqlTrace = false;
+        }
+
+        public UmbracoDatabase(string connectionString, string providerName, ILogger logger)
+            : base(connectionString, providerName)
+        {
+            _logger = logger;
+            EnableSqlTrace = false;
+        }
+
+        public UmbracoDatabase(string connectionString, DbProviderFactory provider, ILogger logger)
+            : base(connectionString, provider)
+        {
+            _logger = logger;
+            EnableSqlTrace = false;
+        }
+
+        public UmbracoDatabase(string connectionStringName, ILogger logger)
+            : base(connectionStringName)
+        {
+            _logger = logger;
+            EnableSqlTrace = false;
+        }
+
+        public override IDbConnection OnConnectionOpened(IDbConnection connection)
+        {
+            // propagate timeout if none yet
+
+            // wrap the connection with a profiling connection that tracks timings
+            return new StackExchange.Profiling.Data.ProfiledDbConnection(connection as DbConnection, MiniProfiler.Current);
+        }
+
+        public override void OnException(Exception x)
+        {
+            _logger.Error&lt;UmbracoDatabase&gt;(&quot;Database exception occurred&quot;, x);
+            base.OnException(x);
+        }
+
+        public override void OnExecutingCommand(IDbCommand cmd)
+        {
+            // if no timeout is specified, and the connection has a longer timeout, use it
+            if (OneTimeCommandTimeout == 0 &amp;&amp; CommandTimeout == 0 &amp;&amp; cmd.Connection.ConnectionTimeout &gt; 30)
+                cmd.CommandTimeout = cmd.Connection.ConnectionTimeout;
+
+            if (EnableSqlTrace)
+            {
+                var sb = new StringBuilder();
+                sb.Append(cmd.CommandText);
+                foreach (DbParameter p in cmd.Parameters)
+                {
+                    sb.Append(&quot; - &quot;);
+                    sb.Append(p.Value);
+                }
+                
+                _logger.Debug&lt;UmbracoDatabase&gt;(sb.ToString());
+            }
+
+            base.OnExecutingCommand(cmd);
+        }
+
+        public override void OnExecutedCommand(IDbCommand cmd)
+        {
+            if (_enableCount)
+            {
+                SqlCount++;
+            }
+            base.OnExecutedCommand(cmd);
+        }
+
+        /// &lt;summary&gt;
+        /// We are overriding this in the case that we are using SQL Server 2012+ so we can make paging more efficient than the default PetaPoco paging
+        /// see: http://issues.umbraco.org/issue/U4-8837
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sql&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;sqlSelectRemoved&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;sqlOrderBy&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;args&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;sqlPage&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;databaseType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;skip&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;take&quot;&gt;&lt;/param&gt;
+        internal override void BuildSqlDbSpecificPagingQuery(DBType databaseType, long skip, long take, string sql, string sqlSelectRemoved, string sqlOrderBy, ref object[] args, out string sqlPage)
+        {
+            if (databaseType == DBType.SqlServer)
+            {
+                //we need to check it&#39;s version to see what kind of paging format we can use
+                //TODO: This is a hack, but we don&#39;t have access to the SqlSyntaxProvider here, we can in v8 but not now otherwise
+                // this would be a breaking change.
+                var sqlServerSyntax = SqlSyntaxContext.SqlSyntaxProvider as SqlServerSyntaxProvider;
+                if (sqlServerSyntax != null)
+                {
+                    if ((int) sqlServerSyntax.GetVersionName(this) &gt;= (int) SqlServerVersionName.V2012)
+                    {
+                        //we can use the good paging! to do that we are going to change the databaseType to SQLCE since
+                        //it also uses the good paging syntax.
+                        base.BuildSqlDbSpecificPagingQuery(DBType.SqlServerCE, skip, take, sql, sqlSelectRemoved, sqlOrderBy, ref args, out sqlPage);
+                        return;
+                    }
+                }
+            }
+           
+            //use the defaults
+            base.BuildSqlDbSpecificPagingQuery(databaseType, skip, take, sql, sqlSelectRemoved, sqlOrderBy, ref args, out sqlPage);
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,9,24,60,0],[24,9,24,60,0],[24,9,24,60,1],[24,9,24,60,1],[32,17,32,18,0],[32,19,32,38,0],[32,39,32,40,0],[38,40,38,44,1],[38,45,38,49,1],[44,9,44,10,1],[45,13,45,33,1],[46,9,46,10,1],[52,9,52,10,1],[53,13,53,34,1],[54,13,54,26,1],[55,9,55,10,1],[60,33,60,37,1],[60,38,60,50,1],[64,15,64,62,0],[65,9,65,10,0],[66,9,66,10,0],[70,15,70,82,0],[71,9,71,10,0],[72,9,72,10,0],[76,15,76,78,0],[77,9,77,10,0],[78,9,78,10,0],[82,15,82,72,0],[83,9,83,10,0],[84,9,84,10,0],[87,15,87,31,0],[88,9,88,10,0],[89,13,89,30,0],[90,13,90,36,0],[91,9,91,10,0],[94,15,94,51,1],[95,9,95,10,1],[96,13,96,30,1],[97,13,97,36,1],[98,9,98,10,1],[101,15,101,47,0],[102,9,102,10,0],[103,13,103,30,0],[104,13,104,36,0],[105,9,105,10,0],[108,15,108,41,1],[109,9,109,10,1],[110,13,110,30,1],[111,13,111,36,1],[112,9,112,10,1],[115,9,115,10,1],[119,13,119,124,1],[120,9,120,10,1],[123,9,123,10,1],[124,13,124,78,1],[125,13,125,33,1],[126,9,126,10,1],[129,9,129,10,1],[131,13,131,108,1],[132,17,132,71,0],[134,13,134,32,1],[135,13,135,14,1],[136,17,136,46,1],[137,17,137,44,1],[138,17,138,24,1],[138,26,138,39,1],[138,40,138,42,1],[138,43,138,57,1],[139,17,139,18,1],[140,21,140,38,1],[141,21,141,40,1],[142,17,142,18,1],[144,17,144,63,1],[145,13,145,14,1],[147,13,147,42,1],[148,9,148,10,1],[151,9,151,10,1],[152,13,152,30,1],[153,13,153,14,1],[154,17,154,28,1],[155,13,155,14,1],[156,13,156,41,1],[157,9,157,10,1],[172,9,172,10,1],[173,13,173,50,1],[174,13,174,14,0],[178,17,178,101,0],[179,17,179,45,0],[180,17,180,18,0],[181,21,181,104,0],[182,21,182,22,0],[185,25,185,150,0],[186,25,186,32,0],[188,17,188,18,0],[189,13,189,14,0],[192,13,192,132,1],[193,9,193,10,1]]);
+    </script>
+  </body>
+</html>

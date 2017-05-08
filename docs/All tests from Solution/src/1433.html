@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\UriExtensions.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.IO;
+using System.Linq;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+
+namespace Umbraco.Core
+{
+    /// &lt;summary&gt;
+    /// Provides extension methods to &lt;see cref=&quot;Uri&quot;/&gt;.
+    /// &lt;/summary&gt;
+    public static class UriExtensions
+    {
+        /// &lt;summary&gt;
+        /// Checks if the current uri is a back office request
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;url&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;applicationPath&quot;&gt;
+        /// The current application path or VirtualPath
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// There are some special routes we need to check to properly determine this:
+        /// 
+        ///     If any route has an extension in the path like .aspx = back office
+        /// 
+        ///     These are def back office:
+        ///         /Umbraco/RestServices   = back office
+        ///         /Umbraco/BackOffice     = back office
+        ///     If it&#39;s not any of the above, and there&#39;s no extension then we cannot determine if it&#39;s back office or front-end
+        ///     so we can only assume that it is not back office. This will occur if people use an UmbracoApiController for the backoffice
+        ///     but do not inherit from UmbracoAuthorizedApiController and do not use [IsBackOffice] attribute.
+        /// 
+        ///     These are def front-end: 
+        ///         /Umbraco/Surface        = front-end
+        ///         /Umbraco/Api            = front-end
+        ///     But if we&#39;ve got this far we&#39;ll just have to assume it&#39;s front-end anyways.
+        /// 
+        /// &lt;/remarks&gt;
+        internal static bool IsBackOfficeRequest(this Uri url, string applicationPath)
+        {
+            applicationPath = applicationPath ?? string.Empty;
+
+            var fullUrlPath = url.AbsolutePath.TrimStart(new[] {&#39;/&#39;});
+            var appPath = applicationPath.TrimStart(new[] {&#39;/&#39;});
+            var urlPath = fullUrlPath.TrimStart(appPath).EnsureStartsWith(&#39;/&#39;);
+            
+            //check if this is in the umbraco back office
+            var isUmbracoPath = urlPath.InvariantStartsWith(GlobalSettings.Path.EnsureStartsWith(&#39;/&#39;).TrimStart(appPath.EnsureStartsWith(&#39;/&#39;)).EnsureStartsWith(&#39;/&#39;));
+            //if not, then def not back office
+            if (isUmbracoPath == false) return false;
+
+            //if its the normal /umbraco path
+            if (urlPath.InvariantEquals(&quot;/&quot; + GlobalSettings.UmbracoMvcArea)
+                || urlPath.InvariantEquals(&quot;/&quot; + GlobalSettings.UmbracoMvcArea + &quot;/&quot;))
+            {
+                return true;
+            }
+
+            //check for a file extension
+            var extension = Path.GetExtension(url.LocalPath);
+            //has an extension, def back office
+            if (extension.IsNullOrWhiteSpace() == false) return true;
+            //check for special case asp.net calls like:
+            //  /umbraco/webservices/legacyAjaxCalls.asmx/js which will return a null file extension but are still considered extension&#39;d requests
+            if (urlPath.InvariantContains(&quot;.asmx/&quot;)
+                || urlPath.InvariantContains(&quot;.aspx/&quot;)
+                || urlPath.InvariantContains(&quot;.ashx/&quot;)
+                || urlPath.InvariantContains(&quot;.axd/&quot;)
+                || urlPath.InvariantContains(&quot;.svc/&quot;))
+            {
+                return true;
+            }
+
+            //check for special back office paths
+            if (urlPath.InvariantStartsWith(&quot;/&quot; + GlobalSettings.UmbracoMvcArea + &quot;/BackOffice/&quot;)
+                || urlPath.InvariantStartsWith(&quot;/&quot; + GlobalSettings.UmbracoMvcArea + &quot;/RestServices/&quot;))
+            {
+                return true;
+            }
+
+            //check for special front-end paths
+            if (urlPath.InvariantStartsWith(&quot;/&quot; + GlobalSettings.UmbracoMvcArea + &quot;/Surface/&quot;)
+                || urlPath.InvariantStartsWith(&quot;/&quot; + GlobalSettings.UmbracoMvcArea + &quot;/Api/&quot;))
+            {
+                return false;
+            }
+
+            //if its none of the above, we will have to try to detect if it&#39;s a PluginController route, we can detect this by 
+            // checking how many parts the route has, for example, all PluginController routes will be routed like
+            // Umbraco/MYPLUGINAREA/MYCONTROLLERNAME/{action}/{id}
+            // so if the path contains at a minimum 3 parts: Umbraco + MYPLUGINAREA + MYCONTROLLERNAME then we will have to assume it is a 
+            // plugin controller for the front-end.
+            if (urlPath.Split(new[] {&#39;/&#39;}, StringSplitOptions.RemoveEmptyEntries).Length &gt;= 3)
+            {
+                return false;
+            }
+
+            //if its anything else we can assume it&#39;s back office
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the current uri is an install request
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;url&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static bool IsInstallerRequest(this Uri url)
+        {
+            var authority = url.GetLeftPart(UriPartial.Authority);
+            var afterAuthority = url.GetLeftPart(UriPartial.Query)
+                                    .TrimStart(authority)
+                                    .TrimStart(&quot;/&quot;);
+
+            //check if this is in the umbraco back office
+            return afterAuthority.InvariantStartsWith(IOHelper.ResolveUrl(&quot;~/install&quot;).TrimStart(&quot;/&quot;));
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the uri is a request for the default back office page
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;url&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static bool IsDefaultBackOfficeRequest(this Uri url)
+        {
+            if (url.AbsolutePath.InvariantEquals(GlobalSettings.Path.TrimEnd(&quot;/&quot;))
+                || url.AbsolutePath.InvariantEquals(GlobalSettings.Path.EnsureEndsWith(&#39;/&#39;))
+                || url.AbsolutePath.InvariantEquals(GlobalSettings.Path.EnsureEndsWith(&#39;/&#39;) + &quot;Default&quot;)
+                || url.AbsolutePath.InvariantEquals(GlobalSettings.Path.EnsureEndsWith(&#39;/&#39;) + &quot;Default/&quot;))
+            {
+                return true;
+            }
+            return false;
+        }
+        
+        /// &lt;summary&gt;
+        /// This is a performance tweak to check if this not an ASP.Net server file
+        /// .Net will pass these requests through to the module when in integrated mode.
+        /// We want to ignore all of these requests immediately.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;url&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static bool IsClientSideRequest(this Uri url)
+        {
+            var ext = Path.GetExtension(url.LocalPath);
+            if (ext.IsNullOrWhiteSpace()) return false;
+            var toInclude = new[] { &quot;.aspx&quot;, &quot;.ashx&quot;, &quot;.asmx&quot;, &quot;.axd&quot;, &quot;.svc&quot; };
+            return toInclude.Any(ext.InvariantEquals) == false;
+        }
+
+        /// &lt;summary&gt;
+        /// Rewrites the path of uri.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uri&quot;&gt;The uri.&lt;/param&gt;
+        /// &lt;param name=&quot;path&quot;&gt;The new path, which must begin with a slash.&lt;/param&gt;
+        /// &lt;returns&gt;The rewritten uri.&lt;/returns&gt;
+        /// &lt;remarks&gt;Everything else remains unchanged, except for the fragment which is removed.&lt;/remarks&gt;
+        public static Uri Rewrite(this Uri uri, string path)
+        {
+            if (path.StartsWith(&quot;/&quot;) == false)
+                throw new ArgumentException(&quot;Path must start with a slash.&quot;, &quot;path&quot;);
+
+            return uri.IsAbsoluteUri
+                ? new Uri(uri.GetLeftPart(UriPartial.Authority) + path + uri.Query)
+                : new Uri(path + uri.GetSafeQuery(), UriKind.Relative);
+        }
+
+        /// &lt;summary&gt;
+        /// Rewrites the path and query of a uri.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uri&quot;&gt;The uri.&lt;/param&gt;
+        /// &lt;param name=&quot;path&quot;&gt;The new path, which must begin with a slash.&lt;/param&gt;
+        /// &lt;param name=&quot;query&quot;&gt;The new query, which must be empty or begin with a question mark.&lt;/param&gt;
+        /// &lt;returns&gt;The rewritten uri.&lt;/returns&gt;
+        /// &lt;remarks&gt;Everything else remains unchanged, except for the fragment which is removed.&lt;/remarks&gt;
+        public static Uri Rewrite(this Uri uri, string path, string query)
+        {
+            if (path.StartsWith(&quot;/&quot;) == false)
+                throw new ArgumentException(&quot;Path must start with a slash.&quot;, &quot;path&quot;);
+            if (query.Length &gt; 0 &amp;&amp; query.StartsWith(&quot;?&quot;) == false)
+                throw new ArgumentException(&quot;Query must start with a question mark.&quot;, &quot;query&quot;);
+            if (query == &quot;?&quot;)
+                query = &quot;&quot;;
+
+            return uri.IsAbsoluteUri
+                ? new Uri(uri.GetLeftPart(UriPartial.Authority) + path + query)
+                : new Uri(path + query, UriKind.Relative);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the absolute path of the uri, even if the uri is relative.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uri&quot;&gt;The uri.&lt;/param&gt;
+        /// &lt;returns&gt;The absolute path of the uri.&lt;/returns&gt;
+        /// &lt;remarks&gt;Default uri.AbsolutePath does not support relative uris.&lt;/remarks&gt;
+        public static string GetSafeAbsolutePath(this Uri uri)
+        {
+            if (uri.IsAbsoluteUri)
+                return uri.AbsolutePath;
+
+            // cannot get .AbsolutePath on relative uri (InvalidOperation)
+            var s = uri.OriginalString;
+            var posq = s.IndexOf(&quot;?&quot;, StringComparison.Ordinal);
+            var posf = s.IndexOf(&quot;#&quot;, StringComparison.Ordinal);
+            var pos = posq &gt; 0 ? posq : (posf &gt; 0 ? posf : 0);
+            var path = pos &gt; 0 ? s.Substring(0, pos) : s;
+            return path;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the decoded, absolute path of the uri.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uri&quot;&gt;The uri.&lt;/param&gt;
+        /// &lt;returns&gt;The absolute path of the uri.&lt;/returns&gt;
+        /// &lt;remarks&gt;Only for absolute uris.&lt;/remarks&gt;
+        public static string GetAbsolutePathDecoded(this Uri uri)
+        {
+            return System.Web.HttpUtility.UrlDecode(uri.AbsolutePath);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the decoded, absolute path of the uri, even if the uri is relative.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uri&quot;&gt;The uri.&lt;/param&gt;
+        /// &lt;returns&gt;The absolute path of the uri.&lt;/returns&gt;
+        /// &lt;remarks&gt;Default uri.AbsolutePath does not support relative uris.&lt;/remarks&gt;
+        public static string GetSafeAbsolutePathDecoded(this Uri uri)
+        {
+            return System.Web.HttpUtility.UrlDecode(uri.GetSafeAbsolutePath());
+        }
+
+        /// &lt;summary&gt;
+        /// Rewrites the path of the uri so it ends with a slash.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uri&quot;&gt;The uri.&lt;/param&gt;
+        /// &lt;returns&gt;The rewritten uri.&lt;/returns&gt;
+        /// &lt;remarks&gt;Everything else remains unchanged.&lt;/remarks&gt;
+        public static Uri EndPathWithSlash(this Uri uri)
+        {
+            var path = uri.GetSafeAbsolutePath();
+            if (uri.IsAbsoluteUri)
+            {
+				if (path != &quot;/&quot; &amp;&amp; path.EndsWith(&quot;/&quot;) == false)
+                    uri = new Uri(uri.GetLeftPart(UriPartial.Authority) + path + &quot;/&quot; + uri.Query);
+                return uri;
+            }
+		    
+            if (path != &quot;/&quot; &amp;&amp; path.EndsWith(&quot;/&quot;) == false)
+					uri = new Uri(path + &quot;/&quot; + uri.Query, UriKind.Relative);
+		    
+            return uri;
+        }
+
+        /// &lt;summary&gt;
+        /// Rewrites the path of the uri so it does not end with a slash.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uri&quot;&gt;The uri.&lt;/param&gt;
+        /// &lt;returns&gt;The rewritten uri.&lt;/returns&gt;
+        /// &lt;remarks&gt;Everything else remains unchanged.&lt;/remarks&gt;
+        public static Uri TrimPathEndSlash(this Uri uri)
+        {
+            var path = uri.GetSafeAbsolutePath();
+            if (uri.IsAbsoluteUri)
+            {
+                if (path != &quot;/&quot;)
+                    uri = new Uri(uri.GetLeftPart(UriPartial.Authority) + path.TrimEnd(&#39;/&#39;) + uri.Query);
+            }
+            else
+            {
+                if (path != &quot;/&quot;)
+                    uri = new Uri(path.TrimEnd(&#39;/&#39;) + uri.Query, UriKind.Relative);
+            }
+            return uri;
+        }
+
+        /// &lt;summary&gt;
+        /// Transforms a relative uri into an absolute uri.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uri&quot;&gt;The relative uri.&lt;/param&gt;
+        /// &lt;param name=&quot;baseUri&quot;&gt;The base absolute uri.&lt;/param&gt;
+        /// &lt;returns&gt;The absolute uri.&lt;/returns&gt;
+        public static Uri MakeAbsolute(this Uri uri, Uri baseUri)
+        {
+            if (uri.IsAbsoluteUri)
+                throw new ArgumentException(&quot;Uri is already absolute.&quot;, &quot;uri&quot;);
+
+            return new Uri(baseUri.GetLeftPart(UriPartial.Authority) + uri.GetSafeAbsolutePath() + uri.GetSafeQuery());
+        }
+
+        static string GetSafeQuery(this Uri uri)
+        {
+            if (uri.IsAbsoluteUri)
+                return uri.Query;
+
+            // cannot get .Query on relative uri (InvalidOperation)
+            var s = uri.OriginalString;
+            var posq = s.IndexOf(&quot;?&quot;, StringComparison.Ordinal);
+            var posf = s.IndexOf(&quot;#&quot;, StringComparison.Ordinal);
+            var query = posq &lt; 0 ? null : (posf &lt; 0 ? s.Substring(posq) : s.Substring(posq, posf - posq));
+
+            return query;
+        }
+
+        /// &lt;summary&gt;
+        /// Removes the port from the uri.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uri&quot;&gt;The uri.&lt;/param&gt;
+        /// &lt;returns&gt;The same uri, without its port.&lt;/returns&gt;
+        public static Uri WithoutPort(this Uri uri)
+        {
+            return new Uri(uri.GetComponents(UriComponents.AbsoluteUri &amp; ~UriComponents.Port, UriFormat.UriEscaped));
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[41,9,41,10,1],[42,13,42,63,1],[44,13,44,71,1],[45,13,45,66,1],[46,13,46,80,1],[49,13,49,167,1],[51,13,51,40,1],[51,41,51,54,1],[54,13,55,87,1],[56,13,56,14,1],[57,17,57,29,1],[61,13,61,62,1],[63,13,63,57,1],[63,58,63,70,1],[66,13,70,55,1],[71,13,71,14,1],[72,17,72,29,1],[76,13,77,104,1],[78,13,78,14,1],[79,17,79,29,1],[83,13,84,95,1],[85,13,85,14,1],[86,17,86,30,1],[94,13,94,95,1],[95,13,95,14,1],[96,17,96,30,1],[100,13,100,25,1],[101,9,101,10,1],[109,9,109,10,1],[110,13,110,67,1],[111,13,113,53,1],[116,13,116,104,1],[117,9,117,10,1],[125,9,125,10,0],[126,13,129,107,0],[130,13,130,14,0],[131,17,131,29,0],[133,13,133,26,0],[134,9,134,10,0],[144,9,144,10,1],[145,13,145,56,1],[146,13,146,42,1],[146,43,146,56,1],[147,13,147,81,1],[148,13,148,64,1],[149,9,149,10,1],[159,9,159,10,1],[160,13,160,47,1],[161,17,161,86,1],[163,13,165,72,1],[166,9,166,10,1],[177,9,177,10,1],[178,13,178,47,1],[179,17,179,86,1],[180,13,180,68,1],[181,17,181,96,1],[182,13,182,30,1],[183,17,183,28,0],[185,13,187,59,1],[188,9,188,10,1],[197,9,197,10,1],[198,13,198,35,1],[199,17,199,41,1],[202,13,202,40,1],[203,13,203,65,1],[204,13,204,65,1],[205,13,205,63,1],[206,13,206,58,1],[207,13,207,25,1],[208,9,208,10,1],[217,9,217,10,1],[218,13,218,71,1],[219,9,219,10,1],[228,9,228,10,1],[229,13,229,80,1],[230,9,230,10,1],[239,9,239,10,1],[240,13,240,50,1],[241,13,241,35,1],[242,13,242,14,1],[243,5,243,52,1],[244,21,244,99,1],[245,17,245,28,1],[248,13,248,60,0],[249,6,249,62,0],[251,13,251,24,0],[252,9,252,10,1],[261,9,261,10,1],[262,13,262,50,1],[263,13,263,35,1],[264,13,264,14,1],[265,17,265,33,1],[266,21,266,106,1],[267,13,267,14,1],[269,13,269,14,0],[270,17,270,33,0],[271,21,271,84,0],[272,13,272,14,0],[273,13,273,24,1],[274,9,274,10,1],[283,9,283,10,1],[284,13,284,35,1],[285,17,285,80,0],[287,13,287,120,1],[288,9,288,10,1],[291,9,291,10,1],[292,13,292,35,1],[293,17,293,34,0],[296,13,296,40,1],[297,13,297,65,1],[298,13,298,65,1],[299,13,299,107,1],[301,13,301,26,1],[302,9,302,10,1],[310,9,310,10,1],[311,13,311,118,1],[312,9,312,10,1]]);
+    </script>
+  </body>
+</html>

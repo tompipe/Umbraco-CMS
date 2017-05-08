@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Migrations\Initial\DatabaseSchemaResult.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using Semver;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Core.Persistence.Migrations.Initial
+{
+    public class DatabaseSchemaResult
+    {
+        public DatabaseSchemaResult()
+        {
+            Errors = new List&lt;Tuple&lt;string, string&gt;&gt;();
+            TableDefinitions = new List&lt;TableDefinition&gt;();
+            ValidTables = new List&lt;string&gt;();
+            ValidColumns = new List&lt;string&gt;();
+            ValidConstraints = new List&lt;string&gt;();
+            ValidIndexes = new List&lt;string&gt;();
+        }
+
+        public List&lt;Tuple&lt;string, string&gt;&gt; Errors { get; set; }
+
+        public List&lt;TableDefinition&gt; TableDefinitions { get; set; }
+
+        public List&lt;string&gt; ValidTables { get; set; }
+
+        public List&lt;string&gt; ValidColumns { get; set; }
+
+        public List&lt;string&gt; ValidConstraints { get; set; }
+
+        public List&lt;string&gt; ValidIndexes { get; set; }
+
+        internal IEnumerable&lt;DbIndexDefinition&gt; DbIndexDefinitions { get; set; }
+
+        /// &lt;summary&gt;
+        /// Checks in the db which version is installed based on the migrations that have been run
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;migrationEntryService&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public SemVersion DetermineInstalledVersionByMigrations(IMigrationEntryService migrationEntryService)
+        {
+            SemVersion mostrecent = null;
+
+            if (ValidTables.Any(x =&gt; x.InvariantEquals(&quot;umbracoMigration&quot;)))
+            {
+                var allMigrations = migrationEntryService.GetAll(GlobalSettings.UmbracoMigrationName);
+                 mostrecent = allMigrations.OrderByDescending(x =&gt; x.Version).Select(x =&gt; x.Version).FirstOrDefault();
+            }
+
+            return mostrecent ?? new SemVersion(new Version(0, 0, 0));
+        }
+
+        /// &lt;summary&gt;
+        /// Determines the version of the currently installed database by detecting the current database structure
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;
+        /// A &lt;see cref=&quot;Version&quot;/&gt; with Major and Minor values for 
+        /// non-empty database, otherwise &quot;0.0.0&quot; for empty databases.
+        /// &lt;/returns&gt;
+        public Version DetermineInstalledVersion()
+        {
+            //If (ValidTables.Count == 0) database is empty and we return -&gt; new Version(0, 0, 0);
+            if (ValidTables.Count == 0)
+                return new Version(0, 0, 0);
+
+            //If Errors is empty or if TableDefinitions tables + columns correspond to valid tables + columns then we&#39;re at current version
+            if (Errors.Any() == false ||
+                (TableDefinitions.All(x =&gt; ValidTables.Contains(x.Name))
+                 &amp;&amp; TableDefinitions.SelectMany(definition =&gt; definition.Columns).All(x =&gt; ValidColumns.Contains(x.Name))))
+                return UmbracoVersion.Current;
+
+            //If Errors contains umbracoApp or umbracoAppTree its pre-6.0.0 -&gt; new Version(4, 10, 0);
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Table&quot;) &amp;&amp; (x.Item2.InvariantEquals(&quot;umbracoApp&quot;) || x.Item2.InvariantEquals(&quot;umbracoAppTree&quot;))))
+            {
+                //If Errors contains umbracoUser2app or umbracoAppTree foreignkey to umbracoApp exists its pre-4.8.0 -&gt; new Version(4, 7, 0);
+                if (Errors.Any(x =&gt;
+                               x.Item1.Equals(&quot;Constraint&quot;)
+                               &amp;&amp; (x.Item2.InvariantContains(&quot;umbracoUser2app_umbracoApp&quot;)
+                                   || x.Item2.InvariantContains(&quot;umbracoAppTree_umbracoApp&quot;))))
+                {
+                    return new Version(4, 7, 0);
+                }
+
+                return new Version(4, 8, 0);
+            }
+
+            //if the error is for umbracoServer
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Table&quot;) &amp;&amp; (x.Item2.InvariantEquals(&quot;umbracoServer&quot;))))
+            {
+                return new Version(6, 0, 0);
+            }
+
+            //if the error indicates a problem with the column cmsMacroProperty.macroPropertyType then it is not version 7 
+            // since these columns get removed in v7
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Column&quot;) &amp;&amp; (x.Item2.InvariantEquals(&quot;cmsMacroProperty,macroPropertyType&quot;))))
+            {
+                //if the error is for this IX_umbracoNodeTrashed which is added in 6.2 AND in 7.1 but we do not have the above columns
+                // then it must mean that we aren&#39;t on 6.2 so must be 6.1
+                if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Index&quot;) &amp;&amp; (x.Item2.InvariantEquals(&quot;IX_umbracoNodeTrashed&quot;))))
+                {
+                    return new Version(6, 1, 0);
+                }
+                else
+                {
+                    //if there are no errors for that index, then the person must have 6.2 installed
+                    return new Version(6, 2, 0);
+                }
+            }
+
+            //if the error indicates a problem with the constraint FK_cmsContent_cmsContentType_nodeId then it is not version 7.2 
+            // since this gets added in 7.2.0 so it must be the previous version
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Constraint&quot;) &amp;&amp; (x.Item2.InvariantEquals(&quot;FK_cmsContent_cmsContentType_nodeId&quot;))))
+            {
+                return new Version(7, 0, 0);
+            }
+
+            //if the error is for umbracoAccess it must be the previous version to 7.3 since that is when it is added
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Table&quot;) &amp;&amp; (x.Item2.InvariantEquals(&quot;umbracoAccess&quot;))))
+            {
+                return new Version(7, 2, 0);
+            }
+
+            //if the error is for umbracoDeployChecksum it must be the previous version to 7.4 since that is when it is added
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Table&quot;) &amp;&amp; (x.Item2.InvariantEquals(&quot;umbracoDeployChecksum&quot;))))
+            {
+                return new Version(7, 3, 0);
+            }
+
+            //if the error is for umbracoRedirectUrl it must be the previous version to 7.5 since that is when it is added
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Table&quot;) &amp;&amp; (x.Item2.InvariantEquals(&quot;umbracoRedirectUrl&quot;))))
+            {
+                return new Version(7, 4, 0);
+            }
+
+            return UmbracoVersion.Current;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a summary of the schema validation result
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;A string containing a human readable string with a summary message&lt;/returns&gt;
+        public string GetSummary()
+        {
+            var sb = new StringBuilder();
+            if (Errors.Any() == false)
+            {
+                sb.AppendLine(&quot;The database schema validation didn&#39;t find any errors.&quot;);
+                return sb.ToString();
+            }
+
+            //Table error summary
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Table&quot;)))
+            {
+                sb.AppendLine(&quot;The following tables were found in the database, but are not in the current schema:&quot;);
+                sb.AppendLine(string.Join(&quot;,&quot;, Errors.Where(x =&gt; x.Item1.Equals(&quot;Table&quot;)).Select(x =&gt; x.Item2)));
+                sb.AppendLine(&quot; &quot;);
+            }
+            //Column error summary
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Column&quot;)))
+            {
+                sb.AppendLine(&quot;The following columns were found in the database, but are not in the current schema:&quot;);
+                sb.AppendLine(string.Join(&quot;,&quot;, Errors.Where(x =&gt; x.Item1.Equals(&quot;Column&quot;)).Select(x =&gt; x.Item2)));
+                sb.AppendLine(&quot; &quot;);
+            }
+            //Constraint error summary
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Constraint&quot;)))
+            {
+                sb.AppendLine(&quot;The following constraints (Primary Keys, Foreign Keys and Indexes) were found in the database, but are not in the current schema:&quot;);
+                sb.AppendLine(string.Join(&quot;,&quot;, Errors.Where(x =&gt; x.Item1.Equals(&quot;Constraint&quot;)).Select(x =&gt; x.Item2)));
+                sb.AppendLine(&quot; &quot;);
+            }
+            //Index error summary
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Index&quot;)))
+            {
+                sb.AppendLine(&quot;The following indexes were found in the database, but are not in the current schema:&quot;);
+                sb.AppendLine(string.Join(&quot;,&quot;, Errors.Where(x =&gt; x.Item1.Equals(&quot;Index&quot;)).Select(x =&gt; x.Item2)));
+                sb.AppendLine(&quot; &quot;);
+            }
+            //Unknown constraint error summary
+            if (Errors.Any(x =&gt; x.Item1.Equals(&quot;Unknown&quot;)))
+            {
+                sb.AppendLine(&quot;The following unknown constraints (Primary Keys, Foreign Keys and Indexes) were found in the database, but are not in the current schema:&quot;);
+                sb.AppendLine(string.Join(&quot;,&quot;, Errors.Where(x =&gt; x.Item1.Equals(&quot;Unknown&quot;)).Select(x =&gt; x.Item2)));
+                sb.AppendLine(&quot; &quot;);
+            }
+
+            if (SqlSyntaxContext.SqlSyntaxProvider is MySqlSyntaxProvider)
+            {
+                sb.AppendLine(&quot;Please note that the constraints could not be validated because the current dataprovider is MySql.&quot;);
+            }
+
+            return sb.ToString();
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[15,9,15,38,1],[16,9,16,10,1],[17,13,17,56,1],[18,13,18,60,1],[19,13,19,46,1],[20,13,20,47,1],[21,13,21,51,1],[22,13,22,47,1],[23,9,23,10,1],[25,53,25,57,1],[25,58,25,62,1],[27,57,27,61,1],[27,62,27,66,1],[29,43,29,47,1],[29,48,29,52,1],[31,44,31,48,1],[31,49,31,53,1],[33,48,33,52,1],[33,53,33,57,1],[35,44,35,48,1],[35,49,35,53,1],[37,70,37,74,1],[37,75,37,79,1],[45,9,45,10,0],[46,13,46,42,0],[48,13,48,38,0],[48,38,48,75,0],[48,75,48,77,0],[48,13,48,77,0],[49,13,49,14,0],[50,17,50,103,0],[51,18,51,68,0],[51,68,51,77,0],[51,77,51,91,0],[51,91,51,100,0],[51,100,51,119,0],[51,18,51,119,0],[52,13,52,14,0],[54,13,54,71,0],[55,9,55,10,0],[65,9,65,10,1],[67,13,67,40,1],[68,17,68,45,0],[71,13,72,44,1],[72,44,72,72,1],[72,72,73,63,1],[73,63,73,81,0],[73,81,73,92,1],[73,92,73,121,0],[73,121,73,124,1],[71,13,73,124,1],[74,17,74,47,1],[77,13,77,33,1],[77,33,77,144,1],[77,144,77,146,1],[77,13,77,146,1],[78,13,78,14,1],[80,17,81,32,1],[81,32,83,94,1],[83,94,83,96,1],[80,17,83,96,1],[84,17,84,18,1],[85,21,85,49,1],[88,17,88,45,0],[92,13,92,33,0],[92,33,92,102,0],[92,102,92,104,0],[92,13,92,104,0],[93,13,93,14,0],[94,17,94,45,0],[99,13,99,33,0],[99,33,99,124,0],[99,124,99,126,0],[99,13,99,126,0],[100,13,100,14,0],[103,17,103,37,0],[103,37,103,114,0],[103,114,103,116,0],[103,17,103,116,0],[104,17,104,18,0],[105,21,105,49,0],[108,17,108,18,0],[110,21,110,49,0],[116,13,116,33,0],[116,33,116,129,0],[116,129,116,131,0],[116,13,116,131,0],[117,13,117,14,0],[118,17,118,45,0],[122,13,122,33,0],[122,33,122,102,0],[122,102,122,104,0],[122,13,122,104,0],[123,13,123,14,0],[124,17,124,45,0],[128,13,128,33,0],[128,33,128,110,0],[128,110,128,112,0],[128,13,128,112,0],[129,13,129,14,0],[130,17,130,45,0],[134,13,134,33,0],[134,33,134,107,0],[134,107,134,109,0],[134,13,134,109,0],[135,13,135,14,0],[136,17,136,45,0],[139,13,139,43,0],[140,9,140,10,1],[147,9,147,10,0],[148,13,148,42,0],[149,13,149,39,0],[150,13,150,14,0],[151,17,151,89,0],[152,17,152,38,0],[156,13,156,33,0],[156,33,156,56,0],[156,56,156,58,0],[156,13,156,58,0],[157,13,157,14,0],[158,17,158,118,0],[159,17,159,66,0],[159,66,159,89,0],[159,89,159,103,0],[159,103,159,110,0],[159,110,159,114,0],[159,17,159,114,0],[160,17,160,36,0],[161,13,161,14,0],[163,13,163,33,0],[163,33,163,57,0],[163,57,163,59,0],[163,13,163,59,0],[164,13,164,14,0],[165,17,165,119,0],[166,17,166,66,0],[166,66,166,90,0],[166,90,166,104,0],[166,104,166,111,0],[166,111,166,115,0],[166,17,166,115,0],[167,17,167,36,0],[168,13,168,14,0],[170,13,170,33,0],[170,33,170,61,0],[170,61,170,63,0],[170,13,170,63,0],[171,13,171,14,0],[172,17,172,164,0],[173,17,173,66,0],[173,66,173,94,0],[173,94,173,108,0],[173,108,173,115,0],[173,115,173,119,0],[173,17,173,119,0],[174,17,174,36,0],[175,13,175,14,0],[177,13,177,33,0],[177,33,177,56,0],[177,56,177,58,0],[177,13,177,58,0],[178,13,178,14,0],[179,17,179,119,0],[180,17,180,66,0],[180,66,180,89,0],[180,89,180,103,0],[180,103,180,110,0],[180,110,180,114,0],[180,17,180,114,0],[181,17,181,36,0],[182,13,182,14,0],[184,13,184,33,0],[184,33,184,58,0],[184,58,184,60,0],[184,13,184,60,0],[185,13,185,14,0],[186,17,186,172,0],[187,17,187,66,0],[187,66,187,91,0],[187,91,187,105,0],[187,105,187,112,0],[187,112,187,116,0],[187,17,187,116,0],[188,17,188,36,0],[189,13,189,14,0],[191,13,191,75,0],[192,13,192,14,0],[193,17,193,133,0],[194,13,194,14,0],[196,13,196,34,0],[197,9,197,10,0]]);
+    </script>
+  </body>
+</html>

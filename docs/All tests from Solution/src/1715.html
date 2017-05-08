@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\MediaTypeRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Events;
+using Umbraco.Core.Exceptions;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents a repository for doing CRUD operations for &lt;see cref=&quot;IMediaType&quot;/&gt;
+    /// &lt;/summary&gt;
+    internal class MediaTypeRepository : ContentTypeBaseRepository&lt;IMediaType&gt;, IMediaTypeRepository
+    {
+
+        public MediaTypeRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax)
+            : base(work, cache, logger, sqlSyntax)
+        {
+        }
+
+        private FullDataSetRepositoryCachePolicyFactory&lt;IMediaType, int&gt; _cachePolicyFactory;
+        protected override IRepositoryCachePolicyFactory&lt;IMediaType, int&gt; CachePolicyFactory
+        {
+            get
+            {
+                //Use a FullDataSet cache policy - this will cache the entire GetAll result in a single collection
+                return _cachePolicyFactory ?? (_cachePolicyFactory = new FullDataSetRepositoryCachePolicyFactory&lt;IMediaType, int&gt;(
+                    RuntimeCache, GetEntityId, () =&gt; PerformGetAll(),
+                    //allow this cache to expire
+                    expires: true));
+            }
+        }
+
+        protected override IMediaType PerformGet(int id)
+        {
+            //use the underlying GetAll which will force cache all content types
+            return GetAll().FirstOrDefault(x =&gt; x.Id == id);
+        }
+
+        protected override IEnumerable&lt;IMediaType&gt; PerformGetAll(params int[] ids)
+        {
+            if (ids.Any())
+            {
+                //NOTE: This logic should never be executed according to our cache policy
+                return ContentTypeQueryMapper.GetMediaTypes(Database, SqlSyntax, this)
+                    .Where(x =&gt; ids.Contains(x.Id));
+            }
+
+            return ContentTypeQueryMapper.GetMediaTypes(Database, SqlSyntax, this);
+        }
+
+        protected override IEnumerable&lt;IMediaType&gt; PerformGetByQuery(IQuery&lt;IMediaType&gt; query)
+        {
+            var sqlClause = GetBaseQuery(false);
+            var translator = new SqlTranslator&lt;IMediaType&gt;(sqlClause, query);
+            var sql = translator.Translate();
+
+            var dtos = Database.Fetch&lt;ContentTypeDto, NodeDto&gt;(sql);
+
+            return
+                //This returns a lookup from the GetAll cached looup
+                (dtos.Any()
+                    ? GetAll(dtos.DistinctBy(x =&gt; x.NodeId).Select(x =&gt; x.NodeId).ToArray())
+                    : Enumerable.Empty&lt;IMediaType&gt;())
+                    //order the result by name
+                    .OrderBy(x =&gt; x.Name);
+        }
+        
+        /// &lt;summary&gt;
+        /// Gets all entities of the specified &lt;see cref=&quot;PropertyType&quot;/&gt; query
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;query&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;IContentType&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IMediaType&gt; GetByQuery(IQuery&lt;PropertyType&gt; query)
+        {
+            var ints = PerformGetByQuery(query).ToArray();
+            return ints.Any()
+                ? GetAll(ints)
+                : Enumerable.Empty&lt;IMediaType&gt;();
+        }       
+        
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+            sql.Select(isCount ? &quot;COUNT(*)&quot; : &quot;*&quot;)
+                .From&lt;ContentTypeDto&gt;(SqlSyntax)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;ContentTypeDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId);
+            return sql;
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoNode.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            var list = new List&lt;string&gt;
+                           {
+                               &quot;DELETE FROM umbracoUser2NodeNotify WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodePermission WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsTagRelationship WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentTypeAllowedContentType WHERE Id = @Id&quot;,
+                               &quot;DELETE FROM cmsContentTypeAllowedContentType WHERE AllowedId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentType2ContentType WHERE parentContentTypeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentType2ContentType WHERE childContentTypeId = @Id&quot;,
+                               &quot;DELETE FROM cmsPropertyType WHERE contentTypeId = @Id&quot;,
+                               &quot;DELETE FROM cmsPropertyTypeGroup WHERE contenttypeNodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentType WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoNode WHERE id = @Id&quot;
+                           };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { return new Guid(Constants.ObjectTypes.MediaType); }
+        }
+        
+        protected override void PersistNewItem(IMediaType entity)
+        {
+            ((MediaType)entity).AddingEntity();
+
+            PersistNewBaseContentType(entity);
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(IMediaType entity)
+        {
+            ValidateAlias(entity);
+
+            //Updates Modified date
+            ((MediaType)entity).UpdatingEntity();
+
+            //Look up parent to get and set the correct Path if ParentId has changed
+            if (entity.IsPropertyDirty(&quot;ParentId&quot;))
+            {
+                var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = entity.ParentId });
+                entity.Path = string.Concat(parent.Path, &quot;,&quot;, entity.Id);
+                entity.Level = parent.Level + 1;
+                var maxSortOrder =
+                    Database.ExecuteScalar&lt;int&gt;(
+                        &quot;SELECT coalesce(max(sortOrder),0) FROM umbracoNode WHERE parentid = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                        new { ParentId = entity.ParentId, NodeObjectType = NodeObjectTypeId });
+                entity.SortOrder = maxSortOrder + 1;
+            }
+
+            PersistUpdatedBaseContentType(entity);
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override IMediaType PerformGet(Guid id)
+        {
+            //use the underlying GetAll which will force cache all content types
+            return GetAll().FirstOrDefault(x =&gt; x.Key == id);
+        }
+
+        protected override IEnumerable&lt;IMediaType&gt; PerformGetAll(params Guid[] ids)
+        {
+            //use the underlying GetAll which will force cache all content types
+
+            if (ids.Any())
+            {
+                return GetAll().Where(x =&gt; ids.Contains(x.Key));
+            }
+            else
+            {
+                return GetAll();
+            }
+        }
+
+        protected override bool PerformExists(Guid id)
+        {
+            return GetAll().FirstOrDefault(x =&gt; x.Key == id) != null;
+        }
+
+        protected override IMediaType PerformGet(string alias)
+        {
+            //use the underlying GetAll which will force cache all content types
+            return GetAll().FirstOrDefault(x =&gt; x.Alias.InvariantEquals(alias));
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[27,15,27,51,1],[28,9,28,10,1],[29,9,29,10,1],[35,13,35,14,1],[37,17,38,54,1],[38,54,38,69,1],[38,69,40,37,1],[37,17,40,37,1],[41,13,41,14,1],[45,9,45,10,0],[47,13,47,49,0],[47,49,47,59,0],[47,59,47,61,0],[47,13,47,61,0],[48,9,48,10,0],[51,9,51,10,1],[52,13,52,27,1],[53,13,53,14,0],[55,17,56,33,0],[56,33,56,51,0],[56,51,56,53,0],[55,17,56,53,0],[59,13,59,84,1],[60,9,60,10,1],[63,9,63,10,1],[64,13,64,49,1],[65,13,65,78,1],[66,13,66,46,1],[68,13,68,69,1],[70,13,73,51,1],[73,51,73,59,1],[73,59,73,73,1],[73,73,73,81,1],[73,81,76,35,1],[76,35,76,41,1],[76,41,76,43,1],[70,13,76,43,1],[77,9,77,10,1],[85,9,85,10,0],[86,13,86,59,0],[87,13,89,50,0],[90,9,90,10,0],[93,9,93,10,1],[94,13,94,33,1],[95,13,99,76,1],[100,13,100,24,1],[101,9,101,10,1],[104,9,104,10,0],[105,13,105,43,0],[106,9,106,10,0],[109,9,109,10,1],[110,13,123,30,1],[124,13,124,25,1],[125,9,125,10,1],[129,17,129,18,1],[129,19,129,68,1],[129,69,129,70,1],[133,9,133,10,1],[134,13,134,48,1],[136,13,136,47,1],[138,13,138,43,1],[139,9,139,10,1],[142,9,142,10,1],[143,13,143,35,1],[146,13,146,50,1],[149,13,149,52,1],[150,13,150,14,1],[151,17,151,114,1],[152,17,152,74,1],[153,17,153,49,1],[154,17,157,96,1],[158,17,158,53,1],[159,13,159,14,1],[161,13,161,51,1],[163,13,163,43,1],[164,9,164,10,1],[167,9,167,10,1],[169,13,169,49,1],[169,49,169,60,1],[169,60,169,62,1],[169,13,169,62,1],[170,9,170,10,1],[173,9,173,10,1],[176,13,176,27,1],[177,13,177,14,1],[178,17,178,44,1],[178,44,178,63,1],[178,63,178,65,1],[178,17,178,65,1],[181,13,181,14,1],[182,17,182,33,1],[184,9,184,10,1],[187,9,187,10,0],[188,13,188,49,0],[188,49,188,60,0],[188,60,188,70,0],[188,13,188,70,0],[189,9,189,10,0],[192,9,192,10,0],[194,13,194,49,0],[194,49,194,79,0],[194,79,194,81,0],[194,13,194,81,0],[195,9,195,10,0]]);
+    </script>
+  </body>
+</html>

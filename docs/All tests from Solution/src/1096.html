@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Mvc\ControllerExtensions.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.IO;
+using System.Threading;
+using System.Web.Mvc;
+
+namespace Umbraco.Web.Mvc
+{
+    internal static class ControllerExtensions
+    {
+        /// &lt;summary&gt;
+        /// Return the controller name from the controller type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;controllerType&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+		internal static string GetControllerName(Type controllerType)
+        {
+            if (!controllerType.Name.EndsWith(&quot;Controller&quot;))
+            {
+                throw new InvalidOperationException(&quot;The controller type &quot; + controllerType + &quot; does not follow conventions, MVC Controller class names must be suffixed with the term &#39;Controller&#39;&quot;);
+            }
+            return controllerType.Name.Substring(0, controllerType.Name.LastIndexOf(&quot;Controller&quot;));
+        }
+
+        /// &lt;summary&gt;
+        /// Return the controller name from the controller instance
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;controllerInstance&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+	    internal static string GetControllerName(this IController controllerInstance)
+	    {
+	        return GetControllerName(controllerInstance.GetType());
+	    }
+
+	    /// &lt;summary&gt;
+        /// Return the controller name from the controller type
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;&lt;/remarks&gt;
+		internal static string GetControllerName&lt;T&gt;()
+        {
+            return GetControllerName(typeof(T));
+        }
+
+		/// &lt;summary&gt;
+		/// This is generally used for proxying to a ChildAction which requires a ViewContext to be setup
+		/// but since the View isn&#39;t actually rendered the IView object is null, however the rest of the 
+		/// properties are filled in.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;controller&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		internal static ViewContext CreateEmptyViewContext(this ControllerBase controller)
+		{
+			return new ViewContext
+			{
+				Controller = controller,
+				HttpContext = controller.ControllerContext.HttpContext,
+				RequestContext = controller.ControllerContext.RequestContext,
+				RouteData = controller.ControllerContext.RouteData,
+				TempData = controller.TempData,
+				ViewData = controller.ViewData
+			};
+		}
+
+		/// &lt;summary&gt;
+		/// Returns the string output from a ViewResultBase object
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;controller&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;viewResult&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		internal static string RenderViewResultAsString(this ControllerBase controller, ViewResultBase viewResult)
+		{
+			using (var sw = new StringWriter())
+			{
+				controller.EnsureViewObjectDataOnResult(viewResult);
+
+				var viewContext = new ViewContext(controller.ControllerContext, viewResult.View, viewResult.ViewData, viewResult.TempData, sw);
+				viewResult.View.Render(viewContext, sw);
+				foreach (var v in viewResult.ViewEngineCollection)
+				{
+					v.ReleaseView(controller.ControllerContext, viewResult.View);
+				}
+				return sw.ToString().Trim();
+			}
+		}
+		
+		/// &lt;summary&gt;
+		/// Renders the partial view to string.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;controller&quot;&gt;The controller context.&lt;/param&gt;
+		/// &lt;param name=&quot;viewName&quot;&gt;Name of the view.&lt;/param&gt;
+		/// &lt;param name=&quot;model&quot;&gt;The model.&lt;/param&gt;
+		/// &lt;param name=&quot;isPartial&quot;&gt;true if it is a Partial view, otherwise false for a normal view &lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		internal static string RenderViewToString(this ControllerBase controller, string viewName, object model, bool isPartial = false)
+		{
+			if (controller.ControllerContext == null)
+				throw new ArgumentException(&quot;The controller must have an assigned ControllerContext to execute this method.&quot;);
+
+			controller.ViewData.Model = model;
+
+			using (var sw = new StringWriter())
+			{
+				var viewResult = !isPartial 
+					? ViewEngines.Engines.FindView(controller.ControllerContext, viewName, null) 
+					: ViewEngines.Engines.FindPartialView(controller.ControllerContext, viewName);
+				var viewContext = new ViewContext(controller.ControllerContext, viewResult.View, controller.ViewData, controller.TempData, sw);
+				viewResult.View.Render(viewContext, sw);
+				viewResult.ViewEngine.ReleaseView(controller.ControllerContext, viewResult.View);				
+				return sw.GetStringBuilder().ToString();
+			}
+		}
+
+        /// &lt;summary&gt;
+        /// Normally in MVC the way that the View object gets assigned to the result is to Execute the ViewResult, this however
+        /// will write to the Response output stream which isn&#39;t what we want. Instead, this method will use the same logic inside
+        /// of MVC to assign the View object to the result but without executing it.
+        /// This is only relavent for view results of PartialViewResult or ViewResult.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;result&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;controller&quot;&gt;&lt;/param&gt;
+        private static void EnsureViewObjectDataOnResult(this ControllerBase controller, ViewResultBase result)
+        {            
+            if (result.View != null) return;
+
+            if (string.IsNullOrEmpty(result.ViewName))
+                result.ViewName = controller.ControllerContext.RouteData.GetRequiredString(&quot;action&quot;);
+
+            if (result.View != null) return;
+
+            if (result is PartialViewResult)
+            {
+                var viewEngineResult = ViewEngines.Engines.FindPartialView(controller.ControllerContext, result.ViewName);
+
+                if (viewEngineResult.View == null)
+                {
+                    throw new InvalidOperationException(&quot;Could not find the view &quot; + result.ViewName + &quot;, the following locations were searched: &quot; + Environment.NewLine + string.Join(Environment.NewLine, viewEngineResult.SearchedLocations));
+                }
+
+                result.View = viewEngineResult.View;
+            }
+            else if (result is ViewResult)
+            {
+                var vr = (ViewResult)result;
+                var viewEngineResult = ViewEngines.Engines.FindView(controller.ControllerContext, vr.ViewName, vr.MasterName);
+
+                if (viewEngineResult.View == null)
+                {
+                    throw new InvalidOperationException(&quot;Could not find the view &quot; + vr.ViewName + &quot;, the following locations were searched: &quot; + Environment.NewLine + string.Join(Environment.NewLine, viewEngineResult.SearchedLocations));
+                }
+
+                result.View = viewEngineResult.View;
+            }
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[16,9,16,10,1],[17,13,17,61,1],[18,13,18,14,0],[19,17,19,199,0],[21,13,21,100,1],[22,9,22,10,1],[30,6,30,7,0],[31,10,31,65,0],[32,6,32,7,0],[41,9,41,10,0],[42,13,42,49,0],[43,9,43,10,0],[53,3,53,4,0],[54,4,62,6,0],[63,3,63,4,0],[72,3,72,4,0],[73,11,73,38,0],[74,4,74,5,0],[75,5,75,57,0],[77,5,77,132,0],[78,5,78,45,0],[79,5,79,12,0],[79,14,79,19,0],[79,20,79,22,0],[79,23,79,54,0],[80,5,80,6,0],[81,6,81,67,0],[82,5,82,6,0],[83,5,83,33,0],[85,3,85,4,0],[96,3,96,4,0],[97,4,97,45,0],[98,5,98,115,0],[100,4,100,38,0],[102,11,102,38,0],[103,4,103,5,0],[104,5,106,84,0],[107,5,107,132,0],[108,5,108,45,0],[109,5,109,86,0],[110,5,110,45,0],[112,3,112,4,0],[123,9,123,10,0],[124,13,124,37,0],[124,38,124,45,0],[126,13,126,55,0],[127,17,127,102,0],[129,13,129,37,0],[129,38,129,45,0],[131,13,131,45,0],[132,13,132,14,0],[133,17,133,123,0],[135,17,135,51,0],[136,17,136,18,0],[137,21,137,242,0],[140,17,140,53,0],[141,13,141,14,0],[142,18,142,43,0],[143,13,143,14,0],[144,17,144,45,0],[145,17,145,127,0],[147,17,147,51,0],[148,17,148,18,0],[149,21,149,238,0],[152,17,152,53,0],[153,13,153,14,0],[154,9,154,10,0]]);
+    </script>
+  </body>
+</html>

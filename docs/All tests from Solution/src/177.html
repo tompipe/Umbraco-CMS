@@ -1,0 +1,1855 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Services\ContentServiceTests.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using Moq;
+using NUnit.Framework;
+using Umbraco.Core;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.Events;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Publishing;
+using Umbraco.Core.Services;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Tests.TestHelpers.Entities;
+
+namespace Umbraco.Tests.Services
+{
+    /// &lt;summary&gt;
+    /// Tests covering all methods in the ContentService class.
+    /// This is more of an integration test as it involves multiple layers
+    /// as well as configuration.
+    /// &lt;/summary&gt;
+    [DatabaseTestBehavior(DatabaseBehavior.NewDbFileAndSchemaPerTest)]
+    [TestFixture, RequiresSTA]
+    public class ContentServiceTests : BaseServiceTest
+    {
+        [SetUp]
+        public override void Initialize()
+        {
+            base.Initialize();
+
+            VersionableRepositoryBase&lt;int, IContent&gt;.ThrowOnWarning = true;
+        }
+
+        [TearDown]
+        public override void TearDown()
+        {
+            VersionableRepositoryBase&lt;int, IContent&gt;.ThrowOnWarning = false;
+
+            base.TearDown();
+        }
+
+        //TODO Add test to verify there is only ONE newest document/content in cmsDocument table after updating.
+        //TODO Add test to delete specific version (with and without deleting prior versions) and versions by date.
+
+
+        /// &lt;summary&gt;
+        /// Ensures that we don&#39;t unpublish all nodes when a node is deleted that has an invalid path of -1
+        /// Note: it is actually the MoveToRecycleBin happening on the initial deletion of a node through the UI
+        /// that causes the issue.
+        /// Regression test: http://issues.umbraco.org/issue/U4-9336
+        /// &lt;/summary&gt;
+        [Test]
+        public void Moving_Node_To_Recycle_Bin_With_Invalid_Path()
+        {
+            var contentService = ServiceContext.ContentService;
+            var root = ServiceContext.ContentService.GetById(NodeDto.NodeIdSeed + 1);
+            Assert.IsTrue(contentService.PublishWithStatus(root).Success);
+            var content = contentService.CreateContentWithIdentity(&quot;Test&quot;, -1, &quot;umbTextpage&quot;, 0);
+            Assert.IsTrue(contentService.PublishWithStatus(content).Success);
+            var hierarchy = CreateContentHierarchy().OrderBy(x =&gt; x.Level).ToArray();
+            contentService.Save(hierarchy, 0);
+            foreach (var c in hierarchy)
+            {
+                Assert.IsTrue(contentService.PublishWithStatus(c).Success);
+            }
+
+            //now make the data corrupted :/
+            DatabaseContext.Database.Execute(&quot;UPDATE umbracoNode SET path = &#39;-1&#39; WHERE id = @id&quot;, new {id = content.Id});
+
+            //re-get with the corrupt path
+            content = contentService.GetById(content.Id);
+
+            // here we get all descendants by the path of the node being moved to bin, and unpublish all of them.
+            // since the path is invalid, there&#39;s logic in here to fix that if it&#39;s possible and re-persist the entity.
+            var moveResult = ServiceContext.ContentService.WithResult().MoveToRecycleBin(content);
+
+            Assert.IsTrue(moveResult.Success);
+
+            //re-get with the fixed/moved path 
+            content = contentService.GetById(content.Id);
+
+            Assert.AreEqual(&quot;-1,-20,&quot; + content.Id, content.Path);
+
+            //re-get
+            hierarchy = contentService.GetByIds(hierarchy.Select(x =&gt; x.Id).ToArray()).OrderBy(x =&gt; x.Level).ToArray();
+
+            Assert.That(hierarchy.All(c =&gt; c.Trashed == false), Is.True);
+            Assert.That(hierarchy.All(c =&gt; c.Path.StartsWith(&quot;-1,-20&quot;) == false), Is.True);
+        }
+
+        [Test]
+        public void Remove_Scheduled_Publishing_Date()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var content = contentService.CreateContentWithIdentity(&quot;Test&quot;, -1, &quot;umbTextpage&quot;, 0);
+
+            content.ReleaseDate = DateTime.Now.AddHours(2);
+            contentService.Save(content, 0);
+
+            content = contentService.GetById(content.Id);
+            content.ReleaseDate = null;
+            contentService.Save(content, 0);
+
+
+            // Assert
+            Assert.IsTrue(contentService.PublishWithStatus(content).Success);
+        }
+
+        [Test]
+        public void Get_Top_Version_Ids()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var content = contentService.CreateContentWithIdentity(&quot;Test&quot;, -1, &quot;umbTextpage&quot;, 0);
+            for (int i = 0; i &lt; 20; i++)
+            {
+                content.SetValue(&quot;bodyText&quot;, &quot;hello world &quot; + Guid.NewGuid());
+                contentService.SaveAndPublishWithStatus(content);
+            }
+
+
+            // Assert
+            var allVersions = contentService.GetVersionIds(content.Id, int.MaxValue);
+            Assert.AreEqual(21, allVersions.Count());
+
+            var topVersions = contentService.GetVersionIds(content.Id, 4);
+            Assert.AreEqual(4, topVersions.Count());
+        }
+
+        [Test]
+        public void Get_By_Ids_Sorted()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var results = new List&lt;IContent&gt;();
+            for (int i = 0; i &lt; 20; i++)
+            {
+                results.Add(contentService.CreateContentWithIdentity(&quot;Test&quot;, -1, &quot;umbTextpage&quot;, 0));
+            }
+
+            var sortedGet = contentService.GetByIds(new[] { results[10].Id, results[5].Id, results[12].Id }).ToArray();
+
+            // Assert
+            Assert.AreEqual(sortedGet[0].Id, results[10].Id);
+            Assert.AreEqual(sortedGet[1].Id, results[5].Id);
+            Assert.AreEqual(sortedGet[2].Id, results[12].Id);
+        }
+
+        [Test]
+        public void Count_All()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            for (int i = 0; i &lt; 20; i++)
+            {
+                contentService.CreateContentWithIdentity(&quot;Test&quot;, -1, &quot;umbTextpage&quot;, 0);
+            }
+
+            // Assert
+            Assert.AreEqual(24, contentService.Count());
+        }
+
+        [Test]
+        public void Count_By_Content_Type()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbBlah&quot;, &quot;test Doc Type&quot;);
+            contentTypeService.Save(contentType);
+
+            // Act
+            for (int i = 0; i &lt; 20; i++)
+            {
+                contentService.CreateContentWithIdentity(&quot;Test&quot;, -1, &quot;umbBlah&quot;, 0);
+            }
+
+            // Assert
+            Assert.AreEqual(20, contentService.Count(contentTypeAlias: &quot;umbBlah&quot;));
+        }
+
+        [Test]
+        public void Count_Children()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbBlah&quot;, &quot;test Doc Type&quot;);
+            contentTypeService.Save(contentType);
+            var parent = contentService.CreateContentWithIdentity(&quot;Test&quot;, -1, &quot;umbBlah&quot;, 0);
+
+            // Act
+            for (int i = 0; i &lt; 20; i++)
+            {
+                contentService.CreateContentWithIdentity(&quot;Test&quot;, parent, &quot;umbBlah&quot;);
+            }
+
+            // Assert
+            Assert.AreEqual(20, contentService.CountChildren(parent.Id));
+        }
+
+        [Test]
+        public void Count_Descendants()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbBlah&quot;, &quot;test Doc Type&quot;);
+            contentTypeService.Save(contentType);
+            var parent = contentService.CreateContentWithIdentity(&quot;Test&quot;, -1, &quot;umbBlah&quot;, 0);
+
+            // Act
+            IContent current = parent;
+            for (int i = 0; i &lt; 20; i++)
+            {
+                current = contentService.CreateContentWithIdentity(&quot;Test&quot;, current, &quot;umbBlah&quot;);
+            }
+
+            // Assert
+            Assert.AreEqual(20, contentService.CountDescendants(parent.Id));
+        }
+
+        [Test]
+        public void GetAncestors_Returns_Empty_List_When_Path_Is_Null()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var current = new Mock&lt;IContent&gt;();
+            var res = contentService.GetAncestors(current.Object);
+
+            // Assert
+            Assert.IsEmpty(res);
+        }
+
+        [Test]
+        public void Tags_For_Entity_Are_Not_Exposed_Via_Tag_Api_When_Content_Is_Recycled()
+        {
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var tagService = ServiceContext.TagService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            contentType.PropertyGroups.First().PropertyTypes.Add(
+                new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;tags&quot;)
+                {
+                    DataTypeDefinitionId = 1041
+                });
+            contentTypeService.Save(contentType);
+
+            var content1 = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content 1&quot;, -1);
+            content1.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content1);
+
+            var content2 = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content 2&quot;, -1);
+            content2.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content2);
+
+            // Act            
+            contentService.MoveToRecycleBin(content1);
+
+            // Assert
+
+            //there should be no tags for this entity
+            var tags = tagService.GetTagsForEntity(content1.Id);
+            Assert.AreEqual(0, tags.Count());
+
+            //these tags should still be returned since they still have actively published content assigned
+            var allTags = tagService.GetAllContentTags();
+            Assert.AreEqual(4, allTags.Count());
+        }
+
+        [Test]
+        public void All_Tags_Are_Not_Exposed_Via_Tag_Api_When_Content_Is_Recycled()
+        {
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var tagService = ServiceContext.TagService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            contentType.PropertyGroups.First().PropertyTypes.Add(
+                new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;tags&quot;)
+                {
+                    DataTypeDefinitionId = 1041
+                });
+            contentTypeService.Save(contentType);
+
+            var content1 = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content 1&quot;, -1);
+            content1.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content1);
+
+            var content2 = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content 2&quot;, -1);
+            content2.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content2);
+
+            // Act            
+            contentService.MoveToRecycleBin(content1);
+            contentService.MoveToRecycleBin(content2);
+
+            // Assert
+
+            //there should be no exposed content tags now that nothing is published.
+            var allTags = tagService.GetAllContentTags();
+            Assert.AreEqual(0, allTags.Count());
+        }
+
+        [Test]
+        public void All_Tags_Are_Not_Exposed_Via_Tag_Api_When_Content_Is_Un_Published()
+        {
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var tagService = ServiceContext.TagService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            contentType.PropertyGroups.First().PropertyTypes.Add(
+                new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;tags&quot;)
+                {
+                    DataTypeDefinitionId = 1041
+                });
+            contentTypeService.Save(contentType);
+
+            var content1 = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content 1&quot;, -1);
+            content1.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content1);
+
+            var content2 = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content 2&quot;, -1);
+            content2.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content2);
+
+            // Act            
+            contentService.UnPublish(content1);
+            contentService.UnPublish(content2);
+
+            // Assert
+
+            //there should be no exposed content tags now that nothing is published.
+            var allTags = tagService.GetAllContentTags();
+            Assert.AreEqual(0, allTags.Count());
+        }
+
+        [Test]
+        public void Tags_Are_Not_Exposed_Via_Tag_Api_When_Content_Is_Re_Published()
+        {
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var tagService = ServiceContext.TagService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            contentType.PropertyGroups.First().PropertyTypes.Add(
+                new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;tags&quot;)
+                {
+                    DataTypeDefinitionId = 1041
+                });
+            contentTypeService.Save(contentType);
+
+            var content1 = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content 1&quot;, -1);
+            content1.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content1);
+
+            var content2 = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content 2&quot;, -1);
+            content2.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content2);
+
+            contentService.UnPublish(content1);
+            contentService.UnPublish(content2);
+
+            // Act            
+            contentService.Publish(content1);
+
+            // Assert
+
+            var tags = tagService.GetTagsForEntity(content1.Id);
+            Assert.AreEqual(4, tags.Count());
+            var allTags = tagService.GetAllContentTags();
+            Assert.AreEqual(4, allTags.Count());
+        }
+
+        [Test]
+        public void Tags_Are_Not_Exposed_Via_Tag_Api_When_Content_Is_Restored()
+        {
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var tagService = ServiceContext.TagService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            contentType.PropertyGroups.First().PropertyTypes.Add(
+                new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;tags&quot;)
+                {
+                    DataTypeDefinitionId = 1041
+                });
+            contentTypeService.Save(contentType);
+
+            var content1 = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content 1&quot;, -1);
+            content1.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content1);
+
+            var content2 = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content 2&quot;, -1);
+            content2.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content2);
+
+            contentService.MoveToRecycleBin(content1);
+            contentService.MoveToRecycleBin(content2);
+
+            // Act            
+            contentService.Move(content1, -1);
+            contentService.Publish(content1);
+
+            // Assert
+
+            var tags = tagService.GetTagsForEntity(content1.Id);
+            Assert.AreEqual(4, tags.Count());
+            var allTags = tagService.GetAllContentTags();
+            Assert.AreEqual(4, allTags.Count());
+        }
+
+        [Test]
+        public void Create_Tag_Data_Bulk_Publish_Operation()
+        {
+            //Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var dataTypeService = ServiceContext.DataTypeService;
+            //set the pre-values
+            dataTypeService.SavePreValues(1041, new Dictionary&lt;string, PreValue&gt;
+            {
+                {&quot;group&quot;, new PreValue(&quot;test&quot;)},
+                {&quot;storageType&quot;, new PreValue(&quot;Csv&quot;)}
+            });
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            contentType.PropertyGroups.First().PropertyTypes.Add(
+                new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;tags&quot;)
+                {
+                    DataTypeDefinitionId = 1041
+                });
+            contentTypeService.Save(contentType);
+            contentType.AllowedContentTypes = new[] { new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; contentType.Id), 0, contentType.Alias) };
+
+            var content = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content&quot;, -1);
+            content.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Save(content);
+
+            var child1 = MockedContent.CreateSimpleContent(contentType, &quot;child 1 content&quot;, content.Id);
+            child1.SetTags(&quot;tags&quot;, new[] { &quot;hello1&quot;, &quot;world1&quot;, &quot;some1&quot; }, true);
+            contentService.Save(child1);
+
+            var child2 = MockedContent.CreateSimpleContent(contentType, &quot;child 2 content&quot;, content.Id);
+            child2.SetTags(&quot;tags&quot;, new[] { &quot;hello2&quot;, &quot;world2&quot; }, true);
+            contentService.Save(child2);
+
+            // Act
+            contentService.PublishWithChildrenWithStatus(content, includeUnpublished: true);
+
+            // Assert
+            var propertyTypeId = contentType.PropertyTypes.Single(x =&gt; x.Alias == &quot;tags&quot;).Id;
+
+            Assert.AreEqual(4, DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                &quot;SELECT COUNT(*) FROM cmsTagRelationship WHERE nodeId=@nodeId AND propertyTypeId=@propTypeId&quot;,
+                new { nodeId = content.Id, propTypeId = propertyTypeId }));
+
+            Assert.AreEqual(3, DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                &quot;SELECT COUNT(*) FROM cmsTagRelationship WHERE nodeId=@nodeId AND propertyTypeId=@propTypeId&quot;,
+                new { nodeId = child1.Id, propTypeId = propertyTypeId }));
+
+            Assert.AreEqual(2, DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                &quot;SELECT COUNT(*) FROM cmsTagRelationship WHERE nodeId=@nodeId AND propertyTypeId=@propTypeId&quot;,
+                new { nodeId = child2.Id, propTypeId = propertyTypeId }));
+        }
+
+        [Test]
+        public void Does_Not_Create_Tag_Data_For_Non_Published_Version()
+        {
+            //Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            contentType.PropertyGroups.First().PropertyTypes.Add(
+                new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;tags&quot;)
+                {
+                    DataTypeDefinitionId = 1041
+                });
+            contentTypeService.Save(contentType);
+            var content = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content&quot;, -1);
+            content.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content);
+
+            // Act
+            content.SetTags(&quot;tags&quot;, new[] { &quot;another&quot;, &quot;world&quot; }, false);
+            contentService.Save(content);
+
+            // Assert
+
+            //the value will have changed but the tags db table will not have
+            Assert.AreEqual(5, content.Properties[&quot;tags&quot;].Value.ToString().Split(&#39;,&#39;).Distinct().Count());
+            var propertyTypeId = contentType.PropertyTypes.Single(x =&gt; x.Alias == &quot;tags&quot;).Id;
+            Assert.AreEqual(4, DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                &quot;SELECT COUNT(*) FROM cmsTagRelationship WHERE nodeId=@nodeId AND propertyTypeId=@propTypeId&quot;,
+                new { nodeId = content.Id, propTypeId = propertyTypeId }));
+        }
+
+        [Test]
+        public void Can_Replace_Tag_Data_To_Published_Content()
+        {
+            //Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            contentType.PropertyGroups.First().PropertyTypes.Add(
+                new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;tags&quot;)
+                {
+                    DataTypeDefinitionId = 1041
+                });
+            contentTypeService.Save(contentType);
+
+            var content = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content&quot;, -1);
+
+
+            // Act
+            content.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.Publish(content);
+
+            // Assert
+            Assert.AreEqual(4, content.Properties[&quot;tags&quot;].Value.ToString().Split(&#39;,&#39;).Distinct().Count());
+            var propertyTypeId = contentType.PropertyTypes.Single(x =&gt; x.Alias == &quot;tags&quot;).Id;
+            Assert.AreEqual(4, DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                &quot;SELECT COUNT(*) FROM cmsTagRelationship WHERE nodeId=@nodeId AND propertyTypeId=@propTypeId&quot;,
+                new { nodeId = content.Id, propTypeId = propertyTypeId }));
+        }
+
+        [Test]
+        public void Can_Append_Tag_Data_To_Published_Content()
+        {
+            //Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            contentType.PropertyGroups.First().PropertyTypes.Add(
+                new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;tags&quot;)
+                {
+                    DataTypeDefinitionId = 1041
+                });
+            contentTypeService.Save(contentType);
+            var content = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content&quot;, -1);
+            content.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.PublishWithStatus(content);
+
+            // Act
+            content.SetTags(&quot;tags&quot;, new[] { &quot;another&quot;, &quot;world&quot; }, false);
+            contentService.PublishWithStatus(content);
+
+            // Assert
+            Assert.AreEqual(5, content.Properties[&quot;tags&quot;].Value.ToString().Split(&#39;,&#39;).Distinct().Count());
+            var propertyTypeId = contentType.PropertyTypes.Single(x =&gt; x.Alias == &quot;tags&quot;).Id;
+            Assert.AreEqual(5, DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                &quot;SELECT COUNT(*) FROM cmsTagRelationship WHERE nodeId=@nodeId AND propertyTypeId=@propTypeId&quot;,
+                new { nodeId = content.Id, propTypeId = propertyTypeId }));
+        }
+
+        [Test]
+        public void Can_Remove_Tag_Data_To_Published_Content()
+        {
+            //Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            contentType.PropertyGroups.First().PropertyTypes.Add(
+                new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Ntext, &quot;tags&quot;)
+                {
+                    DataTypeDefinitionId = 1041
+                });
+            contentTypeService.Save(contentType);
+            var content = MockedContent.CreateSimpleContent(contentType, &quot;Tagged content&quot;, -1);
+            content.SetTags(&quot;tags&quot;, new[] { &quot;hello&quot;, &quot;world&quot;, &quot;some&quot;, &quot;tags&quot; }, true);
+            contentService.PublishWithStatus(content);
+
+            // Act
+            content.RemoveTags(&quot;tags&quot;, new[] { &quot;some&quot;, &quot;world&quot; });
+            contentService.PublishWithStatus(content);
+
+            // Assert
+            Assert.AreEqual(2, content.Properties[&quot;tags&quot;].Value.ToString().Split(&#39;,&#39;).Distinct().Count());
+            var propertyTypeId = contentType.PropertyTypes.Single(x =&gt; x.Alias == &quot;tags&quot;).Id;
+            Assert.AreEqual(2, DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                &quot;SELECT COUNT(*) FROM cmsTagRelationship WHERE nodeId=@nodeId AND propertyTypeId=@propTypeId&quot;,
+                new { nodeId = content.Id, propTypeId = propertyTypeId }));
+        }
+
+        [Test]
+        public void Can_Remove_Property_Type()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var content = contentService.CreateContent(&quot;Test&quot;, -1, &quot;umbTextpage&quot;, 0);
+
+            // Assert
+            Assert.That(content, Is.Not.Null);
+            Assert.That(content.HasIdentity, Is.False);
+        }
+
+        [Test]
+        public void Can_Create_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var content = contentService.CreateContent(&quot;Test&quot;, -1, &quot;umbTextpage&quot;, 0);
+
+            // Assert
+            Assert.That(content, Is.Not.Null);
+            Assert.That(content.HasIdentity, Is.False);
+        }
+
+        [Test]
+        public void Can_Create_Content_Without_Explicitly_Set_User()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var content = contentService.CreateContent(&quot;Test&quot;, -1, &quot;umbTextpage&quot;);
+
+            // Assert
+            Assert.That(content, Is.Not.Null);
+            Assert.That(content.HasIdentity, Is.False);
+            Assert.That(content.CreatorId, Is.EqualTo(0));//Default to zero/administrator
+        }
+
+        [Test]
+        public void Can_Save_New_Content_With_Explicit_User()
+        {
+            var user = new User(ServiceContext.UserService.GetUserTypeByAlias(&quot;admin&quot;))
+            {
+                Name = &quot;Test&quot;,
+                Email = &quot;test@test.com&quot;,
+                Username = &quot;test&quot;,
+                RawPasswordValue = &quot;test&quot;
+            };
+            ServiceContext.UserService.Save(user);
+            var content = new Content(&quot;Test&quot;, -1, ServiceContext.ContentTypeService.GetContentType(&quot;umbTextpage&quot;));
+
+            // Act
+            ServiceContext.ContentService.Save(content, (int)user.Id);
+
+            // Assert
+            Assert.That(content.CreatorId, Is.EqualTo(user.Id));
+            Assert.That(content.WriterId, Is.EqualTo(user.Id));
+        }
+
+        [Test]
+        public void Cannot_Create_Content_With_Non_Existing_ContentType_Alias()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act &amp; Assert
+            Assert.Throws&lt;Exception&gt;(() =&gt; contentService.CreateContent(&quot;Test&quot;, -1, &quot;umbAliasDoesntExist&quot;));
+        }
+
+        [Test]
+        public void Cannot_Save_Content_With_Empty_Name()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = new Content(string.Empty, -1, ServiceContext.ContentTypeService.GetContentType(&quot;umbTextpage&quot;));
+
+            // Act &amp; Assert
+            Assert.Throws&lt;ArgumentException&gt;(() =&gt; contentService.Save(content));
+        }
+
+        [Test]
+        public void Can_Get_Content_By_Id()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 1);
+
+            // Assert
+            Assert.That(content, Is.Not.Null);
+            Assert.That(content.Id, Is.EqualTo(NodeDto.NodeIdSeed + 1));
+        }
+
+        [Test]
+        public void Can_Get_Content_By_Guid_Key()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var content = contentService.GetById(new Guid(&quot;B58B3AD4-62C2-4E27-B1BE-837BD7C533E0&quot;));
+
+            // Assert
+            Assert.That(content, Is.Not.Null);
+            Assert.That(content.Id, Is.EqualTo(NodeDto.NodeIdSeed + 1));
+        }
+
+        [Test]
+        public void Can_Get_Content_By_Level()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var contents = contentService.GetByLevel(2).ToList();
+
+            // Assert
+            Assert.That(contents, Is.Not.Null);
+            Assert.That(contents.Any(), Is.True);
+            Assert.That(contents.Count(), Is.GreaterThanOrEqualTo(2));
+        }
+
+        [Test]
+        public void Can_Get_Children_Of_Content_Id()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var contents = contentService.GetChildren(NodeDto.NodeIdSeed + 1).ToList();
+
+            // Assert
+            Assert.That(contents, Is.Not.Null);
+            Assert.That(contents.Any(), Is.True);
+            Assert.That(contents.Count(), Is.GreaterThanOrEqualTo(2));
+        }
+
+        [Test]
+        public void Can_Get_Descendents_Of_Contnet()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var hierarchy = CreateContentHierarchy();
+            contentService.Save(hierarchy, 0);
+
+            // Act
+            var contents = contentService.GetDescendants(NodeDto.NodeIdSeed + 1).ToList();
+
+            // Assert
+            Assert.That(contents, Is.Not.Null);
+            Assert.That(contents.Any(), Is.True);
+            Assert.That(contents.Count(), Is.EqualTo(52));
+        }
+
+        [Test]
+        public void Can_Get_All_Versions_Of_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var parent = ServiceContext.ContentService.GetById(NodeDto.NodeIdSeed + 1);
+            ServiceContext.ContentService.Publish(parent);//Publishing root, so Text Page 2 can be updated.
+            var subpage2 = contentService.GetById(NodeDto.NodeIdSeed + 3);
+
+            subpage2.Name = &quot;Text Page 2 Updated&quot;;
+            subpage2.SetValue(&quot;author&quot;, &quot;Jane Doe&quot;);
+            contentService.SaveAndPublishWithStatus(subpage2, 0);//NOTE New versions are only added between publish-state-changed, so publishing to ensure addition version.
+
+            subpage2.Name = &quot;Text Page 2 Updated again&quot;;
+            subpage2.SetValue(&quot;author&quot;, &quot;Bob Hope&quot;);
+            contentService.SaveAndPublishWithStatus(subpage2, 0);//NOTE New versions are only added between publish-state-changed, so publishing to ensure addition version.
+
+            // Act
+            var versions = contentService.GetVersions(NodeDto.NodeIdSeed + 3).ToList();
+
+            // Assert
+            Assert.That(versions.Any(), Is.True);
+            Assert.That(versions.Count(), Is.GreaterThanOrEqualTo(2));
+
+            //ensure each version contains the correct property values
+            Assert.AreEqual(&quot;John Doe&quot;, versions[2].GetValue(&quot;author&quot;));
+            Assert.AreEqual(&quot;Jane Doe&quot;, versions[1].GetValue(&quot;author&quot;));
+            Assert.AreEqual(&quot;Bob Hope&quot;, versions[0].GetValue(&quot;author&quot;));
+        }
+
+        [Test]
+        public void Can_Get_Root_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var contents = contentService.GetRootContent().ToList();
+
+            // Assert
+            Assert.That(contents, Is.Not.Null);
+            Assert.That(contents.Any(), Is.True);
+            Assert.That(contents.Count(), Is.EqualTo(1));
+        }
+
+        [Test]
+        public void Can_Get_Content_For_Expiration()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var root = contentService.GetById(NodeDto.NodeIdSeed + 1);
+            contentService.SaveAndPublishWithStatus(root);
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 3);
+            content.ExpireDate = DateTime.Now.AddSeconds(1);
+            contentService.SaveAndPublishWithStatus(content);
+
+            // Act
+            Thread.Sleep(new TimeSpan(0, 0, 0, 2));
+            var contents = contentService.GetContentForExpiration().ToList();
+
+            // Assert
+            Assert.That(contents, Is.Not.Null);
+            Assert.That(contents.Any(), Is.True);
+            Assert.That(contents.Count(), Is.EqualTo(1));
+        }
+
+        [Test]
+        public void Can_Get_Content_For_Release()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var contents = contentService.GetContentForRelease().ToList();
+
+            // Assert
+            Assert.That(DateTime.Now.AddMinutes(-5) &lt;= DateTime.Now);
+            Assert.That(contents, Is.Not.Null);
+            Assert.That(contents.Any(), Is.True);
+            Assert.That(contents.Count(), Is.EqualTo(1));
+        }
+
+        [Test]
+        public void Can_Get_Content_In_RecycleBin()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            var contents = contentService.GetContentInRecycleBin().ToList();
+
+            // Assert
+            Assert.That(contents, Is.Not.Null);
+            Assert.That(contents.Any(), Is.True);
+            Assert.That(contents.Count(), Is.EqualTo(1));
+        }
+
+        [Test]
+        public void Can_UnPublish_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 1);
+            bool published = contentService.Publish(content, 0);
+
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var uow = provider.GetUnitOfWork();
+            Assert.IsTrue(uow.Database.Exists&lt;ContentXmlDto&gt;(content.Id));
+
+            // Act
+            bool unpublished = contentService.UnPublish(content, 0);
+
+            // Assert
+            Assert.That(published, Is.True);
+            Assert.That(unpublished, Is.True);
+            Assert.That(content.Published, Is.False);
+
+            uow = provider.GetUnitOfWork();
+            Assert.IsFalse(uow.Database.Exists&lt;ContentXmlDto&gt;(content.Id));
+        }
+
+        /// &lt;summary&gt;
+        /// This test is ignored because the way children are handled when
+        /// parent is unpublished is treated differently now then from when this test
+        /// was written.
+        /// The correct case is now that Root is UnPublished removing the children
+        /// from cache, but still having them &quot;Published&quot; in the &quot;background&quot;.
+        /// Once the Parent is Published the Children should re-appear as published.
+        /// &lt;/summary&gt;
+        [Test, NUnit.Framework.Ignore]
+        public void Can_UnPublish_Root_Content_And_Verify_Children_Is_UnPublished()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var published = contentService.RePublishAll(0);
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 1);
+
+            // Act
+            bool unpublished = contentService.UnPublish(content, 0);
+            var children = contentService.GetChildren(NodeDto.NodeIdSeed + 1).ToList();
+
+            // Assert
+            Assert.That(published, Is.True);//Verify that everything was published
+
+            //Verify that content with Id (NodeDto.NodeIdSeed + 1) was unpublished
+            Assert.That(unpublished, Is.True);
+            Assert.That(content.Published, Is.False);
+
+            //Verify that all children was unpublished
+            Assert.That(children.Any(x =&gt; x.Published), Is.False);
+            Assert.That(children.First(x =&gt; x.Id == NodeDto.NodeIdSeed + 2).Published, Is.False);//Released 5 mins ago, but should be unpublished
+            Assert.That(children.First(x =&gt; x.Id == NodeDto.NodeIdSeed + 2).ReleaseDate.HasValue, Is.False);//Verify that the release date has been removed
+            Assert.That(children.First(x =&gt; x.Id == NodeDto.NodeIdSeed + 3).Published, Is.False);//Expired 5 mins ago, so isn&#39;t be published
+        }
+
+        [Test]
+        public void Can_RePublish_All_Content()
+        {
+            // Arrange
+            var contentService = (ContentService)ServiceContext.ContentService;
+            var rootContent = contentService.GetRootContent().ToList();
+            foreach (var c in rootContent)
+            {
+                contentService.PublishWithChildren(c);
+            }
+            var allContent = rootContent.Concat(rootContent.SelectMany(x =&gt; x.Descendants()));
+            //for testing we need to clear out the contentXml table so we can see if it worked
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            using (var uow = provider.GetUnitOfWork())
+            {
+                uow.Database.TruncateTable(&quot;cmsContentXml&quot;);
+            }
+
+
+            //for this test we are also going to save a revision for a content item that is not published, this is to ensure
+            //that it&#39;s published version still makes it into the cmsContentXml table!
+            contentService.Save(allContent.Last());
+
+            // Act
+            var published = contentService.RePublishAll(0);
+
+            // Assert
+            Assert.IsTrue(published);
+            using (var uow = provider.GetUnitOfWork())
+            {
+                Assert.AreEqual(allContent.Count(), uow.Database.ExecuteScalar&lt;int&gt;(&quot;select count(*) from cmsContentXml&quot;));
+            }
+        }
+
+        [Test]
+        public void Can_RePublish_All_Content_Of_Type()
+        {
+            // Arrange
+            var contentService = (ContentService)ServiceContext.ContentService;
+            var rootContent = contentService.GetRootContent().ToList();
+            foreach (var c in rootContent)
+            {
+                contentService.PublishWithChildren(c);
+            }
+            var allContent = rootContent.Concat(rootContent.SelectMany(x =&gt; x.Descendants())).ToList();
+            //for testing we need to clear out the contentXml table so we can see if it worked
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+
+            using (var uow = provider.GetUnitOfWork())
+            {
+                uow.Database.TruncateTable(&quot;cmsContentXml&quot;);
+            }
+            //for this test we are also going to save a revision for a content item that is not published, this is to ensure
+            //that it&#39;s published version still makes it into the cmsContentXml table!
+            contentService.Save(allContent.Last());
+
+            // Act
+            contentService.RePublishAll(new int[] { allContent.Last().ContentTypeId });
+
+            // Assert            
+            using (var uow = provider.GetUnitOfWork())
+            {
+                Assert.AreEqual(allContent.Count(), uow.Database.ExecuteScalar&lt;int&gt;(&quot;select count(*) from cmsContentXml&quot;));
+            }
+        }
+
+        [Test]
+        public void Can_Publish_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 1);
+
+            // Act
+            bool published = contentService.Publish(content, 0);
+
+            // Assert
+            Assert.That(published, Is.True);
+            Assert.That(content.Published, Is.True);
+        }
+
+        [Test]
+        public void Can_Publish_Content_WithEvents()
+        {
+            ContentService.Publishing += ContentServiceOnPublishing;
+
+            // tests that during &#39;publishing&#39; event, what we get from the repo is the &#39;old&#39; content,
+            // because &#39;publishing&#39; fires before the &#39;saved&#39; event ie before the content is actually
+            // saved
+
+            try
+            {
+                var contentService = ServiceContext.ContentService;
+                var content = contentService.GetById(NodeDto.NodeIdSeed + 1);
+                Assert.AreEqual(&quot;Home&quot;, content.Name);
+
+                content.Name = &quot;foo&quot;;
+                var published = contentService.Publish(content, 0);
+
+                Assert.That(published, Is.True);
+                Assert.That(content.Published, Is.True);
+
+                var e = ServiceContext.ContentService.GetById(content.Id);
+                Assert.AreEqual(&quot;foo&quot;, e.Name);
+            }
+            finally
+            {
+                ContentService.Publishing -= ContentServiceOnPublishing;
+            }
+        }
+
+        private void ContentServiceOnPublishing(IPublishingStrategy sender, PublishEventArgs&lt;IContent&gt; args)
+        {
+            Assert.AreEqual(1, args.PublishedEntities.Count());
+            var entity = args.PublishedEntities.First();
+            Assert.AreEqual(&quot;foo&quot;, entity.Name);
+
+            var e = ServiceContext.ContentService.GetById(entity.Id);
+            Assert.AreEqual(&quot;Home&quot;, e.Name);
+        }
+
+        [Test]
+        public void Can_Publish_Only_Valid_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            contentTypeService.Save(contentType);
+
+            Content content = MockedContent.CreateSimpleContent(contentType, &quot;Invalid Content&quot;, NodeDto.NodeIdSeed + 1);
+            content.SetValue(&quot;author&quot;, string.Empty);
+            contentService.Save(content, 0);
+
+            // Act
+            var parent = contentService.GetById(NodeDto.NodeIdSeed + 1);
+            bool parentPublished = contentService.Publish(parent, 0);
+            bool published = contentService.Publish(content, 0);
+
+            // Assert
+            Assert.That(parentPublished, Is.True);
+            Assert.That(published, Is.False);
+            Assert.That(content.IsValid(), Is.False);
+            Assert.That(parent.Published, Is.True);
+            Assert.That(content.Published, Is.False);
+        }
+
+        [Test]
+        public void Can_Publish_Content_Children()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 1);
+
+            // Act
+            bool published = contentService.PublishWithChildren(content, 0);
+            var children = contentService.GetChildren(NodeDto.NodeIdSeed + 1);
+
+            // Assert
+            Assert.That(published, Is.True);//Nothing was cancelled, so should be true
+            Assert.That(content.Published, Is.True);//No restrictions, so should be published
+            Assert.That(children.First(x =&gt; x.Id == NodeDto.NodeIdSeed + 2).Published, Is.True);//Released 5 mins ago, so should be published
+        }
+
+        [Test]
+        public void Cannot_Publish_Expired_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 3); //This Content expired 5min ago
+            content.ExpireDate = DateTime.Now.AddMinutes(-5);
+            contentService.Save(content);
+
+            var parent = contentService.GetById(NodeDto.NodeIdSeed + 1);
+            bool parentPublished = contentService.Publish(parent, 0);//Publish root Home node to enable publishing of &#39;NodeDto.NodeIdSeed + 3&#39;
+
+            // Act
+            bool published = contentService.Publish(content, 0);
+
+            // Assert
+            Assert.That(parentPublished, Is.True);
+            Assert.That(published, Is.False);
+            Assert.That(content.Published, Is.False);
+        }
+
+        [Test]
+        public void Cannot_Publish_Content_Awaiting_Release()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 2);
+            content.ReleaseDate = DateTime.Now.AddHours(2);
+            contentService.Save(content, 0);
+
+            var parent = contentService.GetById(NodeDto.NodeIdSeed + 1);
+            bool parentPublished = contentService.Publish(parent, 0);//Publish root Home node to enable publishing of &#39;NodeDto.NodeIdSeed + 3&#39;
+
+            // Act
+            bool published = contentService.Publish(content, 0);
+
+            // Assert
+            Assert.That(parentPublished, Is.True);
+            Assert.That(published, Is.False);
+            Assert.That(content.Published, Is.False);
+        }
+
+        [Test]
+        public void Cannot_Publish_Content_Where_Parent_Is_Unpublished()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.CreateContent(&quot;Subpage with Unpublisehed Parent&quot;, NodeDto.NodeIdSeed + 1, &quot;umbTextpage&quot;, 0);
+            contentService.Save(content, 0);
+
+            // Act
+            bool published = contentService.PublishWithChildren(content, 0);
+
+            // Assert
+            Assert.That(published, Is.False);
+            Assert.That(content.Published, Is.False);
+        }
+
+        [Test]
+        public void Cannot_Publish_Trashed_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 4);
+
+            // Act
+            bool published = contentService.Publish(content, 0);
+
+            // Assert
+            Assert.That(published, Is.False);
+            Assert.That(content.Published, Is.False);
+            Assert.That(content.Trashed, Is.True);
+        }
+
+        [Test]
+        public void Can_Save_And_Publish_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.CreateContent(&quot;Home US&quot;, -1, &quot;umbTextpage&quot;, 0);
+            content.SetValue(&quot;author&quot;, &quot;Barack Obama&quot;);
+
+            // Act
+            bool published = contentService.SaveAndPublish(content, 0);
+
+            // Assert
+            Assert.That(content.HasIdentity, Is.True);
+            Assert.That(content.Published, Is.True);
+            Assert.That(published, Is.True);
+        }
+
+        [Test]
+        public void Can_Get_Published_Descendant_Versions()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var root = contentService.GetById(NodeDto.NodeIdSeed + 1);
+            var rootPublished = contentService.Publish(root);
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 3);
+            content.Properties[&quot;title&quot;].Value = content.Properties[&quot;title&quot;].Value + &quot; Published&quot;;
+            bool published = contentService.SaveAndPublish(content);
+
+            var publishedVersion = content.Version;
+
+            content.Properties[&quot;title&quot;].Value = content.Properties[&quot;title&quot;].Value + &quot; Saved&quot;;
+            contentService.Save(content);
+
+            var savedVersion = content.Version;
+
+            // Act
+            var publishedDescendants = ((ContentService)contentService).GetPublishedDescendants(root).ToList();
+
+            // Assert
+            Assert.That(rootPublished, Is.True);
+            Assert.That(published, Is.True);
+            Assert.That(publishedDescendants.Any(x =&gt; x.Version == publishedVersion), Is.True);
+            Assert.That(publishedDescendants.Any(x =&gt; x.Version == savedVersion), Is.False);
+
+            //Ensure that the published content version has the correct property value and is marked as published
+            var publishedContentVersion = publishedDescendants.First(x =&gt; x.Version == publishedVersion);
+            Assert.That(publishedContentVersion.Published, Is.True);
+            Assert.That(publishedContentVersion.Properties[&quot;title&quot;].Value, Contains.Substring(&quot;Published&quot;));
+
+            //Ensure that the saved content version has the correct property value and is not marked as published
+            var savedContentVersion = contentService.GetByVersion(savedVersion);
+            Assert.That(savedContentVersion.Published, Is.False);
+            Assert.That(savedContentVersion.Properties[&quot;title&quot;].Value, Contains.Substring(&quot;Saved&quot;));
+
+            //Ensure that the latest version of the content is the saved and not-yet-published one
+            var currentContent = contentService.GetById(NodeDto.NodeIdSeed + 3);
+            Assert.That(currentContent.Published, Is.False);
+            Assert.That(currentContent.Properties[&quot;title&quot;].Value, Contains.Substring(&quot;Saved&quot;));
+            Assert.That(currentContent.Version, Is.EqualTo(savedVersion));
+        }
+
+        [Test]
+        public void Can_Save_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.CreateContent(&quot;Home US&quot;, -1, &quot;umbTextpage&quot;, 0);
+            content.SetValue(&quot;author&quot;, &quot;Barack Obama&quot;);
+
+            // Act
+            contentService.Save(content, 0);
+
+            // Assert
+            Assert.That(content.HasIdentity, Is.True);
+        }
+
+        [Test]
+        public void Can_Bulk_Save_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+
+            var contentType = contentTypeService.GetContentType(&quot;umbTextpage&quot;);
+            Content subpage = MockedContent.CreateSimpleContent(contentType, &quot;Text Subpage 1&quot;, NodeDto.NodeIdSeed + 2);
+            Content subpage2 = MockedContent.CreateSimpleContent(contentType, &quot;Text Subpage 2&quot;, NodeDto.NodeIdSeed + 2);
+            var list = new List&lt;IContent&gt; { subpage, subpage2 };
+
+            // Act
+            contentService.Save(list, 0);
+
+            // Assert
+            Assert.That(list.Any(x =&gt; !x.HasIdentity), Is.False);
+        }
+
+        [Test]
+        public void Can_Bulk_Save_New_Hierarchy_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var hierarchy = CreateContentHierarchy().ToList();
+
+            // Act
+            contentService.Save(hierarchy, 0);
+
+            Assert.That(hierarchy.Any(), Is.True);
+            Assert.That(hierarchy.Any(x =&gt; x.HasIdentity == false), Is.False);
+            //all parent id&#39;s should be ok, they are lazy and if they equal zero an exception will be thrown
+            Assert.DoesNotThrow(() =&gt; hierarchy.Any(x =&gt; x.ParentId != 0));
+
+        }
+
+        [Test]
+        public void Can_Delete_Content_Of_Specific_ContentType()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var contentType = contentTypeService.GetContentType(&quot;umbTextpage&quot;);
+
+            // Act
+            contentService.DeleteContentOfType(contentType.Id);
+            var rootContent = contentService.GetRootContent();
+            var contents = contentService.GetContentOfContentType(contentType.Id);
+
+            // Assert
+            Assert.That(rootContent.Any(), Is.False);
+            Assert.That(contents.Any(x =&gt; !x.Trashed), Is.False);
+        }
+
+        [Test]
+        public void Can_Delete_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 4);
+
+            // Act
+            contentService.Delete(content, 0);
+            var deleted = contentService.GetById(NodeDto.NodeIdSeed + 4);
+
+            // Assert
+            Assert.That(deleted, Is.Null);
+        }
+
+        [Test]
+        public void Can_Move_Content_To_RecycleBin()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 3);
+
+            // Act
+            contentService.MoveToRecycleBin(content, 0);
+
+            // Assert
+            Assert.That(content.ParentId, Is.EqualTo(-20));
+            Assert.That(content.Trashed, Is.True);
+        }
+
+        [Test]
+        public void Can_Move_Content_Structure_To_RecycleBin_And_Empty_RecycleBin()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentType = ServiceContext.ContentTypeService.GetContentType(&quot;umbTextpage&quot;);
+            Content subsubpage = MockedContent.CreateSimpleContent(contentType, &quot;Text Page 3&quot;, NodeDto.NodeIdSeed + 2);
+            contentService.Save(subsubpage, 0);
+
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 1);
+
+            // Act
+            contentService.MoveToRecycleBin(content, 0);
+            var descendants = contentService.GetDescendants(content).ToList();
+
+            // Assert
+            Assert.That(content.ParentId, Is.EqualTo(-20));
+            Assert.That(content.Trashed, Is.True);
+            Assert.That(descendants.Count(), Is.EqualTo(3));
+            Assert.That(descendants.Any(x =&gt; x.Path.Contains(&quot;-20&quot;) == false), Is.False);
+
+            //Empty Recycle Bin
+            contentService.EmptyRecycleBin();
+            var trashed = contentService.GetContentInRecycleBin();
+
+            Assert.That(trashed.Any(), Is.False);
+        }
+
+        [Test]
+        public void Can_Empty_RecycleBin()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+
+            // Act
+            contentService.EmptyRecycleBin();
+            var contents = contentService.GetContentInRecycleBin();
+
+            // Assert
+            Assert.That(contents.Any(), Is.False);
+        }
+
+        [Test]
+        public void Can_Empty_RecycleBin_With_Content_That_Has_All_Related_Data()
+        {
+            // Arrange
+            //need to:
+            // * add relations
+            // * add permissions
+            // * add notifications
+            // * public access
+            // * tags
+            // * domain
+            // * published &amp; preview data
+            // * multiple versions
+
+            var contentType = MockedContentTypes.CreateAllTypesContentType(&quot;test&quot;, &quot;test&quot;);
+            ServiceContext.ContentTypeService.Save(contentType, 0);
+
+            object obj =
+               new
+               {
+                   tags = &quot;Hello,World&quot;
+               };
+            var content1 = MockedContent.CreateBasicContent(contentType);
+            content1.PropertyValues(obj);
+            content1.ResetDirtyProperties(false);
+            ServiceContext.ContentService.Save(content1, 0);
+            Assert.IsTrue(ServiceContext.ContentService.PublishWithStatus(content1, 0).Success);
+            var content2 = MockedContent.CreateBasicContent(contentType);
+            content2.PropertyValues(obj);
+            content2.ResetDirtyProperties(false);
+            ServiceContext.ContentService.Save(content2, 0);
+            Assert.IsTrue(ServiceContext.ContentService.PublishWithStatus(content2, 0).Success);
+
+            ServiceContext.RelationService.Save(new RelationType(Constants.ObjectTypes.DocumentGuid, Constants.ObjectTypes.DocumentGuid, &quot;test&quot;));
+            Assert.IsNotNull(ServiceContext.RelationService.Relate(content1, content2, &quot;test&quot;));
+
+            ServiceContext.PublicAccessService.Save(new PublicAccessEntry(content1, content2, content2, new List&lt;PublicAccessRule&gt;
+            {
+                new PublicAccessRule
+                {
+                    RuleType = &quot;test&quot;,
+                    RuleValue = &quot;test&quot;
+                }
+            }));
+            Assert.IsTrue(ServiceContext.PublicAccessService.AddRule(content1, &quot;test2&quot;, &quot;test2&quot;).Success);
+
+            Assert.IsNotNull(ServiceContext.NotificationService.CreateNotification(ServiceContext.UserService.GetUserById(0), content1, &quot;test&quot;));
+
+            ServiceContext.ContentService.AssignContentPermission(content1, &#39;A&#39;, new[] {0});
+
+            Assert.IsTrue(ServiceContext.DomainService.Save(new UmbracoDomain(&quot;www.test.com&quot;, &quot;en-AU&quot;)
+            {
+                RootContentId = content1.Id
+            }).Success);
+            
+            // Act
+            ServiceContext.ContentService.EmptyRecycleBin();
+            var contents = ServiceContext.ContentService.GetContentInRecycleBin();
+
+            // Assert
+            Assert.That(contents.Any(), Is.False);
+        }
+
+        [Test]
+        public void Can_Move_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 4);
+
+            // Act - moving out of recycle bin
+            contentService.Move(content, NodeDto.NodeIdSeed + 1, 0);
+
+            // Assert
+            Assert.That(content.ParentId, Is.EqualTo(NodeDto.NodeIdSeed + 1));
+            Assert.That(content.Trashed, Is.False);
+            Assert.That(content.Published, Is.False);
+        }
+
+        [Test]
+        public void Can_Copy_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var temp = contentService.GetById(NodeDto.NodeIdSeed + 3);
+
+            // Act
+            var copy = contentService.Copy(temp, temp.ParentId, false, 0);
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 3);
+
+            // Assert
+            Assert.That(copy, Is.Not.Null);
+            Assert.That(copy.Id, Is.Not.EqualTo(content.Id));
+            Assert.AreNotSame(content, copy);
+            foreach (var property in copy.Properties)
+            {
+                Assert.AreNotEqual(property.Id, content.Properties[property.Alias].Id);
+                Assert.AreEqual(property.Value, content.Properties[property.Alias].Value);
+            }
+            //Assert.AreNotEqual(content.Name, copy.Name);
+        }
+
+        [Test]
+        public void Can_Copy_Recursive()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var temp = contentService.GetById(NodeDto.NodeIdSeed + 1);
+            Assert.AreEqual(&quot;Home&quot;, temp.Name);
+            Assert.AreEqual(2, temp.Children().Count());
+
+            // Act
+            var copy = contentService.Copy(temp, temp.ParentId, false, true, 0);
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 1);
+
+            // Assert
+            Assert.That(copy, Is.Not.Null);
+            Assert.That(copy.Id, Is.Not.EqualTo(content.Id));
+            Assert.AreNotSame(content, copy);
+            Assert.AreEqual(2, copy.Children().Count());
+
+            var child = contentService.GetById(NodeDto.NodeIdSeed + 2);
+            var childCopy = copy.Children().First();
+            Assert.AreEqual(childCopy.Name, child.Name);
+            Assert.AreNotEqual(childCopy.Id, child.Id);
+            Assert.AreNotEqual(childCopy.Key, child.Key);
+        }
+
+        [Test]
+        public void Can_Copy_NonRecursive()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var temp = contentService.GetById(NodeDto.NodeIdSeed + 1);
+            Assert.AreEqual(&quot;Home&quot;, temp.Name);
+            Assert.AreEqual(2, temp.Children().Count());
+
+            // Act
+            var copy = contentService.Copy(temp, temp.ParentId, false, false, 0);
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 1);
+
+            // Assert
+            Assert.That(copy, Is.Not.Null);
+            Assert.That(copy.Id, Is.Not.EqualTo(content.Id));
+            Assert.AreNotSame(content, copy);
+            Assert.AreEqual(0, copy.Children().Count());
+        }
+
+        [Test]
+        public void Can_Copy_Content_With_Tags()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var contentType = ServiceContext.ContentTypeService.GetContentType(&quot;umbTextpage&quot;);
+            var temp = MockedContent.CreateSimpleContent(contentType, &quot;Simple Text Page&quot;, -1);
+            var prop = temp.Properties.First();
+            temp.SetTags(prop.Alias, new[] { &quot;hello&quot;, &quot;world&quot; }, true);
+            var status = contentService.PublishWithStatus(temp);
+
+            // Act
+            var copy = contentService.Copy(temp, temp.ParentId, false, 0);
+
+            // Assert
+            var copiedTags = ServiceContext.TagService.GetTagsForEntity(copy.Id).ToArray();
+            Assert.AreEqual(2, copiedTags.Count());
+            Assert.AreEqual(&quot;hello&quot;, copiedTags[0].Text);
+            Assert.AreEqual(&quot;world&quot;, copiedTags[1].Text);
+        }
+
+        [Test, NUnit.Framework.Ignore]
+        public void Can_Send_To_Publication()
+        { }
+
+        [Test]
+        public void Can_Rollback_Version_On_Content()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var parent = ServiceContext.ContentService.GetById(NodeDto.NodeIdSeed + 1);
+            ServiceContext.ContentService.Publish(parent);//Publishing root, so Text Page 2 can be updated.
+            var subpage2 = contentService.GetById(NodeDto.NodeIdSeed + 3);
+            var version = subpage2.Version;
+            var nameBeforeRollback = subpage2.Name;
+            subpage2.Name = &quot;Text Page 2 Updated&quot;;
+            subpage2.SetValue(&quot;author&quot;, &quot;Jane Doe&quot;);
+            contentService.SaveAndPublishWithStatus(subpage2, 0);//Saving and publishing, so a new version is created
+
+            // Act
+            var rollback = contentService.Rollback(NodeDto.NodeIdSeed + 3, version, 0);
+
+            // Assert
+            Assert.That(rollback, Is.Not.Null);
+            Assert.AreNotEqual(rollback.Version, subpage2.Version);
+            Assert.That(rollback.GetValue&lt;string&gt;(&quot;author&quot;), Is.Not.EqualTo(&quot;Jane Doe&quot;));
+            Assert.AreEqual(nameBeforeRollback, rollback.Name);
+        }
+
+        [Test]
+        public void Can_Save_Lazy_Content()
+        {
+            var unitOfWork = PetaPocoUnitOfWorkProvider.CreateUnitOfWork(Mock.Of&lt;ILogger&gt;());
+            var contentType = ServiceContext.ContentTypeService.GetContentType(&quot;umbTextpage&quot;);
+            var root = ServiceContext.ContentService.GetById(NodeDto.NodeIdSeed + 1);
+
+            var c = new Lazy&lt;IContent&gt;(() =&gt; MockedContent.CreateSimpleContent(contentType, &quot;Hierarchy Simple Text Page&quot;, root.Id));
+            var c2 = new Lazy&lt;IContent&gt;(() =&gt; MockedContent.CreateSimpleContent(contentType, &quot;Hierarchy Simple Text Subpage&quot;, c.Value.Id));
+            var list = new List&lt;Lazy&lt;IContent&gt;&gt; { c, c2 };
+
+            ContentTypeRepository contentTypeRepository;
+            using (var repository = CreateRepository(unitOfWork, out contentTypeRepository))
+            {
+                foreach (var content in list)
+                {
+                    repository.AddOrUpdate(content.Value);
+                    unitOfWork.Commit();
+                }
+
+                Assert.That(c.Value.HasIdentity, Is.True);
+                Assert.That(c2.Value.HasIdentity, Is.True);
+
+                Assert.That(c.Value.Id &gt; 0, Is.True);
+                Assert.That(c2.Value.Id &gt; 0, Is.True);
+
+                Assert.That(c.Value.ParentId &gt; 0, Is.True);
+                Assert.That(c2.Value.ParentId &gt; 0, Is.True);
+            }
+
+        }
+
+        [Test]
+        public void Can_Verify_Content_Has_Published_Version()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 1);
+            bool published = contentService.PublishWithChildren(content, 0);
+            var homepage = contentService.GetById(NodeDto.NodeIdSeed + 1);
+            homepage.Name = &quot;Homepage&quot;;
+            ServiceContext.ContentService.Save(homepage);
+
+            // Act
+            bool hasPublishedVersion = ServiceContext.ContentService.HasPublishedVersion(NodeDto.NodeIdSeed + 1);
+
+            // Assert
+            Assert.That(published, Is.True);
+            Assert.That(homepage.Published, Is.False);
+            Assert.That(hasPublishedVersion, Is.True);
+        }
+
+        [Test]
+        public void Can_Verify_Property_Types_On_Content()
+        {
+            // Arrange
+            var contentTypeService = ServiceContext.ContentTypeService;
+            var contentType = MockedContentTypes.CreateAllTypesContentType(&quot;allDataTypes&quot;, &quot;All DataTypes&quot;);
+            contentTypeService.Save(contentType);
+            var contentService = ServiceContext.ContentService;
+            var content = MockedContent.CreateAllTypesContent(contentType, &quot;Random Content&quot;, -1);
+            contentService.Save(content);
+            var id = content.Id;
+
+            // Act
+            var sut = contentService.GetById(id);
+
+            // Arrange
+            Assert.That(sut.GetValue&lt;bool&gt;(&quot;isTrue&quot;), Is.True);
+            Assert.That(sut.GetValue&lt;int&gt;(&quot;number&quot;), Is.EqualTo(42));
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;bodyText&quot;), Is.EqualTo(&quot;Lorem Ipsum Body Text Test&quot;));
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;singleLineText&quot;), Is.EqualTo(&quot;Single Line Text Test&quot;));
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;multilineText&quot;), Is.EqualTo(&quot;Multiple lines \n in one box&quot;));
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;upload&quot;), Is.EqualTo(&quot;/media/1234/koala.jpg&quot;));
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;label&quot;), Is.EqualTo(&quot;Non-editable label&quot;));
+            //SD: This is failing because the &#39;content&#39; call to GetValue&lt;DateTime&gt; always has empty milliseconds
+            //MCH: I&#39;m guessing this is an issue because of the format the date is actually stored as, right? Cause we don&#39;t do any formatting when saving or loading
+            Assert.That(sut.GetValue&lt;DateTime&gt;(&quot;dateTime&quot;).ToString(&quot;G&quot;), Is.EqualTo(content.GetValue&lt;DateTime&gt;(&quot;dateTime&quot;).ToString(&quot;G&quot;)));
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;colorPicker&quot;), Is.EqualTo(&quot;black&quot;));
+            //that one is gone in 7.4
+            //Assert.That(sut.GetValue&lt;string&gt;(&quot;folderBrowser&quot;), Is.Null);
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;ddlMultiple&quot;), Is.EqualTo(&quot;1234,1235&quot;));
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;rbList&quot;), Is.EqualTo(&quot;random&quot;));
+            Assert.That(sut.GetValue&lt;DateTime&gt;(&quot;date&quot;).ToString(&quot;G&quot;), Is.EqualTo(content.GetValue&lt;DateTime&gt;(&quot;date&quot;).ToString(&quot;G&quot;)));
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;ddl&quot;), Is.EqualTo(&quot;1234&quot;));
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;chklist&quot;), Is.EqualTo(&quot;randomc&quot;));
+            Assert.That(sut.GetValue&lt;int&gt;(&quot;contentPicker&quot;), Is.EqualTo(1090));
+            Assert.That(sut.GetValue&lt;int&gt;(&quot;mediaPicker&quot;), Is.EqualTo(1091));
+            Assert.That(sut.GetValue&lt;int&gt;(&quot;memberPicker&quot;), Is.EqualTo(1092));
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;relatedLinks&quot;), Is.EqualTo(&quot;&lt;links&gt;&lt;link title=\&quot;google\&quot; link=\&quot;http://google.com\&quot; type=\&quot;external\&quot; newwindow=\&quot;0\&quot; /&gt;&lt;/links&gt;&quot;));
+            Assert.That(sut.GetValue&lt;string&gt;(&quot;tags&quot;), Is.EqualTo(&quot;this,is,tags&quot;));
+        }
+
+        [Test]
+        public void Can_Delete_Previous_Versions_Not_Latest()
+        {
+            // Arrange
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.GetById(NodeDto.NodeIdSeed + 4);
+            var version = content.Version;
+
+            // Act
+            contentService.DeleteVersion(NodeDto.NodeIdSeed + 4, version, true, 0);
+            var sut = contentService.GetById(NodeDto.NodeIdSeed + 4);
+
+            // Assert
+            Assert.That(sut.Version, Is.EqualTo(version));
+        }
+
+        [Test]
+        public void Ensure_Content_Xml_Created()
+        {
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.CreateContent(&quot;Home US&quot;, -1, &quot;umbTextpage&quot;, 0);
+            content.SetValue(&quot;author&quot;, &quot;Barack Obama&quot;);
+
+            contentService.Save(content);
+
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+
+            using (var uow = provider.GetUnitOfWork())
+            {
+                Assert.IsFalse(uow.Database.Exists&lt;ContentXmlDto&gt;(content.Id));
+            }
+
+            contentService.Publish(content);
+
+            using (var uow = provider.GetUnitOfWork())
+            {
+                Assert.IsTrue(uow.Database.Exists&lt;ContentXmlDto&gt;(content.Id));
+            }
+        }
+
+        [Test]
+        public void Ensure_Preview_Xml_Created()
+        {
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.CreateContent(&quot;Home US&quot;, -1, &quot;umbTextpage&quot;, 0);
+            content.SetValue(&quot;author&quot;, &quot;Barack Obama&quot;);
+
+            contentService.Save(content);
+
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+
+            using (var uow = provider.GetUnitOfWork())
+            {
+                Assert.IsTrue(uow.Database.SingleOrDefault&lt;PreviewXmlDto&gt;(&quot;WHERE nodeId=@nodeId AND versionId = @versionId&quot;, new { nodeId = content.Id, versionId = content.Version }) != null);
+            }
+        }
+
+        [Test]
+        public void Created_HasPublishedVersion_Not()
+        {
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.CreateContent(&quot;Home US&quot;, -1, &quot;umbTextpage&quot;, 0);
+            content.SetValue(&quot;author&quot;, &quot;Barack Obama&quot;);
+
+            contentService.Save(content);
+
+            Assert.IsTrue(content.HasIdentity);
+            Assert.IsFalse(content.HasPublishedVersion);
+
+            content = contentService.GetById(content.Id);
+            Assert.IsFalse(content.HasPublishedVersion);
+        }
+
+        [Test]
+        public void Published_HasPublishedVersion_Self()
+        {
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.CreateContent(&quot;Home US&quot;, -1, &quot;umbTextpage&quot;, 0);
+            content.SetValue(&quot;author&quot;, &quot;Barack Obama&quot;);
+
+            contentService.SaveAndPublishWithStatus(content);
+
+            Assert.IsTrue(content.HasIdentity);
+            Assert.IsTrue(content.HasPublishedVersion);
+            Assert.AreEqual(content.PublishedVersionGuid, content.Version);
+
+            content = contentService.GetById(content.Id);
+            Assert.IsTrue(content.HasPublishedVersion);
+            Assert.AreEqual(content.PublishedVersionGuid, content.Version);
+        }
+
+        [Test]
+        public void PublishedWithChanges_HasPublishedVersion_Other()
+        {
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.CreateContent(&quot;Home US&quot;, -1, &quot;umbTextpage&quot;, 0);
+            content.SetValue(&quot;author&quot;, &quot;Barack Obama&quot;);
+
+            contentService.SaveAndPublishWithStatus(content);
+            content.SetValue(&quot;author&quot;, &quot;James Dean&quot;);
+            contentService.Save(content);
+
+            Assert.IsTrue(content.HasIdentity);
+            Assert.IsTrue(content.HasPublishedVersion);
+            Assert.AreNotEqual(content.PublishedVersionGuid, content.Version);
+
+            content = contentService.GetById(content.Id);
+            Assert.IsFalse(content.Published);
+            Assert.IsTrue(content.HasPublishedVersion);
+            Assert.AreNotEqual(content.PublishedVersionGuid, content.Version);
+
+            var published = contentService.GetPublishedVersion(content);
+            Assert.IsTrue(published.Published);
+            Assert.IsTrue(published.HasPublishedVersion);
+            Assert.AreEqual(published.PublishedVersionGuid, published.Version);
+        }
+
+        [Test]
+        public void Unpublished_HasPublishedVersion_Not()
+        {
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.CreateContent(&quot;Home US&quot;, -1, &quot;umbTextpage&quot;, 0);
+            content.SetValue(&quot;author&quot;, &quot;Barack Obama&quot;);
+
+            contentService.SaveAndPublishWithStatus(content);
+            contentService.UnPublish(content);
+
+            Assert.IsTrue(content.HasIdentity);
+            Assert.IsFalse(content.HasPublishedVersion);
+
+            content = contentService.GetById(content.Id);
+            Assert.IsFalse(content.HasPublishedVersion);
+        }
+
+        [Test]
+        public void HasPublishedVersion_Method()
+        {
+            var contentService = ServiceContext.ContentService;
+            var content = contentService.CreateContent(&quot;Home US&quot;, -1, &quot;umbTextpage&quot;, 0);
+            content.SetValue(&quot;author&quot;, &quot;Barack Obama&quot;);
+
+            contentService.Save(content);
+            Assert.IsTrue(content.HasIdentity);
+            Assert.IsFalse(content.HasPublishedVersion);
+            Assert.IsFalse(content.HasPublishedVersion());
+
+            contentService.SaveAndPublishWithStatus(content);
+            Assert.IsTrue(content.HasPublishedVersion);
+            Assert.IsTrue(content.HasPublishedVersion());
+        }
+
+        private IEnumerable&lt;IContent&gt; CreateContentHierarchy()
+        {
+            var contentType = ServiceContext.ContentTypeService.GetContentType(&quot;umbTextpage&quot;);
+            var root = ServiceContext.ContentService.GetById(NodeDto.NodeIdSeed + 1);
+
+            var list = new List&lt;IContent&gt;();
+
+            for (int i = 0; i &lt; 10; i++)
+            {
+                var content = MockedContent.CreateSimpleContent(contentType, &quot;Hierarchy Simple Text Page &quot; + i, root);
+
+                list.Add(content);
+                list.AddRange(CreateChildrenOf(contentType, content, 4));
+
+                Debug.Print(&quot;Created: &#39;Hierarchy Simple Text Page {0}&#39;&quot;, i);
+            }
+
+            return list;
+        }
+
+        private IEnumerable&lt;IContent&gt; CreateChildrenOf(IContentType contentType, IContent content, int depth)
+        {
+            var list = new List&lt;IContent&gt;();
+            for (int i = 0; i &lt; depth; i++)
+            {
+                var c = MockedContent.CreateSimpleContent(contentType, &quot;Hierarchy Simple Text Subpage &quot; + i, content);
+                list.Add(c);
+
+                Debug.Print(&quot;Created: &#39;Hierarchy Simple Text Subpage {0}&#39; - Depth: {1}&quot;, i, depth);
+            }
+            return list;
+        }
+
+        private ContentRepository CreateRepository(IDatabaseUnitOfWork unitOfWork, out ContentTypeRepository contentTypeRepository)
+        {
+            var templateRepository = new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;ITemplatesSection&gt;());
+            var tagRepository = new TagRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax);
+            contentTypeRepository = new ContentTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, templateRepository);
+            var repository = new ContentRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, contentTypeRepository, templateRepository, tagRepository, Mock.Of&lt;IContentSection&gt;());
+            return repository;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[37,9,37,10,1],[38,13,38,31,1],[40,13,40,76,1],[41,9,41,10,1],[45,9,45,10,1],[46,13,46,77,1],[48,13,48,29,1],[49,9,49,10,1],[63,9,63,10,1],[64,13,64,64,1],[65,13,65,86,1],[66,13,66,75,1],[67,13,67,98,1],[68,13,68,78,1],[69,13,69,67,1],[69,67,69,74,1],[69,74,69,86,1],[69,13,69,86,1],[70,13,70,47,1],[71,13,71,20,1],[71,22,71,27,1],[71,28,71,30,1],[71,31,71,40,1],[72,13,72,14,1],[73,17,73,76,1],[74,13,74,14,1],[77,13,77,122,1],[80,13,80,58,1],[84,13,84,99,1],[86,13,86,47,1],[89,13,89,58,1],[91,13,91,67,1],[94,13,94,71,1],[94,71,94,75,1],[94,75,94,101,1],[94,101,94,108,1],[94,108,94,120,1],[94,13,94,120,1],[96,13,96,44,1],[96,44,96,62,1],[96,62,96,74,1],[96,13,96,74,1],[97,13,97,44,1],[97,44,97,80,1],[97,80,97,92,1],[97,13,97,92,1],[98,9,98,10,1],[102,9,102,10,1],[104,13,104,64,1],[107,13,107,98,1],[109,13,109,60,1],[110,13,110,45,1],[112,13,112,58,1],[113,13,113,40,1],[114,13,114,45,1],[118,13,118,78,1],[119,9,119,10,1],[123,9,123,10,1],[125,13,125,64,1],[128,13,128,98,1],[129,18,129,27,1],[129,29,129,35,1],[129,37,129,40,1],[130,13,130,14,1],[131,17,131,79,1],[132,17,132,66,1],[133,13,133,14,1],[137,13,137,86,1],[138,13,138,54,1],[140,13,140,75,1],[141,13,141,53,1],[142,9,142,10,1],[146,9,146,10,1],[148,13,148,64,1],[151,13,151,48,1],[152,18,152,27,1],[152,29,152,35,1],[152,37,152,40,1],[153,13,153,14,1],[154,17,154,101,1],[155,13,155,14,1],[157,13,157,120,1],[160,13,160,62,1],[161,13,161,61,1],[162,13,162,62,1],[163,9,163,10,1],[167,9,167,10,1],[169,13,169,64,1],[172,18,172,27,1],[172,29,172,35,1],[172,37,172,40,1],[173,13,173,14,1],[174,17,174,88,1],[175,13,175,14,1],[178,13,178,57,1],[179,9,179,10,1],[183,9,183,10,1],[185,13,185,64,1],[186,13,186,72,1],[187,13,187,102,1],[188,13,188,50,1],[191,18,191,27,1],[191,29,191,35,1],[191,37,191,40,1],[192,13,192,14,1],[193,17,193,84,1],[194,13,194,14,1],[197,13,197,84,1],[198,9,198,10,1],[202,9,202,10,1],[204,13,204,64,1],[205,13,205,72,1],[206,13,206,102,1],[207,13,207,50,1],[208,13,208,93,1],[211,18,211,27,1],[211,29,211,35,1],[211,37,211,40,1],[212,13,212,14,1],[213,17,213,85,1],[214,13,214,14,1],[217,13,217,74,1],[218,9,218,10,1],[222,9,222,10,1],[224,13,224,64,1],[225,13,225,72,1],[226,13,226,102,1],[227,13,227,50,1],[228,13,228,93,1],[231,13,231,39,1],[232,18,232,27,1],[232,29,232,35,1],[232,37,232,40,1],[233,13,233,14,1],[234,17,234,96,1],[235,13,235,14,1],[238,13,238,77,1],[239,9,239,10,1],[243,9,243,10,1],[245,13,245,64,1],[248,13,248,48,1],[249,13,249,67,1],[252,13,252,33,1],[253,9,253,10,1],[257,9,257,10,1],[258,13,258,64,1],[259,13,259,72,1],[260,13,260,56,1],[261,13,261,118,1],[262,13,266,20,1],[267,13,267,50,1],[269,13,269,99,1],[270,13,270,88,1],[271,13,271,46,1],[273,13,273,99,1],[274,13,274,88,1],[275,13,275,46,1],[278,13,278,55,1],[283,13,283,65,1],[284,13,284,46,1],[287,13,287,58,1],[288,13,288,49,1],[289,9,289,10,1],[293,9,293,10,1],[294,13,294,64,1],[295,13,295,72,1],[296,13,296,56,1],[297,13,297,118,1],[298,13,302,20,1],[303,13,303,50,1],[305,13,305,99,1],[306,13,306,88,1],[307,13,307,46,1],[309,13,309,99,1],[310,13,310,88,1],[311,13,311,46,1],[314,13,314,55,1],[315,13,315,55,1],[320,13,320,58,1],[321,13,321,49,1],[322,9,322,10,1],[326,9,326,10,1],[327,13,327,64,1],[328,13,328,72,1],[329,13,329,56,1],[330,13,330,118,1],[331,13,335,20,1],[336,13,336,50,1],[338,13,338,99,1],[339,13,339,88,1],[340,13,340,46,1],[342,13,342,99,1],[343,13,343,88,1],[344,13,344,46,1],[347,13,347,48,1],[348,13,348,48,1],[353,13,353,58,1],[354,13,354,49,1],[355,9,355,10,1],[359,9,359,10,1],[360,13,360,64,1],[361,13,361,72,1],[362,13,362,56,1],[363,13,363,118,1],[364,13,368,20,1],[369,13,369,50,1],[371,13,371,99,1],[372,13,372,88,1],[373,13,373,46,1],[375,13,375,99,1],[376,13,376,88,1],[377,13,377,46,1],[379,13,379,48,1],[380,13,380,48,1],[383,13,383,46,1],[387,13,387,65,1],[388,13,388,46,1],[389,13,389,58,1],[390,13,390,49,1],[391,9,391,10,1],[395,9,395,10,1],[396,13,396,64,1],[397,13,397,72,1],[398,13,398,56,1],[399,13,399,118,1],[400,13,404,20,1],[405,13,405,50,1],[407,13,407,99,1],[408,13,408,88,1],[409,13,409,46,1],[411,13,411,99,1],[412,13,412,88,1],[413,13,413,46,1],[415,13,415,55,1],[416,13,416,55,1],[419,13,419,47,1],[420,13,420,46,1],[424,13,424,65,1],[425,13,425,46,1],[426,13,426,58,1],[427,13,427,49,1],[428,9,428,10,1],[432,9,432,10,1],[434,13,434,64,1],[435,13,435,72,1],[436,13,436,66,1],[438,13,442,16,1],[443,13,443,118,1],[444,13,448,20,1],[449,13,449,50,1],[450,13,450,95,1],[450,95,450,109,0],[450,109,450,136,1],[450,13,450,136,1],[452,13,452,96,1],[453,13,453,87,1],[454,13,454,42,1],[456,13,456,104,1],[457,13,457,81,1],[458,13,458,41,1],[460,13,460,104,1],[461,13,461,72,1],[462,13,462,41,1],[465,13,465,93,1],[468,13,468,72,1],[468,72,468,89,1],[468,89,468,94,1],[468,13,468,94,1],[470,13,472,76,1],[474,13,476,75,1],[478,13,480,75,1],[481,9,481,10,1],[485,9,485,10,1],[487,13,487,64,1],[488,13,488,72,1],[489,13,489,118,1],[490,13,494,20,1],[495,13,495,50,1],[496,13,496,96,1],[497,13,497,87,1],[498,13,498,45,1],[501,13,501,74,1],[502,13,502,42,1],[507,13,507,107,1],[508,13,508,72,1],[508,72,508,89,1],[508,89,508,94,1],[508,13,508,94,1],[509,13,511,76,1],[512,9,512,10,1],[516,9,516,10,1],[518,13,518,64,1],[519,13,519,72,1],[520,13,520,118,1],[521,13,525,20,1],[526,13,526,50,1],[528,13,528,96,1],[532,13,532,87,1],[533,13,533,45,1],[536,13,536,107,1],[537,13,537,72,1],[537,72,537,89,1],[537,89,537,94,1],[537,13,537,94,1],[538,13,540,76,1],[541,9,541,10,1],[545,9,545,10,1],[547,13,547,64,1],[548,13,548,72,1],[549,13,549,118,1],[550,13,554,20,1],[555,13,555,50,1],[556,13,556,96,1],[557,13,557,87,1],[558,13,558,55,1],[561,13,561,74,1],[562,13,562,55,1],[565,13,565,107,1],[566,13,566,72,1],[566,72,566,89,1],[566,89,566,94,1],[566,13,566,94,1],[567,13,569,76,1],[570,9,570,10,1],[574,9,574,10,1],[576,13,576,64,1],[577,13,577,72,1],[578,13,578,118,1],[579,13,583,20,1],[584,13,584,50,1],[585,13,585,96,1],[586,13,586,87,1],[587,13,587,55,1],[590,13,590,67,1],[591,13,591,55,1],[594,13,594,107,1],[595,13,595,72,1],[595,72,595,89,1],[595,89,595,94,1],[595,13,595,94,1],[596,13,598,76,1],[599,9,599,10,1],[603,9,603,10,1],[605,13,605,64,1],[608,13,608,86,1],[611,13,611,47,1],[612,13,612,56,1],[613,9,613,10,1],[617,9,617,10,1],[619,13,619,64,1],[622,13,622,86,1],[625,13,625,47,1],[626,13,626,56,1],[627,9,627,10,1],[631,9,631,10,1],[633,13,633,64,1],[636,13,636,83,1],[639,13,639,47,1],[640,13,640,56,1],[641,13,641,59,1],[642,9,642,10,1],[646,9,646,10,1],[647,13,653,15,1],[654,13,654,51,1],[655,13,655,116,1],[658,13,658,71,1],[661,13,661,65,1],[662,13,662,64,1],[663,9,663,10,1],[667,9,667,10,1],[669,13,669,64,1],[672,13,672,44,1],[672,44,672,107,1],[672,107,672,109,1],[672,13,672,109,1],[673,9,673,10,1],[677,9,677,10,1],[679,13,679,64,1],[680,13,680,122,1],[683,13,683,52,1],[683,52,683,80,1],[683,80,683,82,1],[683,13,683,82,1],[684,9,684,10,1],[688,9,688,10,1],[690,13,690,64,1],[693,13,693,74,1],[696,13,696,47,1],[697,13,697,73,1],[698,9,698,10,1],[702,9,702,10,1],[704,13,704,64,1],[707,13,707,100,1],[710,13,710,47,1],[711,13,711,73,1],[712,9,712,10,1],[716,9,716,10,1],[718,13,718,64,1],[721,13,721,66,1],[724,13,724,48,1],[725,13,725,50,1],[726,13,726,71,1],[727,9,727,10,1],[731,9,731,10,1],[733,13,733,64,1],[736,13,736,88,1],[739,13,739,48,1],[740,13,740,50,1],[741,13,741,71,1],[742,9,742,10,1],[746,9,746,10,1],[748,13,748,64,1],[749,13,749,54,1],[750,13,750,47,1],[753,13,753,91,1],[756,13,756,48,1],[757,13,757,50,1],[758,13,758,59,1],[759,9,759,10,1],[763,9,763,10,1],[765,13,765,64,1],[766,13,766,88,1],[767,13,767,59,1],[768,13,768,75,1],[770,13,770,51,1],[771,13,771,53,1],[772,13,772,66,1],[774,13,774,57,1],[775,13,775,53,1],[776,13,776,66,1],[779,13,779,88,1],[782,13,782,50,1],[783,13,783,71,1],[786,13,786,73,1],[787,13,787,73,1],[788,13,788,73,1],[789,9,789,10,1],[793,9,793,10,1],[795,13,795,64,1],[798,13,798,69,1],[801,13,801,48,1],[802,13,802,50,1],[803,13,803,58,1],[804,9,804,10,1],[808,9,808,10,1],[810,13,810,64,1],[811,13,811,71,1],[812,13,812,59,1],[813,13,813,74,1],[814,13,814,61,1],[815,13,815,62,1],[818,13,818,52,1],[819,13,819,78,1],[822,13,822,48,1],[823,13,823,50,1],[824,13,824,58,1],[825,9,825,10,1],[829,9,829,10,1],[831,13,831,64,1],[834,13,834,75,1],[837,13,837,70,1],[838,13,838,48,1],[839,13,839,50,1],[840,13,840,58,1],[841,9,841,10,1],[845,9,845,10,1],[847,13,847,64,1],[850,13,850,77,1],[853,13,853,48,1],[854,13,854,50,1],[855,13,855,58,1],[856,9,856,10,1],[860,9,860,10,1],[862,13,862,64,1],[863,13,863,74,1],[864,13,864,65,1],[866,13,866,67,1],[867,13,867,48,1],[868,13,868,75,1],[871,13,871,69,1],[874,13,874,45,1],[875,13,875,47,1],[876,13,876,54,1],[878,13,878,44,1],[879,13,879,76,1],[880,9,880,10,1],[892,9,892,10,0],[894,13,894,64,0],[895,13,895,60,0],[896,13,896,74,0],[899,13,899,69,0],[900,13,900,88,0],[903,13,903,45,0],[906,13,906,47,0],[907,13,907,54,0],[910,13,910,43,0],[910,43,910,54,0],[910,54,910,67,0],[910,13,910,67,0],[911,13,911,45,0],[911,45,911,75,0],[911,75,911,98,0],[911,13,911,98,0],[912,13,912,45,0],[912,45,912,75,0],[912,75,912,109,0],[912,13,912,109,0],[913,13,913,45,0],[913,45,913,75,0],[913,75,913,98,0],[913,13,913,98,0],[914,9,914,10,0],[918,9,918,10,1],[920,13,920,80,1],[921,13,921,72,1],[922,13,922,20,1],[922,22,922,27,1],[922,28,922,30,1],[922,31,922,42,1],[923,13,923,14,1],[924,17,924,55,1],[925,13,925,14,1],[926,13,926,77,1],[926,77,926,92,1],[926,92,926,95,1],[926,13,926,95,1],[928,13,928,67,1],[929,20,929,54,1],[930,13,930,14,1],[931,17,931,61,1],[932,13,932,14,1],[937,13,937,52,1],[940,13,940,60,1],[943,13,943,38,1],[944,20,944,54,1],[945,13,945,14,1],[946,17,946,124,1],[947,13,947,14,1],[948,9,948,10,1],[952,9,952,10,1],[954,13,954,80,1],[955,13,955,72,1],[956,13,956,20,1],[956,22,956,27,1],[956,28,956,30,1],[956,31,956,42,1],[957,13,957,14,1],[958,17,958,55,1],[959,13,959,14,1],[960,13,960,77,1],[960,77,960,92,1],[960,92,960,104,1],[960,13,960,104,1],[962,13,962,67,1],[964,20,964,54,1],[965,13,965,14,1],[966,17,966,61,1],[967,13,967,14,1],[970,13,970,52,1],[973,13,973,88,1],[976,20,976,54,1],[977,13,977,14,1],[978,17,978,124,1],[979,13,979,14,1],[980,9,980,10,1],[984,9,984,10,1],[986,13,986,64,1],[987,13,987,74,1],[990,13,990,65,1],[993,13,993,45,1],[994,13,994,53,1],[995,9,995,10,1],[999,9,999,10,1],[1000,13,1000,69,1],[1007,13,1007,14,1],[1008,17,1008,68,1],[1009,17,1009,78,1],[1010,17,1010,55,1],[1012,17,1012,38,1],[1013,17,1013,68,1],[1015,17,1015,49,1],[1016,17,1016,57,1],[1018,17,1018,75,1],[1019,17,1019,48,1],[1020,13,1020,14,1],[1022,13,1022,14,1],[1023,17,1023,73,1],[1024,13,1024,14,1],[1025,9,1025,10,1],[1028,9,1028,10,1],[1029,13,1029,64,1],[1030,13,1030,57,1],[1031,13,1031,49,1],[1033,13,1033,70,1],[1034,13,1034,45,1],[1035,9,1035,10,1],[1039,9,1039,10,1],[1041,13,1041,64,1],[1042,13,1042,72,1],[1043,13,1043,118,1],[1044,13,1044,50,1],[1046,13,1046,121,1],[1047,13,1047,54,1],[1048,13,1048,45,1],[1051,13,1051,73,1],[1052,13,1052,70,1],[1053,13,1053,65,1],[1056,13,1056,51,1],[1057,13,1057,46,1],[1058,13,1058,54,1],[1059,13,1059,52,1],[1060,13,1060,54,1],[1061,9,1061,10,1],[1065,9,1065,10,1],[1067,13,1067,64,1],[1068,13,1068,74,1],[1071,13,1071,77,1],[1072,13,1072,79,1],[1075,13,1075,45,1],[1076,13,1076,53,1],[1077,13,1077,45,1],[1077,45,1077,75,1],[1077,75,1077,97,1],[1077,13,1077,97,1],[1078,9,1078,10,1],[1082,9,1082,10,1],[1084,13,1084,64,1],[1085,13,1085,74,1],[1086,13,1086,62,1],[1087,13,1087,42,1],[1089,13,1089,73,1],[1090,13,1090,70,1],[1093,13,1093,65,1],[1096,13,1096,51,1],[1097,13,1097,46,1],[1098,13,1098,54,1],[1099,9,1099,10,1],[1103,9,1103,10,1],[1105,13,1105,64,1],[1106,13,1106,74,1],[1107,13,1107,60,1],[1108,13,1108,45,1],[1110,13,1110,73,1],[1111,13,1111,70,1],[1114,13,1114,65,1],[1117,13,1117,51,1],[1118,13,1118,46,1],[1119,13,1119,54,1],[1120,9,1120,10,1],[1124,9,1124,10,1],[1126,13,1126,64,1],[1127,13,1127,134,1],[1128,13,1128,45,1],[1131,13,1131,77,1],[1134,13,1134,46,1],[1135,13,1135,54,1],[1136,9,1136,10,1],[1140,9,1140,10,1],[1142,13,1142,64,1],[1143,13,1143,74,1],[1146,13,1146,65,1],[1149,13,1149,46,1],[1150,13,1150,54,1],[1151,13,1151,51,1],[1152,9,1152,10,1],[1156,9,1156,10,1],[1158,13,1158,64,1],[1159,13,1159,89,1],[1160,13,1160,56,1],[1163,13,1163,72,1],[1166,13,1166,55,1],[1167,13,1167,53,1],[1168,13,1168,45,1],[1169,9,1169,10,1],[1173,9,1173,10,1],[1175,13,1175,64,1],[1176,13,1176,71,1],[1177,13,1177,62,1],[1178,13,1178,74,1],[1179,13,1179,98,1],[1180,13,1180,69,1],[1182,13,1182,52,1],[1184,13,1184,94,1],[1185,13,1185,42,1],[1187,13,1187,48,1],[1190,13,1190,112,1],[1193,13,1193,49,1],[1194,13,1194,45,1],[1195,13,1195,55,1],[1195,55,1195,84,1],[1195,84,1195,96,1],[1195,13,1195,96,1],[1196,13,1196,55,1],[1196,55,1196,80,1],[1196,80,1196,93,1],[1196,13,1196,93,1],[1199,13,1199,75,1],[1199,75,1199,104,1],[1199,104,1199,106,1],[1199,13,1199,106,1],[1200,13,1200,69,1],[1201,13,1201,109,1],[1204,13,1204,81,1],[1205,13,1205,66,1],[1206,13,1206,101,1],[1209,13,1209,81,1],[1210,13,1210,61,1],[1211,13,1211,96,1],[1212,13,1212,75,1],[1213,9,1213,10,1],[1217,9,1217,10,1],[1219,13,1219,64,1],[1220,13,1220,89,1],[1221,13,1221,56,1],[1224,13,1224,45,1],[1227,13,1227,55,1],[1228,9,1228,10,1],[1232,9,1232,10,1],[1234,13,1234,64,1],[1235,13,1235,72,1],[1237,13,1237,80,1],[1238,13,1238,120,1],[1239,13,1239,121,1],[1240,13,1240,65,1],[1243,13,1243,42,1],[1246,13,1246,39,1],[1246,39,1246,53,1],[1246,53,1246,66,1],[1246,13,1246,66,1],[1247,9,1247,10,1],[1251,9,1251,10,1],[1253,13,1253,64,1],[1254,13,1254,63,1],[1257,13,1257,47,1],[1259,13,1259,51,1],[1260,13,1260,44,1],[1260,44,1260,66,1],[1260,66,1260,79,1],[1260,13,1260,79,1],[1262,13,1262,39,1],[1262,39,1262,58,1],[1262,58,1262,73,1],[1262,73,1262,74,1],[1262,39,1262,74,1],[1262,74,1262,76,1],[1262,13,1262,76,1],[1264,9,1264,10,1],[1268,9,1268,10,1],[1270,13,1270,64,1],[1271,13,1271,72,1],[1272,13,1272,80,1],[1275,13,1275,64,1],[1276,13,1276,63,1],[1277,13,1277,83,1],[1280,13,1280,54,1],[1281,13,1281,43,1],[1281,43,1281,53,0],[1281,53,1281,66,1],[1281,13,1281,66,1],[1282,9,1282,10,1],[1286,9,1286,10,1],[1288,13,1288,64,1],[1289,13,1289,74,1],[1292,13,1292,47,1],[1293,13,1293,74,1],[1296,13,1296,43,1],[1297,9,1297,10,1],[1301,9,1301,10,1],[1303,13,1303,64,1],[1304,13,1304,74,1],[1307,13,1307,57,1],[1310,13,1310,60,1],[1311,13,1311,51,1],[1312,9,1312,10,1],[1316,9,1316,10,1],[1318,13,1318,64,1],[1319,13,1319,95,1],[1320,13,1320,120,1],[1321,13,1321,48,1],[1323,13,1323,74,1],[1326,13,1326,57,1],[1327,13,1327,79,1],[1330,13,1330,60,1],[1331,13,1331,51,1],[1332,13,1332,61,1],[1333,13,1333,46,1],[1333,46,1333,77,1],[1333,77,1333,90,1],[1333,13,1333,90,1],[1336,13,1336,46,1],[1337,13,1337,67,1],[1339,13,1339,50,1],[1340,9,1340,10,1],[1344,9,1344,10,1],[1346,13,1346,64,1],[1349,13,1349,46,1],[1350,13,1350,68,1],[1353,13,1353,51,1],[1354,9,1354,10,1],[1358,9,1358,10,1],[1370,13,1370,92,1],[1371,13,1371,68,1],[1373,13,1377,18,1],[1378,13,1378,74,1],[1379,13,1379,42,1],[1380,13,1380,50,1],[1381,13,1381,61,1],[1382,13,1382,97,1],[1383,13,1383,74,1],[1384,13,1384,42,1],[1385,13,1385,50,1],[1386,13,1386,61,1],[1387,13,1387,97,1],[1389,13,1389,147,1],[1390,13,1390,97,1],[1392,13,1399,17,1],[1400,13,1400,107,1],[1402,13,1402,146,1],[1404,13,1404,93,1],[1406,13,1409,25,1],[1412,13,1412,61,1],[1413,13,1413,83,1],[1416,13,1416,51,1],[1417,9,1417,10,1],[1421,9,1421,10,1],[1423,13,1423,64,1],[1424,13,1424,74,1],[1427,13,1427,69,1],[1430,13,1430,79,1],[1431,13,1431,52,1],[1432,13,1432,54,1],[1433,9,1433,10,1],[1437,9,1437,10,1],[1439,13,1439,64,1],[1440,13,1440,71,1],[1443,13,1443,75,1],[1444,13,1444,74,1],[1447,13,1447,44,1],[1448,13,1448,62,1],[1449,13,1449,46,1],[1450,13,1450,20,1],[1450,22,1450,34,1],[1450,35,1450,37,1],[1450,38,1450,53,1],[1451,13,1451,14,1],[1452,17,1452,88,1],[1453,17,1453,91,1],[1454,13,1454,14,1],[1456,9,1456,10,1],[1460,9,1460,10,1],[1462,13,1462,64,1],[1463,13,1463,71,1],[1464,13,1464,48,1],[1465,13,1465,57,1],[1468,13,1468,81,1],[1469,13,1469,74,1],[1472,13,1472,44,1],[1473,13,1473,62,1],[1474,13,1474,46,1],[1475,13,1475,57,1],[1477,13,1477,72,1],[1478,13,1478,53,1],[1479,13,1479,57,1],[1480,13,1480,56,1],[1481,13,1481,58,1],[1482,9,1482,10,1],[1486,9,1486,10,1],[1488,13,1488,64,1],[1489,13,1489,71,1],[1490,13,1490,48,1],[1491,13,1491,57,1],[1494,13,1494,82,1],[1495,13,1495,74,1],[1498,13,1498,44,1],[1499,13,1499,62,1],[1500,13,1500,46,1],[1501,13,1501,57,1],[1502,9,1502,10,1],[1506,9,1506,10,1],[1508,13,1508,64,1],[1509,13,1509,95,1],[1510,13,1510,95,1],[1511,13,1511,48,1],[1512,13,1512,72,1],[1513,13,1513,65,1],[1516,13,1516,75,1],[1519,13,1519,92,1],[1520,13,1520,52,1],[1521,13,1521,58,1],[1522,13,1522,58,1],[1523,9,1523,10,1],[1527,9,1527,10,0],[1527,11,1527,12,0],[1531,9,1531,10,1],[1533,13,1533,64,1],[1534,13,1534,88,1],[1535,13,1535,59,1],[1536,13,1536,75,1],[1537,13,1537,44,1],[1538,13,1538,52,1],[1539,13,1539,51,1],[1540,13,1540,53,1],[1541,13,1541,66,1],[1544,13,1544,88,1],[1547,13,1547,48,1],[1548,13,1548,68,1],[1549,13,1549,90,1],[1550,13,1550,64,1],[1551,9,1551,10,1],[1555,9,1555,10,1],[1556,13,1556,94,1],[1557,13,1557,95,1],[1558,13,1558,86,1],[1560,13,1560,46,1],[1560,46,1560,131,1],[1560,131,1560,133,1],[1560,13,1560,133,1],[1561,13,1561,47,1],[1561,47,1561,138,1],[1561,138,1561,140,1],[1561,13,1561,140,1],[1562,13,1562,59,1],[1565,20,1565,92,1],[1566,13,1566,14,1],[1567,17,1567,24,1],[1567,26,1567,37,1],[1567,38,1567,40,1],[1567,41,1567,45,1],[1568,17,1568,18,1],[1569,21,1569,59,1],[1570,21,1570,41,1],[1571,17,1571,18,1],[1573,17,1573,59,1],[1574,17,1574,60,1],[1576,17,1576,54,1],[1577,17,1577,55,1],[1579,17,1579,60,1],[1580,17,1580,61,1],[1581,13,1581,14,1],[1583,9,1583,10,1],[1587,9,1587,10,1],[1589,13,1589,64,1],[1590,13,1590,74,1],[1591,13,1591,77,1],[1592,13,1592,75,1],[1593,13,1593,40,1],[1594,13,1594,58,1],[1597,13,1597,114,1],[1600,13,1600,45,1],[1601,13,1601,55,1],[1602,13,1602,55,1],[1603,9,1603,10,1],[1607,9,1607,10,1],[1609,13,1609,72,1],[1610,13,1610,109,1],[1611,13,1611,50,1],[1612,13,1612,64,1],[1613,13,1613,98,1],[1614,13,1614,42,1],[1615,13,1615,33,1],[1618,13,1618,50,1],[1621,13,1621,64,1],[1622,13,1622,70,1],[1623,13,1623,101,1],[1624,13,1624,102,1],[1625,13,1625,108,1],[1626,13,1626,94,1],[1627,13,1627,90,1],[1630,13,1630,141,1],[1631,13,1631,83,1],[1634,13,1634,87,1],[1635,13,1635,79,1],[1636,13,1636,133,1],[1637,13,1637,74,1],[1638,13,1638,81,1],[1639,13,1639,79,1],[1640,13,1640,77,1],[1641,13,1641,78,1],[1642,13,1642,180,1],[1643,13,1643,83,1],[1644,9,1644,10,1],[1648,9,1648,10,1],[1650,13,1650,64,1],[1651,13,1651,74,1],[1652,13,1652,43,1],[1655,13,1655,84,1],[1656,13,1656,70,1],[1659,13,1659,59,1],[1660,9,1660,10,1],[1664,9,1664,10,1],[1665,13,1665,64,1],[1666,13,1666,89,1],[1667,13,1667,56,1],[1669,13,1669,42,1],[1671,13,1671,67,1],[1673,20,1673,54,1],[1674,13,1674,14,1],[1675,17,1675,80,1],[1676,13,1676,14,1],[1678,13,1678,45,1],[1680,20,1680,54,1],[1681,13,1681,14,1],[1682,17,1682,79,1],[1683,13,1683,14,1],[1684,9,1684,10,1],[1688,9,1688,10,1],[1689,13,1689,64,1],[1690,13,1690,89,1],[1691,13,1691,56,1],[1693,13,1693,42,1],[1695,13,1695,67,1],[1697,20,1697,54,1],[1698,13,1698,14,1],[1699,17,1699,193,1],[1700,13,1700,14,1],[1701,9,1701,10,1],[1705,9,1705,10,1],[1706,13,1706,64,1],[1707,13,1707,89,1],[1708,13,1708,56,1],[1710,13,1710,42,1],[1712,13,1712,48,1],[1713,13,1713,57,1],[1715,13,1715,58,1],[1716,13,1716,57,1],[1717,9,1717,10,1],[1721,9,1721,10,1],[1722,13,1722,64,1],[1723,13,1723,89,1],[1724,13,1724,56,1],[1726,13,1726,62,1],[1728,13,1728,48,1],[1729,13,1729,56,1],[1730,13,1730,76,1],[1732,13,1732,58,1],[1733,13,1733,56,1],[1734,13,1734,76,1],[1735,9,1735,10,1],[1739,9,1739,10,1],[1740,13,1740,64,1],[1741,13,1741,89,1],[1742,13,1742,56,1],[1744,13,1744,62,1],[1745,13,1745,54,1],[1746,13,1746,42,1],[1748,13,1748,48,1],[1749,13,1749,56,1],[1750,13,1750,79,1],[1752,13,1752,58,1],[1753,13,1753,47,1],[1754,13,1754,56,1],[1755,13,1755,79,1],[1757,13,1757,73,1],[1758,13,1758,48,1],[1759,13,1759,58,1],[1760,13,1760,80,1],[1761,9,1761,10,1],[1765,9,1765,10,1],[1766,13,1766,64,1],[1767,13,1767,89,1],[1768,13,1768,56,1],[1770,13,1770,62,1],[1771,13,1771,47,1],[1773,13,1773,48,1],[1774,13,1774,57,1],[1776,13,1776,58,1],[1777,13,1777,57,1],[1778,9,1778,10,1],[1782,9,1782,10,1],[1783,13,1783,64,1],[1784,13,1784,89,1],[1785,13,1785,56,1],[1787,13,1787,42,1],[1788,13,1788,48,1],[1789,13,1789,57,1],[1790,13,1790,59,1],[1792,13,1792,62,1],[1793,13,1793,56,1],[1794,13,1794,58,1],[1795,9,1795,10,1],[1798,9,1798,10,1],[1799,13,1799,95,1],[1800,13,1800,86,1],[1802,13,1802,45,1],[1804,18,1804,27,1],[1804,29,1804,35,1],[1804,37,1804,40,1],[1805,13,1805,14,1],[1806,17,1806,119,1],[1808,17,1808,35,1],[1809,17,1809,74,1],[1811,17,1811,77,1],[1812,13,1812,14,1],[1814,13,1814,25,1],[1815,9,1815,10,1],[1818,9,1818,10,1],[1819,13,1819,45,1],[1820,18,1820,27,1],[1820,29,1820,38,1],[1820,40,1820,43,1],[1821,13,1821,14,1],[1822,17,1822,119,1],[1823,17,1823,29,1],[1825,17,1825,100,1],[1826,13,1826,14,1],[1827,13,1827,25,1],[1828,9,1828,10,1],[1831,9,1831,10,1],[1832,13,1832,223,1],[1833,13,1833,135,1],[1834,13,1834,167,1],[1835,13,1835,222,1],[1836,13,1836,31,1],[1837,9,1837,10,1]]);
+    </script>
+  </body>
+</html>

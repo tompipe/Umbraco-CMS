@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Cache\MediaCacheRefresher.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Web.Script.Serialization;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Events;
+using Umbraco.Core.IO;
+using Umbraco.Core.Models;
+
+using Umbraco.Core.Persistence.Repositories;
+using umbraco.interfaces;
+using System.Linq;
+using Umbraco.Web.PublishedCache.XmlPublishedCache;
+
+namespace Umbraco.Web.Cache
+{
+    /// &lt;summary&gt;
+    /// A cache refresher to ensure media cache is updated
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// This is not intended to be used directly in your code and it should be sealed but due to legacy code we cannot seal it.
+    /// &lt;/remarks&gt;
+    public class MediaCacheRefresher : JsonCacheRefresherBase&lt;MediaCacheRefresher&gt;
+    {
+        #region Static helpers
+
+        /// &lt;summary&gt;
+        /// Converts the json to a JsonPayload object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;json&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static JsonPayload[] DeserializeFromJsonPayload(string json)
+        {
+            var serializer = new JavaScriptSerializer();
+            var jsonObject = serializer.Deserialize&lt;JsonPayload[]&gt;(json);
+            return jsonObject;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates the custom Json payload used to refresh cache amongst the servers
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;operation&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;media&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static string SerializeToJsonPayload(OperationType operation, params IMedia[] media)
+        {
+            var serializer = new JavaScriptSerializer();
+            var items = media.Select(x =&gt; FromMedia(x, operation)).ToArray();
+            var json = serializer.Serialize(items);
+            return json;
+        }
+
+        internal static string SerializeToJsonPayloadForMoving(OperationType operation, MoveEventInfo&lt;IMedia&gt;[] media)
+        {
+            var serializer = new JavaScriptSerializer();
+            var items = media.Select(x =&gt; new JsonPayload
+            {
+                Id = x.Entity.Id,
+                Operation = operation,
+                Path = x.OriginalPath
+            }).ToArray();
+            var json = serializer.Serialize(items);
+            return json;
+        }
+
+        internal static string SerializeToJsonPayloadForPermanentDeletion(params int[] mediaIds)
+        {
+            var serializer = new JavaScriptSerializer();
+            var items = mediaIds.Select(x =&gt; new JsonPayload
+            {
+                Id = x,
+                Operation = OperationType.Deleted
+            }).ToArray();
+            var json = serializer.Serialize(items);
+            return json;
+        }
+
+        /// &lt;summary&gt;
+        /// Converts a macro to a jsonPayload object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;media&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;operation&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static JsonPayload FromMedia(IMedia media, OperationType operation)
+        {
+            if (media == null) return null;
+
+            var payload = new JsonPayload
+            {
+                Id = media.Id,
+                Path = media.Path,
+                Operation = operation
+            };
+            return payload;
+        }
+
+        #endregion
+
+        #region Sub classes
+
+        public enum OperationType
+        {
+            Saved,
+            Trashed,
+            Deleted
+        }
+
+        public class JsonPayload
+        {
+            public string Path { get; set; }
+            public int Id { get; set; }
+            public OperationType Operation { get; set; }
+        }
+
+        #endregion
+
+        protected override MediaCacheRefresher Instance
+        {
+            get { return this; }
+        }
+
+        public override Guid UniqueIdentifier
+        {
+            get { return new Guid(DistributedCache.MediaCacheRefresherId); }
+        }
+
+        public override string Name
+        {
+            get { return &quot;Clears Media Cache from umbraco.library&quot;; }
+        }
+
+        public override void Refresh(string jsonPayload)
+        {
+            ClearCache(DeserializeFromJsonPayload(jsonPayload));
+            base.Refresh(jsonPayload);
+        }
+
+        public override void Refresh(int id)
+        {
+            ClearCache(FromMedia(ApplicationContext.Current.Services.MediaService.GetById(id), OperationType.Saved));
+            base.Refresh(id);
+        }
+
+        public override void Remove(int id)
+        {
+            ClearCache(FromMedia(ApplicationContext.Current.Services.MediaService.GetById(id),
+                //NOTE: we&#39;ll just default to trashed for this one.    
+                OperationType.Trashed));
+            base.Remove(id);
+        }
+
+        private static void ClearCache(params JsonPayload[] payloads)
+        {
+            if (payloads == null) return;
+
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(CacheKeys.IdToKeyCacheKey);
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(CacheKeys.KeyToIdCacheKey);
+            ApplicationContext.Current.ApplicationCache.ClearPartialViewCache();
+
+            payloads.ForEach(payload =&gt;
+            {
+                var mediaCache = ApplicationContext.Current.ApplicationCache.IsolatedRuntimeCache.GetCache&lt;IMedia&gt;();
+
+                //if there&#39;s no path, then just use id (this will occur on permanent deletion like emptying recycle bin)
+                if (payload.Path.IsNullOrWhiteSpace())
+                {
+                    ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(
+                        string.Format(&quot;{0}_{1}&quot;, CacheKeys.MediaCacheKey, payload.Id));
+                }
+                else
+                {
+                    foreach (var idPart in payload.Path.Split(&#39;,&#39;))
+                    {
+                        int idPartAsInt;
+                        if (int.TryParse(idPart, out idPartAsInt) &amp;&amp; mediaCache)
+                        {
+                            mediaCache.Result.ClearCacheItem(RepositoryBase.GetCacheIdKey&lt;IMedia&gt;(idPartAsInt));
+                        }
+
+                        ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(
+                            string.Format(&quot;{0}_{1}_True&quot;, CacheKeys.MediaCacheKey, idPart));
+
+                        // Also clear calls that only query this specific item!
+                        if (idPart == payload.Id.ToString(CultureInfo.InvariantCulture))
+                            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheByKeySearch(
+                                string.Format(&quot;{0}_{1}&quot;, CacheKeys.MediaCacheKey, payload.Id));
+                    }
+                }
+
+                // published cache...
+                PublishedMediaCache.ClearCache(payload.Id);
+            });
+
+
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[34,9,34,10,0],[35,13,35,57,0],[36,13,36,74,0],[37,13,37,31,0],[38,9,38,10,0],[47,9,47,10,0],[48,13,48,57,0],[49,13,49,43,0],[49,43,49,66,0],[49,66,49,78,0],[49,13,49,78,0],[50,13,50,52,0],[51,13,51,25,0],[52,9,52,10,0],[55,9,55,10,0],[56,13,56,57,0],[57,13,57,43,0],[57,43,62,14,0],[62,14,62,26,0],[57,13,62,26,0],[63,13,63,52,0],[64,13,64,25,0],[65,9,65,10,0],[68,9,68,10,0],[69,13,69,57,0],[70,13,70,46,0],[70,46,74,14,0],[74,14,74,26,0],[70,13,74,26,0],[75,13,75,52,0],[76,13,76,25,0],[77,9,77,10,0],[86,9,86,10,0],[87,13,87,31,0],[87,32,87,44,0],[89,13,94,15,0],[95,13,95,28,0],[96,9,96,10,0],[111,34,111,38,0],[111,39,111,43,0],[112,29,112,33,0],[112,34,112,38,0],[113,46,113,50,0],[113,51,113,55,0],[120,17,120,18,0],[120,19,120,31,0],[120,32,120,33,0],[125,17,125,18,0],[125,19,125,75,0],[125,76,125,77,0],[130,17,130,18,0],[130,19,130,68,0],[130,69,130,70,0],[134,9,134,10,0],[135,13,135,65,0],[136,13,136,39,0],[137,9,137,10,0],[140,9,140,10,0],[141,13,141,118,0],[142,13,142,30,0],[143,9,143,10,0],[146,9,146,10,0],[147,13,149,41,0],[150,13,150,29,0],[151,9,151,10,0],[154,9,154,10,0],[155,13,155,34,0],[155,35,155,42,0],[157,13,157,119,0],[158,13,158,119,0],[159,13,159,81,0],[161,13,162,13,0],[162,13,162,14,0],[162,14,163,17,0],[163,17,163,118,0],[163,118,166,17,0],[166,17,166,55,0],[166,55,167,17,0],[167,17,167,18,0],[167,18,168,21,0],[168,21,169,88,0],[169,88,170,17,0],[170,17,170,18,0],[170,18,172,17,0],[172,17,172,18,0],[172,18,173,21,0],[173,21,173,28,0],[173,28,173,30,0],[173,30,173,40,0],[173,40,173,41,0],[173,41,173,43,0],[173,43,173,44,0],[173,44,173,67,0],[173,67,174,21,0],[174,21,174,22,0],[174,22,176,25,0],[176,25,176,81,0],[176,81,177,25,0],[177,25,177,26,0],[177,26,178,29,0],[178,29,178,113,0],[178,113,179,25,0],[179,25,179,26,0],[179,26,181,25,0],[181,25,182,93,0],[182,93,185,25,0],[185,25,185,89,0],[185,89,186,29,0],[186,29,187,96,0],[187,96,188,21,0],[188,21,188,22,0],[188,22,189,17,0],[189,17,189,18,0],[189,18,192,17,0],[192,17,192,60,0],[192,60,193,13,0],[193,13,193,14,0],[193,14,193,16,0],[161,13,193,16,0],[196,9,196,10,0]]);
+    </script>
+  </body>
+</html>

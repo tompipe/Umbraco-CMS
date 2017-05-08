@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Routing\DefaultUrlProvider.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.Logging;
+using Umbraco.Web.PublishedCache;
+using umbraco.cms.businesslogic.web;
+
+namespace Umbraco.Web.Routing
+{
+    /// &lt;summary&gt;
+    /// Provides urls.
+    /// &lt;/summary&gt;
+    public class DefaultUrlProvider : IUrlProvider
+    {
+        private readonly IRequestHandlerSection _requestSettings;
+
+        [Obsolete(&quot;Use the ctor that specifies the IRequestHandlerSection&quot;)]
+        public DefaultUrlProvider()
+            : this(UmbracoConfig.For.UmbracoSettings().RequestHandler)
+        {            
+        }
+
+        public DefaultUrlProvider(IRequestHandlerSection requestSettings)
+        {
+            _requestSettings = requestSettings;
+        }
+
+        #region GetUrl
+
+        /// &lt;summary&gt;
+        /// Gets the nice url of a published content.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbracoContext&quot;&gt;The Umbraco context.&lt;/param&gt;
+        /// &lt;param name=&quot;id&quot;&gt;The published content id.&lt;/param&gt;
+        /// &lt;param name=&quot;current&quot;&gt;The current absolute url.&lt;/param&gt;
+        /// &lt;param name=&quot;mode&quot;&gt;The url mode.&lt;/param&gt;
+        /// &lt;returns&gt;The url for the published content.&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// &lt;para&gt;The url is absolute or relative depending on &lt;c&gt;mode&lt;/c&gt; and on &lt;c&gt;current&lt;/c&gt;.&lt;/para&gt;
+        /// &lt;para&gt;If the provider is unable to provide a url, it should return &lt;c&gt;null&lt;/c&gt;.&lt;/para&gt;
+        /// &lt;/remarks&gt;
+        public virtual string GetUrl(UmbracoContext umbracoContext, int id, Uri current, UrlProviderMode mode)
+        {
+            if (!current.IsAbsoluteUri)
+                throw new ArgumentException(&quot;Current url must be absolute.&quot;, &quot;current&quot;);
+
+            // will not use cache if previewing
+            var route = umbracoContext.ContentCache.GetRouteById(id);
+
+            return GetUrlFromRoute(route, umbracoContext, id, current, mode);
+        }
+
+        internal string GetUrlFromRoute(string route, UmbracoContext umbracoContext, int id, Uri current, UrlProviderMode mode)
+        {
+            if (string.IsNullOrWhiteSpace(route))
+            {
+                LogHelper.Debug&lt;DefaultUrlProvider&gt;(
+                    &quot;Couldn&#39;t find any page with nodeId={0}. This is most likely caused by the page not being published.&quot;,
+                    () =&gt; id);
+                return null;
+            }
+
+            var domainHelper = new DomainHelper(umbracoContext.Application.Services.DomainService);
+
+            // extract domainUri and path
+            // route is /&lt;path&gt; or &lt;domainRootId&gt;/&lt;path&gt;
+            var pos = route.IndexOf(&#39;/&#39;);
+            var path = pos == 0 ? route : route.Substring(pos);
+            var domainUri = pos == 0
+                ? null
+                : domainHelper.DomainForNode(int.Parse(route.Substring(0, pos)), current);
+
+            // assemble the url from domainUri (maybe null) and path
+            return AssembleUrl(domainUri, path, current, mode).ToString();
+        }
+
+        #endregion
+
+        #region GetOtherUrls
+
+        /// &lt;summary&gt;
+        /// Gets the other urls of a published content.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbracoContext&quot;&gt;The Umbraco context.&lt;/param&gt;
+        /// &lt;param name=&quot;id&quot;&gt;The published content id.&lt;/param&gt;
+        /// &lt;param name=&quot;current&quot;&gt;The current absolute url.&lt;/param&gt;
+        /// &lt;returns&gt;The other urls for the published content.&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// &lt;para&gt;Other urls are those that &lt;c&gt;GetUrl&lt;/c&gt; would not return in the current context, but would be valid
+        /// urls for the node in other contexts (different domain for current request, umbracoUrlAlias...).&lt;/para&gt;
+        /// &lt;/remarks&gt;
+        public virtual IEnumerable&lt;string&gt; GetOtherUrls(UmbracoContext umbracoContext, int id, Uri current)
+        {
+            // will not use cache if previewing
+            var route = umbracoContext.ContentCache.GetRouteById(id);
+
+            if (string.IsNullOrWhiteSpace(route))
+            {
+                LogHelper.Debug&lt;DefaultUrlProvider&gt;(
+                    &quot;Couldn&#39;t find any page with nodeId={0}. This is most likely caused by the page not being published.&quot;,
+                    () =&gt; id);
+                return null;
+            }
+
+            var domainHelper = new DomainHelper(umbracoContext.Application.Services.DomainService);
+
+            // extract domainUri and path
+            // route is /&lt;path&gt; or &lt;domainRootId&gt;/&lt;path&gt;
+            var pos = route.IndexOf(&#39;/&#39;);
+            var path = pos == 0 ? route : route.Substring(pos);
+            var domainUris = pos == 0 ? null : domainHelper.DomainsForNode(int.Parse(route.Substring(0, pos)), current);
+
+            // assemble the alternate urls from domainUris (maybe empty) and path
+            return AssembleUrls(domainUris, path).Select(uri =&gt; uri.ToString());
+        }
+
+        #endregion
+
+        #region Utilities
+
+        Uri AssembleUrl(DomainAndUri domainUri, string path, Uri current, UrlProviderMode mode)
+        {
+            Uri uri;
+
+            // ignore vdir at that point, UriFromUmbraco will do it
+
+            if (mode == UrlProviderMode.AutoLegacy)
+            {
+                mode = _requestSettings.UseDomainPrefixes
+                    ? UrlProviderMode.Absolute
+                    : UrlProviderMode.Auto;
+            }
+
+            if (domainUri == null) // no domain was found
+            {
+                if (current == null)
+                    mode = UrlProviderMode.Relative; // best we can do
+
+                switch (mode)
+                {
+                    case UrlProviderMode.Absolute:
+                        uri = new Uri(current.GetLeftPart(UriPartial.Authority) + path);
+                        break;
+                    case UrlProviderMode.Relative:
+                    case UrlProviderMode.Auto:
+                        uri = new Uri(path, UriKind.Relative);
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;mode&quot;);
+                }
+            }
+            else // a domain was found
+            {
+                if (mode == UrlProviderMode.Auto)
+                {
+                    if (current != null &amp;&amp; domainUri.Uri.GetLeftPart(UriPartial.Authority) == current.GetLeftPart(UriPartial.Authority))
+                        mode = UrlProviderMode.Relative;
+                    else
+                        mode = UrlProviderMode.Absolute;
+                }
+
+                switch (mode)
+                {
+                    case UrlProviderMode.Absolute:
+                        uri = new Uri(CombinePaths(domainUri.Uri.GetLeftPart(UriPartial.Path), path));
+                        break;
+                    case UrlProviderMode.Relative:
+                        uri = new Uri(CombinePaths(domainUri.Uri.AbsolutePath, path), UriKind.Relative);
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;mode&quot;);
+                }
+            }
+
+            // UriFromUmbraco will handle vdir
+            // meaning it will add vdir into domain urls too!
+            return UriUtility.UriFromUmbraco(uri);
+        }
+
+        string CombinePaths(string path1, string path2)
+        {
+            string path = path1.TrimEnd(&#39;/&#39;) + path2;
+            return path == &quot;/&quot; ? path : path.TrimEnd(&#39;/&#39;);
+        }
+
+        // always build absolute urls unless we really cannot
+        IEnumerable&lt;Uri&gt; AssembleUrls(IEnumerable&lt;DomainAndUri&gt; domainUris, string path)
+        {
+            // no domain == no &quot;other&quot; url
+            if (domainUris == null)
+                return Enumerable.Empty&lt;Uri&gt;();
+
+            // if no domain was found and then we have no &quot;other&quot; url
+            // else return absolute urls, ignoring vdir at that point
+            var uris = domainUris.Select(domainUri =&gt; new Uri(CombinePaths(domainUri.Uri.GetLeftPart(UriPartial.Path), path)));
+
+            // UriFromUmbraco will handle vdir
+            // meaning it will add vdir into domain urls too!
+            return uris.Select(UriUtility.UriFromUmbraco);
+        }
+
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,15,24,71,1],[25,9,25,10,1],[26,9,26,10,1],[28,9,28,74,1],[29,9,29,10,1],[30,13,30,48,1],[31,9,31,10,1],[48,9,48,10,1],[49,13,49,40,1],[50,17,50,89,0],[53,13,53,70,1],[55,13,55,78,1],[56,9,56,10,1],[59,9,59,10,1],[60,13,60,50,1],[61,13,61,14,1],[62,17,64,27,1],[64,27,64,29,0],[64,29,64,31,1],[62,17,64,31,1],[65,17,65,29,1],[68,13,68,100,1],[72,13,72,42,1],[73,13,73,64,1],[74,13,76,91,1],[79,13,79,75,1],[80,9,80,10,1],[98,9,98,10,1],[100,13,100,70,1],[102,13,102,50,1],[103,13,103,14,0],[104,17,106,27,0],[106,27,106,29,0],[106,29,106,31,0],[104,17,106,31,0],[107,17,107,29,0],[110,13,110,100,1],[114,13,114,42,1],[115,13,115,64,1],[116,13,116,121,1],[119,13,119,65,1],[119,65,119,79,1],[119,79,119,81,1],[119,13,119,81,1],[120,9,120,10,1],[127,9,127,10,1],[132,13,132,52,1],[133,13,133,14,1],[134,17,136,44,1],[137,13,137,14,1],[139,13,139,35,1],[140,13,140,14,1],[141,17,141,37,1],[142,21,142,53,0],[144,17,144,30,1],[147,25,147,89,1],[148,25,148,31,1],[151,25,151,63,1],[152,25,152,31,1],[154,25,154,71,0],[156,13,156,14,1],[158,13,158,14,1],[159,17,159,50,1],[160,17,160,18,1],[161,21,161,137,1],[162,25,162,57,1],[164,25,164,57,1],[165,17,165,18,1],[167,17,167,30,1],[170,25,170,103,1],[171,25,171,31,1],[173,25,173,105,1],[174,25,174,31,1],[176,25,176,71,0],[178,13,178,14,1],[182,13,182,51,1],[183,9,183,10,1],[186,9,186,10,1],[187,13,187,54,1],[188,13,188,59,1],[189,9,189,10,1],[193,9,193,10,1],[195,13,195,36,1],[196,17,196,48,0],[200,13,200,55,1],[200,55,200,126,1],[200,126,200,128,1],[200,13,200,128,1],[204,13,204,59,1],[205,9,205,10,1]]);
+    </script>
+  </body>
+</html>

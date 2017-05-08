@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\Trees\TreeDefinitionCollection.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Data;
+using System.Configuration;
+using System.Threading;
+using System.Web;
+using System.Web.Security;
+using System.Web.UI;
+using System.Web.UI.WebControls;
+using System.Web.UI.WebControls.WebParts;
+using System.Web.UI.HtmlControls;
+using System.Collections.Generic;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Web;
+using umbraco.interfaces;
+using umbraco.BusinessLogic.Utils;
+using umbraco.BusinessLogic;
+using umbraco.BasePages;
+
+namespace umbraco.cms.presentation.Trees
+{
+    /// &lt;summary&gt;
+    /// A collection of TreeDefinitions found in any loaded assembly.
+    /// &lt;/summary&gt;
+    public class TreeDefinitionCollection : List&lt;TreeDefinition&gt;
+    {
+
+        //create singleton
+        private static readonly TreeDefinitionCollection instance = new TreeDefinitionCollection();
+
+        private static readonly object Locker = new object();
+        private static volatile bool _ensureTrees = false;
+
+        public static TreeDefinitionCollection Instance
+        {
+            get 
+            {
+				instance.EnsureTreesRegistered();
+                return instance; 
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Find the TreeDefinition object based on the ITree
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;tree&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public TreeDefinition FindTree(ITree tree)
+        {
+			EnsureTreesRegistered();
+
+            var foundTree = this.Find(
+            	t =&gt; t.TreeType == tree.GetType()
+            	);
+            if (foundTree != null)
+                return foundTree;
+
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// Finds the TreeDefinition with the generic type specified
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public TreeDefinition FindTree&lt;T&gt;() where T : ITree
+        {
+			EnsureTreesRegistered();
+
+            var foundTree = this.Find(
+               delegate(TreeDefinition t)
+               {
+                   // zb-00002 #29929 : use IsAssignableFrom instead of Equal, otherwise you can&#39;t override built-in
+                   // trees because for ex. PermissionEditor.aspx.cs OnInit calls FindTree&lt;loadContent&gt;()
+                   return typeof(T).IsAssignableFrom(t.TreeType);
+               }
+           );
+            if (foundTree != null)
+                return foundTree;
+
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// Return the TreeDefinition object based on the tree alias and application it belongs to
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public TreeDefinition FindTree(string alias)
+        {
+			EnsureTreesRegistered();
+
+            var foundTree = this.Find(
+            	t =&gt; t.Tree.Alias.ToLower() == alias.ToLower()
+            	);
+            if (foundTree != null)
+                return foundTree;
+
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// Return a list of TreeDefinition&#39;s with the appAlias specified
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;appAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public List&lt;TreeDefinition&gt; FindTrees(string appAlias)
+        {
+			EnsureTreesRegistered();
+
+            return this.FindAll(
+            	tree =&gt; (tree.App != null &amp;&amp; tree.App.alias.ToLower() == appAlias.ToLower())
+            	);
+        }
+
+        /// &lt;summary&gt;
+        /// Return a list of TreeDefinition&#39;s with the appAlias specified
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;appAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public List&lt;TreeDefinition&gt; FindActiveTrees(string appAlias)
+        {
+			EnsureTreesRegistered();
+
+            return this.FindAll(
+            	tree =&gt; (tree.App != null &amp;&amp; tree.App.alias.ToLower() == appAlias.ToLower() &amp;&amp; tree.Tree.Initialize)
+            	);
+        }
+
+        public void ReRegisterTrees()
+        {
+            //clears the trees/flag so that they are lazily refreshed on next access
+            lock (Locker)
+            {
+                this.Clear();
+                _ensureTrees = false;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Finds all instances of ITree in loaded assemblies, then finds their associated ApplicationTree and Application objects
+        /// and stores them together in a TreeDefinition class and adds the definition to our list.
+        /// This will also store an instance of each tree object in the TreeDefinition class which should be 
+        /// used when referencing all tree classes.
+        /// &lt;/summary&gt;
+        private void EnsureTreesRegistered()
+        {
+            if (_ensureTrees == false)
+            {
+                lock (Locker)
+                {
+                    if (_ensureTrees == false)
+                    {
+
+                        var foundITrees = PluginManager.Current.ResolveTrees();
+
+                        var objTrees = ApplicationTree.getAll();
+                        var appTrees = new List&lt;ApplicationTree&gt;();
+                        appTrees.AddRange(objTrees);
+
+                        var apps = Application.getAll();
+
+                        foreach (var type in foundITrees)
+                        {
+
+                            //find the Application tree&#39;s who&#39;s combination of assembly name and tree type is equal to 
+                            //the Type that was found&#39;s full name.
+                            //Since a tree can exist in multiple applications we&#39;ll need to register them all.
+
+                            //The logic of this has changed in 6.0: http://issues.umbraco.org/issue/U4-1360
+                            // we will support the old legacy way but the normal way is to match on assembly qualified names
+
+                            var appTreesForType = appTrees.FindAll(
+                                tree =&gt;
+                                {
+                                    //match the type on assembly qualified name if the assembly attribute is empty or if the
+                                    // tree type contains a comma (meaning it is assembly qualified)
+                                    if (tree.AssemblyName.IsNullOrWhiteSpace() || tree.Type.Contains(&quot;,&quot;))
+                                    {
+                                        return tree.GetRuntimeType() == type;
+                                    }
+
+                                    //otherwise match using legacy match rules
+                                    return (string.Format(&quot;{0}.{1}&quot;, tree.AssemblyName, tree.Type).InvariantEquals(type.FullName));
+                                }
+                                );
+
+                            foreach (var appTree in appTreesForType)
+                            {
+                                //find the Application object whos name is the same as our appTree ApplicationAlias
+                                var app = apps.Find(
+                                    a =&gt; (a.alias == appTree.ApplicationAlias)
+                                    );
+
+                                var def = new TreeDefinition(type, appTree, app);
+                                this.Add(def);
+                            }
+                        }
+                        //sort our trees with the sort order definition
+                        this.Sort((t1, t2) =&gt; t1.Tree.SortOrder.CompareTo(t2.Tree.SortOrder));
+
+                        _ensureTrees = true;
+                    }
+                }
+            }
+
+
+        }
+       
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[29,9,29,100,0],[31,9,31,62,0],[32,9,32,59,0],[37,13,37,14,0],[38,5,38,38,0],[39,17,39,33,0],[40,13,40,14,0],[49,9,49,10,0],[50,4,50,28,0],[52,13,53,19,0],[53,19,53,47,0],[53,47,54,16,0],[52,13,54,16,0],[55,13,55,35,0],[56,17,56,34,0],[58,13,58,25,0],[59,9,59,10,0],[67,9,67,10,0],[68,4,68,28,0],[70,13,72,16,0],[72,16,72,17,0],[72,17,75,20,0],[75,20,75,66,0],[75,66,76,16,0],[76,16,76,17,0],[76,17,77,14,0],[70,13,77,14,0],[78,13,78,35,0],[79,17,79,34,0],[81,13,81,25,0],[82,9,82,10,0],[90,9,90,10,0],[91,4,91,28,0],[93,13,94,19,0],[94,19,94,60,0],[94,60,95,16,0],[93,13,95,16,0],[96,13,96,35,0],[97,17,97,34,0],[99,13,99,25,0],[100,9,100,10,0],[108,9,108,10,0],[109,4,109,28,0],[111,13,112,22,0],[112,22,112,90,0],[112,90,113,16,0],[111,13,113,16,0],[114,9,114,10,0],[122,9,122,10,0],[123,4,123,28,0],[125,13,126,22,0],[126,22,126,114,0],[126,114,127,16,0],[125,13,127,16,0],[128,9,128,10,0],[131,9,131,10,0],[133,13,133,26,0],[134,13,134,14,0],[135,17,135,30,0],[136,17,136,38,0],[137,13,137,14,0],[138,9,138,10,0],[147,9,147,10,0],[148,13,148,39,0],[149,13,149,14,0],[150,17,150,30,0],[151,17,151,18,0],[152,21,152,47,0],[153,21,153,22,0],[155,25,155,80,0],[157,25,157,65,0],[158,25,158,68,0],[159,25,159,53,0],[161,25,161,57,0],[163,25,163,32,0],[163,34,163,42,0],[163,43,163,45,0],[163,46,163,57,0],[164,25,164,26,0],[173,29,175,33,0],[175,33,175,34,0],[175,34,178,37,0],[178,37,178,107,0],[178,107,179,37,0],[179,37,179,38,0],[179,38,180,41,0],[180,41,180,78,0],[180,78,184,37,0],[184,37,184,132,0],[184,132,185,33,0],[185,33,185,34,0],[185,34,186,35,0],[173,29,186,35,0],[188,29,188,36,0],[188,38,188,49,0],[188,50,188,52,0],[188,53,188,68,0],[189,29,189,30,0],[191,33,192,42,0],[192,42,192,79,0],[192,79,193,39,0],[191,33,193,39,0],[195,33,195,82,0],[196,33,196,47,0],[197,29,197,30,0],[198,25,198,26,0],[200,25,200,47,0],[200,47,200,93,0],[200,93,200,95,0],[200,25,200,95,0],[202,25,202,45,0],[203,21,203,22,0],[204,17,204,18,0],[205,13,205,14,0],[208,9,208,10,0]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\SQLCE4Umbraco\SqlCEHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+/************************************************************************************
+ * 
+ *  Umbraco Data Layer
+ *  MIT Licensed work
+ *  �2008 Ruben Verborgh
+ * 
+ ***********************************************************************************/
+
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlServerCe;
+using System.Linq;
+using System.Xml;
+using System.Diagnostics;
+using umbraco.DataLayer;
+using umbraco.DataLayer.SqlHelpers.SqlServer;
+
+namespace SqlCE4Umbraco
+{
+    /// &lt;summary&gt;
+    /// Sql Helper for an SQL Server database.
+    /// &lt;/summary&gt;
+    public class SqlCEHelper : SqlHelper&lt;SqlCeParameter&gt;
+    {
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;SqlCEHelper&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;connectionString&quot;&gt;The connection string.&lt;/param&gt;
+        public SqlCEHelper(string connectionString) : base(connectionString)
+        {
+            m_Utility = new SqlCEUtility(this);
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the actual database exists, if it doesn&#39;t then it will create it
+        /// &lt;/summary&gt;
+        internal void CreateEmptyDatabase()
+        {
+            var localConnection = new SqlCeConnection(ConnectionString);
+            if (!System.IO.File.Exists(ReplaceDataDirectory(localConnection.Database)))
+            {
+                using (var sqlCeEngine = new SqlCeEngine(ConnectionString))
+                {
+                    sqlCeEngine.CreateDatabase();
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Most likely only will be used for unit tests but will remove all tables from the database
+        /// &lt;/summary&gt;
+        internal void ClearDatabase()
+        {
+            // drop constraints before tables to avoid exceptions
+            // looping on try/catching exceptions was not really nice
+
+            // http://stackoverflow.com/questions/536350/drop-all-the-tables-stored-procedures-triggers-constriants-and-all-the-depend
+
+            var localConnection = new SqlCeConnection(ConnectionString);
+            if (System.IO.File.Exists(ReplaceDataDirectory(localConnection.Database)))
+            {
+                List&lt;string&gt; tables;
+
+                // drop foreign keys
+                // SQL may need &quot;where constraint_catalog=DB_NAME() and ...&quot;
+                tables = new List&lt;string&gt;();
+                using (var reader = ExecuteReader(&quot;select table_name from information_schema.table_constraints where constraint_type = &#39;FOREIGN KEY&#39; order by table_name&quot;))
+                {
+                    while (reader.Read()) tables.Add(reader.GetString(&quot;table_name&quot;).Trim());
+                }
+
+                foreach (var table in tables)
+                {
+                    var constraints = new List&lt;string&gt;();
+                    using (var reader = ExecuteReader(&quot;select constraint_name from information_schema.table_constraints where constraint_type = &#39;FOREIGN KEY&#39; and table_name = &#39;&quot; + table + &quot;&#39; order by constraint_name&quot;))
+                    {
+                        while (reader.Read()) constraints.Add(reader.GetString(&quot;constraint_name&quot;).Trim());
+                    }
+                    foreach (var constraint in constraints)
+                    {
+                        // SQL may need &quot;[dbo].[table]&quot;
+                        ExecuteNonQuery(&quot;alter table [&quot; + table + &quot;] drop constraint [&quot; + constraint + &quot;]&quot;);
+                    }
+                }
+
+                // drop primary keys
+                // SQL may need &quot;where constraint_catalog=DB_NAME() and ...&quot;
+                tables = new List&lt;string&gt;();
+                using (var reader = ExecuteReader(&quot;select table_name from information_schema.table_constraints where constraint_type = &#39;PRIMARY KEY&#39; order by table_name&quot;))
+                {
+                    while (reader.Read()) tables.Add(reader.GetString(&quot;table_name&quot;).Trim());
+                }
+
+                foreach (var table in tables)
+                {
+                    var constraints = new List&lt;string&gt;();
+                    using (var reader = ExecuteReader(&quot;select constraint_name from information_schema.table_constraints where constraint_type = &#39;PRIMARY KEY&#39; and table_name = &#39;&quot; + table + &quot;&#39; order by constraint_name&quot;))
+                    {
+                        while (reader.Read()) constraints.Add(reader.GetString(&quot;constraint_name&quot;).Trim());
+                    }
+                    foreach (var constraint in constraints)
+                    {
+                        // SQL may need &quot;[dbo].[table]&quot;
+                        ExecuteNonQuery(&quot;alter table [&quot; + table + &quot;] drop constraint [&quot; + constraint + &quot;]&quot;);
+                    }
+                }
+
+                // drop tables
+                tables = new List&lt;string&gt;();
+                using (var reader = ExecuteReader(&quot;select table_name from information_schema.tables where table_type &lt;&gt; &#39;VIEW&#39; order by table_name&quot;))
+                {
+                    while (reader.Read()) tables.Add(reader.GetString(&quot;table_name&quot;).Trim());
+                }
+
+                foreach (var table in tables)
+                {
+                    ExecuteNonQuery(&quot;drop table [&quot; + table + &quot;]&quot;);
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Drops all foreign keys on a table.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;table&quot;&gt;The name of the table.&lt;/param&gt;
+        /// &lt;remarks&gt;To be used in unit tests.&lt;/remarks&gt;
+        internal void DropForeignKeys(string table)
+        {
+            var constraints = new List&lt;string&gt;();
+            using (var reader = ExecuteReader(&quot;select constraint_name from information_schema.table_constraints where constraint_type = &#39;FOREIGN KEY&#39; and table_name = &#39;&quot; + table + &quot;&#39; order by constraint_name&quot;))
+            {
+                while (reader.Read()) constraints.Add(reader.GetString(&quot;constraint_name&quot;).Trim());
+            }
+            foreach (var constraint in constraints)
+            {
+                // SQL may need &quot;[dbo].[table]&quot;
+                ExecuteNonQuery(&quot;alter table [&quot; + table + &quot;] drop constraint [&quot; + constraint + &quot;]&quot;);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Replaces the data directory with a local path.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;path&quot;&gt;The path.&lt;/param&gt;
+        /// &lt;returns&gt;A local path with the resolved &#39;DataDirectory&#39; mapping.&lt;/returns&gt;
+        private string ReplaceDataDirectory(string path)
+        {
+            if (!string.IsNullOrWhiteSpace(path) &amp;&amp; path.Contains(&quot;|DataDirectory|&quot;))
+            {
+                var dataDirectory = AppDomain.CurrentDomain.GetData(&quot;DataDirectory&quot;) as string;
+                if (!string.IsNullOrEmpty(dataDirectory))
+                {
+                    path = path.Contains(@&quot;|\&quot;) 
+                        ? path.Replace(&quot;|DataDirectory|&quot;, dataDirectory) 
+                        : path.Replace(&quot;|DataDirectory|&quot;, dataDirectory + System.IO.Path.DirectorySeparatorChar);
+                }
+            }
+
+            return path;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new parameter for use with this specific implementation of ISqlHelper.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parameterName&quot;&gt;Name of the parameter.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;Value of the parameter.&lt;/param&gt;
+        /// &lt;returns&gt;A new parameter of the correct type.&lt;/returns&gt;
+        /// &lt;remarks&gt;Abstract factory pattern&lt;/remarks&gt;
+        public override IParameter CreateParameter(string parameterName, object value)
+        {
+            return new SqlCEParameter(parameterName, value);
+        }
+
+        /// &lt;summary&gt;
+        /// Executes a command that returns a single value.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;The return value of the command.&lt;/returns&gt;
+        protected override object ExecuteScalar(string commandText, SqlCeParameter[] parameters)
+        {
+            #if DEBUG &amp;&amp; DebugDataLayer
+                // Log Query Execution
+                Trace.TraceInformation(GetType().Name + &quot; SQL ExecuteScalar: &quot; + commandText);
+            #endif
+
+            return SqlCeApplicationBlock.ExecuteScalar(ConnectionString, CommandType.Text, commandText, parameters);
+        }
+
+        /// &lt;summary&gt;
+        /// Executes a command and returns the number of rows affected.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The number of rows affected by the command.
+        /// &lt;/returns&gt;
+        protected override int ExecuteNonQuery(string commandText, SqlCeParameter[] parameters)
+        {
+            #if DEBUG &amp;&amp; DebugDataLayer
+                // Log Query Execution
+                Trace.TraceInformation(GetType().Name + &quot; SQL ExecuteNonQuery: &quot; + commandText);
+            #endif
+
+            return SqlCeApplicationBlock.ExecuteNonQuery(ConnectionString, CommandType.Text, commandText, parameters);
+        }
+
+        /// &lt;summary&gt;
+        /// Executes a command and returns a records reader containing the results.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;commandText&quot;&gt;The command text.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A data reader containing the results of the command.
+        /// &lt;/returns&gt;
+        protected override IRecordsReader ExecuteReader(string commandText, SqlCeParameter[] parameters)
+        {
+            #if DEBUG &amp;&amp; DebugDataLayer
+                // Log Query Execution
+                Trace.TraceInformation(GetType().Name + &quot; SQL ExecuteReader: &quot; + commandText);
+            #endif
+
+            return new SqlCeDataReaderHelper(SqlCeApplicationBlock.ExecuteReader(ConnectionString, CommandType.Text,
+                                                            commandText, parameters));
+        }
+
+
+        internal IRecordsReader ExecuteReader(string commandText)
+        {
+            return ExecuteReader(commandText, new SqlCEParameter(string.Empty, string.Empty));
+        }
+
+
+        internal int ExecuteNonQuery(string commandText)
+        {
+            return ExecuteNonQuery(commandText, new SqlCEParameter(string.Empty, string.Empty));
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[30,55,30,77,1],[31,9,31,10,1],[32,13,32,48,1],[33,9,33,10,1],[39,9,39,10,0],[40,13,40,73,0],[41,13,41,88,0],[42,13,42,14,0],[43,24,43,75,0],[44,17,44,18,0],[45,21,45,50,0],[46,17,46,18,0],[47,13,47,14,0],[48,9,48,10,0],[54,9,54,10,1],[60,13,60,73,1],[61,13,61,87,1],[62,13,62,14,0],[67,17,67,45,0],[68,24,68,171,0],[69,17,69,18,0],[70,21,70,42,0],[70,43,70,93,0],[71,17,71,18,0],[73,17,73,24,0],[73,26,73,35,0],[73,36,73,38,0],[73,39,73,45,0],[74,17,74,18,0],[75,21,75,58,0],[76,28,76,218,0],[77,21,77,22,0],[78,25,78,46,0],[78,47,78,107,0],[79,21,79,22,0],[80,21,80,28,0],[80,30,80,44,0],[80,45,80,47,0],[80,48,80,59,0],[81,21,81,22,0],[83,25,83,109,0],[84,21,84,22,0],[85,17,85,18,0],[89,17,89,45,0],[90,24,90,171,0],[91,17,91,18,0],[92,21,92,42,0],[92,43,92,93,0],[93,17,93,18,0],[95,17,95,24,0],[95,26,95,35,0],[95,36,95,38,0],[95,39,95,45,0],[96,17,96,18,0],[97,21,97,58,0],[98,28,98,218,0],[99,21,99,22,0],[100,25,100,46,0],[100,47,100,107,0],[101,21,101,22,0],[102,21,102,28,0],[102,30,102,44,0],[102,45,102,47,0],[102,48,102,59,0],[103,21,103,22,0],[105,25,105,109,0],[106,21,106,22,0],[107,17,107,18,0],[110,17,110,45,0],[111,24,111,149,0],[112,17,112,18,0],[113,21,113,42,0],[113,43,113,93,0],[114,17,114,18,0],[116,17,116,24,0],[116,26,116,35,0],[116,36,116,38,0],[116,39,116,45,0],[117,17,117,18,0],[118,21,118,67,0],[119,17,119,18,0],[120,13,120,14,0],[121,9,121,10,1],[129,9,129,10,0],[130,13,130,50,0],[131,20,131,210,0],[132,13,132,14,0],[133,17,133,38,0],[133,39,133,99,0],[134,13,134,14,0],[135,13,135,20,0],[135,22,135,36,0],[135,37,135,39,0],[135,40,135,51,0],[136,13,136,14,0],[138,17,138,101,0],[139,13,139,14,0],[140,9,140,10,0],[148,9,148,10,1],[149,13,149,86,1],[150,13,150,14,1],[151,17,151,96,1],[152,17,152,58,1],[153,17,153,18,0],[154,21,156,114,0],[157,17,157,18,0],[158,13,158,14,1],[160,13,160,25,1],[161,9,161,10,1],[171,9,171,10,1],[172,13,172,61,1],[173,9,173,10,1],[182,9,182,10,1],[188,13,188,117,1],[189,9,189,10,1],[200,9,200,10,0],[206,13,206,119,0],[207,9,207,10,0],[218,9,218,10,1],[224,13,225,87,1],[226,9,226,10,1],[230,9,230,10,0],[231,13,231,95,0],[232,9,232,10,0],[236,9,236,10,0],[237,13,237,97,0],[238,9,238,10,0]]);
+    </script>
+  </body>
+</html>

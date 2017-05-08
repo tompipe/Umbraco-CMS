@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.editorControls\MultiNodeTreePicker\FilteredContentTree.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Linq;
+using System.Xml;
+using System.Xml.Linq;
+using umbraco.cms.businesslogic.web;
+using umbraco.cms.presentation.Trees;
+
+namespace umbraco.editorControls.MultiNodeTreePicker
+{
+    /// &lt;summary&gt;
+    /// FilteredContentTree for the MultiNodeTreePicker
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;IDataType and all other references to the legacy property editors are no longer used this will be removed from the codebase in future versions&quot;)]
+    public class FilteredContentTree : BaseContentTree
+    {
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;FilteredContentTree&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;The app.&lt;/param&gt;
+        public FilteredContentTree(string app)
+            : base(app)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// 
+        /// &lt;/summary&gt;
+        private Document m_UserStartNodeDoc;
+
+        /// &lt;summary&gt;
+        /// 
+        /// &lt;/summary&gt;
+        private Document m_DefinedStartNodeDoc;
+
+        /// &lt;summary&gt;
+        /// The start node id determined by the defined id and by the user&#39;s defined id
+        /// &lt;/summary&gt;
+        private int? m_DeterminedStartNodeId = null;
+
+        protected override bool LoadMinimalDocument
+        {
+            get
+            {
+                return false;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the Document object of the starting node for the current User. This ensures
+        /// that the Document object is only instantiated once.
+        /// &lt;/summary&gt;
+        protected Document UserStartNodeDoc
+        {
+            get
+            {
+                if (m_UserStartNodeDoc == null)
+                {
+                    if (CurrentUser.StartNodeId &lt;= 0)
+                    {
+                        return new Document(uQuery.RootNodeId, true);
+                    }
+                    m_UserStartNodeDoc = new Document(CurrentUser.StartNodeId);
+                }
+                return m_UserStartNodeDoc;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the Document object of the starting node that is defined in the prevalue editor. This ensures
+        /// that the Document object is only instantiated once.
+        /// &lt;/summary&gt;        
+        protected Document DefinedStartNodeDoc
+        {
+            get
+            {
+                if (m_DefinedStartNodeDoc == null)
+                {
+                    var startNodeSelectionType =
+                        this.GetPersistedCookieValue(x =&gt; x.MntpGetStartNodeSelectionType(this.GetDataTypeId()),
+                                                     NodeSelectionType.Picker);
+                    switch (startNodeSelectionType)
+                    {
+                        case NodeSelectionType.Picker:
+                            //if it is a picker, then find the start node id
+                            var definedId = this.GetPersistedCookieValue(
+                                x =&gt; x.MntpGetStartNodeId(this.GetDataTypeId()), uQuery.RootNodeId);
+                            //return a document with id -1 (don&#39;t set this up as it will exception!)
+                            m_DefinedStartNodeDoc = (definedId &gt; 0) ? new Document(definedId) : new Document(uQuery.RootNodeId, true);
+                            break;
+                        case NodeSelectionType.XPathExpression:
+                            //if it is an expression, then we need to find the start node based on the xpression type, etc...
+                            var expressionType =
+                                this.GetPersistedCookieValue(
+                                    x =&gt; x.MntpGetStartNodeXPathExpressionType(this.GetDataTypeId()),
+                                    XPathExpressionType.Global);
+                            //the default expression should match both schema types
+                            var xpath =
+                                this.GetPersistedCookieValue(
+                                    x =&gt; x.MntpGetStartNodeXPathExpression(this.GetDataTypeId()), &quot;//*[number(@id)&gt;0]&quot;);
+                            switch (expressionType)
+                            {
+                                case XPathExpressionType.Global:
+                                    //if its a global expression, then we need to run the xpath against the entire tree
+                                    var nodes = uQuery.GetNodesByXPath(xpath);
+                                    //we&#39;ll just use the first node found (THERE SHOULD ONLY BE ONE)
+                                    m_DefinedStartNodeDoc = nodes.Any() ? new Document(nodes.First().Id) : null;
+                                    break;
+                                case XPathExpressionType.FromCurrent:
+                                    //if it&#39;s a relative query, then it cannot start with //!
+                                    if (xpath.StartsWith(&quot;/&quot;))
+                                    {
+                                        throw new InvalidOperationException(&quot;A relative xpath query cannot start with a slash&quot;);
+                                    }
+
+                                    //if it&#39;s a FromCurrent expression, then we need to run the xpath from this node and below
+                                    var currId =
+                                        this.GetPersistedCookieValue(
+                                            x =&gt; x.MntpGetCurrentEditingNode(this.GetDataTypeId()), uQuery.RootNodeId);
+                                    var currNode = umbraco.library.GetXmlNodeById(currId.ToString());
+                                    if (currNode.MoveNext())
+                                    {
+                                        if (currNode.Current != null)
+                                        {
+                                            var result = currNode.Current.Select(xpath);
+                                            //set it to the first node found (if there is one), otherwise to -1
+                                            if (result.Current != null)
+                                                m_DefinedStartNodeDoc = result.MoveNext() ? uQuery.GetDocument(result.Current.GetAttribute(&quot;id&quot;, string.Empty)) : null;
+                                            else
+                                                m_DefinedStartNodeDoc = null;
+                                        }
+                                        else
+                                            m_DefinedStartNodeDoc = null;
+                                    }
+                                    else
+                                    {
+                                        m_DefinedStartNodeDoc = null;
+                                    }
+                                    break;
+                                default:
+                                    throw new ArgumentOutOfRangeException();
+                            }
+                            break;
+                        default:
+                            throw new ArgumentOutOfRangeException();
+                    }
+
+                }
+                return m_DefinedStartNodeDoc;
+            }
+        }
+
+        #region Overridden methods
+        /// &lt;summary&gt;
+        /// Determines the allowed start node id based on the users start node id and the 
+        /// defined start node id in the data type.
+        /// &lt;/summary&gt;
+        public override int StartNodeID
+        {
+            get
+            {
+                //we only need to determine the id once
+                if (m_DeterminedStartNodeId.HasValue)
+                {
+                    return m_DeterminedStartNodeId.Value;
+                }
+
+                //based on security principles, get the actual start node id
+                m_DeterminedStartNodeId = this.GetStartNodeId(DefinedStartNodeDoc, UserStartNodeDoc);
+
+                return m_DeterminedStartNodeId.Value;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Creates the root node.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;rootNode&quot;&gt;The root node.&lt;/param&gt;
+        protected override void CreateRootNode(ref XmlTreeNode rootNode)
+        {
+            if (!this.SetNullTreeRootNode(StartNodeID, ref rootNode, app))
+            {
+                rootNode.Action = &quot;javascript:openContent(-1);&quot;;
+                rootNode.Source = this.GetTreeServiceUrlWithParams(StartNodeID, this.GetDataTypeId());
+                if (StartNodeID &gt; 0)
+                {
+                    var startNode = new Document(StartNodeID);
+                    rootNode.Text = startNode.Text;
+                    rootNode.Icon = startNode.ContentTypeIcon;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Called when [render node].
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xNode&quot;&gt;The x node.&lt;/param&gt;
+        /// &lt;param name=&quot;doc&quot;&gt;The doc.&lt;/param&gt;
+        protected override void OnRenderNode(ref XmlTreeNode xNode, Document doc)
+        {
+            base.OnRenderNode(ref xNode, doc);
+
+            var dataTypeId = this.GetDataTypeId();
+            var xpath = this.GetXPathFromCookie(dataTypeId);
+            var xPathType = this.GetXPathFilterTypeFromCookie(dataTypeId);
+
+            // resolves any Umbraco params in the XPath
+            xpath = uQuery.ResolveXPath(xpath);
+
+            var xDoc = new XmlDocument();
+            XmlNode xmlDoc;
+            if (!doc.Published)
+            {
+                xmlDoc = doc.ToPreviewXml(xDoc);
+            }
+            else
+            {
+                xmlDoc = doc.ToXml(xDoc, false);
+            }
+
+            var xmlString = &quot;&lt;root&gt;&quot; + xmlDoc.OuterXml + &quot;&lt;/root&gt;&quot;;
+            var xml = XElement.Parse(xmlString);
+
+            xNode.DetermineClickable(xpath, xPathType, xml);
+
+            //ensure that the NodeKey is passed through
+            xNode.Source = this.GetTreeServiceUrlWithParams(int.Parse(xNode.NodeID), dataTypeId);
+        }
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[21,15,21,24,0],[22,9,22,10,0],[23,9,23,10,0],[38,9,38,53,0],[43,13,43,14,0],[44,17,44,30,0],[45,13,45,14,0],[55,13,55,14,0],[56,17,56,48,0],[57,17,57,18,0],[58,21,58,54,0],[59,21,59,22,0],[60,25,60,70,0],[62,21,62,80,0],[63,17,63,18,0],[64,17,64,43,0],[65,13,65,14,0],[75,13,75,14,0],[76,17,76,51,0],[77,17,77,18,0],[78,21,79,59,0],[79,59,79,112,0],[79,112,80,80,0],[78,21,80,80,0],[81,21,81,52,0],[85,29,86,38,0],[86,38,86,80,0],[86,80,86,101,0],[85,29,86,101,0],[88,29,88,135,0],[89,29,89,35,0],[92,29,94,42,0],[94,42,94,101,0],[94,101,95,65,0],[92,29,95,65,0],[97,29,99,42,0],[99,42,99,97,0],[99,97,99,121,0],[97,29,99,121,0],[100,29,100,52,0],[104,37,104,79,0],[106,37,106,113,0],[107,37,107,43,0],[110,37,110,63,0],[111,37,111,38,0],[112,41,112,129,0],[116,37,118,50,0],[118,50,118,99,0],[118,99,118,120,0],[116,37,118,120,0],[119,37,119,102,0],[120,37,120,61,0],[121,37,121,38,0],[122,41,122,70,0],[123,41,123,42,0],[124,45,124,89,0],[126,45,126,72,0],[127,49,127,168,0],[129,49,129,78,0],[130,41,130,42,0],[132,45,132,74,0],[133,37,133,38,0],[135,37,135,38,0],[136,41,136,70,0],[137,37,137,38,0],[138,37,138,43,0],[140,37,140,77,0],[142,29,142,35,0],[144,29,144,69,0],[147,17,147,18,0],[148,17,148,46,0],[149,13,149,14,0],[160,13,160,14,0],[162,17,162,54,0],[163,17,163,18,0],[164,21,164,58,0],[168,17,168,102,0],[170,17,170,54,0],[171,13,171,14,0],[179,9,179,10,0],[180,13,180,75,0],[181,13,181,14,0],[182,17,182,65,0],[183,17,183,103,0],[184,17,184,37,0],[185,17,185,18,0],[186,21,186,63,0],[187,21,187,52,0],[188,21,188,63,0],[189,17,189,18,0],[190,13,190,14,0],[191,9,191,10,0],[199,9,199,10,0],[200,13,200,47,0],[202,13,202,51,0],[203,13,203,61,0],[204,13,204,75,0],[207,13,207,48,0],[209,13,209,42,0],[211,13,211,32,0],[212,13,212,14,0],[213,17,213,49,0],[214,13,214,14,0],[216,13,216,14,0],[217,17,217,49,0],[218,13,218,14,0],[220,13,220,68,0],[221,13,221,49,0],[223,13,223,61,0],[226,13,226,98,0],[227,9,227,10,0]]);
+    </script>
+  </body>
+</html>

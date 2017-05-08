@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\Packager\Repositories\Repository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Xml;
+using System.IO;
+using System.Net;
+using Umbraco.Core;
+using Umbraco.Core.Auditing;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.IO;
+
+namespace umbraco.cms.businesslogic.packager.repositories
+{
+    public class Repository : DisposableObject
+    {        
+        public string Guid { get; private set; }
+
+        public string Name { get; private set; }
+
+        public string RepositoryUrl { get; private set; }
+
+        public string WebserviceUrl { get; private set; }
+
+
+        public RepositoryWebservice Webservice
+        {
+            get
+            {
+                var repo = new RepositoryWebservice(WebserviceUrl);
+                return repo;
+            }
+        }
+
+        public SubmitStatus SubmitPackage(string authorGuid, PackageInstance package, byte[] doc)
+        {
+
+            string packageName = package.Name;
+            string packageGuid = package.PackageGuid;
+            string description = package.Readme;
+            string packageFile = package.PackagePath;
+
+
+            System.IO.FileStream fs1 = null;
+
+            try
+            {
+
+                byte[] pack = new byte[0];
+                fs1 = System.IO.File.Open(IOHelper.MapPath(packageFile), FileMode.Open, FileAccess.Read);
+                pack = new byte[fs1.Length];
+                fs1.Read(pack, 0, (int) fs1.Length);
+                fs1.Close();
+                fs1 = null;
+
+                byte[] thumb = new byte[0]; //todo upload thumbnail... 
+
+                return Webservice.SubmitPackage(Guid, authorGuid, packageGuid, pack, doc, thumb, packageName, &quot;&quot;, &quot;&quot;, description);
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Error&lt;Repository&gt;(&quot;An error occurred in SubmitPackage&quot;, ex);
+
+                return SubmitStatus.Error;
+            }
+        }
+
+        public static List&lt;Repository&gt; getAll()
+        {
+
+            var repositories = new List&lt;Repository&gt;();
+
+            foreach (var r in UmbracoConfig.For.UmbracoSettings().PackageRepositories.Repositories)
+            {
+                var repository = new Repository
+                {
+                    Guid = r.Id.ToString(),
+                    Name = r.Name
+                };
+
+                repository.RepositoryUrl = r.RepositoryUrl;
+                repository.WebserviceUrl = repository.RepositoryUrl.Trim(&#39;/&#39;) + &quot;/&quot; + r.WebServiceUrl.Trim(&#39;/&#39;);
+                if (r.HasCustomWebServiceUrl)
+                {
+                    string wsUrl = r.WebServiceUrl;
+
+                    if (wsUrl.Contains(&quot;://&quot;))
+                    {
+                        repository.WebserviceUrl = r.WebServiceUrl;
+                    }
+                    else
+                    {
+                        repository.WebserviceUrl = repository.RepositoryUrl.Trim(&#39;/&#39;) + &quot;/&quot; + wsUrl.Trim(&#39;/&#39;);
+                    }
+                }
+
+                repositories.Add(repository);
+            }
+
+            return repositories;
+        }
+
+        public static Repository getByGuid(string repositoryGuid)
+        {
+            Guid id;
+            if (System.Guid.TryParse(repositoryGuid, out id) == false)
+            {
+                throw new FormatException(&quot;The repositoryGuid is not a valid GUID&quot;);
+            }
+
+            var found = UmbracoConfig.For.UmbracoSettings().PackageRepositories.Repositories.FirstOrDefault(x =&gt; x.Id == id);
+            if (found == null)
+            {
+                return null;
+            }
+            
+            var repository = new Repository
+            {
+                Guid = found.Id.ToString(),
+                Name = found.Name
+            };
+
+            repository.RepositoryUrl = found.RepositoryUrl;
+            repository.WebserviceUrl = repository.RepositoryUrl.Trim(&#39;/&#39;) + &quot;/&quot; + found.WebServiceUrl.Trim(&#39;/&#39;);
+
+            if (found.HasCustomWebServiceUrl)
+            {
+                string wsUrl = found.WebServiceUrl;
+
+                if (wsUrl.Contains(&quot;://&quot;))
+                {
+                    repository.WebserviceUrl = found.WebServiceUrl;
+                }
+                else
+                {
+                    repository.WebserviceUrl = repository.RepositoryUrl.Trim(&#39;/&#39;) + &quot;/&quot; + wsUrl.Trim(&#39;/&#39;);
+                }
+            }
+
+            return repository;
+        }
+
+        //shortcut method to download pack from repo and place it on the server...
+        public string fetch(string packageGuid)
+        {
+
+            return fetch(packageGuid, string.Empty);
+
+        }
+
+        public string fetch(string packageGuid, int userId)
+        {
+            // log
+            Audit.Add(AuditTypes.PackagerInstall,
+                                    string.Format(&quot;Package {0} fetched from {1}&quot;, packageGuid, this.Guid),
+                                    userId, -1);
+            return fetch(packageGuid);
+        }
+
+        public bool HasConnection()
+        {
+
+            string strServer = this.RepositoryUrl;
+
+            try
+            {
+
+                HttpWebRequest reqFP = (HttpWebRequest) HttpWebRequest.Create(strServer);
+                HttpWebResponse rspFP = (HttpWebResponse) reqFP.GetResponse();
+
+                if (HttpStatusCode.OK == rspFP.StatusCode)
+                {
+
+                    // HTTP = 200 - Internet connection available, server online
+                    rspFP.Close();
+
+                    return true;
+
+                }
+                else
+                {
+
+                    // Other status - Server or connection not available
+
+                    rspFP.Close();
+
+                    return false;
+
+                }
+
+            }
+            catch (WebException)
+            {
+
+                // Exception - connection not available
+
+                return false;
+
+            }
+        }
+
+        public string fetch(string packageGuid, string key)
+        {
+
+            byte[] fileByteArray = new byte[0];
+
+            if (key == string.Empty)
+            {
+                if (UmbracoConfig.For.UmbracoSettings().Content.UseLegacyXmlSchema)
+                    fileByteArray = this.Webservice.fetchPackage(packageGuid);
+                else
+                    fileByteArray = this.Webservice.fetchPackageByVersion(packageGuid, Version.Version41);
+            }
+            else
+            {
+                fileByteArray = this.Webservice.fetchProtectedPackage(packageGuid, key);
+            }
+
+            //successfull 
+            if (fileByteArray.Length &gt; 0)
+            {
+
+                // Check for package directory
+                if (Directory.Exists(IOHelper.MapPath(Settings.PackagerRoot)) == false)
+                    Directory.CreateDirectory(IOHelper.MapPath(Settings.PackagerRoot));
+
+                using (var fs1 = new FileStream(IOHelper.MapPath(Settings.PackagerRoot + Path.DirectorySeparatorChar + packageGuid + &quot;.umb&quot;), FileMode.Create))
+                {
+                    fs1.Write(fileByteArray, 0, fileByteArray.Length);
+                    fs1.Close();
+                    return &quot;packages\\&quot; + packageGuid + &quot;.umb&quot;;
+                }
+            }
+
+            // log
+
+            return &quot;&quot;;
+        }
+
+        /// &lt;summary&gt;
+        /// Handles the disposal of resources. Derived from abstract class &lt;see cref=&quot;DisposableObject&quot;/&gt; which handles common required locking logic.
+        /// &lt;/summary&gt;
+        protected override void DisposeResources()
+        {
+            Webservice.Dispose();
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[18,30,18,34,0],[18,35,18,47,0],[20,30,20,34,0],[20,35,20,47,0],[22,39,22,43,0],[22,44,22,56,0],[24,39,24,43,0],[24,44,24,56,0],[30,13,30,14,0],[31,17,31,68,0],[32,17,32,29,0],[33,13,33,14,0],[37,9,37,10,0],[39,13,39,47,0],[40,13,40,54,0],[41,13,41,49,0],[42,13,42,54,0],[45,13,45,45,0],[48,13,48,14,0],[50,17,50,43,0],[51,17,51,106,0],[52,17,52,45,0],[53,17,53,53,0],[54,17,54,29,0],[55,17,55,28,0],[57,17,57,44,0],[59,17,59,132,0],[61,13,61,33,0],[62,13,62,14,0],[63,17,63,87,0],[65,17,65,43,0],[67,9,67,10,0],[70,9,70,10,0],[72,13,72,55,0],[74,13,74,20,0],[74,22,74,27,0],[74,28,74,30,0],[74,31,74,99,0],[75,13,75,14,0],[76,17,80,19,0],[82,17,82,60,0],[83,17,83,113,0],[84,17,84,46,0],[85,17,85,18,0],[86,21,86,52,0],[88,21,88,47,0],[89,21,89,22,0],[90,25,90,68,0],[91,21,91,22,0],[93,21,93,22,0],[94,25,94,111,0],[95,21,95,22,0],[96,17,96,18,0],[98,17,98,46,0],[99,13,99,14,0],[101,13,101,33,0],[102,9,102,10,0],[105,9,105,10,0],[107,13,107,71,0],[108,13,108,14,0],[109,17,109,85,0],[112,13,112,114,0],[112,114,112,124,0],[112,124,112,126,0],[112,13,112,126,0],[113,13,113,31,0],[114,13,114,14,0],[115,17,115,29,0],[118,13,122,15,0],[124,13,124,60,0],[125,13,125,113,0],[127,13,127,46,0],[128,13,128,14,0],[129,17,129,52,0],[131,17,131,43,0],[132,17,132,18,0],[133,21,133,68,0],[134,17,134,18,0],[136,17,136,18,0],[137,21,137,107,0],[138,17,138,18,0],[139,13,139,14,0],[141,13,141,31,0],[142,9,142,10,0],[146,9,146,10,0],[148,13,148,53,0],[150,9,150,10,0],[153,9,153,10,0],[155,13,157,49,0],[158,13,158,39,0],[159,9,159,10,0],[162,9,162,10,0],[164,13,164,51,0],[167,13,167,14,0],[169,17,169,90,0],[170,17,170,79,0],[172,17,172,59,0],[173,17,173,18,0],[176,21,176,35,0],[178,21,178,33,0],[182,17,182,18,0],[186,21,186,35,0],[188,21,188,34,0],[193,13,193,33,0],[194,13,194,14,0],[198,17,198,30,0],[201,9,201,10,0],[204,9,204,10,0],[206,13,206,48,0],[208,13,208,37,0],[209,13,209,14,0],[210,17,210,84,0],[211,21,211,79,0],[213,21,213,107,0],[214,13,214,14,0],[216,13,216,14,0],[217,17,217,89,0],[218,13,218,14,0],[221,13,221,42,0],[222,13,222,14,0],[225,17,225,88,0],[226,21,226,88,0],[228,24,228,159,0],[229,17,229,18,0],[230,21,230,71,0],[231,21,231,33,0],[232,21,232,64,0],[238,13,238,23,0],[239,9,239,10,0],[245,9,245,10,0],[246,13,246,34,0],[247,9,247,10,0]]);
+    </script>
+  </body>
+</html>

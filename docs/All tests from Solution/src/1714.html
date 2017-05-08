@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\MediaRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Xml.Linq;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents a repository for doing CRUD operations for &lt;see cref=&quot;IMedia&quot;/&gt;
+    /// &lt;/summary&gt;
+    internal class MediaRepository : RecycleBinRepository&lt;int, IMedia&gt;, IMediaRepository
+    {
+        private readonly IMediaTypeRepository _mediaTypeRepository;
+        private readonly ITagRepository _tagRepository;
+        private readonly ContentXmlRepository&lt;IMedia&gt; _contentXmlRepository;
+        private readonly ContentPreviewRepository&lt;IMedia&gt; _contentPreviewRepository;
+
+        public MediaRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax, IMediaTypeRepository mediaTypeRepository, ITagRepository tagRepository, IContentSection contentSection)
+            : base(work, cache, logger, sqlSyntax, contentSection)
+        {
+            if (mediaTypeRepository == null) throw new ArgumentNullException(&quot;mediaTypeRepository&quot;);
+            if (tagRepository == null) throw new ArgumentNullException(&quot;tagRepository&quot;);
+            _mediaTypeRepository = mediaTypeRepository;
+            _tagRepository = tagRepository;
+            _contentXmlRepository = new ContentXmlRepository&lt;IMedia&gt;(work, CacheHelper.CreateDisabledCacheHelper(), logger, sqlSyntax);
+            _contentPreviewRepository = new ContentPreviewRepository&lt;IMedia&gt;(work, CacheHelper.CreateDisabledCacheHelper(), logger, sqlSyntax);
+            EnsureUniqueNaming = contentSection.EnsureUniqueNaming;
+        }
+
+        public bool EnsureUniqueNaming { get; private set; }
+
+        #region Overrides of RepositoryBase&lt;int,IMedia&gt;
+
+        protected override IMedia PerformGet(int id)
+        {
+            var sql = GetBaseQuery(false);
+            sql.Where(GetBaseWhereClause(), new { Id = id });
+            sql.OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate, SqlSyntax);
+
+            var dto = Database.Fetch&lt;ContentVersionDto, ContentDto, NodeDto&gt;(SqlSyntax.SelectTop(sql, 1)).FirstOrDefault();
+
+            if (dto == null)
+                return null;
+
+            var content = CreateMediaFromDto(dto, sql);
+
+            return content;
+        }
+
+        protected override IEnumerable&lt;IMedia&gt; PerformGetAll(params int[] ids)
+        {
+            var sql = GetBaseQuery(false);
+            if (ids.Any())
+            {
+                sql.Where(&quot;umbracoNode.id in (@ids)&quot;, new { ids = ids });
+            }
+
+            return ProcessQuery(sql, new PagingSqlQuery(sql));
+        }
+
+        protected override IEnumerable&lt;IMedia&gt; PerformGetByQuery(IQuery&lt;IMedia&gt; query)
+        {
+            var sqlClause = GetBaseQuery(false);
+            var translator = new SqlTranslator&lt;IMedia&gt;(sqlClause, query);
+            var sql = translator.Translate()
+                                .OrderBy&lt;NodeDto&gt;(x =&gt; x.SortOrder, SqlSyntax);
+
+            return ProcessQuery(sql, new PagingSqlQuery(sql));
+        }
+
+        #endregion
+
+        #region Overrides of PetaPocoRepositoryBase&lt;int,IMedia&gt;
+        
+        protected override Sql GetBaseQuery(BaseQueryType queryType)
+        {
+            var sql = new Sql();
+            sql.Select(queryType == BaseQueryType.Count ? &quot;COUNT(*)&quot; : (queryType == BaseQueryType.Ids ? &quot;cmsContentVersion.contentId&quot; : &quot;*&quot;))
+                .From&lt;ContentVersionDto&gt;(SqlSyntax)
+                .InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                .On&lt;ContentVersionDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;ContentDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId, SqlSyntax)
+                //TODO: IF we want to enable querying on content type information this will need to be joined
+                //.InnerJoin&lt;ContentTypeDto&gt;(SqlSyntax)
+                //.On&lt;ContentDto, ContentTypeDto&gt;(SqlSyntax, left =&gt; left.ContentTypeId, right =&gt; right.NodeId, SqlSyntax);
+                .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId, SqlSyntax);
+            return sql;
+        }
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            return GetBaseQuery(isCount ? BaseQueryType.Count : BaseQueryType.FullSingle);
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoNode.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            var list = new List&lt;string&gt;
+                           {
+                               &quot;DELETE FROM cmsTask WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodeNotify WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodePermission WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoRelation WHERE parentId = @Id&quot;,
+                               &quot;DELETE FROM umbracoRelation WHERE childId = @Id&quot;,
+                               &quot;DELETE FROM cmsTagRelationship WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsDocument WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsPropertyData WHERE contentNodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsPreviewXml WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentVersion WHERE ContentId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentXml WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContent WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoNode WHERE id = @Id&quot;
+                           };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { return new Guid(Constants.ObjectTypes.Media); }
+        }
+
+        #endregion
+
+        #region Overrides of VersionableRepositoryBase&lt;IContent&gt;
+
+        public override IEnumerable&lt;IMedia&gt; GetAllVersions(int id)
+        {
+            var sql = GetBaseQuery(false)
+                .Where(GetBaseWhereClause(), new { Id = id })
+                .OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate, SqlSyntax);
+            return ProcessQuery(sql, new PagingSqlQuery(sql), true);
+        }
+
+        /// &lt;summary&gt;
+        /// This is the underlying method that processes most queries for this repository
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sqlFull&quot;&gt;
+        /// The full SQL to select all media data 
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;pagingSqlQuery&quot;&gt;
+        /// The Id SQL to just return all media ids - used to process the properties for the media item
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;withCache&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IEnumerable&lt;IMedia&gt; ProcessQuery(Sql sqlFull, PagingSqlQuery pagingSqlQuery, bool withCache = false)
+        {
+            // fetch returns a list so it&#39;s ok to iterate it in this method
+            var dtos = Database.Fetch&lt;ContentVersionDto, ContentDto, NodeDto&gt;(sqlFull);
+            
+            //This is a tuple list identifying if the content item came from the cache or not
+            var content = new List&lt;Tuple&lt;IMedia, bool&gt;&gt;();
+            var defs = new DocumentDefinitionCollection();
+
+            //track the looked up content types, even though the content types are cached
+            // they still need to be deep cloned out of the cache and we don&#39;t want to add
+            // the overhead of deep cloning them on every item in this loop
+            var contentTypes = new Dictionary&lt;int, IMediaType&gt;();
+
+            foreach (var dto in dtos)
+            {
+                // if the cache contains the item, use it
+                if (withCache)
+                {
+                    var cached = RuntimeCache.GetCacheItem&lt;IMedia&gt;(GetCacheIdKey&lt;IMedia&gt;(dto.NodeId));
+                    //only use this cached version if the dto returned is the same version - this is just a safety check, media doesn&#39;t 
+                    //store different versions, but just in case someone corrupts some data we&#39;ll double check to be sure.
+                    if (cached != null &amp;&amp; cached.Version == dto.VersionId)
+                    {
+                        content.Add(new Tuple&lt;IMedia, bool&gt;(cached, true));
+                        continue;
+                    }
+                }
+
+                // else, need to fetch from the database
+                // content type repository is full-cache so OK to get each one independently
+
+                IMediaType contentType;
+                if (contentTypes.ContainsKey(dto.ContentDto.ContentTypeId))
+                {
+                    contentType = contentTypes[dto.ContentDto.ContentTypeId];
+                }
+                else
+                {
+                    contentType = _mediaTypeRepository.Get(dto.ContentDto.ContentTypeId);
+                    contentTypes[dto.ContentDto.ContentTypeId] = contentType;
+                }
+
+                // track the definition and if it&#39;s successfully added or updated then processed
+                if (defs.AddOrUpdate(new DocumentDefinition(dto, contentType)))
+                {
+                    content.Add(new Tuple&lt;IMedia, bool&gt;(MediaFactory.BuildEntity(dto, contentType), false));
+                }
+            }
+
+            // load all properties for all documents from database in 1 query
+            var propertyData = GetPropertyCollection(pagingSqlQuery, defs);
+
+            // assign property data
+            foreach (var contentItem in content)
+            {
+                var cc = contentItem.Item1;
+                var fromCache = contentItem.Item2;
+
+                //if this has come from cache, we do not need to build up it&#39;s structure
+                if (fromCache) continue;
+
+                cc.Properties = propertyData[cc.Version];
+
+                //on initial construction we don&#39;t want to have dirty properties tracked
+                // http://issues.umbraco.org/issue/U4-1946
+                cc.ResetDirtyProperties(false);
+            }
+
+            return content.Select(x =&gt; x.Item1).ToArray();
+        }
+
+        public override IMedia GetByVersion(Guid versionId)
+        {
+            var sql = GetBaseQuery(false);
+            sql.Where(&quot;cmsContentVersion.VersionId = @VersionId&quot;, new { VersionId = versionId });
+            sql.OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate, SqlSyntax);
+
+            var dto = Database.Fetch&lt;ContentVersionDto, ContentDto, NodeDto&gt;(sql).FirstOrDefault();
+
+            if (dto == null)
+                return null;
+
+            var content = CreateMediaFromDto(dto, sql);
+
+            return content;
+        }
+
+        public void RebuildXmlStructures(Func&lt;IMedia, XElement&gt; serializer, int groupSize = 200, IEnumerable&lt;int&gt; contentTypeIds = null)
+        {
+            // the previous way of doing this was to run it all in one big transaction,
+            // and to bulk-insert groups of xml rows - which works, until the transaction
+            // times out - and besides, because v7 transactions are ReadCommited, it does
+            // not bring much safety - so this reverts to updating each record individually,
+            // and it may be slower in the end, but should be more resilient.
+
+            var baseId = 0;
+            var contentTypeIdsA = contentTypeIds == null ? new int[0] : contentTypeIds.ToArray();
+            while (true)
+            {
+                // get the next group of nodes
+                var query = GetBaseQuery(false);
+                if (contentTypeIdsA.Length &gt; 0)
+                {
+                    query = query.WhereIn&lt;ContentDto&gt;(x =&gt; x.ContentTypeId, contentTypeIdsA, SqlSyntax);
+                }
+                query = query
+                    .Where&lt;NodeDto&gt;(x =&gt; x.NodeId &gt; baseId, SqlSyntax)
+                    .Where&lt;NodeDto&gt;(x =&gt; x.Trashed == false, SqlSyntax)
+                    .OrderBy&lt;NodeDto&gt;(x =&gt; x.NodeId, SqlSyntax);
+                var sql = SqlSyntax.SelectTop(query, groupSize);
+                var xmlItems = ProcessQuery(sql, new PagingSqlQuery(sql))
+                    .Select(x =&gt; new ContentXmlDto { NodeId = x.Id, Xml = serializer(x).ToString() })
+                    .ToList();
+
+                // no more nodes, break
+                if (xmlItems.Count == 0) break;
+
+                foreach (var xmlItem in xmlItems)
+                {
+                    try
+                    {
+                        // InsertOrUpdate tries to update first, which is good since it is what
+                        // should happen in most cases, then it tries to insert, and it should work
+                        // unless the node has been deleted, and we just report the exception
+                        Database.InsertOrUpdate(xmlItem);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.Error&lt;MediaRepository&gt;(&quot;Could not rebuild XML for nodeId=&quot; + xmlItem.NodeId, e);
+                    }
+                }
+                baseId = xmlItems[xmlItems.Count - 1].NodeId;
+            }
+
+            //now delete the items that shouldn&#39;t be there
+            var allMediaIds = Database.Fetch&lt;int&gt;(GetBaseQuery(BaseQueryType.Ids).Where&lt;NodeDto&gt;(x =&gt; x.Trashed == false, SqlSyntax));
+            var mediaObjectType = Guid.Parse(Constants.ObjectTypes.Media);
+            var xmlIdsQuery = new Sql()
+                .Select(&quot;DISTINCT cmsContentXml.nodeId&quot;)
+                .From&lt;ContentXmlDto&gt;(SqlSyntax)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;ContentXmlDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId);
+                
+            if (contentTypeIdsA.Length &gt; 0)
+            {
+                xmlIdsQuery.InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                    .On&lt;ContentDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                    .InnerJoin&lt;ContentTypeDto&gt;(SqlSyntax)
+                    .On&lt;ContentTypeDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.ContentTypeId)
+                    .WhereIn&lt;ContentDto&gt;(x =&gt; x.ContentTypeId, contentTypeIdsA, SqlSyntax);
+            }
+
+            xmlIdsQuery.Where&lt;NodeDto&gt;(dto =&gt; dto.NodeObjectType == mediaObjectType, SqlSyntax);
+            
+            var allXmlIds = Database.Fetch&lt;int&gt;(xmlIdsQuery);
+
+            var toRemove = allXmlIds.Except(allMediaIds).ToArray();
+            if (toRemove.Length &gt; 0)
+            {
+                foreach (var idGroup in toRemove.InGroupsOf(2000))
+                {
+                    Database.Execute(&quot;DELETE FROM cmsContentXml WHERE nodeId IN (@ids)&quot;, new { ids = idGroup });
+                }
+            }
+        }
+
+        public void AddOrUpdateContentXml(IMedia content, Func&lt;IMedia, XElement&gt; xml)
+        {
+            _contentXmlRepository.AddOrUpdate(new ContentXmlEntity&lt;IMedia&gt;(content, xml));
+        }
+
+        public void AddOrUpdatePreviewXml(IMedia content, Func&lt;IMedia, XElement&gt; xml)
+        {
+            _contentPreviewRepository.AddOrUpdate(new ContentPreviewEntity&lt;IMedia&gt;(content, xml));
+        }
+
+        protected override void PerformDeleteVersion(int id, Guid versionId)
+        {
+            Database.Delete&lt;PreviewXmlDto&gt;(&quot;WHERE nodeId = @Id AND versionId = @VersionId&quot;, new { Id = id, VersionId = versionId });
+            Database.Delete&lt;PropertyDataDto&gt;(&quot;WHERE contentNodeId = @Id AND versionId = @VersionId&quot;, new { Id = id, VersionId = versionId });
+            Database.Delete&lt;ContentVersionDto&gt;(&quot;WHERE ContentId = @Id AND VersionId = @VersionId&quot;, new { Id = id, VersionId = versionId });
+        }
+
+        #endregion
+
+        #region Unit of Work Implementation
+
+        protected override void PersistNewItem(IMedia entity)
+        {
+            ((Models.Media)entity).AddingEntity();
+
+            //Ensure unique name on the same level
+            entity.Name = EnsureUniqueNodeName(entity.ParentId, entity.Name);
+
+            //Ensure that strings don&#39;t contain characters that are invalid in XML
+            entity.SanitizeEntityPropertiesForXmlStorage();
+
+            var factory = new MediaFactory(NodeObjectTypeId, entity.Id);
+            var dto = factory.BuildDto(entity);
+
+            //NOTE Should the logic below have some kind of fallback for empty parent ids ?
+            //Logic for setting Path, Level and SortOrder
+            var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = entity.ParentId });
+            var level = parent.Level + 1;
+            var maxSortOrder = Database.ExecuteScalar&lt;int&gt;(
+                &quot;SELECT coalesce(max(sortOrder),-1) FROM umbracoNode WHERE parentid = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                new { /*ParentId =*/ entity.ParentId, NodeObjectType = NodeObjectTypeId });
+            var sortOrder = maxSortOrder + 1;
+
+            //Create the (base) node data - umbracoNode
+            var nodeDto = dto.ContentDto.NodeDto;
+            nodeDto.Path = parent.Path;
+            nodeDto.Level = short.Parse(level.ToString(CultureInfo.InvariantCulture));
+            nodeDto.SortOrder = sortOrder;
+            var o = Database.IsNew(nodeDto) ? Convert.ToInt32(Database.Insert(nodeDto)) : Database.Update(nodeDto);
+
+            //Update with new correct path
+            nodeDto.Path = string.Concat(parent.Path, &quot;,&quot;, nodeDto.NodeId);
+            nodeDto.ValidatePathWithException();
+            Database.Update(nodeDto);
+
+            //Update entity with correct values
+            entity.Id = nodeDto.NodeId; //Set Id on entity to ensure an Id is set
+            entity.Path = nodeDto.Path;
+            entity.SortOrder = sortOrder;
+            entity.Level = level;
+
+            //Create the Content specific data - cmsContent
+            var contentDto = dto.ContentDto;
+            contentDto.NodeId = nodeDto.NodeId;
+            Database.Insert(contentDto);
+
+            //Create the first version - cmsContentVersion
+            //Assumes a new Version guid and Version date (modified date) has been set
+            dto.NodeId = nodeDto.NodeId;
+            Database.Insert(dto);
+
+            //Create the PropertyData for this version - cmsPropertyData
+            var propertyFactory = new PropertyFactory(entity.ContentType.CompositionPropertyTypes.ToArray(), entity.Version, entity.Id);
+            var propertyDataDtos = propertyFactory.BuildDto(entity.Properties);
+            var keyDictionary = new Dictionary&lt;int, int&gt;();
+
+            //Add Properties
+            foreach (var propertyDataDto in propertyDataDtos)
+            {
+                var primaryKey = Convert.ToInt32(Database.Insert(propertyDataDto));
+                keyDictionary.Add(propertyDataDto.PropertyTypeId, primaryKey);
+            }
+
+            //Update Properties with its newly set Id
+            foreach (var property in entity.Properties)
+            {
+                property.Id = keyDictionary[property.PropertyTypeId];
+            }
+
+            UpdatePropertyTags(entity, _tagRepository);
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(IMedia entity)
+        {
+            //Updates Modified date
+            ((Models.Media)entity).UpdatingEntity();
+
+            //Ensure unique name on the same level
+            entity.Name = EnsureUniqueNodeName(entity.ParentId, entity.Name, entity.Id);
+
+            //Ensure that strings don&#39;t contain characters that are invalid in XML
+            entity.SanitizeEntityPropertiesForXmlStorage();
+
+            //Look up parent to get and set the correct Path and update SortOrder if ParentId has changed
+            if (entity.IsPropertyDirty(&quot;ParentId&quot;))
+            {
+                var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = entity.ParentId });
+                entity.Path = string.Concat(parent.Path, &quot;,&quot;, entity.Id);
+                entity.Level = parent.Level + 1;
+                var maxSortOrder =
+                    Database.ExecuteScalar&lt;int&gt;(
+                        &quot;SELECT coalesce(max(sortOrder),0) FROM umbracoNode WHERE parentid = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                        new { ParentId = entity.ParentId, NodeObjectType = NodeObjectTypeId });
+                entity.SortOrder = maxSortOrder + 1;
+            }
+
+            var factory = new MediaFactory(NodeObjectTypeId, entity.Id);
+            //Look up Content entry to get Primary for updating the DTO
+            var contentDto = Database.SingleOrDefault&lt;ContentDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = entity.Id });
+            factory.SetPrimaryKey(contentDto.PrimaryKey);
+            var dto = factory.BuildDto(entity);
+
+            //Updates the (base) node data - umbracoNode
+            var nodeDto = dto.ContentDto.NodeDto;
+            nodeDto.ValidatePathWithException();
+            var o = Database.Update(nodeDto);
+
+            //Only update this DTO if the contentType has actually changed
+            if (contentDto.ContentTypeId != entity.ContentTypeId)
+            {
+                //Create the Content specific data - cmsContent
+                var newContentDto = dto.ContentDto;
+                Database.Update(newContentDto);
+            }
+
+            //In order to update the ContentVersion we need to retrieve its primary key id
+            var contentVerDto = Database.SingleOrDefault&lt;ContentVersionDto&gt;(&quot;WHERE VersionId = @Version&quot;, new { Version = entity.Version });
+            dto.Id = contentVerDto.Id;
+            //Updates the current version - cmsContentVersion
+            //Assumes a Version guid exists and Version date (modified date) has been set/updated
+            Database.Update(dto);
+
+            //Create the PropertyData for this version - cmsPropertyData
+            var propertyFactory = new PropertyFactory(entity.ContentType.CompositionPropertyTypes.ToArray(), entity.Version, entity.Id);
+            var propertyDataDtos = propertyFactory.BuildDto(entity.Properties);
+            var keyDictionary = new Dictionary&lt;int, int&gt;();
+
+            //Add Properties
+            foreach (var propertyDataDto in propertyDataDtos)
+            {
+                if (propertyDataDto.Id &gt; 0)
+                {
+                    Database.Update(propertyDataDto);
+                }
+                else
+                {
+                    int primaryKey = Convert.ToInt32(Database.Insert(propertyDataDto));
+                    keyDictionary.Add(propertyDataDto.PropertyTypeId, primaryKey);
+                }
+            }
+
+            //Update Properties with its newly set Id
+            if (keyDictionary.Any())
+            {
+                foreach (var property in entity.Properties)
+                {
+                    if (keyDictionary.ContainsKey(property.PropertyTypeId) == false) continue;
+
+                    property.Id = keyDictionary[property.PropertyTypeId];
+                }
+            }
+
+            UpdatePropertyTags(entity, _tagRepository);
+
+            entity.ResetDirtyProperties();
+        }
+
+        #endregion
+
+        #region IRecycleBinRepository members
+
+        protected override int RecycleBinId
+        {
+            get { return Constants.System.RecycleBinMedia; }
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Gets paged media results
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;query&quot;&gt;Query to excute&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Page number&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Page size&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total records query would return without paging&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;Field to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderDirection&quot;&gt;Direction to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderBySystemField&quot;&gt;Flag to indicate when ordering by system field&lt;/param&gt;
+        /// &lt;param name=&quot;filter&quot;&gt;Search text filter&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IMedia&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IMedia&gt; GetPagedResultsByQuery(IQuery&lt;IMedia&gt; query, long pageIndex, int pageSize, out long totalRecords,
+            string orderBy, Direction orderDirection, bool orderBySystemField, string filter = &quot;&quot;)
+        {
+            var args = new List&lt;object&gt;();
+            var sbWhere = new StringBuilder();
+            Func&lt;Tuple&lt;string, object[]&gt;&gt; filterCallback = null;
+            if (filter.IsNullOrWhiteSpace() == false)
+            {
+                sbWhere
+                    .Append(&quot;AND (&quot;)
+                    .Append(SqlSyntax.GetQuotedTableName(&quot;umbracoNode&quot;))
+                    .Append(&quot;.&quot;)
+                    .Append(SqlSyntax.GetQuotedColumnName(&quot;text&quot;))
+                    .Append(&quot; LIKE @&quot;)
+                    .Append(args.Count)
+                    .Append(&quot;)&quot;);
+                args.Add(&quot;%&quot; + filter + &quot;%&quot;);
+
+                filterCallback = () =&gt; new Tuple&lt;string, object[]&gt;(sbWhere.ToString().Trim(), args.ToArray());
+            }
+
+            return GetPagedResultsByQuery&lt;ContentVersionDto&gt;(query, pageIndex, pageSize, out totalRecords,
+                new Tuple&lt;string, string&gt;(&quot;cmsContentVersion&quot;, &quot;contentId&quot;),
+                (sqlFull, pagingSqlQuery) =&gt; ProcessQuery(sqlFull, pagingSqlQuery), orderBy, orderDirection, orderBySystemField,
+                filterCallback);
+
+        }
+
+        /// &lt;summary&gt;
+        /// Private method to create a media object from a ContentDto
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dto&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;docSql&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IMedia CreateMediaFromDto(ContentVersionDto dto, Sql docSql)
+        {
+            var contentType = _mediaTypeRepository.Get(dto.ContentDto.ContentTypeId);
+            
+            var media = MediaFactory.BuildEntity(dto, contentType);
+
+            var docDef = new DocumentDefinition(dto, contentType);
+
+            var properties = GetPropertyCollection(new PagingSqlQuery(docSql), new[] { docDef });
+
+            media.Properties = properties[dto.VersionId];
+
+            //on initial construction we don&#39;t want to have dirty properties tracked
+            // http://issues.umbraco.org/issue/U4-1946
+            ((Entity)media).ResetDirtyProperties(false);
+            return media;
+        }
+
+        private string EnsureUniqueNodeName(int parentId, string nodeName, int id = 0)
+        {
+            if (EnsureUniqueNaming == false)
+                return nodeName;
+
+            var sql = new Sql();
+            sql.Select(&quot;*&quot;)
+               .From&lt;NodeDto&gt;()
+               .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId &amp;&amp; x.ParentId == parentId &amp;&amp; x.Text.StartsWith(nodeName));
+
+            int uniqueNumber = 1;
+            var currentName = nodeName;
+
+            var dtos = Database.Fetch&lt;NodeDto&gt;(sql);
+            if (dtos.Any())
+            {
+                var results = dtos.OrderBy(x =&gt; x.Text, new SimilarNodeNameComparer());
+                foreach (var dto in results)
+                {
+                    if (id != 0 &amp;&amp; id == dto.NodeId) continue;
+
+                    if (dto.Text.ToLowerInvariant().Equals(currentName.ToLowerInvariant()))
+                    {
+                        currentName = nodeName + string.Format(&quot; ({0})&quot;, uniqueNumber);
+                        uniqueNumber++;
+                    }
+                }
+            }
+
+            return currentName;
+        }
+
+        /// &lt;summary&gt;
+        /// Dispose disposable properties
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Ensure the unit of work is disposed
+        /// &lt;/remarks&gt;
+        protected override void DisposeResources()
+        {
+            _mediaTypeRepository.Dispose();
+            _tagRepository.Dispose();
+            _contentXmlRepository.Dispose();
+            _contentPreviewRepository.Dispose();
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[32,15,32,67,1],[33,9,33,10,1],[34,13,34,45,1],[34,46,34,101,0],[35,13,35,39,1],[35,40,35,89,0],[36,13,36,56,1],[37,13,37,44,1],[38,13,38,136,1],[39,13,39,144,1],[40,13,40,68,1],[41,9,41,10,1],[43,42,43,46,1],[43,47,43,59,1],[48,9,48,10,1],[49,13,49,43,1],[50,13,50,62,1],[51,13,51,85,1],[53,13,53,124,1],[55,13,55,29,1],[56,17,56,29,1],[58,13,58,56,1],[60,13,60,28,1],[61,9,61,10,1],[64,9,64,10,1],[65,13,65,43,1],[66,13,66,27,1],[67,13,67,14,1],[68,17,68,74,1],[69,13,69,14,1],[71,13,71,63,1],[72,9,72,10,1],[75,9,75,10,1],[76,13,76,49,1],[77,13,77,74,1],[78,13,79,80,1],[81,13,81,63,1],[82,9,82,10,1],[89,9,89,10,1],[90,13,90,33,1],[91,13,100,87,1],[101,13,101,24,1],[102,9,102,10,1],[105,9,105,10,1],[106,13,106,91,1],[107,9,107,10,1],[110,9,110,10,1],[111,13,111,43,1],[112,9,112,10,1],[115,9,115,10,1],[116,13,131,30,1],[132,13,132,25,1],[133,9,133,10,1],[137,17,137,18,1],[137,19,137,64,1],[137,65,137,66,1],[145,9,145,10,0],[146,13,148,86,0],[149,13,149,69,0],[150,9,150,10,0],[164,9,164,10,1],[166,13,166,88,1],[169,13,169,59,1],[170,13,170,59,1],[175,13,175,66,1],[177,13,177,20,1],[177,22,177,29,1],[177,30,177,32,1],[177,33,177,37,1],[178,13,178,14,1],[180,17,180,31,1],[181,17,181,18,0],[182,21,182,103,0],[185,21,185,75,0],[186,21,186,22,0],[187,25,187,76,0],[188,25,188,34,0],[190,17,190,18,0],[196,17,196,76,1],[197,17,197,18,1],[198,21,198,78,1],[199,17,199,18,1],[201,17,201,18,1],[202,21,202,90,1],[203,21,203,78,1],[204,17,204,18,1],[207,17,207,80,1],[208,17,208,18,1],[209,21,209,109,1],[210,17,210,18,1],[211,13,211,14,1],[214,13,214,76,1],[217,13,217,20,1],[217,22,217,37,1],[217,38,217,40,1],[217,41,217,48,1],[218,13,218,14,1],[219,17,219,44,1],[220,17,220,51,1],[223,17,223,31,1],[223,32,223,41,0],[225,17,225,58,1],[229,17,229,48,1],[230,13,230,14,1],[232,13,232,40,1],[232,40,232,47,1],[232,47,232,59,1],[232,13,232,59,1],[233,9,233,10,1],[236,9,236,10,0],[237,13,237,43,0],[238,13,238,98,0],[239,13,239,85,0],[241,13,241,100,0],[243,13,243,29,0],[244,17,244,29,0],[246,13,246,56,0],[248,13,248,28,0],[249,9,249,10,0],[252,9,252,10,1],[259,13,259,28,1],[260,13,260,98,1],[261,13,261,25,1],[262,13,262,14,1],[264,17,264,49,1],[265,17,265,48,1],[266,17,266,18,1],[267,21,267,105,1],[268,17,268,18,1],[269,17,272,65,1],[273,17,273,65,1],[274,17,275,34,1],[275,34,275,101,1],[275,101,276,31,1],[274,17,276,31,1],[279,17,279,41,1],[279,42,279,48,1],[281,17,281,24,1],[281,26,281,37,1],[281,38,281,40,1],[281,41,281,49,1],[282,17,282,18,1],[284,21,284,22,1],[288,25,288,58,1],[289,21,289,22,1],[290,21,290,40,0],[291,21,291,22,0],[292,25,292,112,0],[293,21,293,22,0],[294,17,294,18,1],[295,17,295,62,1],[296,13,296,14,1],[299,13,299,135,1],[300,13,300,75,1],[301,13,305,100,1],[307,13,307,44,1],[308,13,308,14,1],[309,17,313,92,1],[314,13,314,14,1],[316,13,316,97,1],[318,13,318,62,1],[320,13,320,68,1],[321,13,321,37,1],[322,13,322,14,1],[323,17,323,24,1],[323,26,323,37,1],[323,38,323,40,1],[323,41,323,66,1],[324,17,324,18,1],[325,21,325,113,1],[326,17,326,18,1],[327,13,327,14,1],[328,9,328,10,1],[331,9,331,10,1],[332,13,332,91,1],[333,9,333,10,1],[336,9,336,10,0],[337,13,337,99,0],[338,9,338,10,0],[341,9,341,10,0],[342,13,342,133,0],[343,13,343,142,0],[344,13,344,140,0],[345,9,345,10,0],[352,9,352,10,1],[353,13,353,51,1],[356,13,356,78,1],[359,13,359,60,1],[361,13,361,73,1],[362,13,362,48,1],[366,13,366,110,1],[367,13,367,42,1],[368,13,370,92,1],[371,13,371,46,1],[374,13,374,50,1],[375,13,375,40,1],[376,13,376,87,1],[377,13,377,43,1],[378,13,378,116,1],[381,13,381,76,1],[382,13,382,49,1],[383,13,383,38,1],[386,13,386,40,1],[387,13,387,40,1],[388,13,388,42,1],[389,13,389,34,1],[392,13,392,45,1],[393,13,393,48,1],[394,13,394,41,1],[398,13,398,41,1],[399,13,399,34,1],[402,13,402,137,1],[403,13,403,80,1],[404,13,404,60,1],[407,13,407,20,1],[407,22,407,41,1],[407,42,407,44,1],[407,45,407,61,1],[408,13,408,14,1],[409,17,409,84,1],[410,17,410,79,1],[411,13,411,14,1],[414,13,414,20,1],[414,22,414,34,1],[414,35,414,37,1],[414,38,414,55,1],[415,13,415,14,1],[416,17,416,70,1],[417,13,417,14,1],[419,13,419,56,1],[421,13,421,43,1],[422,9,422,10,1],[425,9,425,10,1],[427,13,427,53,1],[430,13,430,89,1],[433,13,433,60,1],[436,13,436,52,1],[437,13,437,14,1],[438,17,438,114,1],[439,17,439,74,1],[440,17,440,49,1],[441,17,444,96,1],[445,17,445,53,1],[446,13,446,14,1],[448,13,448,73,1],[450,13,450,113,1],[451,13,451,58,1],[452,13,452,48,1],[455,13,455,50,1],[456,13,456,49,1],[457,13,457,46,1],[460,13,460,66,1],[461,13,461,14,0],[463,17,463,52,0],[464,17,464,48,0],[465,13,465,14,0],[468,13,468,141,1],[469,13,469,39,1],[472,13,472,34,1],[475,13,475,137,1],[476,13,476,80,1],[477,13,477,60,1],[480,13,480,20,1],[480,22,480,41,1],[480,42,480,44,1],[480,45,480,61,1],[481,13,481,14,1],[482,17,482,44,1],[483,17,483,18,1],[484,21,484,54,1],[485,17,485,18,1],[487,17,487,18,0],[488,21,488,88,0],[489,21,489,83,0],[490,17,490,18,0],[491,13,491,14,1],[494,13,494,37,1],[495,13,495,14,0],[496,17,496,24,0],[496,26,496,38,0],[496,39,496,41,0],[496,42,496,59,0],[497,17,497,18,0],[498,21,498,85,0],[498,86,498,95,0],[500,21,500,74,0],[501,17,501,18,0],[502,13,502,14,0],[504,13,504,56,1],[506,13,506,43,1],[507,9,507,10,1],[515,17,515,18,0],[515,19,515,59,0],[515,60,515,61,0],[534,9,534,10,1],[535,13,535,43,1],[536,13,536,47,1],[537,13,537,65,1],[538,13,538,54,1],[539,13,539,14,1],[540,17,547,34,1],[548,17,548,46,1],[550,17,550,40,1],[550,40,550,110,1],[550,110,550,111,1],[550,17,550,111,1],[551,13,551,14,1],[553,13,555,46,1],[555,46,555,83,1],[555,83,556,33,1],[553,13,556,33,1],[558,9,558,10,1],[567,9,567,10,1],[568,13,568,86,1],[570,13,570,68,1],[572,13,572,67,1],[574,13,574,98,1],[576,13,576,58,1],[580,13,580,57,1],[581,13,581,26,1],[582,9,582,10,1],[585,9,585,10,1],[586,13,586,45,1],[587,17,587,33,1],[589,13,589,33,0],[590,13,592,132,0],[594,13,594,34,0],[595,13,595,40,0],[597,13,597,53,0],[598,13,598,28,0],[599,13,599,14,0],[600,17,600,49,0],[600,49,600,55,0],[600,55,600,88,0],[600,17,600,88,0],[601,17,601,24,0],[601,26,601,33,0],[601,34,601,36,0],[601,37,601,44,0],[602,17,602,18,0],[603,21,603,53,0],[603,54,603,63,0],[605,21,605,92,0],[606,21,606,22,0],[607,25,607,88,0],[608,25,608,40,0],[609,21,609,22,0],[610,17,610,18,0],[611,13,611,14,0],[613,13,613,32,0],[614,9,614,10,1],[623,9,623,10,1],[624,13,624,44,1],[625,13,625,38,1],[626,13,626,45,1],[627,13,627,49,1],[628,9,628,10,1]]);
+    </script>
+  </body>
+</html>

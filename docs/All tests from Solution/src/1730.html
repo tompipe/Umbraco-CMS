@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\UserRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Mappers;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.Relators;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents the UserRepository for doing CRUD operations for &lt;see cref=&quot;IUser&quot;/&gt;
+    /// &lt;/summary&gt;
+    internal class UserRepository : PetaPocoRepositoryBase&lt;int, IUser&gt;, IUserRepository
+    {
+        private readonly IUserTypeRepository _userTypeRepository;
+        private readonly CacheHelper _cacheHelper;
+
+        public UserRepository(IDatabaseUnitOfWork work, CacheHelper cacheHelper, ILogger logger, ISqlSyntaxProvider sqlSyntax, IUserTypeRepository userTypeRepository)
+            : base(work, cacheHelper, logger, sqlSyntax)
+        {
+            _userTypeRepository = userTypeRepository;
+            _cacheHelper = cacheHelper;
+        }
+
+        #region Overrides of RepositoryBase&lt;int,IUser&gt;
+
+        protected override IUser PerformGet(int id)
+        {
+            var sql = GetBaseQuery(false);
+            sql.Where(GetBaseWhereClause(), new { Id = id });
+
+            var dto = Database.Fetch&lt;UserDto, User2AppDto, UserDto&gt;(new UserSectionRelator().Map, sql).FirstOrDefault();
+            
+            if (dto == null)
+                return null;
+
+            var userType = _userTypeRepository.Get(dto.Type);
+            var userFactory = new UserFactory(userType);
+            var user = userFactory.BuildEntity(dto);
+
+            return user;
+        }
+
+        protected override IEnumerable&lt;IUser&gt; PerformGetAll(params int[] ids)
+        {
+            var sql = GetBaseQuery(false);
+
+            if (ids.Any())
+            {
+                sql.Where(&quot;umbracoUser.id in (@ids)&quot;, new {ids = ids});
+            }
+            
+            return ConvertFromDtos(Database.Fetch&lt;UserDto, User2AppDto, UserDto&gt;(new UserSectionRelator().Map, sql))
+                    .ToArray(); // important so we don&#39;t iterate twice, if we don&#39;t do this we can end up with null values in cache if we were caching.    
+        }
+        
+        protected override IEnumerable&lt;IUser&gt; PerformGetByQuery(IQuery&lt;IUser&gt; query)
+        {
+            var sqlClause = GetBaseQuery(false);
+            var translator = new SqlTranslator&lt;IUser&gt;(sqlClause, query);
+            var sql = translator.Translate();
+
+            var dtos = Database.Fetch&lt;UserDto, User2AppDto, UserDto&gt;(new UserSectionRelator().Map, sql)
+                .DistinctBy(x =&gt; x.Id);
+
+            return ConvertFromDtos(dtos)
+                    .ToArray(); // important so we don&#39;t iterate twice, if we don&#39;t do this we can end up with null values in cache if we were caching.    
+        }
+        
+        #endregion
+
+        #region Overrides of PetaPocoRepositoryBase&lt;int,IUser&gt;
+        
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+            if (isCount)
+            {
+                sql.Select(&quot;COUNT(*)&quot;).From&lt;UserDto&gt;();
+            }
+            else
+            {
+                return GetBaseQuery(&quot;*&quot;);
+            }
+            return sql;
+        }
+
+        private static Sql GetBaseQuery(string columns)
+        {
+            var sql = new Sql();
+            sql.Select(columns)
+                      .From&lt;UserDto&gt;()
+                      .LeftJoin&lt;User2AppDto&gt;()
+                      .On&lt;UserDto, User2AppDto&gt;(left =&gt; left.Id, right =&gt; right.UserId);
+            return sql;
+        }
+
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoUser.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {            
+            var list = new List&lt;string&gt;
+                           {
+                               &quot;DELETE FROM cmsTask WHERE userId = @Id&quot;,
+                               &quot;DELETE FROM cmsTask WHERE parentUserId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodePermission WHERE userId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodeNotify WHERE userId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2app WHERE &quot; + SqlSyntax.GetQuotedColumnName(&quot;user&quot;) + &quot;=@Id&quot;,
+                               &quot;DELETE FROM umbracoUser WHERE id = @Id&quot;,
+                               &quot;DELETE FROM umbracoExternalLogin WHERE id = @Id&quot;
+                           };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { throw new NotImplementedException(); }
+        }
+        
+        protected override void PersistNewItem(IUser entity)
+        {
+            var userFactory = new UserFactory(entity.UserType);
+
+            //ensure security stamp if non
+            if (entity.SecurityStamp.IsNullOrWhiteSpace())
+            {
+                entity.SecurityStamp = Guid.NewGuid().ToString();
+            }
+            
+            var userDto = userFactory.BuildDto(entity);
+
+            var id = Convert.ToInt32(Database.Insert(userDto));
+            entity.Id = id;
+
+            foreach (var sectionDto in userDto.User2AppDtos)
+            {
+                //need to set the id explicitly here
+                sectionDto.UserId = id;
+                Database.Insert(sectionDto);
+            }
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(IUser entity)
+        {
+            var userFactory = new UserFactory(entity.UserType);
+
+            //ensure security stamp if non
+            if (entity.SecurityStamp.IsNullOrWhiteSpace())
+            {
+                entity.SecurityStamp = Guid.NewGuid().ToString();
+            }
+
+            var userDto = userFactory.BuildDto(entity);
+
+            var dirtyEntity = (ICanBeDirty)entity;
+
+            //build list of columns to check for saving - we don&#39;t want to save the password if it hasn&#39;t changed!
+            //List the columns to save, NOTE: would be nice to not have hard coded strings here but no real good way around that
+            var colsToSave = new Dictionary&lt;string, string&gt;()
+            {
+                {&quot;userDisabled&quot;, &quot;IsApproved&quot;},
+                {&quot;userNoConsole&quot;, &quot;IsLockedOut&quot;},
+                {&quot;userType&quot;, &quot;UserType&quot;},
+                {&quot;startStructureID&quot;, &quot;StartContentId&quot;},
+                {&quot;startMediaID&quot;, &quot;StartMediaId&quot;},
+                {&quot;userName&quot;, &quot;Name&quot;},
+                {&quot;userLogin&quot;, &quot;Username&quot;},                
+                {&quot;userEmail&quot;, &quot;Email&quot;},                
+                {&quot;userLanguage&quot;, &quot;Language&quot;},
+                {&quot;securityStampToken&quot;, &quot;SecurityStamp&quot;},
+                {&quot;lastLockoutDate&quot;, &quot;LastLockoutDate&quot;},
+                {&quot;lastPasswordChangeDate&quot;, &quot;LastPasswordChangeDate&quot;},
+                {&quot;lastLoginDate&quot;, &quot;LastLoginDate&quot;},
+                {&quot;failedLoginAttempts&quot;, &quot;FailedPasswordAttempts&quot;},
+            };
+
+            //create list of properties that have changed
+            var changedCols = colsToSave
+                .Where(col =&gt; dirtyEntity.IsPropertyDirty(col.Value))
+                .Select(col =&gt; col.Key)
+                .ToList();
+
+            // DO NOT update the password if it has not changed or if it is null or empty
+            if (dirtyEntity.IsPropertyDirty(&quot;RawPasswordValue&quot;) &amp;&amp; entity.RawPasswordValue.IsNullOrWhiteSpace() == false)
+            {
+                changedCols.Add(&quot;userPassword&quot;);
+
+                //special case - when using ASP.Net identity the user manager will take care of updating the security stamp, however
+                // when not using ASP.Net identity (i.e. old membership providers), we&#39;ll need to take care of updating this manually
+                // so we can just detect if that property is dirty, if it&#39;s not we&#39;ll set it manually
+                if (dirtyEntity.IsPropertyDirty(&quot;SecurityStamp&quot;) == false)
+                {
+                    userDto.SecurityStampToken = entity.SecurityStamp = Guid.NewGuid().ToString();
+                    changedCols.Add(&quot;securityStampToken&quot;);
+                }
+            }
+
+            //only update the changed cols
+            if (changedCols.Count &gt; 0)
+            {
+                Database.Update(userDto, changedCols);
+            }
+            
+            //update the sections if they&#39;ve changed
+            var user = (User)entity;
+            if (user.IsPropertyDirty(&quot;AllowedSections&quot;))
+            {
+                //now we need to delete any applications that have been removed
+                foreach (var section in user.RemovedSections)
+                {
+                    //we need to manually delete thsi record because it has a composite key
+                    Database.Delete&lt;User2AppDto&gt;(&quot;WHERE app=@Section AND &quot; + SqlSyntax.GetQuotedColumnName(&quot;user&quot;) + &quot;=@UserId&quot;,
+                        new { Section = section, UserId = (int)user.Id });
+                }
+
+                //for any that exist on the object, we need to determine if we need to update or insert
+                //NOTE: the User2AppDtos collection wil always be equal to the User.AllowedSections
+                foreach (var sectionDto in userDto.User2AppDtos)
+                {
+                    //if something has been added then insert it
+                    if (user.AddedSections.Contains(sectionDto.AppAlias))
+                    {
+                        //we need to insert since this was added  
+                        Database.Insert(sectionDto);
+                    }
+                    else
+                    {
+                        //we need to manually update this record because it has a composite key
+                        Database.Update&lt;User2AppDto&gt;(&quot;SET app=@Section WHERE app=@Section AND &quot; + SqlSyntax.GetQuotedColumnName(&quot;user&quot;) + &quot;=@UserId&quot;,
+                                                     new { Section = sectionDto.AppAlias, UserId = sectionDto.UserId });
+                    }
+                }
+
+                
+            }
+
+            entity.ResetDirtyProperties();
+        }
+
+        #endregion
+
+        #region Implementation of IUserRepository
+
+        public int GetCountByQuery(IQuery&lt;IUser&gt; query)
+        {
+            var sqlClause = GetBaseQuery(&quot;umbracoUser.id&quot;);
+            var translator = new SqlTranslator&lt;IUser&gt;(sqlClause, query);
+            var subquery = translator.Translate();
+            //get the COUNT base query
+            var sql = GetBaseQuery(true)
+                .Append(new Sql(&quot;WHERE umbracoUser.id IN (&quot; + subquery.SQL + &quot;)&quot;, subquery.Arguments));
+
+            return Database.ExecuteScalar&lt;int&gt;(sql);
+        }
+
+        public bool Exists(string username)
+        {
+            var sql = new Sql();
+
+            sql.Select(&quot;COUNT(*)&quot;)
+                .From&lt;UserDto&gt;()
+                .Where&lt;UserDto&gt;(x =&gt; x.UserName == username);
+
+            return Database.ExecuteScalar&lt;int&gt;(sql) &gt; 0;
+        }
+
+        public IEnumerable&lt;IUser&gt; GetUsersAssignedToSection(string sectionAlias)
+        {
+            //Here we&#39;re building up a query that looks like this, a sub query is required because the resulting structure
+            // needs to still contain all of the section rows per user.
+
+            //SELECT *
+            //FROM [umbracoUser]
+            //LEFT JOIN [umbracoUser2app]
+            //ON [umbracoUser].[id] = [umbracoUser2app].[user]
+            //WHERE umbracoUser.id IN (SELECT umbracoUser.id
+            //    FROM [umbracoUser]
+            //    LEFT JOIN [umbracoUser2app]
+            //    ON [umbracoUser].[id] = [umbracoUser2app].[user]
+            //    WHERE umbracoUser2app.app = &#39;content&#39;)
+
+            var sql = GetBaseQuery(false);
+            var innerSql = GetBaseQuery(&quot;umbracoUser.id&quot;);
+            innerSql.Where(&quot;umbracoUser2app.app = &quot; + SqlSyntax.GetQuotedValue(sectionAlias));
+            sql.Where(string.Format(&quot;umbracoUser.id IN ({0})&quot;, innerSql.SQL));
+
+            return ConvertFromDtos(Database.Fetch&lt;UserDto, User2AppDto, UserDto&gt;(new UserSectionRelator().Map, sql));
+        }
+
+        /// &lt;summary&gt;
+        /// Gets paged user results
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;query&quot;&gt;
+        /// The where clause, if this is null all records are queried
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// The query supplied will ONLY work with data specifically on the umbracoUser table because we are using PetaPoco paging (SQL paging)
+        /// &lt;/remarks&gt;
+        public IEnumerable&lt;IUser&gt; GetPagedResultsByQuery(IQuery&lt;IUser&gt; query, int pageIndex, int pageSize, out int totalRecords, Expression&lt;Func&lt;IUser, string&gt;&gt; orderBy)
+        {
+            if (orderBy == null)
+                throw new ArgumentNullException(&quot;orderBy&quot;);
+
+            // get the referenced column name and find the corresp mapped column name
+            var expressionMember = ExpressionHelper.GetMemberInfo(orderBy);
+            var mapper = MappingResolver.Current.ResolveMapperByType(typeof(IUser));
+            var mappedField = mapper.Map(expressionMember.Name);
+
+            if (mappedField.IsNullOrWhiteSpace())
+                throw new ArgumentException(&quot;Could not find a mapping for the column specified in the orderBy clause&quot;);
+
+            var sql = new Sql()
+                .Select(&quot;umbracoUser.Id&quot;)
+                .From&lt;UserDto&gt;(SqlSyntax);
+
+            var idsQuery = query == null ? sql : new SqlTranslator&lt;IUser&gt;(sql, query).Translate();
+
+            // need to ensure the order by is in brackets, see: https://github.com/toptensoftware/PetaPoco/issues/177
+            idsQuery.OrderBy(&quot;(&quot; + mappedField + &quot;)&quot;);
+            var page = Database.Page&lt;int&gt;(pageIndex + 1, pageSize, idsQuery);
+            totalRecords = Convert.ToInt32(page.TotalItems);
+
+            if (totalRecords == 0)
+                return Enumerable.Empty&lt;IUser&gt;();
+
+            // now get the actual users and ensure they are ordered properly (same clause)
+            var ids = page.Items.ToArray();
+            return ids.Length == 0 ? Enumerable.Empty&lt;IUser&gt;() : GetAll(ids).OrderBy(orderBy.Compile());
+        }
+
+        internal IEnumerable&lt;IUser&gt; GetNextUsers(int id, int count)
+        {
+            var idsQuery = new Sql()
+                .Select(&quot;umbracoUser.Id&quot;)
+                .From&lt;UserDto&gt;(SqlSyntax)
+                .Where&lt;UserDto&gt;(x =&gt; x.Id &gt;= id)
+                .OrderBy&lt;UserDto&gt;(x =&gt; x.Id, SqlSyntax);
+
+            // first page is index 1, not zero
+            var ids = Database.Page&lt;int&gt;(1, count, idsQuery).Items.ToArray();
+
+            // now get the actual users and ensure they are ordered properly (same clause)
+            return ids.Length == 0 ? Enumerable.Empty&lt;IUser&gt;() : GetAll(ids).OrderBy(x =&gt; x.Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns permissions for a given user for any number of nodes
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;entityIds&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;        
+        public IEnumerable&lt;EntityPermission&gt; GetUserPermissionsForEntities(int userId, params int[] entityIds)
+        {
+            var repo = new PermissionRepository&lt;IContent&gt;(UnitOfWork, _cacheHelper, SqlSyntax);
+            return repo.GetUserPermissionsForEntities(userId, entityIds);
+        }
+
+        /// &lt;summary&gt;
+        /// Replaces the same permission set for a single user to any number of entities
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;permissions&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;entityIds&quot;&gt;&lt;/param&gt;
+        public void ReplaceUserPermissions(int userId, IEnumerable&lt;char&gt; permissions, params int[] entityIds)
+        {
+            var repo = new PermissionRepository&lt;IContent&gt;(UnitOfWork, _cacheHelper, SqlSyntax);
+            repo.ReplaceUserPermissions(userId, permissions, entityIds);
+        }
+
+        /// &lt;summary&gt;
+        /// Assigns the same permission set for a single user to any number of entities
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;permission&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;entityIds&quot;&gt;&lt;/param&gt;
+        public void AssignUserPermission(int userId, char permission, params int[] entityIds)
+        {
+            var repo = new PermissionRepository&lt;IContent&gt;(UnitOfWork, _cacheHelper, SqlSyntax);
+            repo.AssignUserPermission(userId, permission, entityIds);
+        }
+
+        #endregion
+
+        private IEnumerable&lt;IUser&gt; ConvertFromDtos(IEnumerable&lt;UserDto&gt; dtos)
+        {
+            var userTypeIds = dtos.Select(x =&gt; Convert.ToInt32(x.Type)).ToArray();
+
+            var allUserTypes = userTypeIds.Length == 0 ? Enumerable.Empty&lt;IUserType&gt;() : _userTypeRepository.GetAll(userTypeIds);
+
+            return dtos.Select(dto =&gt;
+                {   
+                    var userType = allUserTypes.Single(x =&gt; x.Id == dto.Type);
+
+                    var userFactory = new UserFactory(userType);
+                    return userFactory.BuildEntity(dto);
+                });
+        }
+
+        /// &lt;summary&gt;
+        /// Dispose disposable properties
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Ensure the unit of work is disposed
+        /// &lt;/remarks&gt;
+        protected override void DisposeResources()
+        {
+            _userTypeRepository.Dispose();
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[30,15,30,57,1],[31,9,31,10,1],[32,13,32,54,1],[33,13,33,40,1],[34,9,34,10,1],[39,9,39,10,1],[40,13,40,43,1],[41,13,41,62,1],[43,13,43,121,1],[45,13,45,29,1],[46,17,46,29,1],[48,13,48,62,1],[49,13,49,57,1],[50,13,50,53,1],[52,13,52,25,1],[53,9,53,10,1],[56,9,56,10,1],[57,13,57,43,1],[59,13,59,27,1],[60,13,60,14,1],[61,17,61,72,1],[62,13,62,14,1],[64,13,65,32,1],[66,9,66,10,1],[69,9,69,10,1],[70,13,70,49,1],[71,13,71,73,1],[72,13,72,46,1],[74,13,75,34,1],[75,34,75,38,1],[75,38,75,40,1],[74,13,75,40,1],[77,13,78,32,1],[79,9,79,10,1],[86,9,86,10,1],[87,13,87,33,1],[88,13,88,25,1],[89,13,89,14,1],[90,17,90,56,1],[91,13,91,14,1],[93,13,93,14,1],[94,17,94,42,1],[96,13,96,24,1],[97,9,97,10,1],[100,9,100,10,1],[101,13,101,33,1],[102,13,105,89,1],[106,13,106,24,1],[107,9,107,10,1],[111,9,111,10,1],[112,13,112,43,1],[113,9,113,10,1],[116,9,116,10,1],[117,13,126,30,1],[127,13,127,25,1],[128,9,128,10,1],[132,17,132,18,0],[132,19,132,55,0],[136,9,136,10,1],[137,13,137,64,1],[140,13,140,59,1],[141,13,141,14,1],[142,17,142,66,1],[143,13,143,14,1],[145,13,145,56,1],[147,13,147,64,1],[148,13,148,28,1],[150,13,150,20,1],[150,22,150,36,1],[150,37,150,39,1],[150,40,150,60,1],[151,13,151,14,1],[153,17,153,40,1],[154,17,154,45,1],[155,13,155,14,1],[157,13,157,43,1],[158,9,158,10,1],[161,9,161,10,1],[162,13,162,64,1],[165,13,165,59,1],[166,13,166,14,1],[167,17,167,66,1],[168,13,168,14,1],[170,13,170,56,1],[172,13,172,51,1],[176,13,192,15,1],[195,13,196,31,1],[196,31,196,69,1],[196,69,197,32,1],[197,32,197,39,1],[197,39,198,27,1],[195,13,198,27,1],[201,13,201,122,1],[202,13,202,14,1],[203,17,203,49,1],[208,17,208,75,1],[209,17,209,18,1],[210,21,210,99,1],[211,21,211,59,1],[212,17,212,18,1],[213,13,213,14,1],[216,13,216,39,1],[217,13,217,14,1],[218,17,218,55,1],[219,13,219,14,1],[222,13,222,37,1],[223,13,223,57,1],[224,13,224,14,1],[226,17,226,24,1],[226,26,226,37,1],[226,38,226,40,1],[226,41,226,61,1],[227,17,227,18,1],[229,21,230,75,1],[231,17,231,18,1],[235,17,235,24,1],[235,26,235,40,1],[235,41,235,43,1],[235,44,235,64,1],[236,17,236,18,1],[238,21,238,74,1],[239,21,239,22,1],[241,25,241,53,1],[242,21,242,22,1],[244,21,244,22,1],[246,25,247,121,1],[248,21,248,22,1],[249,17,249,18,1],[252,13,252,14,1],[254,13,254,43,1],[255,9,255,10,1],[262,9,262,10,1],[263,13,263,60,1],[264,13,264,73,1],[265,13,265,51,1],[267,13,268,104,1],[270,13,270,53,1],[271,9,271,10,1],[274,9,274,10,1],[275,13,275,33,1],[277,13,279,62,1],[281,13,281,57,1],[282,9,282,10,1],[285,9,285,10,1],[299,13,299,43,1],[300,13,300,59,1],[301,13,301,95,1],[302,13,302,79,1],[304,13,304,118,1],[305,9,305,10,1],[322,9,322,10,1],[323,13,323,33,1],[324,17,324,60,0],[327,13,327,76,1],[328,13,328,85,1],[329,13,329,65,1],[331,13,331,50,1],[332,17,332,120,0],[334,13,336,43,1],[338,13,338,99,1],[341,13,341,55,1],[342,13,342,78,1],[343,13,343,61,1],[345,13,345,35,1],[346,17,346,50,0],[349,13,349,44,1],[350,13,350,105,1],[351,9,351,10,1],[354,9,354,10,0],[355,13,359,57,0],[362,13,362,78,0],[365,13,365,91,0],[365,91,365,95,0],[365,95,365,97,0],[365,13,365,97,0],[366,9,366,10,0],[375,9,375,10,1],[376,13,376,96,1],[377,13,377,74,1],[378,9,378,10,1],[387,9,387,10,0],[388,13,388,96,0],[389,13,389,73,0],[390,9,390,10,0],[399,9,399,10,0],[400,13,400,96,0],[401,13,401,70,0],[402,9,402,10,0],[407,9,407,10,1],[408,13,408,48,1],[408,48,408,71,1],[408,71,408,83,1],[408,13,408,83,1],[410,13,410,130,1],[412,13,413,17,1],[413,17,413,18,1],[413,18,414,21,1],[414,21,414,61,1],[414,61,414,77,1],[414,77,414,79,1],[414,21,414,79,1],[414,79,416,21,1],[416,21,416,65,1],[416,65,417,21,1],[417,21,417,57,1],[417,57,418,17,1],[418,17,418,18,1],[418,18,418,20,1],[412,13,418,20,1],[419,9,419,10,1],[428,9,428,10,1],[429,13,429,43,1],[430,9,430,10,1]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.providers\members\UmbracoMembershipProvider.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+#region namespace
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Web.Security;
+using System.Configuration;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Security;
+using Umbraco.Core.Services;
+using System.Security.Cryptography;
+using System.Web.Util;
+using System.Collections.Specialized;
+using System.Configuration.Provider;
+using System.Security;
+using System.Security.Permissions;
+using System.Runtime.CompilerServices;
+using Member = umbraco.cms.businesslogic.member.Member;
+using MemberType = umbraco.cms.businesslogic.member.MemberType;
+using User = umbraco.BusinessLogic.User;
+
+#endregion
+
+namespace umbraco.providers.members
+{
+    /// &lt;summary&gt;
+    /// Custom Membership Provider for Umbraco Members (User authentication for Frontend applications NOT umbraco CMS)  
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;This has been superceded by Umbraco.Web.Security.Providers.MembersMembershipProvider&quot;)]
+    public class UmbracoMembershipProvider : UmbracoMembershipProviderBase, IUmbracoMemberTypeMembershipProvider
+    {
+        public UmbracoMembershipProvider()
+
+        {
+            LockPropertyTypeAlias = Constants.Conventions.Member.IsLockedOut;
+            LastLockedOutPropertyTypeAlias = Constants.Conventions.Member.LastLockoutDate;
+            FailedPasswordAttemptsPropertyTypeAlias = Constants.Conventions.Member.FailedPasswordAttempts;
+            ApprovedPropertyTypeAlias = Constants.Conventions.Member.IsApproved;
+            CommentPropertyTypeAlias = Constants.Conventions.Member.Comments;
+            LastLoginPropertyTypeAlias = Constants.Conventions.Member.LastLoginDate;
+            LastPasswordChangedPropertyTypeAlias = Constants.Conventions.Member.LastPasswordChangeDate;
+            PasswordRetrievalQuestionPropertyTypeAlias = Constants.Conventions.Member.PasswordQuestion;
+            PasswordRetrievalAnswerPropertyTypeAlias = Constants.Conventions.Member.PasswordAnswer;
+        }
+
+        #region Fields
+
+        private string _defaultMemberTypeAlias = &quot;Member&quot;;
+        private string _providerName = Member.UmbracoMemberProviderName;
+        private volatile bool _hasDefaultMember = false;
+        private static readonly object Locker = new object();
+
+        #endregion
+
+        public string LockPropertyTypeAlias { get; protected set; }
+        public string LastLockedOutPropertyTypeAlias { get; protected set; }
+        public string FailedPasswordAttemptsPropertyTypeAlias { get; protected set; }
+        public string ApprovedPropertyTypeAlias { get; protected set; }
+        public string CommentPropertyTypeAlias { get; protected set; }
+        public string LastLoginPropertyTypeAlias { get; protected set; }
+        public string LastPasswordChangedPropertyTypeAlias { get; protected set; }
+        public string PasswordRetrievalQuestionPropertyTypeAlias { get; protected set; }
+        public string PasswordRetrievalAnswerPropertyTypeAlias { get; protected set; }
+
+        /// &lt;summary&gt;
+        /// Override to maintain backwards compatibility with 0 required non-alphanumeric chars
+        /// &lt;/summary&gt;
+        public override int DefaultMinNonAlphanumericChars
+        {
+            get { return 0; }
+        }
+
+        /// &lt;summary&gt;
+        /// Override to maintain backwards compatibility with only 4 required length
+        /// &lt;/summary&gt;
+        public override int DefaultMinPasswordLength
+        {
+            get { return 4; }
+        }
+
+        /// &lt;summary&gt;
+        /// Override to maintain backwards compatibility
+        /// &lt;/summary&gt;
+        public override bool DefaultUseLegacyEncoding
+        {
+            get { return true; }
+        }
+
+        /// &lt;summary&gt;
+        /// For backwards compatibility, this provider supports this option
+        /// &lt;/summary&gt;
+        public override bool AllowManuallyChangingPassword
+        {
+            get { return true; }
+        }
+
+        #region Initialization Method
+        /// &lt;summary&gt;
+        /// Initializes the provider.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;name&quot;&gt;The friendly name of the provider.&lt;/param&gt;
+        /// &lt;param name=&quot;config&quot;&gt;A collection of the name/value pairs representing the provider-specific attributes specified in the configuration for this provider.&lt;/param&gt;
+        /// &lt;exception cref=&quot;T:System.ArgumentNullException&quot;&gt;The name of the provider is null.&lt;/exception&gt;
+        /// &lt;exception cref=&quot;T:System.InvalidOperationException&quot;&gt;An attempt is made to call 
+        /// &lt;see cref=&quot;M:System.Configuration.Provider.ProviderBase.Initialize(System.String,System.Collections.Specialized.NameValueCollection)&quot;&gt;&lt;/see&gt; on a provider after the provider 
+        /// has already been initialized.&lt;/exception&gt;
+        /// &lt;exception cref=&quot;T:System.ArgumentException&quot;&gt;The name of the provider has a length of zero.&lt;/exception&gt;
+        public override void Initialize(string name, NameValueCollection config)
+        {
+            // Intialize values from web.config
+            if (config == null) throw new ArgumentNullException(&quot;config&quot;);
+
+            if (string.IsNullOrEmpty(name)) name = Constants.Conventions.Member.UmbracoMemberProviderName;
+            
+            base.Initialize(name, config);
+            
+            _providerName = name;
+            
+            // test for membertype (if not specified, choose the first member type available)
+            if (config[&quot;defaultMemberTypeAlias&quot;] != null)
+            {
+                _defaultMemberTypeAlias = config[&quot;defaultMemberTypeAlias&quot;];
+                if (_defaultMemberTypeAlias.IsNullOrWhiteSpace())
+                {
+                    throw new ProviderException(&quot;No default user type alias is specified in the web.config string. Please add a &#39;defaultUserTypeAlias&#39; to the add element in the provider declaration in web.config&quot;);
+                }
+                _hasDefaultMember = true;
+            }
+
+            // test for approve status
+            if (config[&quot;umbracoApprovePropertyTypeAlias&quot;] != null)
+            {
+                ApprovedPropertyTypeAlias = config[&quot;umbracoApprovePropertyTypeAlias&quot;];
+            }
+            // test for lock attempts
+            if (config[&quot;umbracoLockPropertyTypeAlias&quot;] != null)
+            {
+                LockPropertyTypeAlias = config[&quot;umbracoLockPropertyTypeAlias&quot;];
+            }
+            if (config[&quot;umbracoLastLockedPropertyTypeAlias&quot;] != null)
+            {
+                LastLockedOutPropertyTypeAlias = config[&quot;umbracoLastLockedPropertyTypeAlias&quot;];
+            }
+            if (config[&quot;umbracoLastPasswordChangedPropertyTypeAlias&quot;] != null)
+            {
+                LastPasswordChangedPropertyTypeAlias = config[&quot;umbracoLastPasswordChangedPropertyTypeAlias&quot;];
+            }
+            if (config[&quot;umbracoFailedPasswordAttemptsPropertyTypeAlias&quot;] != null)
+            {
+                FailedPasswordAttemptsPropertyTypeAlias = config[&quot;umbracoFailedPasswordAttemptsPropertyTypeAlias&quot;];
+            }
+            // comment property
+            if (config[&quot;umbracoCommentPropertyTypeAlias&quot;] != null)
+            {
+                CommentPropertyTypeAlias = config[&quot;umbracoCommentPropertyTypeAlias&quot;];
+            }
+            // last login date
+            if (config[&quot;umbracoLastLoginPropertyTypeAlias&quot;] != null)
+            {
+                LastLoginPropertyTypeAlias = config[&quot;umbracoLastLoginPropertyTypeAlias&quot;];
+            }
+            // password retrieval
+            if (config[&quot;umbracoPasswordRetrievalQuestionPropertyTypeAlias&quot;] != null)
+            {
+                PasswordRetrievalQuestionPropertyTypeAlias = config[&quot;umbracoPasswordRetrievalQuestionPropertyTypeAlias&quot;];
+            }
+            if (config[&quot;umbracoPasswordRetrievalAnswerPropertyTypeAlias&quot;] != null)
+            {
+                PasswordRetrievalAnswerPropertyTypeAlias = config[&quot;umbracoPasswordRetrievalAnswerPropertyTypeAlias&quot;];
+            }
+
+        }
+        #endregion
+
+        #region Methods
+
+        /// &lt;summary&gt;
+        /// Processes a request to update the password for a membership user.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;The user to update the password for.&lt;/param&gt;
+        /// &lt;param name=&quot;oldPassword&quot;&gt;This property is ignore for this provider&lt;/param&gt;
+        /// &lt;param name=&quot;newPassword&quot;&gt;The new password for the specified user.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// true if the password was updated successfully; otherwise, false.
+        /// &lt;/returns&gt;
+        protected override bool PerformChangePassword(string username, string oldPassword, string newPassword)
+        {
+            //NOTE: due to backwards compatibilty reasons, this provider doesn&#39;t care about the old password and 
+            // allows simply setting the password manually so we don&#39;t really care about the old password.
+            // This is allowed based on the overridden AllowManuallyChangingPassword option.
+
+            // in order to support updating passwords from the umbraco core, we can&#39;t validate the old password
+            var m = Member.GetMemberFromLoginName(username);            
+            if (m == null) return false;
+            
+            string salt;
+            var encodedPassword = EncryptOrHashNewPassword(newPassword, out salt);
+            m.ChangePassword(
+                FormatPasswordForStorage(encodedPassword, salt));
+
+            UpdateMemberProperty(m, LastPasswordChangedPropertyTypeAlias, DateTime.Now);
+
+            m.Save();
+
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Processes a request to update the password question and answer for a membership user.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;The user to change the password question and answer for.&lt;/param&gt;
+        /// &lt;param name=&quot;password&quot;&gt;The password for the specified user.&lt;/param&gt;
+        /// &lt;param name=&quot;newPasswordQuestion&quot;&gt;The new password question for the specified user.&lt;/param&gt;
+        /// &lt;param name=&quot;newPasswordAnswer&quot;&gt;The new password answer for the specified user.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// true if the password question and answer are updated successfully; otherwise, false.
+        /// &lt;/returns&gt;
+        protected override bool PerformChangePasswordQuestionAndAnswer(string username, string password, string newPasswordQuestion, string newPasswordAnswer)
+        {
+            if (string.IsNullOrEmpty(PasswordRetrievalQuestionPropertyTypeAlias) || string.IsNullOrEmpty(PasswordRetrievalAnswerPropertyTypeAlias))
+            {
+                throw new NotSupportedException(&quot;Updating the password Question and Answer is not valid if the properties aren&#39;t set in the config file&quot;);
+            }
+
+            var m = Member.GetMemberFromLoginName(username);
+            if (m == null)
+            {
+                return false;
+            }
+
+            UpdateMemberProperty(m, PasswordRetrievalQuestionPropertyTypeAlias, newPasswordQuestion);
+            UpdateMemberProperty(m, PasswordRetrievalAnswerPropertyTypeAlias, newPasswordAnswer);
+            m.Save();
+            return true;
+        }
+
+        public override string DefaultMemberTypeAlias
+        {
+            get
+            {
+                if (_hasDefaultMember == false)
+                {
+                    lock (Locker)
+                    {
+                        if (_hasDefaultMember == false)
+                        {
+                            var types = MemberType.GetAll;
+                            if (types.Length == 1)
+                                _defaultMemberTypeAlias = types[0].Alias;
+                            else
+                                throw new ProviderException(&quot;No default MemberType alias is specified in the web.config string. Please add a &#39;defaultMemberTypeAlias&#39; to the add element in the provider declaration in web.config&quot;);
+
+                            _hasDefaultMember = true;
+                        }
+                    }
+                }
+                return _defaultMemberTypeAlias;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Adds a new membership user to the data source.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;memberTypeAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;username&quot;&gt;The user name for the new user.&lt;/param&gt;
+        /// &lt;param name=&quot;password&quot;&gt;The password for the new user.&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;The e-mail address for the new user.&lt;/param&gt;
+        /// &lt;param name=&quot;passwordQuestion&quot;&gt;The password question for the new user.&lt;/param&gt;
+        /// &lt;param name=&quot;passwordAnswer&quot;&gt;The password answer for the new user&lt;/param&gt;
+        /// &lt;param name=&quot;isApproved&quot;&gt;Whether or not the new user is approved to be validated.&lt;/param&gt;
+        /// &lt;param name=&quot;providerUserKey&quot;&gt;The unique identifier from the membership data source for the user.&lt;/param&gt;
+        /// &lt;param name=&quot;status&quot;&gt;A &lt;see cref=&quot;T:System.Web.Security.MembershipCreateStatus&quot;&gt;&lt;/see&gt; enumeration value indicating whether the user was created successfully.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A &lt;see cref=&quot;T:System.Web.Security.MembershipUser&quot;&gt;&lt;/see&gt; object populated with the information for the newly created user.
+        /// &lt;/returns&gt;
+        protected override MembershipUser PerformCreateUser(string memberTypeAlias, string username, string password, string email, string passwordQuestion,
+                                                    string passwordAnswer, bool isApproved, object providerUserKey, out MembershipCreateStatus status)
+        {
+            if (Member.GetMemberFromLoginName(username) != null)
+            {
+                status = MembershipCreateStatus.DuplicateUserName;
+                LogHelper.Warn&lt;UmbracoMembershipProvider&gt;(&quot;Cannot create member as username already exists: &quot; + username);
+                return null;
+            }
+            
+            if (Member.GetMemberFromEmail(email) != null &amp;&amp; RequiresUniqueEmail)
+            {
+                status = MembershipCreateStatus.DuplicateEmail;
+                LogHelper.Warn&lt;UmbracoMembershipProvider&gt;(
+                    &quot;Cannot create member as a member with the same email address exists: &quot; + email);
+                return null;
+            }
+            
+            var memberType = MemberType.GetByAlias(memberTypeAlias);
+            if (memberType == null)
+            {
+                throw new InvalidOperationException(&quot;Could not find a member type with alias &quot; + memberTypeAlias + &quot;. Ensure your membership provider configuration is up to date and that the default member type exists.&quot;);
+            }
+
+            var m = Member.MakeNew(username, email, memberType, User.GetUser(0));
+
+            string salt;
+            var encodedPassword = EncryptOrHashNewPassword(password, out salt);
+            
+            //set the password on the member
+            m.ChangePassword(FormatPasswordForStorage(encodedPassword, salt));
+                
+            // custom fields
+            if (string.IsNullOrEmpty(PasswordRetrievalQuestionPropertyTypeAlias) == false)
+            {
+                UpdateMemberProperty(m, PasswordRetrievalQuestionPropertyTypeAlias, passwordQuestion);
+            }
+
+            if (string.IsNullOrEmpty(PasswordRetrievalAnswerPropertyTypeAlias) == false)
+            {
+                UpdateMemberProperty(m, PasswordRetrievalAnswerPropertyTypeAlias, passwordAnswer);                    
+            }   
+
+            if (string.IsNullOrEmpty(ApprovedPropertyTypeAlias) == false)
+            {
+                UpdateMemberProperty(m, ApprovedPropertyTypeAlias, isApproved ? 1 : 0);                 
+            }
+
+            if (string.IsNullOrEmpty(LastLoginPropertyTypeAlias) == false)
+            {
+                UpdateMemberProperty(m, LastLoginPropertyTypeAlias, DateTime.Now);
+            }
+
+            if (string.IsNullOrEmpty(LastPasswordChangedPropertyTypeAlias) == false)
+            {
+                UpdateMemberProperty(m, LastPasswordChangedPropertyTypeAlias, DateTime.Now);
+            }
+
+            var mUser = ConvertToMembershipUser(m);
+
+            // save
+            m.Save();
+
+            status = MembershipCreateStatus.Success;
+
+            return mUser;
+        }
+
+
+        /// &lt;summary&gt;
+        /// Removes a user from the membership data source.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;The name of the user to delete.&lt;/param&gt;
+        /// &lt;param name=&quot;deleteAllRelatedData&quot;&gt;
+        /// TODO: This setting currently has no effect
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;
+        /// true if the user was successfully deleted; otherwise, false.
+        /// &lt;/returns&gt;
+        public override bool DeleteUser(string username, bool deleteAllRelatedData)
+        {
+            var m = Member.GetMemberFromLoginName(username);
+            if (m == null) return false;
+            m.delete();
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of membership users where the e-mail address contains the specified e-mail address to match.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;emailToMatch&quot;&gt;The e-mail address to search for.&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;The index of the page of results to return. pageIndex is zero-based.&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;The size of the page of results to return.&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;The total number of matched users.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A &lt;see cref=&quot;T:System.Web.Security.MembershipUserCollection&quot;&gt;&lt;/see&gt; collection that contains a page of pageSize&lt;see cref=&quot;T:System.Web.Security.MembershipUser&quot;&gt;&lt;/see&gt; objects beginning at the page specified by pageIndex.
+        /// &lt;/returns&gt;
+        public override MembershipUserCollection FindUsersByEmail(string emailToMatch, int pageIndex, int pageSize, out int totalRecords)
+        {
+            var byEmail = ApplicationContext.Current.Services.MemberService.FindByEmail(emailToMatch, pageIndex, pageSize, out totalRecords, StringPropertyMatchType.Wildcard).ToArray();
+            
+            var collection = new MembershipUserCollection();                        
+            foreach (var m in byEmail)
+            {
+                collection.Add(ConvertToMembershipUser(m));
+            }
+            return collection;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of membership users where the user name contains the specified user name to match.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;usernameToMatch&quot;&gt;The user name to search for.&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;The index of the page of results to return. pageIndex is zero-based.&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;The size of the page of results to return.&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;The total number of matched users.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A &lt;see cref=&quot;T:System.Web.Security.MembershipUserCollection&quot;&gt;&lt;/see&gt; collection that contains a page of pageSize&lt;see cref=&quot;T:System.Web.Security.MembershipUser&quot;&gt;&lt;/see&gt; objects beginning at the page specified by pageIndex.
+        /// &lt;/returns&gt;
+        public override MembershipUserCollection FindUsersByName(string usernameToMatch, int pageIndex, int pageSize, out int totalRecords)
+        {
+            var byEmail = ApplicationContext.Current.Services.MemberService.FindByUsername(usernameToMatch, pageIndex, pageSize, out totalRecords, StringPropertyMatchType.Wildcard).ToArray();
+            
+            var collection = new MembershipUserCollection();            
+            foreach (var m in byEmail)
+            {
+                collection.Add(ConvertToMembershipUser(m));
+            }
+            return collection;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of all the users in the data source in pages of data.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;The index of the page of results to return. pageIndex is zero-based.&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;The size of the page of results to return.&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;The total number of matched users.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A &lt;see cref=&quot;T:System.Web.Security.MembershipUserCollection&quot;&gt;&lt;/see&gt; collection that contains a page of pageSize&lt;see cref=&quot;T:System.Web.Security.MembershipUser&quot;&gt;&lt;/see&gt; objects beginning at the page specified by pageIndex.
+        /// &lt;/returns&gt;
+        public override MembershipUserCollection GetAllUsers(int pageIndex, int pageSize, out int totalRecords)
+        {
+            var membersList = new MembershipUserCollection();
+
+            var pagedMembers = ApplicationContext.Current.Services.MemberService.GetAll(pageIndex, pageSize, out totalRecords);
+
+            foreach (var m in pagedMembers)
+            {
+                membersList.Add(ConvertToMembershipUser(m));
+            }
+            return membersList;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the number of users currently accessing the application.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;
+        /// The number of users currently accessing the application.
+        /// &lt;/returns&gt;
+        public override int GetNumberOfUsersOnline()
+        {
+            return ApplicationContext.Current.Services.MemberService.GetCount(MemberCountType.Online);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the password for the specified user name from the data source.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;The user to retrieve the password for.&lt;/param&gt;
+        /// &lt;param name=&quot;answer&quot;&gt;The password answer for the user.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The password for the specified user name.
+        /// &lt;/returns&gt;
+        protected override string PerformGetPassword(string username, string answer)
+        {
+            var m = Member.GetMemberFromLoginName(username);
+            if (m == null)
+            {
+                throw new MembershipPasswordException(&quot;The supplied user is not found&quot;);
+            }
+
+            // check if user is locked out
+            if (string.IsNullOrEmpty(LockPropertyTypeAlias) == false)
+            {
+                var isLockedOut = false;
+                bool.TryParse(GetMemberProperty(m, LockPropertyTypeAlias, true), out isLockedOut);
+                if (isLockedOut)
+                {
+                    throw new MembershipPasswordException(&quot;The supplied user is locked out&quot;);
+                }
+            }
+
+            if (RequiresQuestionAndAnswer)
+            {
+                // check if password answer property alias is set
+                if (string.IsNullOrEmpty(PasswordRetrievalAnswerPropertyTypeAlias) == false)
+                {
+                    // match password answer
+                    if (GetMemberProperty(m, PasswordRetrievalAnswerPropertyTypeAlias, false) != answer)
+                    {
+                        throw new MembershipPasswordException(&quot;Incorrect password answer&quot;);
+                    }
+                }
+                else
+                {
+                    throw new ProviderException(&quot;Password retrieval answer property alias is not set! To automatically support password question/answers you&#39;ll need to add references to the membertype properties in the &#39;Member&#39; element in web.config by adding their aliases to the &#39;umbracoPasswordRetrievalQuestionPropertyTypeAlias&#39; and &#39;umbracoPasswordRetrievalAnswerPropertyTypeAlias&#39; attributes&quot;);
+                }
+            }
+
+            var decodedPassword = DecryptPassword(m.GetPassword());
+
+            return decodedPassword;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets information from the data source for a user. Provides an option to update the last-activity date/time stamp for the user.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;The name of the user to get information for.&lt;/param&gt;
+        /// &lt;param name=&quot;userIsOnline&quot;&gt;true to update the last-activity date/time stamp for the user; false to return user information without updating the last-activity date/time stamp for the user.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A &lt;see cref=&quot;T:System.Web.Security.MembershipUser&quot;&gt;&lt;/see&gt; object populated with the specified user&#39;s information from the data source.
+        /// &lt;/returns&gt;
+        public override MembershipUser GetUser(string username, bool userIsOnline)
+        {
+            if (string.IsNullOrEmpty(username))
+                return null;
+            var m = Member.GetMemberFromLoginName(username);
+            
+            if (m == null)
+            {
+                return null;
+            }
+
+            if (userIsOnline &amp;&amp; LastLoginPropertyTypeAlias.IsNullOrWhiteSpace() == false)
+            {
+                UpdateMemberProperty(m, LastLoginPropertyTypeAlias, DateTime.Now);
+
+                //don&#39;t raise events for this! It just sets the member dates, if we do raise events this will
+                // cause all distributed cache to execute - which will clear out some caches we don&#39;t want.
+                // http://issues.umbraco.org/issue/U4-3451
+                m.Save(false);
+            }
+
+            return ConvertToMembershipUser(m);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets information from the data source for a user based on the unique identifier for the membership user. Provides an option to update the last-activity date/time stamp for the user.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;providerUserKey&quot;&gt;The unique identifier for the membership user to get information for.&lt;/param&gt;
+        /// &lt;param name=&quot;userIsOnline&quot;&gt;true to update the last-activity date/time stamp for the user; false to return user information without updating the last-activity date/time stamp for the user.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A &lt;see cref=&quot;T:System.Web.Security.MembershipUser&quot;&gt;&lt;/see&gt; object populated with the specified user&#39;s information from the data source.
+        /// &lt;/returns&gt;
+        public override MembershipUser GetUser(object providerUserKey, bool userIsOnline)
+        {
+            var asGuid = providerUserKey.TryConvertTo&lt;Guid&gt;();
+            if (asGuid.Success)
+            {
+                var m = new Member(asGuid.Result);
+                if (userIsOnline &amp;&amp; LastLoginPropertyTypeAlias.IsNullOrWhiteSpace() == false)
+                {
+                    UpdateMemberProperty(m, LastLoginPropertyTypeAlias, DateTime.Now);
+                    //don&#39;t raise events for this! It just sets the member dates, if we do raise events this will
+                    // cause all distributed cache to execute - which will clear out some caches we don&#39;t want.
+                    // http://issues.umbraco.org/issue/U4-3451
+                    m.Save(false);
+                }
+                return ConvertToMembershipUser(m);    
+            }
+            var asInt = providerUserKey.TryConvertTo&lt;int&gt;();
+            if (asInt.Success)
+            {
+                var m = new Member(asInt.Result);
+                if (userIsOnline &amp;&amp; LastLoginPropertyTypeAlias.IsNullOrWhiteSpace() == false)
+                {
+                    UpdateMemberProperty(m, LastLoginPropertyTypeAlias, DateTime.Now);
+                    //don&#39;t raise events for this! It just sets the member dates, if we do raise events this will
+                    // cause all distributed cache to execute - which will clear out some caches we don&#39;t want.
+                    // http://issues.umbraco.org/issue/U4-3451
+                    m.Save(false);
+                }
+                return ConvertToMembershipUser(m);    
+            }
+
+            throw new InvalidOperationException(&quot;The &quot; + GetType() + &quot; provider only supports GUID or Int as a providerUserKey&quot;);
+
+        }
+
+
+        /// &lt;summary&gt;
+        /// Gets the user name associated with the specified e-mail address.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;email&quot;&gt;The e-mail address to search for.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The user name associated with the specified e-mail address. If no match is found, return null.
+        /// &lt;/returns&gt;
+        public override string GetUserNameByEmail(string email)
+        {
+            var m = Member.GetMemberFromEmail(email);
+            return m == null ? null : m.LoginName;
+        }
+
+        /// &lt;summary&gt;
+        /// Resets a user&#39;s password to a new, automatically generated password.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;The user to reset the password for.&lt;/param&gt;
+        /// &lt;param name=&quot;answer&quot;&gt;The password answer for the specified user (not used with Umbraco).&lt;/param&gt;
+        /// &lt;param name=&quot;generatedPassword&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;The new password for the specified user.&lt;/returns&gt;
+        protected override string PerformResetPassword(string username, string answer, string generatedPassword)
+        {
+            //TODO: This should be here - but how do we update failure count in this provider??
+            //if (answer == null &amp;&amp; RequiresQuestionAndAnswer)
+            //{
+            //    UpdateFailureCount(username, &quot;passwordAnswer&quot;);
+
+            //    throw new ProviderException(&quot;Password answer required for password reset.&quot;);
+            //}
+            
+            var m = Member.GetMemberFromLoginName(username);
+            if (m == null)
+            {
+                throw new ProviderException(&quot;The supplied user is not found&quot;);
+            }
+
+            // check if user is locked out
+            if (string.IsNullOrEmpty(LockPropertyTypeAlias) == false)
+            {
+                var isLockedOut = false;
+                bool.TryParse(GetMemberProperty(m, LockPropertyTypeAlias, true), out isLockedOut);
+                if (isLockedOut)
+                {
+                    throw new ProviderException(&quot;The member is locked out.&quot;);
+                }
+            }
+
+            if (RequiresQuestionAndAnswer)
+            {
+                // check if password answer property alias is set
+                if (string.IsNullOrEmpty(PasswordRetrievalAnswerPropertyTypeAlias) == false)
+                {
+                    // match password answer
+                    if (GetMemberProperty(m, PasswordRetrievalAnswerPropertyTypeAlias, false) != answer)
+                    {
+                        throw new ProviderException(&quot;Incorrect password answer&quot;);
+                    }
+                }
+                else
+                {
+                    throw new ProviderException(&quot;Password retrieval answer property alias is not set! To automatically support password question/answers you&#39;ll need to add references to the membertype properties in the &#39;Member&#39; element in web.config by adding their aliases to the &#39;umbracoPasswordRetrievalQuestionPropertyTypeAlias&#39; and &#39;umbracoPasswordRetrievalAnswerPropertyTypeAlias&#39; attributes&quot;);
+                }
+            }
+
+            string salt;
+            var encodedPassword = EncryptOrHashNewPassword(generatedPassword, out salt);
+            //set the password on the member
+            m.ChangePassword(FormatPasswordForStorage(encodedPassword, salt));
+
+            if (string.IsNullOrEmpty(LastPasswordChangedPropertyTypeAlias) == false)
+            {
+                UpdateMemberProperty(m, LastPasswordChangedPropertyTypeAlias, DateTime.Now);
+            }
+
+            m.Save();
+
+            return generatedPassword;
+        }
+
+        /// &lt;summary&gt;
+        /// Clears a lock so that the membership user can be validated.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userName&quot;&gt;The membership user to clear the lock status for.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// true if the membership user was successfully unlocked; otherwise, false.
+        /// &lt;/returns&gt;
+        public override bool UnlockUser(string userName)
+        {
+            if (string.IsNullOrEmpty(LockPropertyTypeAlias) == false)
+            {
+                var m = Member.GetMemberFromLoginName(userName);
+                if (m != null)
+                {
+                    UpdateMemberProperty(m, LockPropertyTypeAlias, 0);
+                    if (string.IsNullOrEmpty(FailedPasswordAttemptsPropertyTypeAlias) == false)
+                    {
+                        UpdateMemberProperty(m, FailedPasswordAttemptsPropertyTypeAlias, 0);
+                    }
+                    m.Save();
+                    return true;
+                }
+                throw new ProviderException(string.Format(&quot;No member with the username &#39;{0}&#39; found&quot;, userName));
+            }
+            throw new ProviderException(&quot;To enable lock/unlocking, you need to add a &#39;bool&#39; property on your membertype and add the alias of the property in the &#39;umbracoLockPropertyTypeAlias&#39; attribute of the membership element in the web.config.&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Updates e-mail and potentially approved status, lock status and comment on a user.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;A &lt;see cref=&quot;T:System.Web.Security.MembershipUser&quot;&gt;&lt;/see&gt; object that represents the user to update and the updated information for the user.&lt;/param&gt;
+        public override void UpdateUser(MembershipUser user)
+        {
+            var m = Member.GetMemberFromLoginName(user.UserName);
+
+            if (m == null)
+            {
+                throw new ProviderException(string.Format(&quot;No member with the username &#39;{0}&#39; found&quot;, user.UserName));
+            }                
+
+            m.Email = user.Email;
+
+            // if supported, update approve status
+            UpdateMemberProperty(m, ApprovedPropertyTypeAlias, user.IsApproved ? 1 : 0);
+
+            // if supported, update lock status
+            UpdateMemberProperty(m, LockPropertyTypeAlias, user.IsLockedOut ? 1 : 0);
+            if (user.IsLockedOut)
+            {
+                UpdateMemberProperty(m, LastLockedOutPropertyTypeAlias, DateTime.Now);
+            }
+
+            // if supported, update comment
+            UpdateMemberProperty(m, CommentPropertyTypeAlias, user.Comment);
+
+            m.Save();
+        }
+
+        /// &lt;summary&gt;
+        /// Verifies that the specified user name and password exist in the data source.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;The name of the user to validate.&lt;/param&gt;
+        /// &lt;param name=&quot;password&quot;&gt;The password for the specified user.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// true if the specified username and password are valid; otherwise, false.
+        /// &lt;/returns&gt;
+        public override bool ValidateUser(string username, string password)
+        {
+            var m = Member.GetMemberFromLoginName(username);
+            if (m == null) return false;
+            var authenticated = CheckPassword(password, m.GetPassword());
+            
+            if (authenticated)
+            {
+                // check for lock status. If locked, then set the member property to null
+                if (string.IsNullOrEmpty(LockPropertyTypeAlias) == false)
+                {
+                    string lockedStatus = GetMemberProperty(m, LockPropertyTypeAlias, true);
+                    if (string.IsNullOrEmpty(lockedStatus) == false)
+                    {
+                        var isLocked = false;
+                        if (bool.TryParse(lockedStatus, out isLocked))
+                        {
+                            if (isLocked)
+                            {
+                                LogHelper.Info&lt;UmbracoMembershipProvider&gt;(&quot;Cannot validate member &quot; + username + &quot; because they are currently locked out&quot;);
+                                return false;
+                            }
+                        }
+                    }
+                }
+
+                //check for approve status. If not approved, then set the member property to null
+                if (CheckApproveStatus(m) == false)
+                {
+                    LogHelper.Info&lt;UmbracoMembershipProvider&gt;(&quot;Cannot validate member &quot; + username + &quot; because they are not approved&quot;);
+                    return false;
+                }
+
+                // maybe update login date
+                if (string.IsNullOrEmpty(LastLoginPropertyTypeAlias) == false)
+                {
+                    UpdateMemberProperty(m, LastLoginPropertyTypeAlias, DateTime.Now);
+                }
+
+                // maybe reset password attempts
+                if (string.IsNullOrEmpty(FailedPasswordAttemptsPropertyTypeAlias) == false)
+                {
+                    UpdateMemberProperty(m, FailedPasswordAttemptsPropertyTypeAlias, 0);
+                }
+
+                // persist data
+
+                //don&#39;t raise events for this! It just sets the member dates, if we do raise events this will
+                // cause all distributed cache to execute - which will clear out some caches we don&#39;t want.
+                // http://issues.umbraco.org/issue/U4-3451
+                m.Save(false);
+
+                return true;
+            }
+
+
+            // update fail rate if it&#39;s approved
+            if (string.IsNullOrEmpty(LockPropertyTypeAlias) == false
+                &amp;&amp; string.IsNullOrEmpty(FailedPasswordAttemptsPropertyTypeAlias) == false)
+            {                                
+                if (CheckApproveStatus(m))
+                {
+                    var failedAttempts = 0;
+                    int.TryParse(GetMemberProperty(m, FailedPasswordAttemptsPropertyTypeAlias, false), out failedAttempts);
+                    failedAttempts = failedAttempts + 1;
+                    UpdateMemberProperty(m, FailedPasswordAttemptsPropertyTypeAlias, failedAttempts);
+
+                    // lock user?
+                    if (failedAttempts &gt;= MaxInvalidPasswordAttempts)
+                    {
+                        UpdateMemberProperty(m, LockPropertyTypeAlias, 1);
+                        UpdateMemberProperty(m, LastLockedOutPropertyTypeAlias, DateTime.Now);
+                        LogHelper.Info&lt;UmbracoMembershipProvider&gt;(&quot;Member &quot; + username + &quot; is now locked out, max invalid password attempts exceeded&quot;);
+                    }
+
+                    //don&#39;t raise events for this! It just sets the member dates, if we do raise events this will
+                    // cause all distributed cache to execute - which will clear out some caches we don&#39;t want.
+                    // http://issues.umbraco.org/issue/U4-3451
+                    m.Save(false);
+                }
+
+            }
+
+            return false;
+        }
+
+        private static void UpdateMemberProperty(Member m, string propertyTypeAlias, object propertyValue)
+        {
+            if (string.IsNullOrEmpty(propertyTypeAlias) == false)
+            {
+                if (m.getProperty(propertyTypeAlias) != null)
+                {
+                    m.getProperty(propertyTypeAlias).Value = propertyValue;
+                }
+            }
+        }
+
+        private static string GetMemberProperty(Member m, string propertyTypeAlias, bool isBool)
+        {
+            if (string.IsNullOrEmpty(propertyTypeAlias) == false)
+            {
+                if (m.getProperty(propertyTypeAlias) != null &amp;&amp;
+                    m.getProperty(propertyTypeAlias).Value != null)
+                {
+                    if (isBool)
+                    {
+                        // Umbraco stored true as 1, which means it can be bool.tryParse&#39;d
+                        return m.getProperty(propertyTypeAlias).Value.ToString().Replace(&quot;1&quot;, &quot;true&quot;).Replace(&quot;0&quot;, &quot;false&quot;);
+                    }
+                    return m.getProperty(propertyTypeAlias).Value.ToString();
+                }
+            }
+
+            return null;
+        }
+
+        private static string GetMemberProperty(IMember m, string propertyTypeAlias, bool isBool)
+        {
+            if (string.IsNullOrEmpty(propertyTypeAlias) == false)
+            {
+                if (m.Properties.Contains(propertyTypeAlias) &amp;&amp; 
+                    m.Properties[propertyTypeAlias] != null &amp;&amp;
+                    m.Properties[propertyTypeAlias].Value != null)
+                {
+                    if (isBool)
+                    {
+                        // Umbraco stored true as 1, which means it can be bool.tryParse&#39;d
+                        return m.Properties[propertyTypeAlias].Value.ToString().Replace(&quot;1&quot;, &quot;true&quot;).Replace(&quot;0&quot;, &quot;false&quot;);
+                    }
+                    return m.Properties[propertyTypeAlias].Value.ToString();
+                }
+            }
+
+            return null;
+        }
+        
+        private bool CheckApproveStatus(Member m)
+        {
+            var isApproved = false;
+            if (string.IsNullOrEmpty(ApprovedPropertyTypeAlias) == false)
+            {
+                if (m != null)
+                {
+                    var approveStatus = GetMemberProperty(m, ApprovedPropertyTypeAlias, true);
+                    if (string.IsNullOrEmpty(approveStatus) == false)
+                    {
+                        //try parsing as bool first (just in case)
+                        if (bool.TryParse(approveStatus, out isApproved) == false)
+                        {
+                            int intStatus;
+                            //if that fails, try parsing as int (since its normally stored as 0 or 1)
+                            if (int.TryParse(approveStatus, out intStatus))
+                            {
+                                isApproved = intStatus != 0;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        //There is no property so we shouldn&#39;t use the approve status
+                        isApproved = true;
+                    }
+                }
+            }
+            else {
+                // if we don&#39;t use approve statuses
+                isApproved = true;
+            }
+            return isApproved;
+        }
+        #endregion
+
+        #region Helper Methods
+        
+        /// &lt;summary&gt;
+        /// Encodes the password.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;password&quot;&gt;The password.&lt;/param&gt;
+        /// &lt;returns&gt;The encoded password.&lt;/returns&gt;
+        [Obsolete(&quot;Do not use this, it is the legacy way to encode a password - use the base class EncryptOrHashExistingPassword instead&quot;)]
+        public string EncodePassword(string password)
+        {
+            return LegacyEncodePassword(password);
+        }
+
+        /// &lt;summary&gt;
+        /// Unencode password.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;encodedPassword&quot;&gt;The encoded password.&lt;/param&gt;
+        /// &lt;returns&gt;The unencoded password.&lt;/returns&gt;
+        [Obsolete(&quot;Do not use this, it is the legacy way to decode a password - use the base class DecodePassword instead&quot;)]
+        public string UnEncodePassword(string encodedPassword)
+        {
+            return LegacyUnEncodePassword(encodedPassword);
+        }
+
+        /// &lt;summary&gt;
+        /// Converts to membership user.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;m&quot;&gt;The m.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private MembershipUser ConvertToMembershipUser(Member m)
+        {
+            if (m == null) return null;
+
+            var lastLogin = DateTime.Now;
+            var lastLocked = DateTime.MinValue;
+            var isApproved = true;
+            var isLocked = false;
+            var comment = &quot;&quot;;
+            var passwordQuestion = &quot;&quot;;
+
+            // last login
+            if (string.IsNullOrEmpty(LastLoginPropertyTypeAlias) == false)
+            {
+                DateTime.TryParse(GetMemberProperty(m, LastLoginPropertyTypeAlias, false), out lastLogin);
+            }
+            // approved
+            if (string.IsNullOrEmpty(ApprovedPropertyTypeAlias) == false)
+            {
+                bool.TryParse(GetMemberProperty(m, ApprovedPropertyTypeAlias, true), out isApproved);
+            }
+            // locked
+            if (string.IsNullOrEmpty(LockPropertyTypeAlias) == false)
+            {
+                bool.TryParse(GetMemberProperty(m, LockPropertyTypeAlias, true), out isLocked);
+            }
+            // last locked
+            if (string.IsNullOrEmpty(LastLockedOutPropertyTypeAlias) == false)
+            {
+                DateTime.TryParse(GetMemberProperty(m, LastLockedOutPropertyTypeAlias, false), out lastLocked);
+            }
+            // comment
+            if (string.IsNullOrEmpty(CommentPropertyTypeAlias) == false)
+            {
+                comment = GetMemberProperty(m, CommentPropertyTypeAlias, false);
+            }
+            // password question
+            if (string.IsNullOrEmpty(PasswordRetrievalQuestionPropertyTypeAlias) == false)
+            {
+                passwordQuestion = GetMemberProperty(m, PasswordRetrievalQuestionPropertyTypeAlias, false);
+            }
+
+            return new MembershipUser(_providerName, m.LoginName, m.Id, m.Email, passwordQuestion, comment, isApproved, isLocked, m.CreateDateTime, lastLogin,
+                                      DateTime.Now, DateTime.Now, lastLocked);
+        }
+
+        /// &lt;summary&gt;
+        /// Converts to membership user.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;m&quot;&gt;The m.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private MembershipUser ConvertToMembershipUser(IMember m)
+        {
+            if (m == null) return null;
+
+            var lastLogin = DateTime.Now;
+            var lastLocked = DateTime.MinValue;
+            var isApproved = true;
+            var isLocked = false;
+            var comment = &quot;&quot;;
+            var passwordQuestion = &quot;&quot;;
+
+            // last login
+            if (string.IsNullOrEmpty(LastLoginPropertyTypeAlias) == false)
+            {
+                DateTime.TryParse(GetMemberProperty(m, LastLoginPropertyTypeAlias, false), out lastLogin);
+            }
+            // approved
+            if (string.IsNullOrEmpty(ApprovedPropertyTypeAlias) == false)
+            {
+                bool.TryParse(GetMemberProperty(m, ApprovedPropertyTypeAlias, true), out isApproved);
+            }
+            // locked
+            if (string.IsNullOrEmpty(LockPropertyTypeAlias) == false)
+            {
+                bool.TryParse(GetMemberProperty(m, LockPropertyTypeAlias, true), out isLocked);
+            }
+            // last locked
+            if (string.IsNullOrEmpty(LastLockedOutPropertyTypeAlias) == false)
+            {
+                DateTime.TryParse(GetMemberProperty(m, LastLockedOutPropertyTypeAlias, false), out lastLocked);
+            }
+            // comment
+            if (string.IsNullOrEmpty(CommentPropertyTypeAlias) == false)
+            {
+                comment = GetMemberProperty(m, CommentPropertyTypeAlias, false);
+            }
+            // password question
+            if (string.IsNullOrEmpty(PasswordRetrievalQuestionPropertyTypeAlias) == false)
+            {
+                passwordQuestion = GetMemberProperty(m, PasswordRetrievalQuestionPropertyTypeAlias, false);
+            }
+
+            return new MembershipUser(_providerName, m.Username, m.Id, m.Email, passwordQuestion, comment, isApproved, isLocked, m.CreateDate, lastLogin,
+                                      DateTime.Now, DateTime.Now, lastLocked);
+        }
+
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[36,9,36,43,0],[38,9,38,10,0],[39,13,39,78,0],[40,13,40,91,0],[41,13,41,107,0],[42,13,42,81,0],[43,13,43,78,0],[44,13,44,85,0],[45,13,45,104,0],[46,13,46,104,0],[47,13,47,100,0],[48,9,48,10,0],[52,9,52,59,0],[53,9,53,73,0],[54,9,54,57,0],[55,9,55,62,0],[59,47,59,51,0],[59,52,59,66,0],[60,56,60,60,0],[60,61,60,75,0],[61,65,61,69,0],[61,70,61,84,0],[62,51,62,55,0],[62,56,62,70,0],[63,50,63,54,0],[63,55,63,69,0],[64,52,64,56,0],[64,57,64,71,0],[65,62,65,66,0],[65,67,65,81,0],[66,68,66,72,0],[66,73,66,87,0],[67,66,67,70,0],[67,71,67,85,0],[74,17,74,18,0],[74,19,74,28,0],[74,29,74,30,0],[82,17,82,18,0],[82,19,82,28,0],[82,29,82,30,0],[90,17,90,18,0],[90,19,90,31,0],[90,32,90,33,0],[98,17,98,18,0],[98,19,98,31,0],[98,32,98,33,0],[113,9,113,10,0],[115,13,115,32,0],[115,33,115,75,0],[117,13,117,44,0],[117,45,117,107,0],[119,13,119,43,0],[121,13,121,34,0],[124,13,124,58,0],[125,13,125,14,0],[126,17,126,76,0],[127,17,127,66,0],[128,17,128,18,0],[129,21,129,215,0],[131,17,131,42,0],[132,13,132,14,0],[135,13,135,67,0],[136,13,136,14,0],[137,17,137,87,0],[138,13,138,14,0],[140,13,140,64,0],[141,13,141,14,0],[142,17,142,80,0],[143,13,143,14,0],[144,13,144,70,0],[145,13,145,14,0],[146,17,146,95,0],[147,13,147,14,0],[148,13,148,79,0],[149,13,149,14,0],[150,17,150,110,0],[151,13,151,14,0],[152,13,152,82,0],[153,13,153,14,0],[154,17,154,116,0],[155,13,155,14,0],[157,13,157,67,0],[158,13,158,14,0],[159,17,159,86,0],[160,13,160,14,0],[162,13,162,69,0],[163,13,163,14,0],[164,17,164,90,0],[165,13,165,14,0],[167,13,167,85,0],[168,13,168,14,0],[169,17,169,122,0],[170,13,170,14,0],[171,13,171,83,0],[172,13,172,14,0],[173,17,173,118,0],[174,13,174,14,0],[176,9,176,10,0],[191,9,191,10,0],[197,13,197,61,0],[198,13,198,27,0],[198,28,198,41,0],[201,13,201,83,0],[202,13,203,66,0],[205,13,205,89,0],[207,13,207,22,0],[209,13,209,25,0],[210,9,210,10,0],[223,9,223,10,0],[224,13,224,148,0],[225,13,225,14,0],[226,17,226,155,0],[229,13,229,61,0],[230,13,230,27,0],[231,13,231,14,0],[232,17,232,30,0],[235,13,235,102,0],[236,13,236,98,0],[237,13,237,22,0],[238,13,238,25,0],[239,9,239,10,0],[244,13,244,14,0],[245,17,245,48,0],[246,17,246,18,0],[247,21,247,34,0],[248,21,248,22,0],[249,25,249,56,0],[250,25,250,26,0],[251,29,251,59,0],[252,29,252,51,0],[253,33,253,74,0],[255,33,255,230,0],[257,29,257,54,0],[258,25,258,26,0],[259,21,259,22,0],[260,17,260,18,0],[261,17,261,48,0],[262,13,262,14,0],[282,9,282,10,0],[283,13,283,65,0],[284,13,284,14,0],[285,17,285,67,0],[286,17,286,123,0],[287,17,287,29,0],[290,13,290,81,0],[291,13,291,14,0],[292,17,292,64,0],[293,17,294,102,0],[295,17,295,29,0],[298,13,298,69,0],[299,13,299,36,0],[300,13,300,14,0],[301,17,301,222,0],[304,13,304,82,0],[307,13,307,80,0],[310,13,310,79,0],[313,13,313,91,0],[314,13,314,14,0],[315,17,315,103,0],[316,13,316,14,0],[318,13,318,89,0],[319,13,319,14,0],[320,17,320,99,0],[321,13,321,14,0],[323,13,323,74,0],[324,13,324,14,0],[325,17,325,88,0],[326,13,326,14,0],[328,13,328,75,0],[329,13,329,14,0],[330,17,330,83,0],[331,13,331,14,0],[333,13,333,85,0],[334,13,334,14,0],[335,17,335,93,0],[336,13,336,14,0],[338,13,338,52,0],[341,13,341,22,0],[343,13,343,53,0],[345,13,345,26,0],[346,9,346,10,0],[360,9,360,10,0],[361,13,361,61,0],[362,13,362,27,0],[362,28,362,41,0],[363,13,363,24,0],[364,13,364,25,0],[365,9,365,10,0],[378,9,378,10,0],[379,13,379,186,0],[381,13,381,61,0],[382,13,382,20,0],[382,22,382,27,0],[382,28,382,30,0],[382,31,382,38,0],[383,13,383,14,0],[384,17,384,60,0],[385,13,385,14,0],[386,13,386,31,0],[387,9,387,10,0],[400,9,400,10,0],[401,13,401,192,0],[403,13,403,61,0],[404,13,404,20,0],[404,22,404,27,0],[404,28,404,30,0],[404,31,404,38,0],[405,13,405,14,0],[406,17,406,60,0],[407,13,407,14,0],[408,13,408,31,0],[409,9,409,10,0],[421,9,421,10,0],[422,13,422,62,0],[424,13,424,128,0],[426,13,426,20,0],[426,22,426,27,0],[426,28,426,30,0],[426,31,426,43,0],[427,13,427,14,0],[428,17,428,61,0],[429,13,429,14,0],[430,13,430,32,0],[431,9,431,10,0],[440,9,440,10,0],[441,13,441,103,0],[442,9,442,10,0],[453,9,453,10,0],[454,13,454,61,0],[455,13,455,27,0],[456,13,456,14,0],[457,17,457,89,0],[461,13,461,70,0],[462,13,462,14,0],[463,17,463,41,0],[464,17,464,99,0],[465,17,465,33,0],[466,17,466,18,0],[467,21,467,94,0],[469,13,469,14,0],[471,13,471,43,0],[472,13,472,14,0],[474,17,474,93,0],[475,17,475,18,0],[477,21,477,105,0],[478,21,478,22,0],[479,25,479,92,0],[481,17,481,18,0],[483,17,483,18,0],[484,21,484,401,0],[486,13,486,14,0],[488,13,488,68,0],[490,13,490,36,0],[491,9,491,10,0],[502,9,502,10,0],[503,13,503,48,0],[504,17,504,29,0],[505,13,505,61,0],[507,13,507,27,0],[508,13,508,14,0],[509,17,509,29,0],[512,13,512,90,0],[513,13,513,14,0],[514,17,514,83,0],[519,17,519,31,0],[520,13,520,14,0],[522,13,522,47,0],[523,9,523,10,0],[534,9,534,10,0],[535,13,535,63,0],[536,13,536,32,0],[537,13,537,14,0],[538,17,538,51,0],[539,17,539,94,0],[540,17,540,18,0],[541,21,541,87,0],[545,21,545,35,0],[546,17,546,18,0],[547,17,547,51,0],[549,13,549,61,0],[550,13,550,31,0],[551,13,551,14,0],[552,17,552,50,0],[553,17,553,94,0],[554,17,554,18,0],[555,21,555,87,0],[559,21,559,35,0],[560,17,560,18,0],[561,17,561,51,0],[564,13,564,130,0],[566,9,566,10,0],[577,9,577,10,0],[578,13,578,54,0],[579,13,579,51,0],[580,9,580,10,0],[590,9,590,10,0],[599,13,599,61,0],[600,13,600,27,0],[601,13,601,14,0],[602,17,602,79,0],[606,13,606,70,0],[607,13,607,14,0],[608,17,608,41,0],[609,17,609,99,0],[610,17,610,33,0],[611,17,611,18,0],[612,21,612,78,0],[614,13,614,14,0],[616,13,616,43,0],[617,13,617,14,0],[619,17,619,93,0],[620,17,620,18,0],[622,21,622,105,0],[623,21,623,22,0],[624,25,624,82,0],[626,17,626,18,0],[628,17,628,18,0],[629,21,629,401,0],[631,13,631,14,0],[634,13,634,89,0],[636,13,636,79,0],[638,13,638,85,0],[639,13,639,14,0],[640,17,640,93,0],[641,13,641,14,0],[643,13,643,22,0],[645,13,645,38,0],[646,9,646,10,0],[656,9,656,10,0],[657,13,657,70,0],[658,13,658,14,0],[659,17,659,65,0],[660,17,660,31,0],[661,17,661,18,0],[662,21,662,71,0],[663,21,663,96,0],[664,21,664,22,0],[665,25,665,93,0],[666,21,666,22,0],[667,21,667,30,0],[668,21,668,33,0],[670,17,670,113,0],[672,13,672,250,0],[673,9,673,10,0],[680,9,680,10,0],[681,13,681,66,0],[683,13,683,27,0],[684,13,684,14,0],[685,17,685,118,0],[688,13,688,34,0],[691,13,691,89,0],[694,13,694,86,0],[695,13,695,34,0],[696,13,696,14,0],[697,17,697,87,0],[698,13,698,14,0],[701,13,701,77,0],[703,13,703,22,0],[704,9,704,10,0],[715,9,715,10,0],[716,13,716,61,0],[717,13,717,27,0],[717,28,717,41,0],[718,13,718,74,0],[720,13,720,31,0],[721,13,721,14,0],[723,17,723,74,0],[724,17,724,18,0],[725,21,725,93,0],[726,21,726,69,0],[727,21,727,22,0],[728,25,728,46,0],[729,25,729,71,0],[730,25,730,26,0],[731,29,731,42,0],[732,29,732,30,0],[733,33,733,156,0],[734,33,734,46,0],[736,25,736,26,0],[737,21,737,22,0],[738,17,738,18,0],[741,17,741,52,0],[742,17,742,18,0],[743,21,743,136,0],[744,21,744,34,0],[748,17,748,79,0],[749,17,749,18,0],[750,21,750,87,0],[751,17,751,18,0],[754,17,754,92,0],[755,17,755,18,0],[756,21,756,89,0],[757,17,757,18,0],[764,17,764,31,0],[766,17,766,29,0],[771,13,772,91,0],[773,13,773,14,0],[774,17,774,43,0],[775,17,775,18,0],[776,21,776,44,0],[777,21,777,124,0],[778,21,778,57,0],[779,21,779,102,0],[782,21,782,70,0],[783,21,783,22,0],[784,25,784,75,0],[785,25,785,95,0],[786,25,786,152,0],[787,21,787,22,0],[792,21,792,35,0],[793,17,793,18,0],[795,13,795,14,0],[797,13,797,26,0],[798,9,798,10,0],[801,9,801,10,0],[802,13,802,66,0],[803,13,803,14,0],[804,17,804,62,0],[805,17,805,18,0],[806,21,806,76,0],[807,17,807,18,0],[808,13,808,14,0],[809,9,809,10,0],[812,9,812,10,0],[813,13,813,66,0],[814,13,814,14,0],[815,17,816,68,0],[817,17,817,18,0],[818,21,818,32,0],[819,21,819,22,0],[821,25,821,125,0],[823,21,823,78,0],[825,13,825,14,0],[827,13,827,25,0],[828,9,828,10,0],[831,9,831,10,0],[832,13,832,66,0],[833,13,833,14,0],[834,17,836,67,0],[837,17,837,18,0],[838,21,838,32,0],[839,21,839,22,0],[841,25,841,124,0],[843,21,843,77,0],[845,13,845,14,0],[847,13,847,25,0],[848,9,848,10,0],[851,9,851,10,0],[852,13,852,36,0],[853,13,853,74,0],[854,13,854,14,0],[855,17,855,31,0],[856,17,856,18,0],[857,21,857,95,0],[858,21,858,70,0],[859,21,859,22,0],[861,25,861,83,0],[862,25,862,26,0],[865,29,865,76,0],[866,29,866,30,0],[867,33,867,61,0],[868,29,868,30,0],[869,25,869,26,0],[870,21,870,22,0],[872,21,872,22,0],[874,25,874,43,0],[875,21,875,22,0],[876,17,876,18,0],[877,13,877,14,0],[878,18,878,19,0],[880,17,880,35,0],[881,13,881,14,0],[882,13,882,31,0],[883,9,883,10,0],[895,9,895,10,0],[896,13,896,51,0],[897,9,897,10,0],[906,9,906,10,0],[907,13,907,60,0],[908,9,908,10,0],[916,9,916,10,0],[917,13,917,27,0],[917,28,917,40,0],[919,13,919,42,0],[920,13,920,48,0],[921,13,921,35,0],[922,13,922,34,0],[923,13,923,30,0],[924,13,924,39,0],[927,13,927,75,0],[928,13,928,14,0],[929,17,929,107,0],[930,13,930,14,0],[932,13,932,74,0],[933,13,933,14,0],[934,17,934,102,0],[935,13,935,14,0],[937,13,937,70,0],[938,13,938,14,0],[939,17,939,96,0],[940,13,940,14,0],[942,13,942,79,0],[943,13,943,14,0],[944,17,944,112,0],[945,13,945,14,0],[947,13,947,73,0],[948,13,948,14,0],[949,17,949,81,0],[950,13,950,14,0],[952,13,952,91,0],[953,13,953,14,0],[954,17,954,108,0],[955,13,955,14,0],[957,13,958,79,0],[959,9,959,10,0],[967,9,967,10,0],[968,13,968,27,0],[968,28,968,40,0],[970,13,970,42,0],[971,13,971,48,0],[972,13,972,35,0],[973,13,973,34,0],[974,13,974,30,0],[975,13,975,39,0],[978,13,978,75,0],[979,13,979,14,0],[980,17,980,107,0],[981,13,981,14,0],[983,13,983,74,0],[984,13,984,14,0],[985,17,985,102,0],[986,13,986,14,0],[988,13,988,70,0],[989,13,989,14,0],[990,17,990,96,0],[991,13,991,14,0],[993,13,993,79,0],[994,13,994,14,0],[995,17,995,112,0],[996,13,996,14,0],[998,13,998,73,0],[999,13,999,14,0],[1000,17,1000,81,0],[1001,13,1001,14,0],[1003,13,1003,91,0],[1004,13,1004,14,0],[1005,17,1005,108,0],[1006,13,1006,14,0],[1008,13,1009,79,0],[1010,9,1010,10,0]]);
+    </script>
+  </body>
+</html>

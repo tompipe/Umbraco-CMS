@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\WebBootManager.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Collections.Specialized;
+using System.Configuration;
+using System.Linq;
+using System.Reflection;
+using System.Web;
+using System.Web.Configuration;
+using System.Web.Http;
+using System.Web.Http.Dispatcher;
+using System.Web.Mvc;
+using System.Web.Routing;
+using ClientDependency.Core.Config;
+using Examine;
+using Examine.Config;
+using Examine.Providers;
+using umbraco;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Dictionary;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Macros;
+using Umbraco.Core.ObjectResolution;
+using Umbraco.Core.Profiling;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Core.PropertyEditors.ValueConverters;
+using Umbraco.Core.Sync;
+using Umbraco.Web.Dictionary;
+using Umbraco.Web.Install;
+using Umbraco.Web.Macros;
+using Umbraco.Web.Media;
+using Umbraco.Web.Media.ThumbnailProviders;
+using Umbraco.Web.Models;
+using Umbraco.Web.Mvc;
+using Umbraco.Web.PropertyEditors;
+using Umbraco.Web.PropertyEditors.ValueConverters;
+using Umbraco.Web.PublishedCache;
+using Umbraco.Web.Routing;
+using Umbraco.Web.Security;
+using Umbraco.Web.Scheduling;
+using Umbraco.Web.UI.JavaScript;
+using Umbraco.Web.WebApi;
+using umbraco.BusinessLogic;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Publishing;
+using Umbraco.Core.Services;
+using Umbraco.Web.Editors;
+using Umbraco.Web.HealthCheck;
+using Umbraco.Web.Profiling;
+using GlobalSettings = Umbraco.Core.Configuration.GlobalSettings;
+using ProfilingViewEngine = Umbraco.Core.Profiling.ProfilingViewEngine;
+
+
+namespace Umbraco.Web
+{
+    /// &lt;summary&gt;
+    /// A bootstrapper for the Umbraco application which initializes all objects including the Web portion of the application
+    /// &lt;/summary&gt;
+    public class WebBootManager : CoreBootManager
+    {
+        private readonly bool _isForTesting;
+        //NOTE: see the Initialize method for what this is used for
+        private static readonly List&lt;BaseIndexProvider&gt; IndexesToRebuild = new List&lt;BaseIndexProvider&gt;();
+
+        public WebBootManager(UmbracoApplicationBase umbracoApplication)
+            : base(umbracoApplication)
+        {
+            _isForTesting = false;
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor for unit tests, ensures some resolvers are not initialized
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbracoApplication&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;isForTesting&quot;&gt;&lt;/param&gt;
+        internal WebBootManager(UmbracoApplicationBase umbracoApplication, ProfilingLogger logger, bool isForTesting)
+            : base(umbracoApplication, logger)
+        {
+            _isForTesting = isForTesting;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and returns the service context for the app
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dbContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dbFactory&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected override ServiceContext CreateServiceContext(DatabaseContext dbContext, IDatabaseFactory dbFactory)
+        {
+            //use a request based messaging factory
+            var evtMsgs = new RequestLifespanMessagesFactory(new SingletonHttpContextAccessor());
+            return new ServiceContext(
+                new RepositoryFactory(ApplicationCache, ProfilingLogger.Logger, dbContext.SqlSyntax, UmbracoConfig.For.UmbracoSettings()),
+                new PetaPocoUnitOfWorkProvider(dbFactory),
+                new FileUnitOfWorkProvider(),
+                new PublishingStrategy(evtMsgs, ProfilingLogger.Logger),
+                ApplicationCache,
+                ProfilingLogger.Logger,
+                evtMsgs);
+        }
+
+        /// &lt;summary&gt;
+        /// Initialize objects before anything during the boot cycle happens
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override IBootManager Initialize()
+        {
+             //This is basically a hack for this item: http://issues.umbraco.org/issue/U4-5976
+             // when Examine initializes it will try to rebuild if the indexes are empty, however in many cases not all of Examine&#39;s
+             // event handlers will be assigned during bootup when the rebuilding starts which is a problem. So with the examine 0.1.58.2941 build
+             // it has an event we can subscribe to in order to cancel this rebuilding process, but what we&#39;ll do is cancel it and postpone the rebuilding until the
+             // boot process has completed. It&#39;s a hack but it works.
+            ExamineManager.Instance.BuildingEmptyIndexOnStartup += OnInstanceOnBuildingEmptyIndexOnStartup;
+
+            base.Initialize();
+
+            // Backwards compatibility - set the path and URL type for ClientDependency 1.5.1 [LK]
+            ClientDependency.Core.CompositeFiles.Providers.XmlFileMapper.FileMapVirtualFolder = &quot;~/App_Data/TEMP/ClientDependency&quot;;
+            ClientDependency.Core.CompositeFiles.Providers.BaseCompositeFileProcessingProvider.UrlTypeDefault = ClientDependency.Core.CompositeFiles.Providers.CompositeUrlType.Base64QueryStrings;
+
+            var section = ConfigurationManager.GetSection(&quot;system.web/httpRuntime&quot;) as HttpRuntimeSection;
+            if (section != null)
+            {
+                //set the max url length for CDF to be the smallest of the max query length, max request length
+                ClientDependency.Core.CompositeFiles.CompositeDependencyHandler.MaxHandlerUrlLength = Math.Min(section.MaxQueryStringLength, section.MaxRequestLength);
+            }
+
+            //set master controller factory
+            ControllerBuilder.Current.SetControllerFactory(
+                new MasterControllerFactory(FilteredControllerFactoriesResolver.Current));
+
+            //set the render view engine
+            ViewEngines.Engines.Add(new RenderViewEngine());
+            //set the plugin view engine
+            ViewEngines.Engines.Add(new PluginViewEngine());
+
+            //set model binder
+            ModelBinderProviders.BinderProviders.Add(new RenderModelBinder()); // is a provider
+
+            ////add the profiling action filter
+            //GlobalFilters.Filters.Add(new ProfilingActionFilter());
+
+            //Register a custom renderer - used to process property editor dependencies
+            var renderer = new DependencyPathRenderer();
+            renderer.Initialize(&quot;Umbraco.DependencyPathRenderer&quot;, new NameValueCollection
+            {
+                { &quot;compositeFileHandlerPath&quot;, ClientDependencySettings.Instance.CompositeFileHandlerPath }
+            });
+            ClientDependencySettings.Instance.MvcRendererCollection.Add(renderer);
+
+            // Disable the X-AspNetMvc-Version HTTP Header
+            MvcHandler.DisableMvcResponseHeader = true;
+
+            InstallHelper insHelper = new InstallHelper(UmbracoContext.Current);
+            insHelper.DeleteLegacyInstaller();
+
+            return this;
+        }
+
+        /// &lt;summary&gt;
+        /// Override this method in order to ensure that the UmbracoContext is also created, this can only be
+        /// created after resolution is frozen!
+        /// &lt;/summary&gt;
+        protected override void FreezeResolution()
+        {
+            base.FreezeResolution();
+
+            //before we do anything, we&#39;ll ensure the umbraco context
+            //see: http://issues.umbraco.org/issue/U4-1717
+            var httpContext = new HttpContextWrapper(UmbracoApplication.Context);
+            UmbracoContext.EnsureContext(
+                httpContext,
+                ApplicationContext,
+                new WebSecurity(httpContext, ApplicationContext),
+                UmbracoConfig.For.UmbracoSettings(),
+                UrlProviderResolver.Current.Providers,
+                false);
+        }
+
+        /// &lt;summary&gt;
+        /// Ensure the current profiler is the web profiler
+        /// &lt;/summary&gt;
+        protected override void InitializeProfilerResolver()
+        {
+            base.InitializeProfilerResolver();
+            //Set the profiler to be the web profiler
+            var profiler = new WebProfiler();
+            ProfilerResolver.Current.SetProfiler(profiler);
+            profiler.Start();
+        }
+
+        /// &lt;summary&gt;
+        /// Ensure that the OnApplicationStarted methods of the IApplicationEvents are called
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;afterComplete&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override IBootManager Complete(Action&lt;ApplicationContext&gt; afterComplete)
+        {
+            //Wrap viewengines in the profiling engine
+            WrapViewEngines(ViewEngines.Engines);
+
+            //add global filters
+            ConfigureGlobalFilters();
+
+            //set routes
+            CreateRoutes();
+
+            base.Complete(afterComplete);
+
+            //Now, startup all of our legacy startup handler
+            ApplicationEventsResolver.Current.InstantiateLegacyStartupHandlers();
+
+            //Ok, now that everything is complete we&#39;ll check if we&#39;ve stored any references to index that need rebuilding and run them
+            // (see the initialize method for notes) - we&#39;ll ensure we remove the event handler too in case examine manager doesn&#39;t actually
+            // initialize during startup, in which case we want it to rebuild the indexes itself.
+            ExamineManager.Instance.BuildingEmptyIndexOnStartup -= OnInstanceOnBuildingEmptyIndexOnStartup;
+            if (IndexesToRebuild.Any())
+            {
+                foreach (var indexer in IndexesToRebuild)
+                {
+                    indexer.RebuildIndex();
+                }
+            }
+
+            //Now ensure webapi is initialized after everything
+            GlobalConfiguration.Configuration.EnsureInitialized();
+
+            return this;
+        }
+
+        internal static void ConfigureGlobalFilters()
+        {
+            GlobalFilters.Filters.Add(new EnsurePartialViewMacroViewContextFilterAttribute());
+        }
+
+        internal static void WrapViewEngines(IList&lt;IViewEngine&gt; viewEngines)
+        {
+            if (viewEngines == null || viewEngines.Count == 0) return;
+
+            var originalEngines = viewEngines.Select(e =&gt; e).ToArray();
+            viewEngines.Clear();
+            foreach (var engine in originalEngines)
+            {
+                var wrappedEngine = engine is ProfilingViewEngine ? engine : new ProfilingViewEngine(engine);
+                viewEngines.Add(wrappedEngine);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Creates the application cache based on the HttpRuntime cache
+        /// &lt;/summary&gt;
+        protected override CacheHelper CreateApplicationCache()
+        {
+            //create a web-based cache helper
+            var cacheHelper = new CacheHelper(
+                //we need to have the dep clone runtime cache provider to ensure
+                //all entities are cached properly (cloned in and cloned out)
+                new DeepCloneRuntimeCacheProvider(new HttpRuntimeCacheProvider(HttpRuntime.Cache)),
+                new StaticCacheProvider(),
+                //we need request based cache when running in web-based context
+                new HttpRequestCacheProvider(),
+                new IsolatedRuntimeCache(type =&gt;
+                    //we need to have the dep clone runtime cache provider to ensure
+                    //all entities are cached properly (cloned in and cloned out)
+                    new DeepCloneRuntimeCacheProvider(new ObjectCacheRuntimeCacheProvider())));
+
+            return cacheHelper;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates the routes
+        /// &lt;/summary&gt;
+        protected internal void CreateRoutes()
+        {
+            var umbracoPath = GlobalSettings.UmbracoMvcArea;
+
+            //Create the front-end route
+            var defaultRoute = RouteTable.Routes.MapRoute(
+                &quot;Umbraco_default&quot;,
+                umbracoPath + &quot;/RenderMvc/{action}/{id}&quot;,
+                new { controller = &quot;RenderMvc&quot;, action = &quot;Index&quot;, id = UrlParameter.Optional }
+                );
+            defaultRoute.RouteHandler = new RenderRouteHandler(ControllerBuilder.Current.GetControllerFactory());
+
+            //register install routes
+            RouteTable.Routes.RegisterArea&lt;UmbracoInstallArea&gt;();
+
+            //register all back office routes
+            RouteTable.Routes.RegisterArea&lt;BackOfficeArea&gt;();
+
+            //plugin controllers must come first because the next route will catch many things
+            RoutePluginControllers();
+        }
+
+        private void RoutePluginControllers()
+        {
+            var umbracoPath = GlobalSettings.UmbracoMvcArea;
+
+            //we need to find the plugin controllers and route them
+            var pluginControllers =
+                SurfaceControllerResolver.Current.RegisteredSurfaceControllers.Concat(
+                    UmbracoApiControllerResolver.Current.RegisteredUmbracoApiControllers).ToArray();
+
+            //local controllers do not contain the attribute
+            var localControllers = pluginControllers.Where(x =&gt; PluginController.GetMetadata(x).AreaName.IsNullOrWhiteSpace());
+            foreach (var s in localControllers)
+            {
+                if (TypeHelper.IsTypeAssignableFrom&lt;SurfaceController&gt;(s))
+                {
+                    RouteLocalSurfaceController(s, umbracoPath);
+                }
+                else if (TypeHelper.IsTypeAssignableFrom&lt;UmbracoApiController&gt;(s))
+                {
+                    RouteLocalApiController(s, umbracoPath);
+                }
+            }
+
+            //need to get the plugin controllers that are unique to each area (group by)
+            var pluginSurfaceControlleres = pluginControllers.Where(x =&gt; !PluginController.GetMetadata(x).AreaName.IsNullOrWhiteSpace());
+            var groupedAreas = pluginSurfaceControlleres.GroupBy(controller =&gt; PluginController.GetMetadata(controller).AreaName);
+            //loop through each area defined amongst the controllers
+            foreach (var g in groupedAreas)
+            {
+                //create an area for the controllers (this will throw an exception if all controllers are not in the same area)
+                var pluginControllerArea = new PluginControllerArea(g.Select(PluginController.GetMetadata));
+                //register it
+                RouteTable.Routes.RegisterArea(pluginControllerArea);
+            }
+        }
+
+        private void RouteLocalApiController(Type controller, string umbracoPath)
+        {
+            var meta = PluginController.GetMetadata(controller);
+
+            //url to match
+            var routePath = meta.IsBackOffice == false
+                                ? umbracoPath + &quot;/Api/&quot; + meta.ControllerName + &quot;/{action}/{id}&quot;
+                                : umbracoPath + &quot;/BackOffice/Api/&quot; + meta.ControllerName + &quot;/{action}/{id}&quot;;
+
+            var route = RouteTable.Routes.MapHttpRoute(
+                string.Format(&quot;umbraco-{0}-{1}&quot;, &quot;api&quot;, meta.ControllerName),
+                routePath,
+                new { controller = meta.ControllerName, id = UrlParameter.Optional },
+                new[] { meta.ControllerNamespace });
+            //web api routes don&#39;t set the data tokens object
+            if (route.DataTokens == null)
+            {
+                route.DataTokens = new RouteValueDictionary();
+            }
+            route.DataTokens.Add(Core.Constants.Web.UmbracoDataToken, &quot;api&quot;); //ensure the umbraco token is set
+        }
+
+        private void RouteLocalSurfaceController(Type controller, string umbracoPath)
+        {
+            var meta = PluginController.GetMetadata(controller);
+            var route = RouteTable.Routes.MapRoute(
+                string.Format(&quot;umbraco-{0}-{1}&quot;, &quot;surface&quot;, meta.ControllerName),
+                umbracoPath + &quot;/Surface/&quot; + meta.ControllerName + &quot;/{action}/{id}&quot;,//url to match
+                new { controller = meta.ControllerName, action = &quot;Index&quot;, id = UrlParameter.Optional },
+                new[] { meta.ControllerNamespace }); //look in this namespace to create the controller
+            route.DataTokens.Add(Core.Constants.Web.UmbracoDataToken, &quot;surface&quot;); //ensure the umbraco token is set
+            route.DataTokens.Add(&quot;UseNamespaceFallback&quot;, false); //Don&#39;t look anywhere else except this namespace!
+            //make it use our custom/special SurfaceMvcHandler
+            route.RouteHandler = new SurfaceRouteHandler();
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes all web based and core resolves
+        /// &lt;/summary&gt;
+        protected override void InitializeResolvers()
+        {
+            base.InitializeResolvers();
+
+            XsltExtensionsResolver.Current = new XsltExtensionsResolver(ServiceProvider, LoggerResolver.Current.Logger, () =&gt; PluginManager.ResolveXsltExtensions());
+
+            EditorValidationResolver.Current= new EditorValidationResolver(ServiceProvider, LoggerResolver.Current.Logger, () =&gt; PluginManager.ResolveTypes&lt;IEditorValidator&gt;());
+
+            //set the default RenderMvcController
+            DefaultRenderMvcControllerResolver.Current = new DefaultRenderMvcControllerResolver(typeof(RenderMvcController));
+
+            //Override the default server messenger, we need to check if the legacy dist calls is enabled, if that is the
+            // case, then we&#39;ll set the default messenger to be the old one, otherwise we&#39;ll set it to the db messenger
+            // which will always be on.
+            if (UmbracoConfig.For.UmbracoSettings().DistributedCall.Enabled)
+            {
+                //set the legacy one by default - this maintains backwards compat
+                ServerMessengerResolver.Current.SetServerMessenger(new BatchedWebServiceServerMessenger(() =&gt;
+                {
+                    //we should not proceed to change this if the app/database is not configured since there will
+                    // be no user, plus we don&#39;t need to have server messages sent if this is the case.
+                    if (ApplicationContext.IsConfigured &amp;&amp; ApplicationContext.DatabaseContext.IsDatabaseConfigured)
+                    {
+                        //disable if they are not enabled
+                        if (UmbracoConfig.For.UmbracoSettings().DistributedCall.Enabled == false)
+                        {
+                            return null;
+                        }
+
+                        try
+                        {
+                            var user = ApplicationContext.Services.UserService.GetUserById(UmbracoConfig.For.UmbracoSettings().DistributedCall.UserId);
+                            return new Tuple&lt;string, string&gt;(user.Username, user.RawPasswordValue);
+                        }
+                        catch (Exception e)
+                        {
+                            LoggerResolver.Current.Logger.Error&lt;WebBootManager&gt;(&quot;An error occurred trying to set the IServerMessenger during application startup&quot;, e);
+                            return null;
+                        }
+                    }
+                    LoggerResolver.Current.Logger.Warn&lt;WebBootManager&gt;(&quot;Could not initialize the DefaultServerMessenger, the application is not configured or the database is not configured&quot;);
+                    return null;
+                }));
+            }
+            else
+            {
+
+                //We are using a custom action here so we can check the examine settings value first, we don&#39;t want to
+                // put that check into the CreateIndexesOnColdBoot method because developers may choose to use this
+                // method directly and they will be in charge of this check if they need it
+                Action rebuildIndexes = () =&gt;
+                {
+                    //If the developer has explicitly opted out of rebuilding indexes on startup then we
+                    // should adhere to that and not do it, this means that if they are load balancing things will be
+                    // out of sync if they are auto-scaling but there&#39;s not much we can do about that.
+                    if (ExamineSettings.Instance.RebuildOnAppStart == false) return;
+
+                    foreach (var indexer in GetIndexesForColdBoot())
+                    {
+                        indexer.RebuildIndex();
+                    }
+                };
+
+                ServerMessengerResolver.Current.SetServerMessenger(new BatchedDatabaseServerMessenger(
+                    ApplicationContext,
+                    true,
+                    //Default options for web including the required callbacks to build caches
+                    new DatabaseServerMessengerOptions
+                    {
+                        //These callbacks will be executed if the server has not been synced
+                        // (i.e. it is a new server or the lastsynced.txt file has been removed)
+                        InitializingCallbacks = new Action[]
+                        {
+                            //rebuild the xml cache file if the server is not synced
+                            () =&gt; global::umbraco.content.Instance.RefreshContentFromDatabase(),
+                            //rebuild indexes if the server is not synced
+                            // NOTE: This will rebuild ALL indexes including the members, if developers want to target specific
+                            // indexes then they can adjust this logic themselves.
+                            rebuildIndexes
+                        }
+                    }));
+            }
+
+            SurfaceControllerResolver.Current = new SurfaceControllerResolver(
+                ServiceProvider, LoggerResolver.Current.Logger,
+                PluginManager.ResolveSurfaceControllers());
+
+            UmbracoApiControllerResolver.Current = new UmbracoApiControllerResolver(
+                ServiceProvider, LoggerResolver.Current.Logger,
+                PluginManager.ResolveUmbracoApiControllers());
+
+            // both TinyMceValueConverter (in Core) and RteMacroRenderingValueConverter (in Web) will be
+            // discovered when CoreBootManager configures the converters. We HAVE to remove one of them
+            // here because there cannot be two converters for one property editor - and we want the full
+            // RteMacroRenderingValueConverter that converts macros, etc. So remove TinyMceValueConverter.
+            // (the limited one, defined in Core, is there for tests)
+            PropertyValueConvertersResolver.Current.RemoveType&lt;TinyMceValueConverter&gt;();
+            // same for other converters
+            PropertyValueConvertersResolver.Current.RemoveType&lt;Core.PropertyEditors.ValueConverters.TextStringValueConverter&gt;();
+            PropertyValueConvertersResolver.Current.RemoveType&lt;Core.PropertyEditors.ValueConverters.MarkdownEditorValueConverter&gt;();
+            PropertyValueConvertersResolver.Current.RemoveType&lt;Core.PropertyEditors.ValueConverters.ImageCropperValueConverter&gt;();
+
+            PublishedCachesResolver.Current = new PublishedCachesResolver(new PublishedCaches(
+                new PublishedCache.XmlPublishedCache.PublishedContentCache(),
+                new PublishedCache.XmlPublishedCache.PublishedMediaCache(ApplicationContext)));
+
+            GlobalConfiguration.Configuration.Services.Replace(typeof(IHttpControllerSelector),
+                new NamespaceHttpControllerSelector(GlobalConfiguration.Configuration));
+
+            FilteredControllerFactoriesResolver.Current = new FilteredControllerFactoriesResolver(
+                ServiceProvider, LoggerResolver.Current.Logger,
+                // add all known factories, devs can then modify this list on application
+                // startup either by binding to events or in their own global.asax
+                new[]
+					{
+						typeof (RenderControllerFactory)
+					});
+
+            UrlProviderResolver.Current = new UrlProviderResolver(
+                ServiceProvider, LoggerResolver.Current.Logger,
+                    //typeof(AliasUrlProvider), // not enabled by default
+                    typeof(DefaultUrlProvider),
+                    typeof(CustomRouteUrlProvider)
+                );
+
+            ContentLastChanceFinderResolver.Current = new ContentLastChanceFinderResolver(
+                // handled by ContentLastChanceFinderByNotFoundHandlers for the time being
+                // soon as we get rid of INotFoundHandler support, we must enable this
+                //new ContentFinderByLegacy404()
+
+                // implement INotFoundHandler support... remove once we get rid of it
+                new ContentLastChanceFinderByNotFoundHandlers());
+
+            ContentFinderResolver.Current = new ContentFinderResolver(
+                ServiceProvider, LoggerResolver.Current.Logger,
+                // all built-in finders in the correct order, devs can then modify this list
+                // on application startup via an application event handler.
+                typeof(ContentFinderByPageIdQuery),
+                typeof(ContentFinderByNiceUrl),
+                typeof(ContentFinderByIdPath),
+
+                // these will be handled by ContentFinderByNotFoundHandlers so they can be enabled/disabled
+                // via the config file... soon as we get rid of INotFoundHandler support, we must enable
+                // them here.
+                //typeof (ContentFinderByNiceUrlAndTemplate),
+                //typeof (ContentFinderByProfile),
+                //typeof (ContentFinderByUrlAlias),
+
+                // note: that one should run *after* NiceUrlAndTemplate, UrlAlias... but at the moment
+                // it cannot be done - just make sure to do it properly in v8!
+                typeof(ContentFinderByRedirectUrl),
+
+                // implement INotFoundHandler support... remove once we get rid of it
+                typeof(ContentFinderByNotFoundHandlers)
+            );
+
+            SiteDomainHelperResolver.Current = new SiteDomainHelperResolver(new SiteDomainHelper());
+
+            // ain&#39;t that a bit dirty?
+            PublishedCache.XmlPublishedCache.PublishedContentCache.UnitTesting = _isForTesting;
+
+            ThumbnailProvidersResolver.Current = new ThumbnailProvidersResolver(
+                ServiceProvider, LoggerResolver.Current.Logger,
+                PluginManager.ResolveThumbnailProviders());
+
+            ImageUrlProviderResolver.Current = new ImageUrlProviderResolver(
+                ServiceProvider, LoggerResolver.Current.Logger,
+                PluginManager.ResolveImageUrlProviders());
+
+            CultureDictionaryFactoryResolver.Current = new CultureDictionaryFactoryResolver(
+                new DefaultCultureDictionaryFactory());
+
+            HealthCheckResolver.Current = new HealthCheckResolver(LoggerResolver.Current.Logger,
+                () =&gt; PluginManager.ResolveTypes&lt;HealthCheck.HealthCheck&gt;());
+        }
+
+        /// &lt;summary&gt;
+        /// The method used to create indexes on a cold boot
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// A cold boot is when the server determines it will not (or cannot) process instructions in the cache table and
+        /// will rebuild it&#39;s own caches itself.
+        /// &lt;/remarks&gt;
+        public static IEnumerable&lt;BaseIndexProvider&gt; GetIndexesForColdBoot()
+        {
+            // NOTE: This is IMPORTANT! ... we don&#39;t want to rebuild any index that is already flagged to be re-indexed
+            // on startup based on our _indexesToRebuild variable and how Examine auto-rebuilds when indexes are empty.
+            // This callback is used above for the DatabaseServerMessenger startup options.
+
+            // all indexes
+            IEnumerable&lt;BaseIndexProvider&gt; indexes = ExamineManager.Instance.IndexProviderCollection;
+
+            // except those that are already flagged
+            // and are processed in Complete()
+            if (IndexesToRebuild.Any())
+                indexes = indexes.Except(IndexesToRebuild);
+
+            // return
+            foreach (var index in indexes)
+                yield return index;
+        }
+
+
+        private void OnInstanceOnBuildingEmptyIndexOnStartup(object sender, BuildingEmptyIndexOnStartupEventArgs args)
+        {
+            //store the indexer that needs rebuilding because it&#39;s empty for when the boot process
+            // is complete and cancel this current event so the rebuild process doesn&#39;t start right now.
+            args.Cancel = true;
+            IndexesToRebuild.Add((BaseIndexProvider)args.Indexer);
+
+            //check if the index is rebuilding due to an error and log it
+            if (args.IsHealthy == false)
+            {
+                var baseIndex = args.Indexer as BaseIndexProvider;
+                var name = baseIndex != null ? baseIndex.Name : &quot;[UKNOWN]&quot;;
+
+                ProfilingLogger.Logger.Error&lt;WebBootManager&gt;(string.Format(&quot;The index {0} is rebuilding due to being unreadable/corrupt&quot;, name), args.UnhealthyException);
+            }
+        }
+    }
+}
+
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[65,9,65,106,1],[68,15,68,39,0],[69,9,69,10,0],[70,13,70,35,0],[71,9,71,10,0],[80,15,80,47,1],[81,9,81,10,1],[82,13,82,42,1],[83,9,83,10,1],[92,9,92,10,0],[94,13,94,98,0],[95,13,102,26,0],[103,9,103,10,0],[110,9,110,10,0],[116,13,116,108,0],[118,13,118,31,0],[121,13,121,132,0],[122,13,122,196,0],[124,13,124,107,0],[125,13,125,33,0],[126,13,126,14,0],[128,17,128,168,0],[129,13,129,14,0],[132,13,133,91,0],[136,13,136,61,0],[138,13,138,61,0],[141,13,141,79,0],[147,13,147,57,0],[148,13,151,16,0],[152,13,152,83,0],[155,13,155,56,0],[157,13,157,81,0],[158,13,158,47,0],[160,13,160,25,0],[161,9,161,10,0],[168,9,168,10,0],[169,13,169,37,0],[173,13,173,82,0],[174,13,180,24,0],[181,9,181,10,0],[187,9,187,10,0],[188,13,188,47,0],[190,13,190,46,0],[191,13,191,60,0],[192,13,192,30,0],[193,9,193,10,0],[201,9,201,10,0],[203,13,203,50,0],[206,13,206,38,0],[209,13,209,28,0],[211,13,211,42,0],[214,13,214,82,0],[219,13,219,108,0],[220,13,220,40,0],[221,13,221,14,0],[222,17,222,24,0],[222,26,222,37,0],[222,38,222,40,0],[222,41,222,57,0],[223,17,223,18,0],[224,21,224,44,0],[225,17,225,18,0],[226,13,226,14,0],[229,13,229,67,0],[231,13,231,25,0],[232,9,232,10,0],[235,9,235,10,0],[236,13,236,95,0],[237,9,237,10,0],[240,9,240,10,1],[241,13,241,63,1],[241,64,241,71,1],[243,13,243,59,1],[243,59,243,60,1],[243,60,243,72,1],[243,13,243,72,1],[244,13,244,33,1],[245,13,245,20,1],[245,22,245,32,1],[245,33,245,35,1],[245,36,245,51,1],[246,13,246,14,1],[247,17,247,110,1],[248,17,248,48,1],[249,13,249,14,1],[250,9,250,10,1],[256,9,256,10,0],[258,13,268,21,0],[268,21,268,93,0],[268,93,268,96,0],[258,13,268,96,0],[270,13,270,32,0],[271,9,271,10,0],[277,9,277,10,1],[278,13,278,61,1],[281,13,285,19,1],[286,13,286,114,1],[289,13,289,66,1],[292,13,292,62,1],[295,13,295,38,1],[296,9,296,10,1],[299,9,299,10,1],[300,13,300,61,1],[303,13,305,101,1],[308,13,308,65,1],[308,65,308,126,1],[308,126,308,128,1],[308,13,308,128,1],[309,13,309,20,1],[309,22,309,27,1],[309,28,309,30,1],[309,31,309,47,1],[310,13,310,14,1],[311,17,311,75,1],[312,17,312,18,1],[313,21,313,65,1],[314,17,314,18,1],[315,22,315,83,1],[316,17,316,18,1],[317,21,317,61,1],[318,17,318,18,1],[319,13,319,14,1],[322,13,322,74,1],[322,74,322,136,1],[322,136,322,138,1],[322,13,322,138,1],[323,13,323,80,1],[323,80,323,129,1],[323,129,323,131,1],[323,13,323,131,1],[325,13,325,20,1],[325,22,325,27,1],[325,28,325,30,1],[325,31,325,43,1],[326,13,326,14,1],[328,17,328,109,1],[330,17,330,70,1],[331,13,331,14,1],[332,9,332,10,1],[335,9,335,10,1],[336,13,336,65,1],[339,13,341,109,1],[343,13,347,53,1],[349,13,349,42,1],[350,13,350,14,0],[351,17,351,63,0],[352,13,352,14,0],[353,13,353,78,1],[354,9,354,10,1],[357,9,357,10,1],[358,13,358,65,1],[359,13,363,53,1],[364,13,364,82,1],[365,13,365,65,1],[367,13,367,60,1],[368,9,368,10,1],[374,9,374,10,0],[375,13,375,40,0],[377,13,377,127,0],[377,127,377,164,0],[377,164,377,166,0],[377,13,377,166,0],[379,13,379,130,0],[379,130,379,176,0],[379,176,379,178,0],[379,13,379,178,0],[382,13,382,126,0],[387,13,387,77,0],[388,13,388,14,0],[390,17,391,17,0],[391,17,391,18,0],[391,18,394,21,0],[394,21,394,116,0],[394,116,395,21,0],[395,21,395,22,0],[395,22,397,25,0],[397,25,397,98,0],[397,98,398,25,0],[398,25,398,26,0],[398,26,399,29,0],[399,29,399,41,0],[399,41,403,25,0],[403,25,403,26,0],[403,26,404,29,0],[404,29,404,152,0],[404,152,405,29,0],[405,29,405,100,0],[405,100,407,25,0],[407,25,407,44,0],[407,44,408,25,0],[408,25,408,26,0],[408,26,409,29,0],[409,29,409,167,0],[409,167,410,29,0],[410,29,410,41,0],[410,41,413,21,0],[413,21,413,192,0],[413,192,414,21,0],[414,21,414,33,0],[414,33,415,17,0],[415,17,415,18,0],[415,18,415,21,0],[390,17,415,21,0],[416,13,416,14,0],[418,13,418,14,0],[423,17,424,17,0],[424,17,424,18,0],[424,18,428,21,0],[428,21,428,77,0],[428,77,428,78,0],[428,78,428,85,0],[428,85,430,21,0],[430,21,430,28,0],[430,28,430,30,0],[430,30,430,41,0],[430,41,430,42,0],[430,42,430,44,0],[430,44,430,45,0],[430,45,430,68,0],[430,68,431,21,0],[431,21,431,22,0],[431,22,432,25,0],[432,25,432,48,0],[432,48,433,21,0],[433,21,433,22,0],[433,22,434,17,0],[434,17,434,18,0],[434,18,434,19,0],[423,17,434,19,0],[436,17,447,35,0],[447,35,447,96,0],[447,96,453,25,0],[436,17,453,25,0],[454,13,454,14,0],[456,13,458,60,0],[460,13,462,63,0],[469,13,469,89,0],[471,13,471,129,0],[472,13,472,133,0],[473,13,473,131,0],[475,13,477,96,0],[479,13,480,89,0],[482,13,489,9,0],[491,13,496,19,0],[498,13,504,66,0],[506,13,527,15,0],[529,13,529,101,0],[532,13,532,96,0],[534,13,536,60,0],[538,13,540,59,0],[542,13,543,56,0],[545,13,546,23,0],[546,23,546,76,0],[546,76,546,78,0],[545,13,546,78,0],[547,9,547,10,0],[557,9,557,10,0],[563,13,563,102,0],[567,13,567,40,0],[568,17,568,60,0],[571,13,571,20,0],[571,22,571,31,0],[571,32,571,34,0],[571,35,571,42,0],[572,17,572,36,0],[573,9,573,10,0],[577,9,577,10,0],[580,13,580,32,0],[581,13,581,67,0],[584,13,584,41,0],[585,13,585,14,0],[586,17,586,67,0],[587,17,587,76,0],[589,17,589,171,0],[590,13,590,14,0],[591,9,591,10,0]]);
+    </script>
+  </body>
+</html>

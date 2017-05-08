@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Cache\DefaultRepositoryCachePolicy.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.EntityBase;
+
+namespace Umbraco.Core.Cache
+{
+    /// &lt;summary&gt;
+    /// The default cache policy for retrieving a single entity
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name=&quot;TEntity&quot;&gt;&lt;/typeparam&gt;
+    /// &lt;typeparam name=&quot;TId&quot;&gt;&lt;/typeparam&gt;
+    /// &lt;remarks&gt;
+    /// This cache policy uses sliding expiration and caches instances for 5 minutes. However if allow zero count is true, then we use the
+    /// default policy with no expiry.
+    /// &lt;/remarks&gt;
+    internal class DefaultRepositoryCachePolicy&lt;TEntity, TId&gt; : RepositoryCachePolicyBase&lt;TEntity, TId&gt;
+        where TEntity : class, IAggregateRoot
+    {
+        private readonly RepositoryCachePolicyOptions _options;
+       
+        public DefaultRepositoryCachePolicy(IRuntimeCacheProvider cache, RepositoryCachePolicyOptions options)
+            : base(cache)
+        {            
+            if (options == null) throw new ArgumentNullException(&quot;options&quot;);
+            _options = options;         
+        }
+
+        protected string GetCacheIdKey(object id)
+        {
+            if (id == null) throw new ArgumentNullException(&quot;id&quot;);
+
+            return string.Format(&quot;{0}{1}&quot;, GetCacheTypeKey(), id);
+        }
+
+        protected string GetCacheTypeKey()
+        {
+            return string.Format(&quot;uRepo_{0}_&quot;, typeof(TEntity).Name);
+        }
+
+        public override void CreateOrUpdate(TEntity entity, Action&lt;TEntity&gt; persistMethod)
+        {
+            if (entity == null) throw new ArgumentNullException(&quot;entity&quot;);
+            if (persistMethod == null) throw new ArgumentNullException(&quot;persistMethod&quot;);
+
+            try
+            {
+                persistMethod(entity);
+
+                //set the disposal action                
+                SetCacheAction(() =&gt;
+                {
+                    //just to be safe, we cannot cache an item without an identity
+                    if (entity.HasIdentity)
+                    {
+                        Cache.InsertCacheItem(GetCacheIdKey(entity.Id), () =&gt; entity,
+                            timeout: TimeSpan.FromMinutes(5),
+                            isSliding: true);
+                    }
+                    
+                    //If there&#39;s a GetAllCacheAllowZeroCount cache, ensure it is cleared
+                    Cache.ClearCacheItem(GetCacheTypeKey());
+                });
+                
+            }
+            catch
+            {
+                //set the disposal action                
+                SetCacheAction(() =&gt;
+                {
+                    //if an exception is thrown we need to remove the entry from cache, this is ONLY a work around because of the way
+                    // that we cache entities: http://issues.umbraco.org/issue/U4-4259
+                    Cache.ClearCacheItem(GetCacheIdKey(entity.Id));
+
+                    //If there&#39;s a GetAllCacheAllowZeroCount cache, ensure it is cleared
+                    Cache.ClearCacheItem(GetCacheTypeKey());
+                });
+                
+                throw;
+            }
+        }
+
+        public override void Remove(TEntity entity, Action&lt;TEntity&gt; persistMethod)
+        {
+            if (entity == null) throw new ArgumentNullException(&quot;entity&quot;);
+            if (persistMethod == null) throw new ArgumentNullException(&quot;persistMethod&quot;);
+
+            try
+            {
+                persistMethod(entity);
+            }
+            finally
+            {
+                //set the disposal action
+                var cacheKey = GetCacheIdKey(entity.Id);
+                SetCacheAction(() =&gt;
+                {
+                    Cache.ClearCacheItem(cacheKey);
+                    //If there&#39;s a GetAllCacheAllowZeroCount cache, ensure it is cleared
+                    Cache.ClearCacheItem(GetCacheTypeKey());
+                });
+            }
+        }
+
+        public override TEntity Get(TId id, Func&lt;TId, TEntity&gt; getFromRepo)
+        {
+            if (getFromRepo == null) throw new ArgumentNullException(&quot;getFromRepo&quot;);
+
+            var cacheKey = GetCacheIdKey(id);
+            var fromCache = Cache.GetCacheItem&lt;TEntity&gt;(cacheKey);
+            if (fromCache != null)
+                return fromCache;
+            
+            var entity = getFromRepo(id);
+
+            //set the disposal action
+            SetCacheAction(cacheKey, entity);
+
+            return entity;
+        }
+
+        public override TEntity Get(TId id)
+        {
+            var cacheKey = GetCacheIdKey(id);
+            return Cache.GetCacheItem&lt;TEntity&gt;(cacheKey);
+        }
+
+        public override bool Exists(TId id, Func&lt;TId, bool&gt; getFromRepo)
+        {
+            if (getFromRepo == null) throw new ArgumentNullException(&quot;getFromRepo&quot;);
+
+            var cacheKey = GetCacheIdKey(id);
+            var fromCache = Cache.GetCacheItem&lt;TEntity&gt;(cacheKey);
+            return fromCache != null || getFromRepo(id);
+        }
+
+        public override TEntity[] GetAll(TId[] ids, Func&lt;TId[], IEnumerable&lt;TEntity&gt;&gt; getFromRepo)            
+        {
+            if (getFromRepo == null) throw new ArgumentNullException(&quot;getFromRepo&quot;);
+
+            if (ids.Any())
+            {
+                var entities = ids.Select(Get).ToArray();
+                if (ids.Length.Equals(entities.Length) &amp;&amp; entities.Any(x =&gt; x == null) == false)
+                    return entities;
+            }
+            else
+            {
+                var allEntities = GetAllFromCache();
+                if (allEntities.Any())
+                {
+                    if (_options.GetAllCacheValidateCount)
+                    {
+                        //Get count of all entities of current type (TEntity) to ensure cached result is correct
+                        var totalCount = _options.PerformCount();
+                        if (allEntities.Length == totalCount)
+                            return allEntities;
+                    }
+                    else
+                    {
+                        return allEntities;
+                    }
+                }
+                else if (_options.GetAllCacheAllowZeroCount)
+                {
+                    //if the repository allows caching a zero count, then check the zero count cache
+                    if (HasZeroCountCache())
+                    {
+                        //there is a zero count cache so return an empty list
+                        return new TEntity[] {};
+                    }
+                }
+            }
+
+            //we need to do the lookup from the repo
+            var entityCollection = getFromRepo(ids)
+                //ensure we don&#39;t include any null refs in the returned collection!
+                .WhereNotNull()
+                .ToArray();
+
+            //set the disposal action
+            SetCacheAction(ids, entityCollection);
+
+            return entityCollection;
+        }
+
+        /// &lt;summary&gt;
+        /// Looks up the zero count cache, must return null if it doesn&#39;t exist
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected bool HasZeroCountCache()
+        {
+            var zeroCount = Cache.GetCacheItem&lt;TEntity[]&gt;(GetCacheTypeKey());
+            return (zeroCount != null &amp;&amp; zeroCount.Any() == false);
+        }
+
+        /// &lt;summary&gt;
+        /// Performs the lookup for all entities of this type from the cache
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected TEntity[] GetAllFromCache()
+        {
+            var allEntities = Cache.GetCacheItemsByKeySearch&lt;TEntity&gt;(GetCacheTypeKey())
+                    .WhereNotNull()
+                    .ToArray();
+            return allEntities.Any() ? allEntities : new TEntity[] {};
+        }       
+
+        /// &lt;summary&gt;
+        /// Sets the action to execute on disposal for a single entity
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        protected virtual void SetCacheAction(string cacheKey, TEntity entity)
+        {
+            if (entity == null) return;
+
+            SetCacheAction(() =&gt;
+            {
+                //just to be safe, we cannot cache an item without an identity
+                if (entity.HasIdentity)
+                {
+                    Cache.InsertCacheItem(cacheKey, () =&gt; entity,
+                        timeout: TimeSpan.FromMinutes(5),
+                        isSliding: true);
+                }
+            });
+        }
+
+        /// &lt;summary&gt;
+        /// Sets the action to execute on disposal for an entity collection
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ids&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;entityCollection&quot;&gt;&lt;/param&gt;
+        protected virtual void SetCacheAction(TId[] ids, TEntity[] entityCollection)
+        {
+            SetCacheAction(() =&gt;
+            {
+                //This option cannot execute if we are looking up specific Ids
+                if (ids.Any() == false &amp;&amp; entityCollection.Length == 0 &amp;&amp; _options.GetAllCacheAllowZeroCount)
+                {
+                    //there was nothing returned but we want to cache a zero count result so add an TEntity[] to the cache
+                    // to signify that there is a zero count cache
+                    //NOTE: Don&#39;t set expiry/sliding for a zero count
+                    Cache.InsertCacheItem(GetCacheTypeKey(), () =&gt; new TEntity[] {});
+                }
+                else
+                {
+                    //This is the default behavior, we&#39;ll individually cache each item so that if/when these items are resolved 
+                    // by id, they are returned from the already existing cache.
+                    foreach (var entity in entityCollection.WhereNotNull())
+                    {
+                        var localCopy = entity;
+                        //just to be safe, we cannot cache an item without an identity
+                        if (localCopy.HasIdentity)
+                        {
+                            Cache.InsertCacheItem(GetCacheIdKey(entity.Id), () =&gt; localCopy,
+                                timeout: TimeSpan.FromMinutes(5),
+                                isSliding: true);
+                        }
+                    }
+                }
+            });
+        }
+        
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,15,24,26,1],[25,9,25,10,1],[26,13,26,33,1],[26,34,26,77,0],[27,13,27,32,1],[28,9,28,10,1],[31,9,31,10,1],[32,13,32,28,1],[32,29,32,67,0],[34,13,34,67,1],[35,9,35,10,1],[38,9,38,10,1],[39,13,39,70,1],[40,9,40,10,1],[43,9,43,10,1],[44,13,44,32,1],[44,33,44,75,0],[45,13,45,39,1],[45,40,45,89,0],[48,13,48,14,1],[49,17,49,39,1],[52,17,53,17,1],[53,17,53,18,1],[53,18,55,21,1],[55,21,55,44,1],[55,44,56,21,1],[56,21,56,22,1],[56,22,57,25,1],[57,25,57,79,1],[57,79,57,85,1],[57,85,59,46,1],[57,25,59,46,1],[59,46,60,21,1],[60,21,60,22,1],[60,22,63,21,1],[63,21,63,61,1],[63,61,64,17,1],[64,17,64,18,1],[64,18,64,20,1],[52,17,64,20,1],[66,13,66,14,1],[67,13,67,18,1],[68,13,68,14,1],[70,17,71,17,1],[71,17,71,18,1],[71,18,74,21,1],[74,21,74,68,1],[74,68,77,21,1],[77,21,77,61,1],[77,61,78,17,1],[78,17,78,18,1],[78,18,78,20,1],[70,17,78,20,1],[80,17,80,23,1],[82,9,82,10,1],[85,9,85,10,1],[86,13,86,32,1],[86,33,86,75,0],[87,13,87,39,1],[87,40,87,89,0],[90,13,90,14,1],[91,17,91,39,1],[92,13,92,14,1],[94,13,94,14,1],[96,17,96,57,1],[97,17,98,17,1],[98,17,98,18,1],[98,18,99,21,1],[99,21,99,52,1],[99,52,101,21,1],[101,21,101,61,1],[101,61,102,17,1],[102,17,102,18,1],[102,18,102,20,1],[97,17,102,20,1],[103,13,103,14,1],[104,9,104,10,1],[107,9,107,10,1],[108,13,108,37,1],[108,38,108,85,0],[110,13,110,46,1],[111,13,111,67,1],[112,13,112,35,1],[113,17,113,34,1],[115,13,115,42,1],[118,13,118,46,1],[120,13,120,27,1],[121,9,121,10,1],[124,9,124,10,1],[125,13,125,46,1],[126,13,126,58,1],[127,9,127,10,1],[130,9,130,10,1],[131,13,131,37,1],[131,38,131,85,0],[133,13,133,46,1],[134,13,134,67,1],[135,13,135,57,1],[136,9,136,10,1],[139,9,139,10,1],[140,13,140,37,1],[140,38,140,85,0],[142,13,142,27,1],[143,13,143,14,1],[144,17,144,58,1],[145,17,145,77,1],[145,77,145,86,1],[145,86,145,97,1],[145,17,145,97,1],[146,21,146,37,0],[147,13,147,14,1],[149,13,149,14,1],[150,17,150,53,1],[151,17,151,39,1],[152,17,152,18,1],[153,21,153,59,1],[154,21,154,22,0],[156,25,156,66,0],[157,25,157,62,0],[158,29,158,48,0],[159,21,159,22,0],[161,21,161,22,1],[162,25,162,44,1],[164,17,164,18,0],[165,22,165,61,1],[166,17,166,18,1],[168,21,168,45,1],[169,21,169,22,0],[171,25,171,49,0],[173,17,173,18,1],[174,13,174,14,1],[177,13,180,28,1],[183,13,183,51,1],[185,13,185,37,1],[186,9,186,10,1],[193,9,193,10,1],[194,13,194,78,1],[195,13,195,68,1],[196,9,196,10,1],[203,9,203,10,1],[204,13,206,32,1],[207,13,207,71,1],[208,9,208,10,1],[216,9,216,10,1],[217,13,217,32,1],[217,33,217,40,1],[219,13,220,13,1],[220,13,220,14,1],[220,14,222,17,1],[222,17,222,40,1],[222,40,223,17,1],[223,17,223,18,1],[223,18,224,21,1],[224,21,224,59,1],[224,59,224,65,0],[224,65,226,42,1],[224,21,226,42,1],[226,42,227,17,1],[227,17,227,18,1],[227,18,228,13,1],[228,13,228,14,1],[228,14,228,16,1],[219,13,228,16,1],[229,9,229,10,1],[237,9,237,10,1],[238,13,239,13,1],[239,13,239,14,1],[239,14,241,17,1],[241,17,241,110,1],[241,110,242,17,1],[242,17,242,18,0],[242,18,246,21,1],[246,21,246,68,0],[246,68,246,84,0],[246,84,246,86,0],[246,21,246,86,0],[246,86,247,17,1],[247,17,247,18,0],[247,18,249,17,1],[249,17,249,18,1],[249,18,252,21,1],[252,21,252,28,1],[252,28,252,30,1],[252,30,252,40,1],[252,40,252,41,1],[252,41,252,43,1],[252,43,252,44,1],[252,44,252,75,1],[252,75,253,21,1],[253,21,253,22,1],[253,22,254,25,1],[254,25,254,48,1],[254,48,256,25,1],[256,25,256,51,1],[256,51,257,25,1],[257,25,257,26,1],[257,26,258,29,1],[258,29,258,83,1],[258,83,258,92,0],[258,92,260,50,1],[258,29,260,50,1],[260,50,261,25,1],[261,25,261,26,1],[261,26,262,21,1],[262,21,262,22,1],[262,22,263,17,1],[263,17,263,18,1],[263,18,264,13,1],[264,13,264,14,1],[264,14,264,16,1],[238,13,264,16,1],[265,9,265,10,1]]);
+    </script>
+  </body>
+</html>

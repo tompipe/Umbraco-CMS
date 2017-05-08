@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Security\WebSecurity.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using System.Web;
+using System.Web.Security;
+using AutoMapper;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Security;
+using Microsoft.AspNet.Identity.Owin;
+using Microsoft.Owin;
+using umbraco.businesslogic.Exceptions;
+using Umbraco.Core.Models.Identity;
+using Umbraco.Web.Models.ContentEditing;
+using GlobalSettings = Umbraco.Core.Configuration.GlobalSettings;
+using User = umbraco.BusinessLogic.User;
+
+namespace Umbraco.Web.Security
+{
+    /// &lt;summary&gt;
+    /// A utility class used for dealing with USER security in Umbraco
+    /// &lt;/summary&gt;
+    public class WebSecurity : DisposableObject
+    {
+        private HttpContextBase _httpContext;
+        private ApplicationContext _applicationContext;
+
+        public WebSecurity(HttpContextBase httpContext, ApplicationContext applicationContext)
+        {
+            _httpContext = httpContext;
+            _applicationContext = applicationContext;
+        }
+        
+        /// &lt;summary&gt;
+        /// Returns true or false if the currently logged in member is authorized based on the parameters provided
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;allowAll&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;allowTypes&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;allowGroups&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;allowMembers&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;Use MembershipHelper.IsMemberAuthorized instead&quot;)]
+        public bool IsMemberAuthorized(
+            bool allowAll = false,
+            IEnumerable&lt;string&gt; allowTypes = null,
+            IEnumerable&lt;string&gt; allowGroups = null,
+            IEnumerable&lt;int&gt; allowMembers = null)
+        {
+            if (HttpContext.Current == null || ApplicationContext.Current == null)
+            {
+                return false;
+            }
+            var helper = new MembershipHelper(ApplicationContext.Current, new HttpContextWrapper(HttpContext.Current));
+            return helper.IsMemberAuthorized(allowAll, allowTypes, allowGroups, allowMembers);
+        }
+
+        private IUser _currentUser;
+
+        /// &lt;summary&gt;
+        /// Gets the current user.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The current user.&lt;/value&gt;
+        public virtual IUser CurrentUser
+        {
+            get
+            {
+                //only load it once per instance!
+                if (_currentUser == null)
+                {
+                    var id = GetUserId();
+                    if (id == -1)
+                    {
+                        return null;
+                    }
+                    _currentUser = _applicationContext.Services.UserService.GetUserById(id);
+                }
+
+                return _currentUser;
+            }
+        }
+
+        private BackOfficeSignInManager _signInManager;
+        private BackOfficeSignInManager SignInManager
+        {
+            get
+            {
+                if (_signInManager == null)
+                {
+                    var mgr = _httpContext.GetOwinContext().Get&lt;BackOfficeSignInManager&gt;();
+                    if (mgr == null)
+                    {
+                        throw new NullReferenceException(&quot;Could not resolve an instance of &quot; + typeof(BackOfficeSignInManager) + &quot; from the &quot; + typeof(IOwinContext));
+                    }
+                    _signInManager = mgr;
+                }
+                return _signInManager;
+            }
+        }
+
+        private BackOfficeUserManager&lt;BackOfficeIdentityUser&gt; _userManager;
+        protected BackOfficeUserManager&lt;BackOfficeIdentityUser&gt; UserManager
+        {
+            get { return _userManager ?? (_userManager = _httpContext.GetOwinContext().GetBackOfficeUserManager()); }
+        }        
+
+        /// &lt;summary&gt;
+        /// Logs a user in.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;The user Id&lt;/param&gt;
+        /// &lt;returns&gt;returns the number of seconds until their session times out&lt;/returns&gt;
+        public virtual double PerformLogin(int userId)
+        {
+            var owinCtx = _httpContext.GetOwinContext();
+            //ensure it&#39;s done for owin too
+            owinCtx.Authentication.SignOut(Constants.Security.BackOfficeExternalAuthenticationType);
+            
+            var user = UserManager.FindByIdAsync(userId).Result;
+            var userData = Mapper.Map&lt;UserData&gt;(user);
+            _httpContext.SetPrincipalForRequest(userData);
+
+            SignInManager.SignInAsync(user, isPersistent: true, rememberBrowser: false).Wait();
+            return TimeSpan.FromMinutes(GlobalSettings.TimeOutInMinutes).TotalSeconds;
+        }
+
+        [Obsolete(&quot;This method should not be used, login is performed by the OWIN pipeline, use the overload that returns double and accepts a UserId instead&quot;)]
+        public virtual FormsAuthenticationTicket PerformLogin(IUser user)
+        {
+            //clear the external cookie - we do this first without owin context because we&#39;re writing cookies directly to httpcontext 
+            // and cookie handling is different with httpcontext vs webapi and owin, normally we&#39;d just do:
+            //_httpContext.GetOwinContext().Authentication.SignOut(Constants.Security.BackOfficeExternalAuthenticationType);
+
+            var externalLoginCookie = _httpContext.Request.Cookies.Get(Constants.Security.BackOfficeExternalCookieName);
+            if (externalLoginCookie != null)
+            {
+                externalLoginCookie.Expires = DateTime.Now.AddYears(-1);
+                _httpContext.Response.Cookies.Set(externalLoginCookie);
+            }
+
+            //ensure it&#39;s done for owin too
+            _httpContext.GetOwinContext().Authentication.SignOut(Constants.Security.BackOfficeExternalAuthenticationType);
+
+            var ticket = _httpContext.CreateUmbracoAuthTicket(Mapper.Map&lt;UserData&gt;(user));
+            return ticket;
+        }
+
+        /// &lt;summary&gt;
+        /// Clears the current login for the currently logged in user
+        /// &lt;/summary&gt;
+        public virtual void ClearCurrentLogin()
+        {
+            _httpContext.UmbracoLogout();
+            _httpContext.GetOwinContext().Authentication.SignOut(
+                Core.Constants.Security.BackOfficeAuthenticationType,
+                Core.Constants.Security.BackOfficeExternalAuthenticationType);
+        }
+
+        /// &lt;summary&gt;
+        /// Renews the user&#39;s login ticket
+        /// &lt;/summary&gt;
+        public virtual void RenewLoginTimeout()
+        {
+            _httpContext.RenewUmbracoAuthTicket();
+        }
+
+        /// &lt;summary&gt;
+        /// Validates credentials for a back office user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;password&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual bool ValidateBackOfficeCredentials(string username, string password)
+        {
+            var membershipProvider = Core.Security.MembershipProviderExtensions.GetUsersMembershipProvider();
+            return membershipProvider != null &amp;&amp; membershipProvider.ValidateUser(username, password);
+        }
+        
+        /// &lt;summary&gt;
+        /// Returns the MembershipUser from the back office membership provider
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;setOnline&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual MembershipUser GetBackOfficeMembershipUser(string username, bool setOnline)
+        {
+            var membershipProvider = Core.Security.MembershipProviderExtensions.GetUsersMembershipProvider();
+            return membershipProvider != null ? membershipProvider.GetUser(username, setOnline) : null;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the back office IUser instance for the username specified
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This will return an Iuser instance no matter what membership provider is installed for the back office, it will automatically
+        /// create any missing Iuser accounts if one is not found and a custom membership provider is being used. 
+        /// &lt;/remarks&gt;
+        internal IUser GetBackOfficeUser(string username)
+        {
+            //get the membership user (set user to be &#39;online&#39; in the provider too)
+            var membershipUser = GetBackOfficeMembershipUser(username, true);
+            var provider = Core.Security.MembershipProviderExtensions.GetUsersMembershipProvider();
+
+            if (membershipUser == null)
+            {
+                throw new InvalidOperationException(
+                    &quot;The username &amp; password validated but the membership provider &#39;&quot; +
+                    provider.Name +
+                    &quot;&#39; did not return a MembershipUser with the username supplied&quot;);
+            }
+
+            //regarldess of the membership provider used, see if this user object already exists in the umbraco data
+            var user = _applicationContext.Services.UserService.GetByUsername(membershipUser.UserName);
+
+            //we&#39;re using the built-in membership provider so the user will already be available
+            if (provider.IsUmbracoUsersProvider())
+            {
+                if (user == null)
+                {
+                    //this should never happen
+                    throw new InvalidOperationException(&quot;The user &#39;&quot; + username + &quot;&#39; could not be found in the Umbraco database&quot;);
+                }
+                return user;
+            }
+
+            //we are using a custom membership provider for the back office, in this case we need to create user accounts for the logged in member.
+            //if we already have a user object in Umbraco we don&#39;t need to do anything, otherwise we need to create a mapped Umbraco account.
+            if (user != null) return user;
+
+            //we need to create an Umbraco IUser of a &#39;writer&#39; type with access to only content - this was how v6 operates.
+            var writer = _applicationContext.Services.UserService.GetUserTypeByAlias(&quot;writer&quot;);
+            
+            var email = membershipUser.Email;
+            if (email.IsNullOrWhiteSpace())
+            {
+                //in some cases if there is no email we have to generate one since it is required!
+                email = Guid.NewGuid().ToString(&quot;N&quot;) + &quot;@example.com&quot;;
+            }
+
+            user = new Core.Models.Membership.User(writer)
+            {
+                Email = email,
+                Language = GlobalSettings.DefaultUILanguage,
+                Name = membershipUser.UserName,
+                RawPasswordValue = Guid.NewGuid().ToString(&quot;N&quot;), //Need to set this to something - will not be used though
+                Username = membershipUser.UserName,
+                StartContentId = -1,
+                StartMediaId = -1,
+                IsLockedOut = false,
+                IsApproved = true
+            };
+            user.AddAllowedSection(&quot;content&quot;);
+
+            _applicationContext.Services.UserService.Save(user);
+
+            return user;
+        }
+
+        /// &lt;summary&gt;
+        /// Validates the user node tree permissions.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbracoUser&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;path&quot;&gt;The path.&lt;/param&gt;
+        /// &lt;param name=&quot;action&quot;&gt;The action.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal bool ValidateUserNodeTreePermissions(User umbracoUser, string path, string action)
+        {
+            var permissions = umbracoUser.GetPermissions(path);
+            if (permissions.IndexOf(action, StringComparison.Ordinal) &gt; -1 &amp;&amp; (path.Contains(&quot;-20&quot;) || (&quot;,&quot; + path + &quot;,&quot;).Contains(&quot;,&quot; + umbracoUser.StartNodeId + &quot;,&quot;)))
+                return true;
+
+            var user = umbracoUser;
+            LogHelper.Info&lt;WebSecurity&gt;(&quot;User {0} has insufficient permissions in UmbracoEnsuredPage: &#39;{1}&#39;, &#39;{2}&#39;, &#39;{3}&#39;&quot;, () =&gt; user.Name, () =&gt; path, () =&gt; permissions, () =&gt; action);
+            return false;
+        }
+
+        /// &lt;summary&gt;
+        /// Validates the current user to see if they have access to the specified app
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal bool ValidateUserApp(string app)
+        {
+            //if it is empty, don&#39;t validate
+            if (app.IsNullOrWhiteSpace())
+            {
+                return true;
+            }
+            return CurrentUser.AllowedSections.Any(uApp =&gt; uApp.InvariantEquals(app));
+        }
+        
+        /// &lt;summary&gt;
+        /// Gets the user id.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbracoUserContextId&quot;&gt;This is not used&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;This method is no longer used, use the GetUserId() method without parameters instead&quot;)]
+        public int GetUserId(string umbracoUserContextId)
+        {           
+            return GetUserId();
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the currnet user&#39;s id.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual int GetUserId()
+        {
+            var identity = _httpContext.GetCurrentIdentity(false);
+            if (identity == null)
+                return -1;
+            return Convert.ToInt32(identity.Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the current user&#39;s unique session id - used to mitigate csrf attacks or any other reason to validate a request
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual string GetSessionId()
+        {
+            var identity = _httpContext.GetCurrentIdentity(false);
+            if (identity == null)
+                return null;
+            return identity.SessionId;
+        }
+
+        /// &lt;summary&gt;
+        /// Validates the user context ID.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;currentUmbracoUserContextId&quot;&gt;This doesn&#39;t do anything&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;This method is no longer used, use the ValidateCurrentUser() method instead&quot;)]
+        public bool ValidateUserContextId(string currentUmbracoUserContextId)
+        {
+            return ValidateCurrentUser();
+        }
+
+        /// &lt;summary&gt;
+        /// Validates the currently logged in user and ensures they are not timed out
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual bool ValidateCurrentUser()
+        {
+            var result = ValidateCurrentUser(false);
+            return result == ValidateRequestAttempt.Success; 
+        }
+
+        /// &lt;summary&gt;
+        /// Validates the current user assigned to the request and ensures the stored user data is valid
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;throwExceptions&quot;&gt;set to true if you want exceptions to be thrown if failed&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal ValidateRequestAttempt ValidateCurrentUser(bool throwExceptions)
+        {
+            //This will first check if the current user is already authenticated - which should be the case in nearly all circumstances
+            // since the authentication happens in the Module, that authentication also checks the ticket expiry. We don&#39;t 
+            // need to check it a second time because that requires another decryption phase and nothing can tamper with it during the request.
+
+            if (IsAuthenticated() == false) 
+            {
+                //There is no user
+                if (throwExceptions) throw new InvalidOperationException(&quot;The user has no umbraco contextid - try logging in&quot;);
+                return ValidateRequestAttempt.FailedNoContextId;
+            }
+
+            var user = CurrentUser;
+
+            // Check for console access
+            if (user == null || user.IsApproved == false || (user.IsLockedOut &amp;&amp; GlobalSettings.RequestIsInUmbracoApplication(_httpContext)))
+            {
+                if (throwExceptions) throw new ArgumentException(&quot;You have no priviledges to the umbraco console. Please contact your administrator&quot;);
+                return ValidateRequestAttempt.FailedNoPrivileges;
+            }
+            return ValidateRequestAttempt.Success;
+
+        }
+
+        /// &lt;summary&gt;
+        /// Authorizes the full request, checks for SSL and validates the current user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;throwExceptions&quot;&gt;set to true if you want exceptions to be thrown if failed&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal ValidateRequestAttempt AuthorizeRequest(bool throwExceptions = false)
+        {
+            // check for secure connection
+            if (GlobalSettings.UseSSL &amp;&amp; _httpContext.Request.IsSecureConnection == false)
+            {
+                if (throwExceptions) throw new UserAuthorizationException(&quot;This installation requires a secure connection (via SSL). Please update the URL to include https://&quot;);
+                return ValidateRequestAttempt.FailedNoSsl;
+            }
+            return ValidateCurrentUser(throwExceptions);
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the specified user as access to the app
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal bool UserHasAppAccess(string app, IUser user)
+        {
+            var apps = user.AllowedSections;
+            return apps.Any(uApp =&gt; uApp.InvariantEquals(app));
+        }
+
+        [Obsolete(&quot;Do not use this method if you don&#39;t have to, use the overload with IUser instead&quot;)]
+        internal bool UserHasAppAccess(string app, User user)
+        {
+            return user.Applications.Any(uApp =&gt; uApp.alias == app);
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the specified user by username as access to the app
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;app&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;username&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal bool UserHasAppAccess(string app, string username)
+        {
+            var user = _applicationContext.Services.UserService.GetByUsername(username);
+            if (user == null)
+            {
+                return false;
+            }
+            return UserHasAppAccess(app, user);
+        }
+
+        [Obsolete(&quot;Returns the current user&#39;s unique umbraco sesion id - this cannot be set and isn&#39;t intended to be used in your code&quot;)]
+        public string UmbracoUserContextId
+        {
+            get
+            {
+                return _httpContext.GetUmbracoAuthTicket() == null ? &quot;&quot; : GetSessionId();                
+            }
+            set
+            {
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures that a back office user is logged in
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public bool IsAuthenticated()
+        {
+            return _httpContext.User.Identity.IsAuthenticated &amp;&amp; _httpContext.GetCurrentIdentity(false) != null;
+        }
+
+        protected override void DisposeResources()
+        {
+            _httpContext = null;
+        }
+
+        
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[30,9,30,95,1],[31,9,31,10,1],[32,13,32,40,1],[33,13,33,54,1],[34,9,34,10,1],[50,9,50,10,0],[51,13,51,83,0],[52,13,52,14,0],[53,17,53,30,0],[55,13,55,120,0],[56,13,56,95,0],[57,9,57,10,0],[68,13,68,14,0],[70,17,70,42,0],[71,17,71,18,0],[72,21,72,42,0],[73,21,73,34,0],[74,21,74,22,0],[75,25,75,37,0],[77,21,77,93,0],[78,17,78,18,0],[80,17,80,37,0],[81,13,81,14,0],[88,13,88,14,0],[89,17,89,44,0],[90,17,90,18,0],[91,21,91,92,0],[92,21,92,37,0],[93,21,93,22,0],[94,25,94,167,0],[96,21,96,42,0],[97,17,97,18,0],[98,17,98,39,0],[99,13,99,14,0],[105,17,105,18,0],[105,19,105,116,0],[105,117,105,118,0],[114,9,114,10,0],[115,13,115,57,0],[117,13,117,101,0],[119,13,119,65,0],[120,13,120,55,0],[121,13,121,59,0],[123,13,123,96,0],[124,13,124,87,0],[125,9,125,10,0],[129,9,129,10,0],[134,13,134,121,0],[135,13,135,45,0],[136,13,136,14,0],[137,17,137,73,0],[138,17,138,72,0],[139,13,139,14,0],[142,13,142,123,0],[144,13,144,91,0],[145,13,145,27,0],[146,9,146,10,0],[152,9,152,10,0],[153,13,153,42,0],[154,13,156,79,0],[157,9,157,10,0],[163,9,163,10,0],[164,13,164,51,0],[165,9,165,10,0],[174,9,174,10,0],[175,13,175,110,0],[176,13,176,102,0],[177,9,177,10,0],[186,9,186,10,0],[187,13,187,110,0],[188,13,188,104,0],[189,9,189,10,0],[201,9,201,10,0],[203,13,203,78,0],[204,13,204,100,0],[206,13,206,40,0],[207,13,207,14,0],[208,17,211,85,0],[215,13,215,104,0],[218,13,218,51,0],[219,13,219,14,0],[220,17,220,34,0],[221,17,221,18,0],[223,21,223,131,0],[225,17,225,29,0],[230,13,230,30,0],[230,31,230,43,0],[233,13,233,96,0],[235,13,235,46,0],[236,13,236,44,0],[237,13,237,14,0],[239,17,239,71,0],[240,13,240,14,0],[242,13,253,15,0],[254,13,254,47,0],[256,13,256,65,0],[258,13,258,25,0],[259,9,259,10,0],[269,9,269,10,0],[270,13,270,64,0],[271,13,271,170,0],[272,17,272,29,0],[274,13,274,36,0],[275,13,275,131,0],[275,131,275,140,0],[275,140,275,148,0],[275,148,275,152,0],[275,152,275,160,0],[275,160,275,171,0],[275,171,275,179,0],[275,179,275,185,0],[275,185,275,187,0],[275,13,275,187,0],[276,13,276,26,0],[277,9,277,10,0],[285,9,285,10,0],[287,13,287,42,0],[288,13,288,14,0],[289,17,289,29,0],[291,13,291,60,0],[291,60,291,85,0],[291,85,291,87,0],[291,13,291,87,0],[292,9,292,10,0],[301,9,301,10,0],[302,13,302,32,0],[303,9,303,10,0],[310,9,310,10,0],[311,13,311,67,0],[312,13,312,34,0],[313,17,313,27,0],[314,13,314,49,0],[315,9,315,10,0],[322,9,322,10,0],[323,13,323,67,0],[324,13,324,34,0],[325,17,325,29,0],[326,13,326,39,0],[327,9,327,10,0],[336,9,336,10,0],[337,13,337,42,0],[338,9,338,10,0],[345,9,345,10,0],[346,13,346,53,0],[347,13,347,61,0],[348,9,348,10,0],[356,9,356,10,0],[361,13,361,44,0],[362,13,362,14,0],[364,17,364,37,0],[364,38,364,128,0],[365,17,365,65,0],[368,13,368,36,0],[371,13,371,142,0],[372,13,372,14,0],[373,17,373,37,0],[373,38,373,151,0],[374,17,374,66,0],[376,13,376,51,0],[378,9,378,10,0],[386,9,386,10,0],[388,13,388,91,0],[389,13,389,14,0],[390,17,390,37,0],[390,38,390,178,0],[391,17,391,59,0],[393,13,393,57,0],[394,9,394,10,0],[403,9,403,10,0],[404,13,404,45,0],[405,13,405,37,0],[405,37,405,62,0],[405,62,405,64,0],[405,13,405,64,0],[406,9,406,10,0],[410,9,410,10,0],[411,13,411,50,0],[411,50,411,67,0],[411,67,411,69,0],[411,13,411,69,0],[412,9,412,10,0],[421,9,421,10,0],[422,13,422,89,0],[423,13,423,30,0],[424,13,424,14,0],[425,17,425,30,0],[427,13,427,48,0],[428,9,428,10,0],[434,13,434,14,0],[435,17,435,90,0],[436,13,436,14,0],[438,13,438,14,0],[439,13,439,14,0],[447,9,447,10,0],[448,13,448,113,0],[449,9,449,10,0],[452,9,452,10,0],[453,13,453,33,0],[454,9,454,10,0]]);
+    </script>
+  </body>
+</html>

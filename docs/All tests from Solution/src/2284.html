@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Cache\ObjectCacheRuntimeCacheProvider.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.Caching;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Web.Caching;
+using CacheItemPriority = System.Web.Caching.CacheItemPriority;
+
+namespace Umbraco.Core.Cache
+{
+    /// &lt;summary&gt;
+    /// Represents a cache provider that caches item in a &lt;see cref=&quot;MemoryCache&quot;/&gt;.
+    /// A cache provider that wraps the logic of a System.Runtime.Caching.ObjectCache
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;The &lt;see cref=&quot;MemoryCache&quot;/&gt; is created with name &quot;in-memory&quot;. That name is
+    /// used to retrieve configuration options. It does not identify the memory cache, i.e.
+    /// each instance of this class has its own, independent, memory cache.&lt;/remarks&gt;
+    public class ObjectCacheRuntimeCacheProvider : IRuntimeCacheProvider
+    {
+        private readonly ReaderWriterLockSlim _locker = new ReaderWriterLockSlim(LockRecursionPolicy.SupportsRecursion);
+        internal ObjectCache MemoryCache;
+
+        /// &lt;summary&gt;
+        /// Used for debugging
+        /// &lt;/summary&gt;
+        internal Guid InstanceId { get; private set; }
+
+        public ObjectCacheRuntimeCacheProvider()
+        {
+            MemoryCache = new MemoryCache(&quot;in-memory&quot;);
+            InstanceId = Guid.NewGuid();
+        }
+
+        #region Clear
+
+        public virtual void ClearAllCache()
+        {
+            using (new WriteLock(_locker))
+            {
+                MemoryCache.DisposeIfDisposable();
+                MemoryCache = new MemoryCache(&quot;in-memory&quot;);
+            }
+        }
+
+        public virtual void ClearCacheItem(string key)
+        {
+            using (new WriteLock(_locker))
+            {
+                if (MemoryCache[key] == null) return;
+                MemoryCache.Remove(key);
+            }
+        }
+
+        public virtual void ClearCacheObjectTypes(string typeName)
+        {
+            var type = TypeFinder.GetTypeByName(typeName);
+            if (type == null) return;
+            var isInterface = type.IsInterface;
+            using (new WriteLock(_locker))
+            {
+                foreach (var key in MemoryCache
+                    .Where(x =&gt;
+                    {
+                        // x.Value is Lazy&lt;object&gt; and not null, its value may be null
+                        // remove null values as well, does not hurt
+                        // get non-created as NonCreatedValue &amp; exceptions as null
+                        var value = DictionaryCacheProviderBase.GetSafeLazyValue((Lazy&lt;object&gt;)x.Value, true);
+
+                        // if T is an interface remove anything that implements that interface
+                        // otherwise remove exact types (not inherited types)
+                        return value == null || (isInterface ? (type.IsInstanceOfType(value)) : (value.GetType() == type));
+                    })
+                    .Select(x =&gt; x.Key)
+                    .ToArray()) // ToArray required to remove
+                    MemoryCache.Remove(key);
+            }
+        }
+
+        public virtual void ClearCacheObjectTypes&lt;T&gt;()
+        {
+            using (new WriteLock(_locker))
+            {
+                var typeOfT = typeof (T);
+                var isInterface = typeOfT.IsInterface;
+                foreach (var key in MemoryCache
+                    .Where(x =&gt;
+                    {
+                        // x.Value is Lazy&lt;object&gt; and not null, its value may be null
+                        // remove null values as well, does not hurt
+                        // get non-created as NonCreatedValue &amp; exceptions as null
+                        var value = DictionaryCacheProviderBase.GetSafeLazyValue((Lazy&lt;object&gt;)x.Value, true);
+
+                        // if T is an interface remove anything that implements that interface
+                        // otherwise remove exact types (not inherited types)
+                        return value == null || (isInterface ? (value is T) : (value.GetType() == typeOfT));
+
+                    })
+                    .Select(x =&gt; x.Key)
+                    .ToArray()) // ToArray required to remove
+                    MemoryCache.Remove(key);
+            }
+        }
+
+        public virtual void ClearCacheObjectTypes&lt;T&gt;(Func&lt;string, T, bool&gt; predicate)
+        {
+            using (new WriteLock(_locker))
+            {
+                var typeOfT = typeof(T);
+                var isInterface = typeOfT.IsInterface;
+                foreach (var key in MemoryCache
+                    .Where(x =&gt;
+                    {
+                        // x.Value is Lazy&lt;object&gt; and not null, its value may be null
+                        // remove null values as well, does not hurt
+                        // get non-created as NonCreatedValue &amp; exceptions as null
+                        var value = DictionaryCacheProviderBase.GetSafeLazyValue((Lazy&lt;object&gt;)x.Value, true);
+                        if (value == null) return true;
+
+                        // if T is an interface remove anything that implements that interface
+                        // otherwise remove exact types (not inherited types)
+                        return (isInterface ? (value is T) : (value.GetType() == typeOfT))
+                               &amp;&amp; predicate(x.Key, (T)value);
+                    })
+                    .Select(x =&gt; x.Key)
+                    .ToArray()) // ToArray required to remove
+                    MemoryCache.Remove(key);
+            }
+        }
+
+        public virtual void ClearCacheByKeySearch(string keyStartsWith)
+        {
+            using (new WriteLock(_locker))
+            {
+                foreach (var key in MemoryCache
+                    .Where(x =&gt; x.Key.InvariantStartsWith(keyStartsWith))
+                    .Select(x =&gt; x.Key)
+                    .ToArray()) // ToArray required to remove
+                    MemoryCache.Remove(key);
+            }
+        }
+
+        public virtual void ClearCacheByKeyExpression(string regexString)
+        {
+            using (new WriteLock(_locker))
+            {
+                foreach (var key in MemoryCache
+                    .Where(x =&gt; Regex.IsMatch(x.Key, regexString))
+                    .Select(x =&gt; x.Key)
+                    .ToArray()) // ToArray required to remove
+                    MemoryCache.Remove(key);
+            }
+        }
+
+        #endregion
+
+        #region Get
+
+        public IEnumerable&lt;object&gt; GetCacheItemsByKeySearch(string keyStartsWith)
+        {
+            KeyValuePair&lt;string, object&gt;[] entries;
+            using (new ReadLock(_locker))
+            {
+                entries = MemoryCache
+                    .Where(x =&gt; x.Key.InvariantStartsWith(keyStartsWith))
+                    .ToArray(); // evaluate while locked
+            }
+            return entries
+                .Select(x =&gt; DictionaryCacheProviderBase.GetSafeLazyValue((Lazy&lt;object&gt;)x.Value)) // return exceptions as null
+                .Where(x =&gt; x != null) // backward compat, don&#39;t store null values in the cache
+                .ToList();
+        }
+
+        public IEnumerable&lt;object&gt; GetCacheItemsByKeyExpression(string regexString)
+        {
+            KeyValuePair&lt;string, object&gt;[] entries;
+            using (new ReadLock(_locker))
+            {
+                entries = MemoryCache
+                    .Where(x =&gt; Regex.IsMatch(x.Key, regexString))
+                    .ToArray(); // evaluate while locked
+            }
+            return entries
+                .Select(x =&gt; DictionaryCacheProviderBase.GetSafeLazyValue((Lazy&lt;object&gt;)x.Value)) // return exceptions as null
+                .Where(x =&gt; x != null) // backward compat, don&#39;t store null values in the cache
+                .ToList();
+        }
+
+        public object GetCacheItem(string cacheKey)
+        {
+            Lazy&lt;object&gt; result;
+            using (new ReadLock(_locker))
+            {
+                result = MemoryCache.Get(cacheKey) as Lazy&lt;object&gt;; // null if key not found
+            }
+            return result == null ? null : DictionaryCacheProviderBase.GetSafeLazyValue(result); // return exceptions as null
+        }
+
+        public object GetCacheItem(string cacheKey, Func&lt;object&gt; getCacheItem)
+        {
+            return GetCacheItem(cacheKey, getCacheItem, null);
+        }
+
+        public object GetCacheItem(string cacheKey, Func&lt;object&gt; getCacheItem, TimeSpan? timeout, bool isSliding = false, CacheItemPriority priority = CacheItemPriority.Normal, CacheItemRemovedCallback removedCallback = null, string[] dependentFiles = null)
+        {
+            // see notes in HttpRuntimeCacheProvider
+
+            Lazy&lt;object&gt; result;
+
+            using (var lck = new UpgradeableReadLock(_locker))
+            {
+                result = MemoryCache.Get(cacheKey) as Lazy&lt;object&gt;;
+                if (result == null || DictionaryCacheProviderBase.GetSafeLazyValue(result, true) == null) // get non-created as NonCreatedValue &amp; exceptions as null
+                {
+                    result = DictionaryCacheProviderBase.GetSafeLazy(getCacheItem);
+                    var policy = GetPolicy(timeout, isSliding, removedCallback, dependentFiles);
+
+                    lck.UpgradeToWriteLock();
+                    //NOTE: This does an add or update
+                    MemoryCache.Set(cacheKey, result, policy);
+                }
+            }
+
+            //return result.Value;
+
+            var value = result.Value; // will not throw (safe lazy)
+            var eh = value as DictionaryCacheProviderBase.ExceptionHolder;
+            if (eh != null) throw eh.Exception; // throw once!
+            return value;
+        }
+
+        #endregion
+
+        #region Insert
+
+        public void InsertCacheItem(string cacheKey, Func&lt;object&gt; getCacheItem, TimeSpan? timeout = null, bool isSliding = false, CacheItemPriority priority = CacheItemPriority.Normal, CacheItemRemovedCallback removedCallback = null, string[] dependentFiles = null)
+        {
+            // NOTE - here also we must insert a Lazy&lt;object&gt; but we can evaluate it right now
+            // and make sure we don&#39;t store a null value.
+
+            var result = DictionaryCacheProviderBase.GetSafeLazy(getCacheItem);
+            var value = result.Value; // force evaluation now
+            if (value == null) return; // do not store null values (backward compat)
+
+            var policy = GetPolicy(timeout, isSliding, removedCallback, dependentFiles);
+            //NOTE: This does an add or update
+            MemoryCache.Set(cacheKey, result, policy);
+        }
+
+        #endregion
+
+        private static CacheItemPolicy GetPolicy(TimeSpan? timeout = null, bool isSliding = false, CacheItemRemovedCallback removedCallback = null, string[] dependentFiles = null)
+        {
+            var absolute = isSliding ? ObjectCache.InfiniteAbsoluteExpiration : (timeout == null ? ObjectCache.InfiniteAbsoluteExpiration : DateTime.Now.Add(timeout.Value));
+            var sliding = isSliding == false ? ObjectCache.NoSlidingExpiration : (timeout ?? ObjectCache.NoSlidingExpiration);
+
+            var policy = new CacheItemPolicy
+            {
+                AbsoluteExpiration = absolute,
+                SlidingExpiration = sliding
+            };
+
+            if (dependentFiles != null &amp;&amp; dependentFiles.Any())
+            {
+                policy.ChangeMonitors.Add(new HostFileChangeMonitor(dependentFiles.ToList()));
+            }
+
+            if (removedCallback != null)
+            {
+                policy.RemovedCallback = arguments =&gt;
+                {
+                    //convert the reason
+                    var reason = CacheItemRemovedReason.Removed;
+                    switch (arguments.RemovedReason)
+                    {
+                        case CacheEntryRemovedReason.Removed:
+                            reason = CacheItemRemovedReason.Removed;
+                            break;
+                        case CacheEntryRemovedReason.Expired:
+                            reason = CacheItemRemovedReason.Expired;
+                            break;
+                        case CacheEntryRemovedReason.Evicted:
+                            reason = CacheItemRemovedReason.Underused;
+                            break;
+                        case CacheEntryRemovedReason.ChangeMonitorChanged:
+                            reason = CacheItemRemovedReason.Expired;
+                            break;
+                        case CacheEntryRemovedReason.CacheSpecificEviction:
+                            reason = CacheItemRemovedReason.Underused;
+                            break;
+                    }
+                    //call the callback
+                    removedCallback(arguments.CacheItem.Key, arguments.CacheItem.Value, reason);
+                };
+            }
+            return policy;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[21,9,21,121,1],[27,36,27,40,0],[27,41,27,53,1],[29,9,29,49,1],[30,9,30,10,1],[31,13,31,56,1],[32,13,32,41,1],[33,9,33,10,1],[38,9,38,10,1],[39,13,39,43,1],[40,13,40,14,1],[41,17,41,51,1],[42,17,42,60,1],[43,13,43,14,1],[44,9,44,10,1],[47,9,47,10,1],[48,13,48,43,1],[49,13,49,14,1],[50,17,50,46,1],[50,47,50,54,1],[51,17,51,41,1],[52,13,52,14,1],[53,9,53,10,1],[56,9,56,10,1],[57,13,57,59,1],[58,13,58,30,1],[58,31,58,38,0],[59,13,59,48,1],[60,13,60,43,1],[61,13,61,14,1],[62,17,62,24,1],[62,26,62,33,1],[62,34,62,36,1],[62,37,64,21,1],[64,21,64,22,1],[64,22,68,25,1],[68,25,68,111,1],[68,111,72,25,1],[72,25,72,124,1],[72,124,73,21,1],[73,21,73,22,1],[73,22,74,34,1],[74,34,74,39,1],[74,39,75,31,1],[62,37,75,31,1],[76,21,76,45,1],[77,13,77,14,1],[78,9,78,10,1],[81,9,81,10,1],[82,13,82,43,1],[83,13,83,14,1],[84,17,84,42,1],[85,17,85,55,1],[86,17,86,24,1],[86,26,86,33,1],[86,34,86,36,1],[86,37,88,21,1],[88,21,88,22,1],[88,22,92,25,1],[92,25,92,111,1],[92,111,96,25,1],[96,25,96,109,1],[96,109,98,21,1],[98,21,98,22,1],[98,22,99,34,1],[99,34,99,39,1],[99,39,100,31,1],[86,37,100,31,1],[101,21,101,45,1],[102,13,102,14,1],[103,9,103,10,1],[106,9,106,10,0],[107,13,107,43,0],[108,13,108,14,0],[109,17,109,41,0],[110,17,110,55,0],[111,17,111,24,0],[111,26,111,33,0],[111,34,111,36,0],[111,37,113,21,0],[113,21,113,22,0],[113,22,117,25,0],[117,25,117,111,0],[117,111,118,25,0],[118,25,118,43,0],[118,43,118,44,0],[118,44,118,56,0],[118,56,122,25,0],[122,25,123,62,0],[123,62,124,21,0],[124,21,124,22,0],[124,22,125,34,0],[125,34,125,39,0],[125,39,126,31,0],[111,37,126,31,0],[127,21,127,45,0],[128,13,128,14,0],[129,9,129,10,0],[132,9,132,10,1],[133,13,133,43,1],[134,13,134,14,1],[135,17,135,24,1],[135,26,135,33,1],[135,34,135,36,1],[135,37,136,33,1],[136,33,136,73,1],[136,73,137,34,1],[137,34,137,39,1],[137,39,138,31,1],[135,37,138,31,1],[139,21,139,45,1],[140,13,140,14,1],[141,9,141,10,1],[144,9,144,10,1],[145,13,145,43,1],[146,13,146,14,1],[147,17,147,24,1],[147,26,147,33,1],[147,34,147,36,1],[147,37,148,33,1],[148,33,148,66,1],[148,66,149,34,1],[149,34,149,39,1],[149,39,150,31,1],[147,37,150,31,1],[151,21,151,45,1],[152,13,152,14,1],[153,9,153,10,1],[160,9,160,10,1],[162,13,162,42,1],[163,13,163,14,1],[164,17,165,33,1],[165,33,165,73,1],[165,73,166,32,1],[164,17,166,32,1],[167,13,167,14,1],[168,13,169,30,1],[169,30,169,97,1],[169,97,170,29,1],[170,29,170,38,1],[170,38,171,27,1],[168,13,171,27,1],[172,9,172,10,1],[175,9,175,10,0],[177,13,177,42,0],[178,13,178,14,0],[179,17,180,33,0],[180,33,180,66,0],[180,66,181,32,0],[179,17,181,32,0],[182,13,182,14,0],[183,13,184,30,0],[184,30,184,97,0],[184,97,185,29,0],[185,29,185,38,0],[185,38,186,27,0],[183,13,186,27,0],[187,9,187,10,0],[190,9,190,10,1],[192,13,192,42,1],[193,13,193,14,1],[194,17,194,68,1],[195,13,195,14,1],[196,13,196,97,1],[197,9,197,10,1],[200,9,200,10,1],[201,13,201,63,1],[202,9,202,10,1],[205,9,205,10,1],[210,20,210,62,1],[211,13,211,14,1],[212,17,212,68,1],[213,17,213,106,1],[214,17,214,18,1],[215,21,215,84,1],[216,21,216,97,1],[218,21,218,46,1],[220,21,220,63,1],[221,17,221,18,1],[222,13,222,14,1],[226,13,226,38,1],[227,13,227,75,1],[228,13,228,28,1],[228,29,228,48,1],[229,13,229,26,1],[230,9,230,10,1],[237,9,237,10,1],[241,13,241,80,1],[242,13,242,38,1],[243,13,243,31,1],[243,32,243,39,0],[245,13,245,89,1],[247,13,247,55,1],[248,9,248,10,1],[253,9,253,10,1],[254,13,254,174,1],[255,13,255,127,1],[257,13,261,15,1],[263,13,263,64,1],[264,13,264,14,0],[265,17,265,95,0],[266,13,266,14,0],[268,13,268,41,1],[269,13,269,14,0],[270,17,271,17,0],[271,17,271,18,0],[271,18,273,21,0],[273,21,273,65,0],[273,65,274,21,0],[274,21,274,53,0],[274,53,277,29,0],[277,29,277,69,0],[277,69,278,29,0],[278,29,278,35,0],[278,35,280,29,0],[280,29,280,69,0],[280,69,281,29,0],[281,29,281,35,0],[281,35,283,29,0],[283,29,283,71,0],[283,71,284,29,0],[284,29,284,35,0],[284,35,286,29,0],[286,29,286,69,0],[286,69,287,29,0],[287,29,287,35,0],[287,35,289,29,0],[289,29,289,71,0],[289,71,290,29,0],[290,29,290,35,0],[290,35,293,21,0],[293,21,293,97,0],[293,97,294,17,0],[294,17,294,18,0],[294,18,294,19,0],[270,17,294,19,0],[295,13,295,14,0],[296,13,296,27,1],[297,9,297,10,1]]);
+    </script>
+  </body>
+</html>

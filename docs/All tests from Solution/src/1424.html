@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\TypeFinder.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
+using System.Security;
+using System.Text;
+using System.Threading;
+using System.Web;
+using System.Web.Compilation;
+using System.Web.Hosting;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Core
+{
+
+    /// &lt;summary&gt;
+    /// A utility class to find all classes of a certain type by reflection in the current bin folder
+    /// of the web application.
+    /// &lt;/summary&gt;
+    public static class TypeFinder
+    {
+        private static volatile HashSet&lt;Assembly&gt; _localFilteredAssemblyCache = null;
+        private static readonly object LocalFilteredAssemblyCacheLocker = new object();
+
+        /// &lt;summary&gt;
+        /// lazily load a reference to all assemblies and only local assemblies.
+        /// This is a modified version of: http://www.dominicpettifer.co.uk/Blog/44/how-to-get-a-reference-to-all-assemblies-in-the--bin-folder
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// We do this because we cannot use AppDomain.Current.GetAssemblies() as this will return only assemblies that have been
+        /// loaded in the CLR, not all assemblies.
+        /// See these threads:
+        /// http://issues.umbraco.org/issue/U5-198
+        /// http://stackoverflow.com/questions/3552223/asp-net-appdomain-currentdomain-getassemblies-assemblies-missing-after-app
+        /// http://stackoverflow.com/questions/2477787/difference-between-appdomain-getassemblies-and-buildmanager-getreferencedassembl
+        /// &lt;/remarks&gt;
+        internal static HashSet&lt;Assembly&gt; GetAllAssemblies()
+        {
+            return AllAssemblies.Value;
+        }
+
+        //Lazy access to the all assemblies list
+        private static readonly Lazy&lt;HashSet&lt;Assembly&gt;&gt; AllAssemblies = new Lazy&lt;HashSet&lt;Assembly&gt;&gt;(() =&gt;
+        {
+            HashSet&lt;Assembly&gt; assemblies = null;
+            try
+            {
+                var isHosted = HttpContext.Current != null;
+
+                try
+                {
+                    if (isHosted)
+                    {
+                        assemblies = new HashSet&lt;Assembly&gt;(BuildManager.GetReferencedAssemblies().Cast&lt;Assembly&gt;());
+                    }
+                }
+                catch (InvalidOperationException e)
+                {
+                    if (!(e.InnerException is SecurityException))
+                        throw;
+                }
+
+                if (assemblies == null)
+                {
+                    //NOTE: we cannot use AppDomain.CurrentDomain.GetAssemblies() because this only returns assemblies that have
+                    // already been loaded in to the app domain, instead we will look directly into the bin folder and load each one.
+                    var binFolder = IOHelper.GetRootDirectoryBinFolder();
+                    var binAssemblyFiles = Directory.GetFiles(binFolder, &quot;*.dll&quot;, SearchOption.TopDirectoryOnly).ToList();
+                    //var binFolder = Assembly.GetExecutingAssembly().GetAssemblyFile().Directory;
+                    //var binAssemblyFiles = Directory.GetFiles(binFolder.FullName, &quot;*.dll&quot;, SearchOption.TopDirectoryOnly).ToList();
+                    assemblies = new HashSet&lt;Assembly&gt;();
+                    foreach (var a in binAssemblyFiles)
+                    {
+                        try
+                        {
+                            var assName = AssemblyName.GetAssemblyName(a);
+                            var ass = Assembly.Load(assName);
+                            assemblies.Add(ass);
+                        }
+                        catch (Exception e)
+                        {
+                            if (e is SecurityException || e is BadImageFormatException)
+                            {
+                                //swallow these exceptions
+                            }
+                            else
+                            {
+                                throw;
+                            }
+                        }
+                    }
+                }
+
+                //if for some reason they are still no assemblies, then use the AppDomain to load in already loaded assemblies.
+                if (!assemblies.Any())
+                {
+                    foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        assemblies.Add(a);
+                    }
+                }
+
+                //here we are trying to get the App_Code assembly
+                var fileExtensions = new[] { &quot;.cs&quot;, &quot;.vb&quot; }; //only vb and cs files are supported
+                var appCodeFolder = new DirectoryInfo(IOHelper.MapPath(IOHelper.ResolveUrl(&quot;~/App_code&quot;)));
+                //check if the folder exists and if there are any files in it with the supported file extensions
+                if (appCodeFolder.Exists &amp;&amp; (fileExtensions.Any(x =&gt; appCodeFolder.GetFiles(&quot;*&quot; + x).Any())))
+                {
+                    try
+                    {
+                        var appCodeAssembly = Assembly.Load(&quot;App_Code&quot;);
+                        if (!assemblies.Contains(appCodeAssembly)) // BuildManager will find App_Code already
+                            assemblies.Add(appCodeAssembly);
+                    }
+                    catch (FileNotFoundException ex)
+                    {
+                        //this will occur if it cannot load the assembly
+                        LogHelper.Error(typeof(TypeFinder), &quot;Could not load assembly App_Code&quot;, ex);
+                    }
+                }
+            }
+            catch (InvalidOperationException e)
+            {
+                if (!(e.InnerException is SecurityException))
+                    throw;
+            }
+
+            return assemblies;
+        });
+
+        /// &lt;summary&gt;
+        /// Return a list of found local Assemblies excluding the known assemblies we don&#39;t want to scan
+        /// and exluding the ones passed in and excluding the exclusion list filter, the results of this are
+        /// cached for perforance reasons.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;excludeFromResults&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static HashSet&lt;Assembly&gt; GetAssembliesWithKnownExclusions(
+            IEnumerable&lt;Assembly&gt; excludeFromResults = null)
+        {
+            if (_localFilteredAssemblyCache == null)
+            {
+                lock (LocalFilteredAssemblyCacheLocker)
+                {
+                    //double check
+                    if (_localFilteredAssemblyCache == null)
+                    {
+                        _localFilteredAssemblyCache = new HashSet&lt;Assembly&gt;();
+                        var assemblies = GetFilteredAssemblies(excludeFromResults, KnownAssemblyExclusionFilter);
+                        foreach (var a in assemblies)
+                        {
+                            _localFilteredAssemblyCache.Add(a);
+                        }
+                    }
+                }
+            }
+            return _localFilteredAssemblyCache;
+        }
+
+        /// &lt;summary&gt;
+        /// Return a distinct list of found local Assemblies and exluding the ones passed in and excluding the exclusion list filter
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;excludeFromResults&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;exclusionFilter&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private static IEnumerable&lt;Assembly&gt; GetFilteredAssemblies(
+            IEnumerable&lt;Assembly&gt; excludeFromResults = null,
+            string[] exclusionFilter = null)
+        {
+            if (excludeFromResults == null)
+                excludeFromResults = new HashSet&lt;Assembly&gt;();
+            if (exclusionFilter == null)
+                exclusionFilter = new string[] { };
+
+            return GetAllAssemblies()
+                .Where(x =&gt; !excludeFromResults.Contains(x)
+                            &amp;&amp; !x.GlobalAssemblyCache
+                            &amp;&amp; !exclusionFilter.Any(f =&gt; x.FullName.StartsWith(f)));
+        }
+
+        /// &lt;summary&gt;
+        /// this is our assembly filter to filter out known types that def dont contain types we&#39;d like to find or plugins
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// NOTE the comma vs period... comma delimits the name in an Assembly FullName property so if it ends with comma then its an exact name match
+        /// NOTE this means that &quot;foo.&quot; will NOT exclude &quot;foo.dll&quot; but only &quot;foo.*.dll&quot;
+        /// &lt;/remarks&gt;
+        internal static readonly string[] KnownAssemblyExclusionFilter = new[]
+                {
+                    &quot;mscorlib,&quot;,
+					&quot;System.&quot;,
+                    &quot;Antlr3.&quot;,
+                    &quot;Autofac.&quot;,
+                    &quot;Autofac,&quot;,
+                    &quot;Castle.&quot;,
+                    &quot;ClientDependency.&quot;,
+                    &quot;DataAnnotationsExtensions.&quot;,
+                    &quot;DataAnnotationsExtensions,&quot;,
+                    &quot;Dynamic,&quot;,
+                    &quot;HtmlDiff,&quot;,
+                    &quot;Iesi.Collections,&quot;,
+                    &quot;log4net,&quot;,
+                    &quot;Microsoft.&quot;,
+                    &quot;Newtonsoft.&quot;,
+                    &quot;NHibernate.&quot;,
+                    &quot;NHibernate,&quot;,
+                    &quot;NuGet.&quot;,
+                    &quot;RouteDebugger,&quot;,
+                    &quot;SqlCE4Umbraco,&quot;,
+                    &quot;umbraco.datalayer,&quot;,
+                    &quot;umbraco.interfaces,&quot;,
+					//&quot;umbraco.providers,&quot;,
+					//&quot;Umbraco.Web.UI,&quot;,
+                    &quot;umbraco.webservices&quot;,
+                    &quot;Lucene.&quot;,
+                    &quot;Examine,&quot;,
+                    &quot;Examine.&quot;,
+                    &quot;ServiceStack.&quot;,
+                    &quot;MySql.&quot;,
+                    &quot;HtmlAgilityPack.&quot;,
+                    &quot;TidyNet.&quot;,
+                    &quot;ICSharpCode.&quot;,
+                    &quot;CookComputing.&quot;,
+                    &quot;AutoMapper,&quot;,
+                    &quot;AutoMapper.&quot;,
+                    &quot;AzureDirectory,&quot;,
+                    &quot;itextsharp,&quot;,
+                    &quot;UrlRewritingNet.&quot;,
+                    &quot;HtmlAgilityPack,&quot;,
+                    &quot;MiniProfiler,&quot;,
+                    &quot;Moq,&quot;,
+                    &quot;nunit.framework,&quot;,
+                    &quot;TidyNet,&quot;,
+                    &quot;WebDriver,&quot;
+                };
+
+        /// &lt;summary&gt;
+        /// Finds any classes derived from the type T that contain the attribute TAttribute
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;typeparam name=&quot;TAttribute&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Type&gt; FindClassesOfTypeWithAttribute&lt;T, TAttribute&gt;()
+            where TAttribute : Attribute
+        {
+            return FindClassesOfTypeWithAttribute&lt;T, TAttribute&gt;(GetAssembliesWithKnownExclusions(), true);
+        }
+
+        /// &lt;summary&gt;
+        /// Finds any classes derived from the type T that contain the attribute TAttribute
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;typeparam name=&quot;TAttribute&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;assemblies&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Type&gt; FindClassesOfTypeWithAttribute&lt;T, TAttribute&gt;(IEnumerable&lt;Assembly&gt; assemblies)
+            where TAttribute : Attribute
+        {
+            return FindClassesOfTypeWithAttribute&lt;T, TAttribute&gt;(assemblies, true);
+        }
+
+        /// &lt;summary&gt;
+        /// Finds any classes derived from the type T that contain the attribute TAttribute
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;typeparam name=&quot;TAttribute&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;assemblies&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;onlyConcreteClasses&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Type&gt; FindClassesOfTypeWithAttribute&lt;T, TAttribute&gt;(
+            IEnumerable&lt;Assembly&gt; assemblies,
+            bool onlyConcreteClasses)
+            where TAttribute : Attribute
+        {
+            return FindClassesOfTypeWithAttribute&lt;TAttribute&gt;(typeof(T), assemblies, onlyConcreteClasses);
+        }
+
+        /// &lt;summary&gt;
+        /// Finds any classes derived from the assignTypeFrom Type that contain the attribute TAttribute
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TAttribute&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;assignTypeFrom&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;assemblies&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;onlyConcreteClasses&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Type&gt; FindClassesOfTypeWithAttribute&lt;TAttribute&gt;(
+            Type assignTypeFrom,
+            IEnumerable&lt;Assembly&gt; assemblies,
+            bool onlyConcreteClasses)
+            where TAttribute : Attribute
+        {
+            if (assemblies == null) throw new ArgumentNullException(&quot;assemblies&quot;);
+
+            return GetClasses(assignTypeFrom, assemblies, onlyConcreteClasses,
+                //the additional filter will ensure that any found types also have the attribute applied.
+                t =&gt; t.GetCustomAttributes&lt;TAttribute&gt;(false).Any());
+        }
+
+        /// &lt;summary&gt;
+        /// Searches all filtered local assemblies specified for classes of the type passed in.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Type&gt; FindClassesOfType&lt;T&gt;()
+        {
+            return FindClassesOfType&lt;T&gt;(GetAssembliesWithKnownExclusions(), true);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all types found of in the assemblies specified of type T
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;assemblies&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;onlyConcreteClasses&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Type&gt; FindClassesOfType&lt;T&gt;(IEnumerable&lt;Assembly&gt; assemblies, bool onlyConcreteClasses)
+        {
+            if (assemblies == null) throw new ArgumentNullException(&quot;assemblies&quot;);
+
+            return GetClasses(typeof(T), assemblies, onlyConcreteClasses);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all types found of in the assemblies specified of type T
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;assemblies&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Type&gt; FindClassesOfType&lt;T&gt;(IEnumerable&lt;Assembly&gt; assemblies)
+        {
+            return FindClassesOfType&lt;T&gt;(assemblies, true);
+        }
+
+        /// &lt;summary&gt;
+        /// Finds the classes with attribute.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;assemblies&quot;&gt;The assemblies.&lt;/param&gt;
+        /// &lt;param name=&quot;onlyConcreteClasses&quot;&gt;if set to &lt;c&gt;true&lt;/c&gt; only concrete classes.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Type&gt; FindClassesWithAttribute&lt;T&gt;(IEnumerable&lt;Assembly&gt; assemblies, bool onlyConcreteClasses)
+            where T : Attribute
+        {
+            return FindClassesWithAttribute(typeof(T), assemblies, onlyConcreteClasses);
+        }
+
+        /// &lt;summary&gt;
+        /// Finds any classes with the attribute.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;attributeType&quot;&gt;The attribute type &lt;/param&gt;
+        /// &lt;param name=&quot;assemblies&quot;&gt;The assemblies.&lt;/param&gt;
+        /// &lt;param name=&quot;onlyConcreteClasses&quot;&gt;if set to &lt;c&gt;true&lt;/c&gt; only concrete classes.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Type&gt; FindClassesWithAttribute(
+            Type attributeType,
+            IEnumerable&lt;Assembly&gt; assemblies,
+            bool onlyConcreteClasses)
+        {
+            if (assemblies == null) throw new ArgumentNullException(&quot;assemblies&quot;);
+
+            if (TypeHelper.IsTypeAssignableFrom&lt;Attribute&gt;(attributeType) == false)
+                throw new ArgumentException(&quot;The type specified: &quot; + attributeType + &quot; is not an Attribute type&quot;);
+
+            var foundAttributedTypes = new HashSet&lt;Type&gt;();
+
+            var assemblyList = assemblies.ToArray();
+
+            //find all assembly references that are referencing the attribute type&#39;s assembly since we
+            //should only be scanning those assemblies because any other assembly will definitely not
+            //contain a class that has this attribute.
+            var referencedAssemblies = TypeHelper.GetReferencedAssemblies(attributeType, assemblyList);
+
+            //get a list of non-referenced assemblies (we&#39;ll use this when we recurse below)
+            var otherAssemblies = assemblyList.Where(x =&gt; referencedAssemblies.Contains(x) == false).ToArray();
+
+            //loop through the referenced assemblies
+            foreach (var a in referencedAssemblies)
+            {
+                //get all types in this assembly
+                var allTypes = GetTypesWithFormattedException(a)
+                    .ToArray();
+
+                var attributedTypes = new Type[] { };
+                try
+                {
+                    //now filter the types based on the onlyConcreteClasses flag, not interfaces, not static classes but have
+                    //the specified attribute
+                    attributedTypes = allTypes
+                        .Where(t =&gt; (TypeHelper.IsNonStaticClass(t)
+                                     &amp;&amp; (onlyConcreteClasses == false || t.IsAbstract == false))
+                            //the type must have this attribute
+                                     &amp;&amp; t.GetCustomAttributes(attributeType, false).Any())
+                        .ToArray();
+                }
+                catch (TypeLoadException ex)
+                {
+                    LogHelper.Error(typeof(TypeFinder), string.Format(&quot;Could not query types on {0} assembly, this is most likely due to this assembly not being compatible with the current Umbraco version&quot;, a), ex);
+                    continue;
+                }
+
+                //add the types to our list to return
+                foreach (var t in attributedTypes)
+                {
+                    foundAttributedTypes.Add(t);
+                }
+
+                //get all attributes of the type being searched for
+                var allAttributeTypes = allTypes.Where(attributeType.IsAssignableFrom);
+
+                //now we need to include types that may be inheriting from sub classes of the attribute type being searched for
+                //so we will search in assemblies that reference those types too.
+                foreach (var subTypesInAssembly in allAttributeTypes.GroupBy(x =&gt; x.Assembly))
+                {
+
+                    //So that we are not scanning too much, we need to group the sub types:
+                    // * if there is more than 1 sub type in the same assembly then we should only search on the &#39;lowest base&#39; type.
+                    // * We should also not search for sub types if the type is sealed since you cannot inherit from a sealed class
+                    // * We should not search for sub types if the type is static since you cannot inherit from them.
+                    var subTypeList = subTypesInAssembly
+                        .Where(t =&gt; t.IsSealed == false &amp;&amp; TypeHelper.IsStaticClass(t) == false)
+                        .ToArray();
+
+                    var baseClassAttempt = TypeHelper.GetLowestBaseType(subTypeList);
+
+                    //if there&#39;s a base class amongst the types then we&#39;ll only search for that type.
+                    //otherwise we&#39;ll have to search for all of them.
+                    var subTypesToSearch = new HashSet&lt;Type&gt;();
+                    if (baseClassAttempt.Success)
+                    {
+                        subTypesToSearch.Add(baseClassAttempt.Result);
+                    }
+                    else
+                    {
+                        foreach (var t in subTypeList)
+                        {
+                            subTypesToSearch.Add(t);
+                        }
+                    }
+
+                    foreach (var typeToSearch in subTypesToSearch)
+                    {
+                        //recursively find the types inheriting from this sub type in the other non-scanned assemblies.
+                        var foundTypes = FindClassesWithAttribute(typeToSearch, otherAssemblies, onlyConcreteClasses);
+
+                        foreach (var f in foundTypes)
+                        {
+                            foundAttributedTypes.Add(f);
+                        }
+                    }
+
+                }
+            }
+
+            return foundAttributedTypes;
+        }
+
+
+        /// &lt;summary&gt;
+        /// Finds the classes with attribute.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;assemblies&quot;&gt;The assemblies.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Type&gt; FindClassesWithAttribute&lt;T&gt;(IEnumerable&lt;Assembly&gt; assemblies)
+            where T : Attribute
+        {
+            return FindClassesWithAttribute&lt;T&gt;(assemblies, true);
+        }
+
+        /// &lt;summary&gt;
+        /// Finds the classes with attribute in filtered local assemblies
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Type&gt; FindClassesWithAttribute&lt;T&gt;()
+            where T : Attribute
+        {
+            return FindClassesWithAttribute&lt;T&gt;(GetAssembliesWithKnownExclusions());
+        }
+
+
+        #region Private methods
+
+        /// &lt;summary&gt;
+        /// Finds types that are assignable from the assignTypeFrom parameter and will scan for these types in the assembly
+        /// list passed in, however we will only scan assemblies that have a reference to the assignTypeFrom Type or any type
+        /// deriving from the base type.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;assignTypeFrom&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;assemblies&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;onlyConcreteClasses&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;additionalFilter&quot;&gt;An additional filter to apply for what types will actually be included in the return value&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private static IEnumerable&lt;Type&gt; GetClasses(
+            Type assignTypeFrom,
+            IEnumerable&lt;Assembly&gt; assemblies,
+            bool onlyConcreteClasses,
+            Func&lt;Type, bool&gt; additionalFilter = null)
+        {
+            //the default filter will always return true.
+            if (additionalFilter == null)
+            {
+                additionalFilter = type =&gt; true;
+            }
+
+            var foundAssignableTypes = new HashSet&lt;Type&gt;();
+
+            var assemblyList = assemblies.ToArray();
+
+            //find all assembly references that are referencing the current type&#39;s assembly since we
+            //should only be scanning those assemblies because any other assembly will definitely not
+            //contain sub type&#39;s of the one we&#39;re currently looking for
+            var referencedAssemblies = TypeHelper.GetReferencedAssemblies(assignTypeFrom, assemblyList);
+
+            //get a list of non-referenced assemblies (we&#39;ll use this when we recurse below)
+            var otherAssemblies = assemblyList.Where(x =&gt; referencedAssemblies.Contains(x) == false).ToArray();
+
+            //loop through the referenced assemblies
+            foreach (var a in referencedAssemblies)
+            {
+                //get all types in the assembly that are sub types of the current type
+                var allSubTypes = GetTypesWithFormattedException(a)
+                    .Where(assignTypeFrom.IsAssignableFrom)
+                    .ToArray();
+
+                var filteredTypes = new Type[] { };
+                try
+                {
+                    //now filter the types based on the onlyConcreteClasses flag, not interfaces, not static classes
+                    filteredTypes = allSubTypes
+                        .Where(t =&gt; (TypeHelper.IsNonStaticClass(t)
+                            //Do not include nested private classes - since we are in full trust now this will find those too!
+                                     &amp;&amp; t.IsNestedPrivate == false
+                                     &amp;&amp; (onlyConcreteClasses == false || t.IsAbstract == false)
+                            //Do not include classes that are flagged to hide from the type finder
+                                     &amp;&amp; t.GetCustomAttribute&lt;HideFromTypeFinderAttribute&gt;() == null
+                                     &amp;&amp; additionalFilter(t)))
+                        .ToArray();
+                }
+                catch (TypeLoadException ex)
+                {
+                    LogHelper.Error(typeof(TypeFinder), string.Format(&quot;Could not query types on {0} assembly, this is most likely due to this assembly not being compatible with the current Umbraco version&quot;, a), ex);
+                    continue;
+                }
+
+                //add the types to our list to return
+                foreach (var t in filteredTypes)
+                {
+                    foundAssignableTypes.Add(t);
+                }
+
+                //now we need to include types that may be inheriting from sub classes of the type being searched for
+                //so we will search in assemblies that reference those types too.
+                foreach (var subTypesInAssembly in allSubTypes.GroupBy(x =&gt; x.Assembly))
+                {
+
+                    //So that we are not scanning too much, we need to group the sub types:
+                    // * if there is more than 1 sub type in the same assembly then we should only search on the &#39;lowest base&#39; type.
+                    // * We should also not search for sub types if the type is sealed since you cannot inherit from a sealed class
+                    // * We should not search for sub types if the type is static since you cannot inherit from them.
+                    var subTypeList = subTypesInAssembly
+                        .Where(t =&gt; t.IsSealed == false &amp;&amp; TypeHelper.IsStaticClass(t) == false)
+                        .ToArray();
+
+                    var baseClassAttempt = TypeHelper.GetLowestBaseType(subTypeList);
+
+                    //if there&#39;s a base class amongst the types then we&#39;ll only search for that type.
+                    //otherwise we&#39;ll have to search for all of them.
+                    var subTypesToSearch = new HashSet&lt;Type&gt;();
+                    if (baseClassAttempt.Success)
+                    {
+                        subTypesToSearch.Add(baseClassAttempt.Result);
+                    }
+                    else
+                    {
+                        foreach (var t in subTypeList)
+                        {
+                            subTypesToSearch.Add(t);
+                        }
+                    }
+
+                    foreach (var typeToSearch in subTypesToSearch)
+                    {
+                        //recursively find the types inheriting from this sub type in the other non-scanned assemblies.
+                        var foundTypes = GetClasses(typeToSearch, otherAssemblies, onlyConcreteClasses, additionalFilter);
+
+                        foreach (var f in foundTypes)
+                        {
+                            foundAssignableTypes.Add(f);
+                        }
+                    }
+
+                }
+
+            }
+            return foundAssignableTypes;
+        }
+
+        internal static IEnumerable&lt;Type&gt; GetTypesWithFormattedException(Assembly a)
+        {
+            //if the assembly is dynamic, do not try to scan it
+            if (a.IsDynamic)
+                return Enumerable.Empty&lt;Type&gt;();
+
+            var getAll = a.GetCustomAttribute&lt;AllowPartiallyTrustedCallersAttribute&gt;() == null;
+
+            try
+            {
+                //we need to detect if an assembly is partially trusted, if so we cannot go interrogating all of it&#39;s types
+                //only its exported types, otherwise we&#39;ll get exceptions.
+                return getAll ? a.GetTypes() : a.GetExportedTypes();
+            }
+            catch (TypeLoadException ex) // GetExportedTypes *can* throw TypeLoadException!
+            {
+                var sb = new StringBuilder();
+                AppendCouldNotLoad(sb, a, getAll);
+                AppendLoaderException(sb, ex);
+
+                // rethrow as ReflectionTypeLoadException (for consistency) with new message
+                throw new ReflectionTypeLoadException(new Type[0], new Exception[] { ex }, sb.ToString());
+            }
+            catch (ReflectionTypeLoadException rex) // GetTypes throws ReflectionTypeLoadException
+            {
+                var sb = new StringBuilder();
+                AppendCouldNotLoad(sb, a, getAll);
+                foreach (var loaderException in rex.LoaderExceptions.WhereNotNull())
+                    AppendLoaderException(sb, loaderException);
+
+                // rethrow with new message
+                throw new ReflectionTypeLoadException(rex.Types, rex.LoaderExceptions, sb.ToString());
+            }
+        }
+
+        private static void AppendCouldNotLoad(StringBuilder sb, Assembly a, bool getAll)
+        {
+            sb.Append(&quot;Could not load &quot;);
+            sb.Append(getAll ? &quot;all&quot; : &quot;exported&quot;);
+            sb.Append(&quot; types from \&quot;&quot;);
+            sb.Append(a.FullName);
+            sb.AppendLine(&quot;\&quot; due to LoaderExceptions, skipping:&quot;);
+        }
+
+        private static void AppendLoaderException(StringBuilder sb, Exception loaderException)
+        {
+            sb.Append(&quot;. &quot;);
+            sb.Append(loaderException.GetType().FullName);
+
+            var tloadex = loaderException as TypeLoadException;
+            if (tloadex != null)
+            {
+                sb.Append(&quot; on &quot;);
+                sb.Append(tloadex.TypeName);
+            }
+
+            sb.Append(&quot;: &quot;);
+            sb.Append(loaderException.Message);
+            sb.AppendLine();
+        }
+
+        #endregion
+
+
+        public static Type GetTypeByName(string typeName)
+        {
+            var type = BuildManager.GetType(typeName, false);
+            if (type != null) return type;
+
+            //TODO: This isn&#39;t very elegant, and will have issues since the AppDomain.CurrentDomain
+            // doesn&#39;t actualy load in all assemblies, only the types that have been referenced so far.
+            // However, in a web context, the BuildManager will have executed which will force all assemblies
+            // to be loaded so it&#39;s fine for now.
+
+            //now try fall back procedures.
+            type = Type.GetType(typeName);
+            if (type != null) return type;
+            return AppDomain.CurrentDomain.GetAssemblies()
+                .Select(x =&gt; x.GetType(typeName))
+                .FirstOrDefault(x =&gt; x != null);
+        }
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[29,9,29,86,1],[30,9,30,88,1],[45,9,45,10,1],[46,13,46,40,1],[47,9,47,10,1],[50,9,51,9,1],[51,9,51,10,1],[51,10,52,13,1],[52,13,52,49,1],[52,49,54,13,1],[54,13,54,14,1],[54,14,55,17,1],[55,17,55,60,1],[55,60,58,17,1],[58,17,58,18,1],[58,18,59,21,1],[59,21,59,34,1],[59,34,60,21,1],[60,21,60,22,0],[60,22,61,25,1],[61,25,61,117,0],[61,117,62,21,1],[62,21,62,22,0],[62,22,63,17,1],[63,17,63,18,1],[63,18,64,17,1],[64,17,64,52,0],[64,52,65,17,1],[65,17,65,18,0],[65,18,66,21,1],[66,21,66,66,0],[66,66,67,25,1],[67,25,67,31,0],[67,31,68,17,1],[68,17,68,18,0],[68,18,70,17,1],[70,17,70,40,1],[70,40,71,17,1],[71,17,71,18,1],[71,18,74,21,1],[74,21,74,74,1],[74,74,75,21,1],[75,21,75,123,1],[75,123,78,21,1],[78,21,78,58,1],[78,58,79,21,1],[79,21,79,28,1],[79,28,79,30,1],[79,30,79,35,1],[79,35,79,36,1],[79,36,79,38,1],[79,38,79,39,1],[79,39,79,55,1],[79,55,80,21,1],[80,21,80,22,1],[80,22,82,25,1],[82,25,82,26,1],[82,26,83,29,1],[83,29,83,75,1],[83,75,84,29,1],[84,29,84,62,1],[84,62,85,29,1],[85,29,85,49,1],[85,49,86,25,1],[86,25,86,26,1],[86,26,87,25,1],[87,25,87,44,0],[87,44,88,25,1],[88,25,88,26,0],[88,26,89,29,1],[89,29,89,88,0],[89,88,90,29,1],[90,29,90,30,0],[90,30,92,29,1],[92,29,92,30,0],[92,30,94,29,1],[94,29,94,30,0],[94,30,95,33,1],[95,33,95,39,0],[95,39,97,25,1],[97,25,97,26,0],[97,26,98,21,1],[98,21,98,22,1],[98,22,99,17,1],[99,17,99,18,1],[99,18,102,17,1],[102,17,102,39,1],[102,39,103,17,1],[103,17,103,18,0],[103,18,104,21,1],[104,21,104,28,0],[104,28,104,30,1],[104,30,104,35,0],[104,35,104,36,1],[104,36,104,38,0],[104,38,104,39,1],[104,39,104,78,0],[104,78,105,21,1],[105,21,105,22,0],[105,22,106,25,1],[106,25,106,43,0],[106,43,107,21,1],[107,21,107,22,0],[107,22,108,17,1],[108,17,108,18,0],[108,18,111,17,1],[111,17,111,61,1],[111,61,112,17,1],[112,17,112,108,1],[112,108,114,17,1],[114,17,114,70,1],[114,70,114,107,0],[114,107,114,110,1],[114,17,114,110,1],[114,110,115,17,1],[115,17,115,18,0],[115,18,117,21,1],[117,21,117,22,0],[117,22,118,25,1],[118,25,118,73,0],[118,73,119,25,1],[119,25,119,67,0],[119,67,120,29,1],[120,29,120,61,0],[120,61,121,21,1],[121,21,121,22,0],[121,22,122,21,1],[122,21,122,53,0],[122,53,123,21,1],[123,21,123,22,0],[123,22,125,25,1],[125,25,125,101,0],[125,101,126,21,1],[126,21,126,22,0],[126,22,127,17,1],[127,17,127,18,0],[127,18,128,13,1],[128,13,128,14,1],[128,14,129,13,1],[129,13,129,48,0],[129,48,130,13,1],[130,13,130,14,0],[130,14,131,17,1],[131,17,131,62,0],[131,62,132,21,1],[132,21,132,27,0],[132,27,133,13,1],[133,13,133,14,0],[133,14,135,13,1],[135,13,135,31,1],[135,31,136,9,1],[136,9,136,10,1],[136,10,136,12,1],[50,9,136,12,1],[147,9,147,10,1],[148,13,148,53,1],[149,13,149,14,1],[150,17,150,56,1],[151,17,151,18,1],[153,21,153,61,1],[154,21,154,22,1],[155,25,155,79,1],[156,25,156,114,1],[157,25,157,32,1],[157,34,157,39,1],[157,40,157,42,1],[157,43,157,53,1],[158,25,158,26,1],[159,29,159,64,1],[160,25,160,26,1],[161,21,161,22,1],[162,17,162,18,1],[163,13,163,14,1],[164,13,164,48,1],[165,9,165,10,1],[176,9,176,10,1],[177,13,177,44,1],[178,17,178,62,1],[179,13,179,41,1],[180,17,180,52,0],[182,13,183,29,1],[183,29,185,58,1],[185,58,185,82,1],[185,82,185,83,1],[183,29,185,83,1],[185,83,185,85,1],[182,13,185,85,1],[186,9,186,10,1],[195,9,242,19,1],[252,9,252,10,0],[253,13,253,108,0],[254,9,254,10,0],[265,9,265,10,1],[266,13,266,84,1],[267,9,267,10,1],[281,9,281,10,1],[282,13,282,107,1],[283,9,283,10,1],[298,9,298,10,1],[299,13,299,36,1],[299,37,299,83,0],[301,13,303,22,1],[303,22,303,68,1],[303,68,303,70,1],[301,13,303,70,1],[304,9,304,10,1],[312,9,312,10,1],[313,13,313,83,1],[314,9,314,10,1],[324,9,324,10,1],[325,13,325,36,1],[325,37,325,83,0],[327,13,327,75,1],[328,9,328,10,1],[337,9,337,10,1],[338,13,338,59,1],[339,9,339,10,1],[350,9,350,10,1],[351,13,351,89,1],[352,9,352,10,1],[365,9,365,10,1],[366,13,366,36,1],[366,37,366,83,0],[368,13,368,84,1],[369,17,369,115,0],[371,13,371,60,1],[373,13,373,53,1],[378,13,378,104,1],[381,13,381,59,1],[381,59,381,100,1],[381,100,381,112,1],[381,13,381,112,1],[384,13,384,20,1],[384,22,384,27,1],[384,28,384,30,1],[384,31,384,51,1],[385,13,385,14,1],[387,17,388,32,1],[390,17,390,54,1],[392,17,392,18,1],[395,21,396,37,1],[396,37,399,90,1],[399,90,400,36,1],[395,21,400,36,1],[401,17,401,18,1],[402,17,402,45,0],[403,17,403,18,0],[404,21,404,216,0],[405,21,405,30,0],[409,17,409,24,1],[409,26,409,31,1],[409,32,409,34,1],[409,35,409,50,1],[410,17,410,18,1],[411,21,411,49,1],[412,17,412,18,1],[415,17,415,88,1],[419,17,419,24,1],[419,26,419,48,1],[419,49,419,51,1],[419,52,419,83,1],[419,83,419,93,1],[419,93,419,94,1],[419,52,419,94,1],[420,17,420,18,1],[426,21,427,37,1],[427,37,427,96,1],[427,96,428,36,1],[426,21,428,36,1],[430,21,430,86,1],[434,21,434,64,1],[435,21,435,50,1],[436,21,436,22,1],[437,25,437,71,1],[438,21,438,22,1],[440,21,440,22,1],[441,25,441,32,1],[441,34,441,39,0],[441,40,441,42,1],[441,43,441,54,1],[442,25,442,26,0],[443,29,443,53,0],[444,25,444,26,0],[445,21,445,22,1],[447,21,447,28,1],[447,30,447,46,1],[447,47,447,49,1],[447,50,447,66,1],[448,21,448,22,1],[450,25,450,119,1],[452,25,452,32,1],[452,34,452,39,0],[452,40,452,42,1],[452,43,452,53,1],[453,25,453,26,0],[454,29,454,57,0],[455,25,455,26,0],[456,21,456,22,1],[458,17,458,18,1],[459,13,459,14,1],[461,13,461,41,1],[462,9,462,10,1],[473,9,473,10,1],[474,13,474,66,1],[475,9,475,10,1],[484,9,484,10,0],[485,13,485,84,0],[486,9,486,10,0],[506,9,506,10,1],[508,13,508,42,1],[509,13,509,14,1],[510,17,510,44,1],[510,44,510,48,1],[510,48,510,49,1],[510,17,510,49,1],[511,13,511,14,1],[513,13,513,60,1],[515,13,515,53,1],[520,13,520,105,1],[523,13,523,59,1],[523,59,523,100,1],[523,100,523,112,1],[523,13,523,112,1],[526,13,526,20,1],[526,22,526,27,1],[526,28,526,30,1],[526,31,526,51,1],[527,13,527,14,1],[529,17,531,32,1],[533,17,533,52,1],[535,17,535,18,1],[537,21,538,37,1],[538,37,544,61,1],[544,61,545,36,1],[537,21,545,36,1],[546,17,546,18,1],[547,17,547,45,0],[548,17,548,18,0],[549,21,549,216,0],[550,21,550,30,0],[554,17,554,24,1],[554,26,554,31,1],[554,32,554,34,1],[554,35,554,48,1],[555,17,555,18,1],[556,21,556,49,1],[557,17,557,18,1],[561,17,561,24,1],[561,26,561,48,1],[561,49,561,51,1],[561,52,561,77,1],[561,77,561,87,1],[561,87,561,88,1],[561,52,561,88,1],[562,17,562,18,1],[568,21,569,37,1],[569,37,569,96,1],[569,96,570,36,1],[568,21,570,36,1],[572,21,572,86,1],[576,21,576,64,1],[577,21,577,50,1],[578,21,578,22,1],[579,25,579,71,1],[580,21,580,22,1],[582,21,582,22,1],[583,25,583,32,1],[583,34,583,39,1],[583,40,583,42,1],[583,43,583,54,1],[584,25,584,26,1],[585,29,585,53,1],[586,25,586,26,1],[587,21,587,22,1],[589,21,589,28,1],[589,30,589,46,1],[589,47,589,49,1],[589,50,589,66,1],[590,21,590,22,1],[592,25,592,123,1],[594,25,594,32,1],[594,34,594,39,0],[594,40,594,42,1],[594,43,594,53,1],[595,25,595,26,0],[596,29,596,57,0],[597,25,597,26,0],[598,21,598,22,1],[600,17,600,18,1],[602,13,602,14,1],[603,13,603,41,1],[604,9,604,10,1],[607,9,607,10,1],[609,13,609,29,1],[610,17,610,49,0],[612,13,612,96,1],[615,13,615,14,1],[618,17,618,69,1],[620,13,620,41,0],[621,13,621,14,0],[622,17,622,46,0],[623,17,623,51,0],[624,17,624,47,0],[627,17,627,107,0],[629,13,629,52,0],[630,13,630,14,0],[631,17,631,46,0],[632,17,632,51,0],[633,17,633,24,0],[633,26,633,45,0],[633,46,633,48,0],[633,49,633,84,0],[634,21,634,64,0],[637,17,637,103,0],[639,9,639,10,1],[642,9,642,10,0],[643,13,643,42,0],[644,13,644,52,0],[645,13,645,41,0],[646,13,646,35,0],[647,13,647,68,0],[648,9,648,10,0],[651,9,651,10,0],[652,13,652,29,0],[653,13,653,59,0],[655,13,655,64,0],[656,13,656,33,0],[657,13,657,14,0],[658,17,658,35,0],[659,17,659,45,0],[660,13,660,14,0],[662,13,662,29,0],[663,13,663,48,0],[664,13,664,29,0],[665,9,665,10,0],[671,9,671,10,1],[672,13,672,62,1],[673,13,673,30,1],[673,31,673,43,0],[681,13,681,43,1],[682,13,682,30,1],[682,31,682,43,0],[683,13,684,30,1],[684,30,684,49,1],[684,49,685,38,1],[685,38,685,47,1],[685,47,685,49,1],[683,13,685,49,1],[686,9,686,10,1]]);
+    </script>
+  </body>
+</html>

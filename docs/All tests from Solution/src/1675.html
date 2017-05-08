@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\SqlSyntax\SqlCeSyntaxProvider.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Persistence.DatabaseAnnotations;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.Querying;
+
+namespace Umbraco.Core.Persistence.SqlSyntax
+{
+    /// &lt;summary&gt;
+    /// Represents an SqlSyntaxProvider for Sql Ce
+    /// &lt;/summary&gt;
+    [SqlSyntaxProviderAttribute(Constants.DatabaseProviders.SqlCe)]
+    public class SqlCeSyntaxProvider : MicrosoftSqlSyntaxProviderBase&lt;SqlCeSyntaxProvider&gt;
+    {
+        public SqlCeSyntaxProvider()
+        {
+            
+        }
+
+        public override Sql SelectTop(Sql sql, int top)
+        {
+            return new Sql(sql.SQL.Insert(sql.SQL.IndexOf(&#39; &#39;), &quot; TOP &quot; + top), sql.Arguments);
+        }
+
+        public override bool SupportsClustered()
+        {
+            return false;
+        }
+
+        /// &lt;summary&gt;
+        /// SqlCe doesn&#39;t support the Truncate Table syntax, so we just have to do a DELETE FROM which is slower but we have no choice.
+        /// &lt;/summary&gt;
+        public override string TruncateTable
+        {
+            get { return &quot;DELETE FROM {0}&quot;; }
+        }
+
+        public override string GetIndexType(IndexTypes indexTypes)
+        {
+            string indexType;
+            //NOTE Sql Ce doesn&#39;t support clustered indexes
+            if (indexTypes == IndexTypes.Clustered)
+            {
+                indexType = &quot;NONCLUSTERED&quot;;
+            }
+            else
+            {
+                indexType = indexTypes == IndexTypes.NonClustered
+                    ? &quot;NONCLUSTERED&quot;
+                    : &quot;UNIQUE NONCLUSTERED&quot;;
+            }
+            return indexType;
+        }
+
+        [Obsolete(&quot;Use the overload with the parameter index instead&quot;)]
+        public override string GetStringColumnEqualComparison(string column, string value, TextColumnType columnType)
+        {
+            switch (columnType)
+            {
+                case TextColumnType.NVarchar:
+                    return base.GetStringColumnEqualComparison(column, value, columnType);
+                case TextColumnType.NText:
+                    //MSSQL doesn&#39;t allow for = comparison with NText columns but allows this syntax
+                    return string.Format(&quot;{0} LIKE &#39;{1}&#39;&quot;, column, value);
+                default:
+                    throw new ArgumentOutOfRangeException(&quot;columnType&quot;);
+            }   
+        }
+
+        
+
+        public override string FormatColumnRename(string tableName, string oldName, string newName)
+        {
+            //NOTE Sql CE doesn&#39;t support renaming a column, so a new column needs to be created, then copy data and finally remove old column
+            //This assumes that the new column has been created, and that the old column will be deleted after this statement has run.
+            //http://stackoverflow.com/questions/3967353/microsoft-sql-compact-edition-rename-column
+
+            return string.Format(&quot;UPDATE {0} SET {1} = {2}&quot;, tableName, newName, oldName);
+        }
+
+        public override string FormatTableRename(string oldName, string newName)
+        {
+            return string.Format(RenameTable, oldName, newName);
+        }
+
+        public override string FormatPrimaryKey(TableDefinition table)
+        {
+            var columnDefinition = table.Columns.FirstOrDefault(x =&gt; x.IsPrimaryKey);
+            if (columnDefinition == null)
+                return string.Empty;
+
+            string constraintName = string.IsNullOrEmpty(columnDefinition.PrimaryKeyName)
+                                        ? string.Format(&quot;PK_{0}&quot;, table.Name)
+                                        : columnDefinition.PrimaryKeyName;
+
+            string columns = string.IsNullOrEmpty(columnDefinition.PrimaryKeyColumns)
+                                 ? GetQuotedColumnName(columnDefinition.Name)
+                                 : string.Join(&quot;, &quot;, columnDefinition.PrimaryKeyColumns
+                                                                     .Split(new[]{&#39;,&#39;, &#39; &#39;}, StringSplitOptions.RemoveEmptyEntries)
+                                                                     .Select(GetQuotedColumnName));
+
+            return string.Format(CreateConstraint,
+                                 GetQuotedTableName(table.Name),
+                                 GetQuotedName(constraintName),
+                                 &quot;PRIMARY KEY&quot;,
+                                 columns);
+        }
+
+        public override IEnumerable&lt;string&gt; GetTablesInSchema(Database db)
+        {
+            var items = db.Fetch&lt;dynamic&gt;(&quot;SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES&quot;);
+            return items.Select(x =&gt; x.TABLE_NAME).Cast&lt;string&gt;().ToList();
+        }
+
+        public override IEnumerable&lt;ColumnInfo&gt; GetColumnsInSchema(Database db)
+        {
+            var items = db.Fetch&lt;dynamic&gt;(&quot;SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS&quot;);
+            return
+                items.Select(
+                    item =&gt;
+                    new ColumnInfo(item.TABLE_NAME, item.COLUMN_NAME, item.ORDINAL_POSITION, item.COLUMN_DEFAULT,
+                                   item.IS_NULLABLE, item.DATA_TYPE)).ToList();
+        }
+
+        public override IEnumerable&lt;Tuple&lt;string, string&gt;&gt; GetConstraintsPerTable(Database db)
+        {
+            var items = db.Fetch&lt;dynamic&gt;(&quot;SELECT TABLE_NAME, CONSTRAINT_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS&quot;);
+            var indexItems = db.Fetch&lt;dynamic&gt;(&quot;SELECT TABLE_NAME, INDEX_NAME FROM INFORMATION_SCHEMA.INDEXES&quot;);
+            return
+                items.Select(item =&gt; new Tuple&lt;string, string&gt;(item.TABLE_NAME, item.CONSTRAINT_NAME))
+                     .Union(
+                         indexItems.Select(
+                             indexItem =&gt; new Tuple&lt;string, string&gt;(indexItem.TABLE_NAME, indexItem.INDEX_NAME)))
+                     .ToList();
+        }
+
+        public override IEnumerable&lt;Tuple&lt;string, string, string&gt;&gt; GetConstraintsPerColumn(Database db)
+        {
+            var items =
+                db.Fetch&lt;dynamic&gt;(
+                    &quot;SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE&quot;);
+            var indexItems = db.Fetch&lt;dynamic&gt;(&quot;SELECT INDEX_NAME, TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.INDEXES&quot;);
+            return
+                items.Select(
+                    item =&gt; new Tuple&lt;string, string, string&gt;(item.TABLE_NAME, item.COLUMN_NAME, item.CONSTRAINT_NAME))
+                     .Union(
+                         indexItems.Select(
+                             indexItem =&gt;
+                             new Tuple&lt;string, string, string&gt;(indexItem.TABLE_NAME, indexItem.COLUMN_NAME,
+                                                               indexItem.INDEX_NAME))).ToList();
+        }
+
+        public override IEnumerable&lt;Tuple&lt;string, string, string, bool&gt;&gt; GetDefinedIndexes(Database db)
+        {
+            var items =
+                db.Fetch&lt;dynamic&gt;(
+                    @&quot;SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, [UNIQUE] FROM INFORMATION_SCHEMA.INDEXES 
+WHERE INDEX_NAME NOT LIKE &#39;PK_%&#39;
+ORDER BY TABLE_NAME, INDEX_NAME&quot;);
+            return
+                items.Select(
+                    item =&gt; new Tuple&lt;string, string, string, bool&gt;(item.TABLE_NAME, item.INDEX_NAME, item.COLUMN_NAME, item.UNIQUE));
+        }
+
+        public override bool DoesTableExist(Database db, string tableName)
+        {
+            var result =
+                db.ExecuteScalar&lt;long&gt;(&quot;SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = @TableName&quot;,
+                                       new { TableName = tableName });
+
+            return result &gt; 0;
+        }
+
+        protected override string FormatIdentity(ColumnDefinition column)
+        {
+            return column.IsIdentity ? GetIdentityString(column) : string.Empty;
+        }
+
+        private static string GetIdentityString(ColumnDefinition column)
+        {
+            if (column.Seeding != default(int))
+                return string.Format(&quot;IDENTITY({0},1)&quot;, column.Seeding);
+
+            return &quot;IDENTITY(1,1)&quot;;
+        }
+
+        protected override string FormatSystemMethods(SystemMethods systemMethod)
+        {
+            switch (systemMethod)
+            {
+                case SystemMethods.NewGuid:
+                    return &quot;NEWID()&quot;;                
+                case SystemMethods.CurrentDateTime:
+                    return &quot;GETDATE()&quot;;
+                //case SystemMethods.NewSequentialId:
+                //    return &quot;NEWSEQUENTIALID()&quot;;
+                //case SystemMethods.CurrentUTCDateTime:
+                //    return &quot;GETUTCDATE()&quot;;
+            }
+
+            return null;
+        }
+
+        public override string DeleteDefaultConstraint
+        {
+            get
+            {
+                return &quot;ALTER TABLE [{0}] ALTER COLUMN [{1}] DROP DEFAULT&quot;;
+            }
+        }
+
+        
+
+        public override string DropIndex { get { return &quot;DROP INDEX {1}.{0}&quot;; } }
+        
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[16,9,16,37,1],[17,9,17,10,1],[19,9,19,10,1],[22,9,22,10,1],[23,13,23,96,1],[24,9,24,10,1],[27,9,27,10,1],[28,13,28,26,1],[29,9,29,10,1],[36,17,36,18,1],[36,19,36,44,1],[36,45,36,46,1],[40,9,40,10,1],[43,13,43,52,1],[44,13,44,14,0],[45,17,45,44,0],[46,13,46,14,0],[48,13,48,14,1],[49,17,51,45,1],[52,13,52,14,1],[53,13,53,30,1],[54,9,54,10,1],[58,9,58,10,0],[59,13,59,32,0],[62,21,62,91,0],[65,21,65,75,0],[67,21,67,73,0],[69,9,69,10,0],[74,9,74,10,1],[79,13,79,91,1],[80,9,80,10,1],[83,9,83,10,1],[84,13,84,65,1],[85,9,85,10,1],[88,9,88,10,1],[89,13,89,70,1],[89,70,89,84,1],[89,84,89,86,1],[89,13,89,86,1],[90,13,90,42,1],[91,17,91,37,0],[93,13,95,75,1],[97,13,101,100,1],[103,13,107,43,1],[108,9,108,10,1],[111,9,111,10,1],[112,13,112,95,1],[113,13,113,38,1],[113,38,113,50,1],[113,50,113,76,1],[113,13,113,76,1],[114,9,114,10,1],[117,9,117,10,1],[118,13,118,167,1],[119,13,122,21,1],[122,21,123,69,1],[123,69,123,80,1],[119,13,123,80,1],[124,9,124,10,1],[127,9,127,10,0],[128,13,128,123,0],[129,13,129,113,0],[130,13,131,38,0],[131,38,131,102,0],[131,102,134,43,0],[134,43,134,112,0],[134,112,135,32,0],[130,13,135,32,0],[136,9,136,10,0],[139,9,139,10,1],[140,13,142,113,1],[143,13,143,126,1],[144,13,146,29,1],[146,29,146,119,1],[146,119,150,30,1],[150,30,151,85,1],[151,85,151,97,1],[144,13,151,97,1],[152,9,152,10,1],[155,9,155,10,1],[156,13,160,35,1],[161,13,163,29,1],[163,29,163,133,1],[163,133,163,135,1],[161,13,163,135,1],[164,9,164,10,1],[167,9,167,10,1],[168,13,170,71,1],[172,13,172,31,1],[173,9,173,10,1],[176,9,176,10,1],[177,13,177,81,1],[178,9,178,10,1],[181,9,181,10,1],[182,13,182,48,1],[183,17,183,73,1],[185,13,185,36,1],[186,9,186,10,1],[189,9,189,10,1],[190,13,190,34,1],[193,21,193,38,1],[195,21,195,40,1],[202,13,202,25,0],[203,9,203,10,1],[208,13,208,14,1],[209,17,209,76,1],[210,13,210,14,1],[215,48,215,49,0],[215,50,215,78,0],[215,79,215,80,0]]);
+    </script>
+  </body>
+</html>

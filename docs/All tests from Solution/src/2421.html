@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\Packager\Installer.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Globalization;
+using System.IO;
+using System.Xml;
+using System.Linq;
+using ICSharpCode.SharpZipLib.Zip;
+using Umbraco.Core;
+using Umbraco.Core.Auditing;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Packaging;
+using umbraco.cms.businesslogic.web;
+using umbraco.BusinessLogic;
+using System.Diagnostics;
+using umbraco.cms.businesslogic.macro;
+using umbraco.cms.businesslogic.template;
+using umbraco.interfaces;
+
+namespace umbraco.cms.businesslogic.packager
+{
+    /// &lt;summary&gt;
+    /// The packager is a component which enables sharing of both data and functionality components between different umbraco installations.
+    /// 
+    /// The output is a .umb (a zip compressed file) which contains the exported documents/medias/macroes/documenttypes (etc.)
+    /// in a Xml document, along with the physical files used (images/usercontrols/xsl documents etc.)
+    /// 
+    /// Partly implemented, import of packages is done, the export is *under construction*.
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// Ruben Verborgh 31/12/2007: I had to change some code, I marked my changes with &quot;DATALAYER&quot;.
+    /// Reason: @@IDENTITY can&#39;t be used with the new datalayer.
+    /// I wasn&#39;t able to test the code, since I&#39;m not aware how the code functions.
+    /// &lt;/remarks&gt;
+    public class Installer
+    {
+        private const string PackageServer = &quot;packages.umbraco.org&quot;;
+
+        private readonly List&lt;string&gt; _unsecureFiles = new List&lt;string&gt;();
+        private readonly Dictionary&lt;string, string&gt; _conflictingMacroAliases = new Dictionary&lt;string, string&gt;();
+        private readonly Dictionary&lt;string, string&gt; _conflictingTemplateAliases = new Dictionary&lt;string, string&gt;();
+        private readonly Dictionary&lt;string, string&gt; _conflictingStyleSheetNames = new Dictionary&lt;string, string&gt;();
+
+        private readonly List&lt;string&gt; _binaryFileErrors = new List&lt;string&gt;();
+        private int _currentUserId = -1;
+
+
+        public string Name { get; private set; }
+        public string Version { get; private set; }
+        public string Url { get; private set; }
+        public string License { get; private set; }
+        public string LicenseUrl { get; private set; }
+        public string Author { get; private set; }
+        public string AuthorUrl { get; private set; }
+        public string ReadMe { get; private set; }
+        public string Control { get; private set; }
+
+        public bool ContainsMacroConflict { get; private set; }
+        public IDictionary&lt;string, string&gt; ConflictingMacroAliases { get { return _conflictingMacroAliases; } }
+
+        public bool ContainsUnsecureFiles { get; private set; }
+        public List&lt;string&gt; UnsecureFiles { get { return _unsecureFiles; } }
+
+        public bool ContainsTemplateConflicts { get; private set; }
+        public IDictionary&lt;string, string&gt; ConflictingTemplateAliases { get { return _conflictingTemplateAliases; } }
+
+        /// &lt;summary&gt;
+        /// Indicates that the package contains assembly reference errors
+        /// &lt;/summary&gt;
+        public bool ContainsBinaryFileErrors { get; private set; }
+
+        /// &lt;summary&gt;
+        /// List each assembly reference error
+        /// &lt;/summary&gt;
+        public List&lt;string&gt; BinaryFileErrors { get { return _binaryFileErrors; } }
+
+        /// &lt;summary&gt;
+        /// Indicates that the package contains legacy property editors
+        /// &lt;/summary&gt;
+        public bool ContainsLegacyPropertyEditors { get; private set; }
+
+        public bool ContainsStyleSheeConflicts { get; private set; }
+        public IDictionary&lt;string, string&gt; ConflictingStyleSheetNames { get { return _conflictingStyleSheetNames; } }
+
+        public int RequirementsMajor { get; private set; }
+        public int RequirementsMinor { get; private set; }
+        public int RequirementsPatch { get; private set; }
+
+        public RequirementsType RequirementsType { get; private set; }
+
+        public string IconUrl { get; private set; }
+
+        /// &lt;summary&gt;
+        /// The xmldocument, describing the contents of a package.
+        /// &lt;/summary&gt;
+        public XmlDocument Config { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        public Installer()
+        {
+            Initialize();
+        }
+
+        public Installer(int currentUserId)
+        {
+            Initialize();
+            _currentUserId = currentUserId;
+        }
+
+        private void Initialize()
+        {
+            ContainsBinaryFileErrors = false;
+            ContainsTemplateConflicts = false;
+            ContainsUnsecureFiles = false;
+            ContainsMacroConflict = false;
+            ContainsStyleSheeConflicts = false;
+        }
+
+        [Obsolete(&quot;Use the ctor with all parameters&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public Installer(string name, string version, string url, string license, string licenseUrl, string author, string authorUrl, int requirementsMajor, int requirementsMinor, int requirementsPatch, string readme, string control)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;name&quot;&gt;The name of the package&lt;/param&gt;
+        /// &lt;param name=&quot;version&quot;&gt;The version of the package&lt;/param&gt;
+        /// &lt;param name=&quot;url&quot;&gt;The url to a descriptionpage&lt;/param&gt;
+        /// &lt;param name=&quot;license&quot;&gt;The license under which the package is released (preferably GPL ;))&lt;/param&gt;
+        /// &lt;param name=&quot;licenseUrl&quot;&gt;The url to a licensedescription&lt;/param&gt;
+        /// &lt;param name=&quot;author&quot;&gt;The original author of the package&lt;/param&gt;
+        /// &lt;param name=&quot;authorUrl&quot;&gt;The url to the Authors website&lt;/param&gt;
+        /// &lt;param name=&quot;requirementsMajor&quot;&gt;Umbraco version major&lt;/param&gt;
+        /// &lt;param name=&quot;requirementsMinor&quot;&gt;Umbraco version minor&lt;/param&gt;
+        /// &lt;param name=&quot;requirementsPatch&quot;&gt;Umbraco version patch&lt;/param&gt;
+        /// &lt;param name=&quot;readme&quot;&gt;The readme text&lt;/param&gt;
+        /// &lt;param name=&quot;control&quot;&gt;The name of the usercontrol used to configure the package after install&lt;/param&gt;
+        /// &lt;param name=&quot;requirementsType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;iconUrl&quot;&gt;&lt;/param&gt;
+        public Installer(string name, string version, string url, string license, string licenseUrl, string author, string authorUrl, int requirementsMajor, int requirementsMinor, int requirementsPatch, string readme, string control, RequirementsType requirementsType, string iconUrl)
+        {
+            ContainsBinaryFileErrors = false;
+            ContainsTemplateConflicts = false;
+            ContainsUnsecureFiles = false;
+            ContainsMacroConflict = false;
+            ContainsStyleSheeConflicts = false;
+            this.Name = name;
+            this.Version = version;
+            this.Url = url;
+            this.License = license;
+            this.LicenseUrl = licenseUrl;
+            this.RequirementsMajor = requirementsMajor;
+            this.RequirementsMinor = requirementsMinor;
+            this.RequirementsPatch = requirementsPatch;
+            this.RequirementsType = requirementsType;
+            this.Author = author;
+            this.AuthorUrl = authorUrl;
+            this.IconUrl = iconUrl;
+            ReadMe = readme;
+            this.Control = control;
+        }
+
+        #region Public Methods
+
+        /// &lt;summary&gt;
+        /// Imports the specified package
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;inputFile&quot;&gt;Filename of the umbracopackage&lt;/param&gt;
+        /// &lt;param name=&quot;deleteFile&quot;&gt;true if the input file should be deleted after import&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public string Import(string inputFile, bool deleteFile)
+        {
+            using (DisposableTimer.DebugDuration&lt;Installer&gt;(
+                () =&gt; &quot;Importing package file &quot; + inputFile,
+                () =&gt; &quot;Package file &quot; + inputFile + &quot;imported&quot;))
+            {
+                var tempDir = &quot;&quot;;
+                if (File.Exists(IOHelper.MapPath(SystemDirectories.Data + Path.DirectorySeparatorChar + inputFile)))
+                {
+                    var fi = new FileInfo(IOHelper.MapPath(SystemDirectories.Data + Path.DirectorySeparatorChar + inputFile));
+                    // Check if the file is a valid package
+                    if (fi.Extension.ToLower() == &quot;.umb&quot;)
+                    {
+                        try
+                        {
+                            tempDir = UnPack(fi.FullName, deleteFile);
+                            LoadConfig(tempDir);
+                        }
+                        catch (Exception exception)
+                        {
+                            LogHelper.Error&lt;Installer&gt;(string.Format(&quot;Error importing file {0}&quot;, fi.FullName), exception);
+                            throw;
+                        }
+                    }
+                    else
+                        throw new Exception(&quot;Error - file isn&#39;t a package (doesn&#39;t have a .umb extension). Check if the file automatically got named &#39;.zip&#39; upon download.&quot;);
+                }
+                else
+                    throw new Exception(&quot;Error - file not found. Could find file named &#39;&quot; + IOHelper.MapPath(SystemDirectories.Data + Path.DirectorySeparatorChar + inputFile) + &quot;&#39;&quot;);
+                return tempDir;
+            }
+
+        }
+
+        /// &lt;summary&gt;
+        /// Imports the specified package
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;inputFile&quot;&gt;Filename of the umbracopackage&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public string Import(string inputFile)
+        {
+            return Import(inputFile, true);
+        }
+
+        public int CreateManifest(string tempDir, string guid, string repoGuid)
+        {
+            //This is the new improved install rutine, which chops up the process into 3 steps, creating the manifest, moving files, and finally handling umb objects
+            var packName = XmlHelper.GetNodeValue(Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/name&quot;));
+            var packAuthor = XmlHelper.GetNodeValue(Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/author/name&quot;));
+            var packAuthorUrl = XmlHelper.GetNodeValue(Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/author/website&quot;));
+            var packVersion = XmlHelper.GetNodeValue(Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/version&quot;));
+            var packReadme = XmlHelper.GetNodeValue(Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/readme&quot;));
+            var packLicense = XmlHelper.GetNodeValue(Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/license &quot;));
+            var packUrl = XmlHelper.GetNodeValue(Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/url &quot;));
+            var iconUrl = XmlHelper.GetNodeValue(Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/iconUrl&quot;));
+
+            var enableSkins = false;
+            var skinRepoGuid = &quot;&quot;;
+
+            if (Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/enableSkins&quot;) != null)
+            {
+                var skinNode = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/enableSkins&quot;);
+                enableSkins = bool.Parse(XmlHelper.GetNodeValue(skinNode));
+                if (skinNode.Attributes[&quot;repository&quot;] != null &amp;&amp; string.IsNullOrEmpty(skinNode.Attributes[&quot;repository&quot;].Value) == false)
+                    skinRepoGuid = skinNode.Attributes[&quot;repository&quot;].Value;
+            }
+
+            //Create a new package instance to record all the installed package adds - this is the same format as the created packages has.
+            //save the package meta data
+            var insPack = InstalledPackage.MakeNew(packName);
+            insPack.Data.Author = packAuthor;
+            insPack.Data.AuthorUrl = packAuthorUrl;
+            insPack.Data.Version = packVersion;
+            insPack.Data.Readme = packReadme;
+            insPack.Data.License = packLicense;
+            insPack.Data.Url = packUrl;
+            insPack.Data.IconUrl = iconUrl;
+
+            //skinning
+            insPack.Data.EnableSkins = enableSkins;
+            insPack.Data.SkinRepoGuid = string.IsNullOrEmpty(skinRepoGuid) ? Guid.Empty : new Guid(skinRepoGuid);
+
+            insPack.Data.PackageGuid = guid; //the package unique key.
+            insPack.Data.RepositoryGuid = repoGuid; //the repository unique key, if the package is a file install, the repository will not get logged.
+            insPack.Save();
+
+            return insPack.Data.Id;
+        }
+
+        public void InstallFiles(int packageId, string tempDir)
+        {
+            using (DisposableTimer.DebugDuration&lt;Installer&gt;(
+                () =&gt; &quot;Installing package files for package id &quot; + packageId + &quot; into temp folder &quot; + tempDir,
+                () =&gt; &quot;Package file installation complete for package id &quot; + packageId))
+            {
+                //retrieve the manifest to continue installation
+                var insPack = InstalledPackage.GetById(packageId);
+
+                //TODO: Depending on some files, some files should be installed differently.
+                //i.e. if stylsheets should probably be installed via business logic, media items should probably use the media IFileSystem!
+
+                // Move files
+                //string virtualBasePath = System.Web.HttpContext.Current.Request.ApplicationPath;
+                string basePath = System.Web.Hosting.HostingEnvironment.ApplicationPhysicalPath;
+
+                try
+                {
+                    foreach (XmlNode n in Config.DocumentElement.SelectNodes(&quot;//file&quot;))
+                    {
+                        var destPath = GetFileName(basePath, XmlHelper.GetNodeValue(n.SelectSingleNode(&quot;orgPath&quot;)));
+                        var sourceFile = GetFileName(tempDir, XmlHelper.GetNodeValue(n.SelectSingleNode(&quot;guid&quot;)));
+                        var destFile = GetFileName(destPath, XmlHelper.GetNodeValue(n.SelectSingleNode(&quot;orgName&quot;)));
+
+                        // Create the destination directory if it doesn&#39;t exist
+                        if (Directory.Exists(destPath) == false)
+                            Directory.CreateDirectory(destPath);
+                        //If a file with this name exists, delete it
+                        else if (File.Exists(destFile))
+                            File.Delete(destFile);
+
+                        // Copy the file
+                        // SJ: Note - this used to do a move but some packages included the same file to be
+                        // copied to multiple locations like so:
+                        //
+                        // &lt;file&gt;
+                        //   &lt;guid&gt;my-icon.png&lt;/guid&gt;
+                        //   &lt;orgPath&gt;/umbraco/Images/&lt;/orgPath&gt;
+                        //   &lt;orgName&gt;my-icon.png&lt;/orgName&gt;
+                        // &lt;/file&gt; 
+                        // &lt;file&gt;
+                        //   &lt;guid&gt;my-icon.png&lt;/guid&gt;
+                        //   &lt;orgPath&gt;/App_Plugins/MyPlugin/Images&lt;/orgPath&gt;
+                        //   &lt;orgName&gt;my-icon.png&lt;/orgName&gt;
+                        // &lt;/file&gt; 
+                        //
+                        // Since this file unzips as a flat list of files, moving the file the first time means
+                        // that when you try to do that a second time, it would result in a FileNotFoundException
+                        File.Copy(sourceFile, destFile);
+
+                        //PPH log file install
+                        insPack.Data.Files.Add(XmlHelper.GetNodeValue(n.SelectSingleNode(&quot;orgPath&quot;)) + &quot;/&quot; + XmlHelper.GetNodeValue(n.SelectSingleNode(&quot;orgName&quot;)));
+
+                    }
+
+                    // Once we&#39;re done copying, remove all the files 
+                    foreach (XmlNode n in Config.DocumentElement.SelectNodes(&quot;//file&quot;))
+                    {
+                        var sourceFile = GetFileName(tempDir, XmlHelper.GetNodeValue(n.SelectSingleNode(&quot;guid&quot;)));
+                        if (File.Exists(sourceFile))
+                            File.Delete(sourceFile);
+                    }
+                }
+                catch (Exception exception)
+                {
+                    LogHelper.Error&lt;Installer&gt;(&quot;Package install error&quot;, exception);
+                    throw;
+                }
+
+                // log that a user has install files
+                if (_currentUserId &gt; -1)
+                {
+                    Audit.Add(AuditTypes.PackagerInstall,
+                                            string.Format(&quot;Package &#39;{0}&#39; installed. Package guid: {1}&quot;, insPack.Data.Name, insPack.Data.PackageGuid),
+                                            _currentUserId, -1);
+                }
+
+                insPack.Save();
+            }
+        }
+
+        public void InstallBusinessLogic(int packageId, string tempDir)
+        {
+            using (DisposableTimer.DebugDuration&lt;Installer&gt;(
+                () =&gt; &quot;Installing business logic for package id &quot; + packageId + &quot; into temp folder &quot; + tempDir,
+                () =&gt; &quot;Package business logic installation complete for package id &quot; + packageId))
+            {
+                InstalledPackage insPack;
+                try
+                {
+                    //retrieve the manifest to continue installation
+                    insPack = InstalledPackage.GetById(packageId);
+                    //bool saveNeeded = false;
+
+                    // Get current user, with a fallback
+                    var currentUser = new User(0);
+
+                    //if there&#39;s a context, try to resolve the user - this will return null if there is a context but no
+                    // user found when there are old/invalid cookies lying around most likely during installation.
+                    // in that case we&#39;ll keep using the admin user
+                    if (string.IsNullOrEmpty(BasePages.UmbracoEnsuredPage.umbracoUserContextID) == false)
+                    {
+                        if (BasePages.UmbracoEnsuredPage.ValidateUserContextID(BasePages.UmbracoEnsuredPage.umbracoUserContextID))
+                        {
+                            var userById = User.GetCurrent();
+                            if (userById != null)
+                                currentUser = userById;
+                        }
+                    }
+
+
+                    //Xml as XElement which is used with the new PackagingService
+                    var rootElement = Config.DocumentElement.GetXElement();
+                    var packagingService = ApplicationContext.Current.Services.PackagingService;
+
+                    //Perhaps it would have been a good idea to put the following into methods eh?!?
+
+                    #region DataTypes
+                    var dataTypeElement = rootElement.Descendants(&quot;DataTypes&quot;).FirstOrDefault();
+                    if (dataTypeElement != null)
+                    {
+                        var dataTypeDefinitions = packagingService.ImportDataTypeDefinitions(dataTypeElement, currentUser.Id);
+                        foreach (var dataTypeDefinition in dataTypeDefinitions)
+                        {
+                            insPack.Data.DataTypes.Add(dataTypeDefinition.Id.ToString(CultureInfo.InvariantCulture));
+                        }
+                    }
+                    #endregion
+
+                    #region Languages
+                    var languageItemsElement = rootElement.Descendants(&quot;Languages&quot;).FirstOrDefault();
+                    if (languageItemsElement != null)
+                    {
+                        var insertedLanguages = packagingService.ImportLanguages(languageItemsElement);
+                        insPack.Data.Languages.AddRange(insertedLanguages.Select(l =&gt; l.Id.ToString(CultureInfo.InvariantCulture)));
+                    }
+
+                    #endregion
+
+                    #region Dictionary items
+                    var dictionaryItemsElement = rootElement.Descendants(&quot;DictionaryItems&quot;).FirstOrDefault();
+                    if (dictionaryItemsElement != null)
+                    {
+                        var insertedDictionaryItems = packagingService.ImportDictionaryItems(dictionaryItemsElement);
+                        insPack.Data.DictionaryItems.AddRange(insertedDictionaryItems.Select(d =&gt; d.Id.ToString(CultureInfo.InvariantCulture)));
+                    }
+                    #endregion
+
+                    #region Macros
+                    var macroItemsElement = rootElement.Descendants(&quot;Macros&quot;).FirstOrDefault();
+                    if (macroItemsElement != null)
+                    {
+                        var insertedMacros = packagingService.ImportMacros(macroItemsElement);
+                        insPack.Data.Macros.AddRange(insertedMacros.Select(m =&gt; m.Id.ToString(CultureInfo.InvariantCulture)));
+                    }
+                    #endregion
+
+                    #region Templates
+                    var templateElement = rootElement.Descendants(&quot;Templates&quot;).FirstOrDefault();
+                    if (templateElement != null)
+                    {
+                        var templates = packagingService.ImportTemplates(templateElement, currentUser.Id);
+                        foreach (var template in templates)
+                        {
+                            insPack.Data.Templates.Add(template.Id.ToString(CultureInfo.InvariantCulture));
+                        }
+                    }
+                    #endregion
+
+                    #region DocumentTypes
+                    //Check whether the root element is a doc type rather then a complete package
+                    var docTypeElement = rootElement.Name.LocalName.Equals(&quot;DocumentType&quot;) ||
+                                         rootElement.Name.LocalName.Equals(&quot;DocumentTypes&quot;)
+                        ? rootElement
+                        : rootElement.Descendants(&quot;DocumentTypes&quot;).FirstOrDefault();
+
+                    if (docTypeElement != null)
+                    {
+                        var contentTypes = packagingService.ImportContentTypes(docTypeElement, currentUser.Id);
+                        foreach (var contentType in contentTypes)
+                        {
+                            insPack.Data.Documenttypes.Add(contentType.Id.ToString(CultureInfo.InvariantCulture));
+                            //saveNeeded = true;
+                        }
+                    }
+                    #endregion
+
+                    #region Stylesheets
+                    foreach (XmlNode n in Config.DocumentElement.SelectNodes(&quot;Stylesheets/Stylesheet&quot;))
+                    {
+                        StyleSheet s = StyleSheet.Import(n, currentUser);
+
+                        insPack.Data.Stylesheets.Add(s.Id.ToString(CultureInfo.InvariantCulture));
+                        //saveNeeded = true;
+                    }
+
+                    //if (saveNeeded) { insPack.Save(); saveNeeded = false; }
+                    #endregion
+
+                    #region Documents
+                    var documentElement = rootElement.Descendants(&quot;DocumentSet&quot;).FirstOrDefault();
+                    if (documentElement != null)
+                    {
+                        var content = packagingService.ImportContent(documentElement, -1, currentUser.Id);
+                        var firstContentItem = content.First();
+                        insPack.Data.ContentNodeId = firstContentItem.Id.ToString(CultureInfo.InvariantCulture);
+                    }
+                    #endregion
+
+                    #region Package Actions
+                    foreach (XmlNode n in Config.DocumentElement.SelectNodes(&quot;Actions/Action&quot;))
+                    {
+                        if (n.Attributes[&quot;undo&quot;] == null || n.Attributes[&quot;undo&quot;].Value == &quot;true&quot;)
+                        {
+                            insPack.Data.Actions += n.OuterXml;
+                        }
+
+                        //Run the actions tagged only for &#39;install&#39;
+
+                        if (n.Attributes[&quot;runat&quot;] != null &amp;&amp; n.Attributes[&quot;runat&quot;].Value == &quot;install&quot;)
+                        {
+                            var alias = n.Attributes[&quot;alias&quot;] != null ? n.Attributes[&quot;alias&quot;].Value : &quot;&quot;;
+
+                            if (alias.IsNullOrWhiteSpace() == false)
+                            {
+                                PackageAction.RunPackageAction(insPack.Data.Name, alias, n);
+                            }
+                        }
+                    }
+                    #endregion
+
+                    // Trigger update of Apps / Trees config.
+                    // (These are ApplicationStartupHandlers so just instantiating them will trigger them)
+                    new ApplicationRegistrar();
+                    new ApplicationTreeRegistrar();
+
+                    insPack.Save();
+                }
+                catch (Exception exception)
+                {
+                    LogHelper.Error&lt;Installer&gt;(&quot;Error installing businesslogic&quot;, exception);
+                    throw;
+                }
+
+                OnPackageBusinessLogicInstalled(insPack);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Remove the temp installation folder
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;packageId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;tempDir&quot;&gt;&lt;/param&gt;
+        public void InstallCleanUp(int packageId, string tempDir)
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, true);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Reads the configuration of the package from the configuration xmldocument
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;tempDir&quot;&gt;The folder to which the contents of the package is extracted&lt;/param&gt;
+        public void LoadConfig(string tempDir)
+        {
+            Config = new XmlDocument();
+            Config.Load(tempDir + Path.DirectorySeparatorChar + &quot;package.xml&quot;);
+
+            Name = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/name&quot;).FirstChild.Value;
+            Version = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/version&quot;).FirstChild.Value;
+            Url = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/url&quot;).FirstChild.Value;
+            License = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/license&quot;).FirstChild.Value;
+            LicenseUrl = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/license&quot;).Attributes.GetNamedItem(&quot;url&quot;).Value;
+
+            RequirementsMajor = int.Parse(Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/requirements/major&quot;).FirstChild.Value);
+            RequirementsMinor = int.Parse(Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/requirements/minor&quot;).FirstChild.Value);
+            RequirementsPatch = int.Parse(Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/requirements/patch&quot;).FirstChild.Value);
+
+            var reqNode = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/requirements&quot;);
+            RequirementsType = reqNode != null &amp;&amp; reqNode.Attributes != null &amp;&amp; reqNode.Attributes[&quot;type&quot;] != null
+                ? Enum&lt;RequirementsType&gt;.Parse(reqNode.Attributes[&quot;type&quot;].Value, true)
+                : RequirementsType.Legacy;
+            var iconNode = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/package/iconUrl&quot;);
+            if (iconNode != null &amp;&amp; iconNode.FirstChild != null)
+            {
+                IconUrl = iconNode.FirstChild.Value;
+            }
+
+            Author = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/author/name&quot;).FirstChild.Value;
+            AuthorUrl = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/author/website&quot;).FirstChild.Value;
+
+            var basePath = System.Web.Hosting.HostingEnvironment.ApplicationPhysicalPath;
+            var dllBinFiles = new List&lt;string&gt;();
+
+            foreach (XmlNode n in Config.DocumentElement.SelectNodes(&quot;//file&quot;))
+            {
+                var badFile = false;
+                var destPath = GetFileName(basePath, XmlHelper.GetNodeValue(n.SelectSingleNode(&quot;orgPath&quot;)));
+                var orgName = XmlHelper.GetNodeValue(n.SelectSingleNode(&quot;orgName&quot;));
+                var destFile = GetFileName(destPath, orgName);
+
+                if (destPath.ToLower().Contains(IOHelper.DirSepChar + &quot;app_code&quot;))
+                {
+                    badFile = true;
+                }
+
+                if (destPath.ToLower().Contains(IOHelper.DirSepChar + &quot;bin&quot;))
+                {
+                    badFile = true;
+                }
+
+                if (destFile.ToLower().EndsWith(&quot;.dll&quot;))
+                {
+                    badFile = true;
+                    dllBinFiles.Add(Path.Combine(tempDir, orgName));
+                }
+
+                if (badFile)
+                {
+                    ContainsUnsecureFiles = true;
+                    _unsecureFiles.Add(XmlHelper.GetNodeValue(n.SelectSingleNode(&quot;orgName&quot;)));
+                }
+            }
+
+            if (ContainsUnsecureFiles)
+            {
+                //Now we want to see if the DLLs contain any legacy data types since we want to warn people about that
+                string[] assemblyErrors;
+                var assembliesWithReferences = PackageBinaryInspector.ScanAssembliesForTypeReference&lt;IDataType&gt;(tempDir, out assemblyErrors).ToArray();
+                if (assemblyErrors.Any())
+                {
+                    ContainsBinaryFileErrors = true;
+                    BinaryFileErrors.AddRange(assemblyErrors);
+                }
+                if (assembliesWithReferences.Any())
+                {
+                    ContainsLegacyPropertyEditors = true;
+                }
+            }
+
+            //this will check for existing macros with the same alias
+            //since we will not overwrite on import it&#39;s a good idea to inform the user what will be overwritten
+            foreach (XmlNode n in Config.DocumentElement.SelectNodes(&quot;//macro&quot;))
+            {
+                var alias = n.SelectSingleNode(&quot;alias&quot;).InnerText;
+                if (!string.IsNullOrEmpty(alias))
+                {
+                    var m = ApplicationContext.Current.Services.MacroService.GetByAlias(alias);
+                    if (m != null)
+                    {
+                        ContainsMacroConflict = true;
+                        if (_conflictingMacroAliases.ContainsKey(m.Name) == false)
+                        {
+                            _conflictingMacroAliases.Add(m.Name, alias);
+                        }
+                    }
+                }
+            }
+
+            foreach (XmlNode n in Config.DocumentElement.SelectNodes(&quot;Templates/Template&quot;))
+            {
+                var alias = n.SelectSingleNode(&quot;Alias&quot;).InnerText;
+                if (!string.IsNullOrEmpty(alias))
+                {
+                    var t = Template.GetByAlias(alias);
+                    if (t != null)
+                    {
+                        ContainsTemplateConflicts = true;
+                        if (_conflictingTemplateAliases.ContainsKey(t.Text) == false)
+                        {
+                            _conflictingTemplateAliases.Add(t.Text, alias);
+                        }
+                    }
+                }
+            }
+
+            foreach (XmlNode n in Config.DocumentElement.SelectNodes(&quot;Stylesheets/Stylesheet&quot;))
+            {
+                var alias = n.SelectSingleNode(&quot;Name&quot;).InnerText;
+                if (!string.IsNullOrEmpty(alias))
+                {
+                    var s = StyleSheet.GetByName(alias);
+                    if (s != null)
+                    {
+                        ContainsStyleSheeConflicts = true;
+                        if (_conflictingStyleSheetNames.ContainsKey(s.Text) == false)
+                        {
+                            _conflictingStyleSheetNames.Add(s.Text, alias);
+                        }
+                    }
+                }
+            }
+
+            var readmeNode = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/info/readme&quot;);
+            if (readmeNode != null)
+            {
+                ReadMe = XmlHelper.GetNodeValue(readmeNode);
+            }
+
+            var controlNode = Config.DocumentElement.SelectSingleNode(&quot;/umbPackage/control&quot;);
+            if (controlNode != null)
+            {
+                Control = XmlHelper.GetNodeValue(controlNode);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This uses the old method of fetching and only supports the packages.umbraco.org repository.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Package&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public string Fetch(Guid Package)
+        {
+            // Check for package directory
+            if (Directory.Exists(IOHelper.MapPath(SystemDirectories.Packages)) == false)
+                Directory.CreateDirectory(IOHelper.MapPath(SystemDirectories.Packages));
+
+            var wc = new System.Net.WebClient();
+
+            wc.DownloadFile(
+                &quot;http://&quot; + PackageServer + &quot;/fetch?package=&quot; + Package.ToString(),
+                IOHelper.MapPath(SystemDirectories.Packages + &quot;/&quot; + Package + &quot;.umb&quot;));
+
+            return &quot;packages\\&quot; + Package + &quot;.umb&quot;;
+        }
+
+        #endregion
+
+        #region Private Methods
+
+        /// &lt;summary&gt;
+        /// Gets the name of the file in the specified path.
+        /// Corrects possible problems with slashes that would result from a simple concatenation.
+        /// Can also be used to concatenate paths.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;path&quot;&gt;The path.&lt;/param&gt;
+        /// &lt;param name=&quot;fileName&quot;&gt;Name of the file.&lt;/param&gt;
+        /// &lt;returns&gt;The name of the file in the specified path.&lt;/returns&gt;
+        private static string GetFileName(string path, string fileName)
+        {
+            // virtual dir support
+            fileName = IOHelper.FindFile(fileName);
+
+            if (path.Contains(&quot;[$&quot;))
+            {
+                //this is experimental and undocumented...
+                path = path.Replace(&quot;[$UMBRACO]&quot;, SystemDirectories.Umbraco);
+                path = path.Replace(&quot;[$UMBRACOCLIENT]&quot;, SystemDirectories.UmbracoClient);
+                path = path.Replace(&quot;[$CONFIG]&quot;, SystemDirectories.Config);
+                path = path.Replace(&quot;[$DATA]&quot;, SystemDirectories.Data);
+            }
+
+            //to support virtual dirs we try to lookup the file... 
+            path = IOHelper.FindFile(path);
+
+
+
+            Debug.Assert(path != null &amp;&amp; path.Length &gt;= 1);
+            Debug.Assert(fileName != null &amp;&amp; fileName.Length &gt;= 1);
+
+            path = path.Replace(&#39;/&#39;, &#39;\\&#39;);
+            fileName = fileName.Replace(&#39;/&#39;, &#39;\\&#39;);
+
+            // Does filename start with a slash? Does path end with one?
+            bool fileNameStartsWithSlash = (fileName[0] == Path.DirectorySeparatorChar);
+            bool pathEndsWithSlash = (path[path.Length - 1] == Path.DirectorySeparatorChar);
+
+            // Path ends with a slash
+            if (pathEndsWithSlash)
+            {
+                if (!fileNameStartsWithSlash)
+                    // No double slash, just concatenate
+                    return path + fileName;
+                return path + fileName.Substring(1);
+            }
+            if (fileNameStartsWithSlash)
+                // Required slash specified, just concatenate
+                return path + fileName;
+            return path + Path.DirectorySeparatorChar + fileName;
+        }
+
+        private static string UnPack(string zipName, bool deleteFile)
+        {
+            // Unzip
+
+            //the temp directory will be the package GUID - this keeps it consistent!
+            //the zipName is always the package Guid.umb
+
+            var packageFileName = Path.GetFileNameWithoutExtension(zipName);
+            var packageId = Guid.NewGuid();
+            Guid.TryParse(packageFileName, out packageId);
+
+            string tempDir = IOHelper.MapPath(SystemDirectories.Data) + Path.DirectorySeparatorChar + packageId.ToString();
+            //clear the directory if it exists
+            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+            Directory.CreateDirectory(tempDir);
+
+            var s = new ZipInputStream(File.OpenRead(zipName));
+
+            ZipEntry theEntry;
+            while ((theEntry = s.GetNextEntry()) != null)
+            {
+                string fileName = Path.GetFileName(theEntry.Name);
+
+                if (fileName != String.Empty)
+                {
+                    FileStream streamWriter = File.Create(tempDir + Path.DirectorySeparatorChar + fileName);
+
+                    int size = 2048;
+                    byte[] data = new byte[2048];
+                    while (true)
+                    {
+                        size = s.Read(data, 0, data.Length);
+                        if (size &gt; 0)
+                        {
+                            streamWriter.Write(data, 0, size);
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+
+                    streamWriter.Close();
+
+                }
+            }
+
+            // Clean up
+            s.Close();
+
+            if (deleteFile)
+            {
+                File.Delete(zipName);
+            }
+
+
+            return tempDir;
+
+        }
+
+        #endregion
+
+        internal static event EventHandler&lt;InstalledPackage&gt; PackageBusinessLogicInstalled;
+
+        private static void OnPackageBusinessLogicInstalled(InstalledPackage e)
+        {
+            EventHandler&lt;InstalledPackage&gt; handler = PackageBusinessLogicInstalled;
+            if (handler != null) handler(null, e);
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[40,9,40,75,0],[40,9,40,75,0],[40,9,40,75,0],[40,9,40,75,0],[41,9,41,113,0],[41,9,41,113,0],[41,9,41,113,0],[41,9,41,113,0],[42,9,42,116,0],[42,9,42,116,0],[42,9,42,116,0],[42,9,42,116,0],[43,9,43,116,0],[43,9,43,116,0],[43,9,43,116,0],[43,9,43,116,0],[45,9,45,78,0],[45,9,45,78,0],[45,9,45,78,0],[45,9,45,78,0],[46,9,46,41,0],[46,9,46,41,0],[46,9,46,41,0],[46,9,46,41,0],[49,30,49,34,0],[49,35,49,47,0],[50,33,50,37,0],[50,38,50,50,0],[51,29,51,33,0],[51,34,51,46,0],[52,33,52,37,0],[52,38,52,50,0],[53,36,53,40,0],[53,41,53,53,0],[54,32,54,36,0],[54,37,54,49,0],[55,35,55,39,0],[55,40,55,52,0],[56,32,56,36,0],[56,37,56,49,0],[57,33,57,37,0],[57,38,57,50,0],[59,45,59,49,0],[59,50,59,62,0],[60,74,60,75,0],[60,76,60,108,0],[60,109,60,110,0],[62,45,62,49,0],[62,50,62,62,0],[63,49,63,50,0],[63,51,63,73,0],[63,74,63,75,0],[65,49,65,53,0],[65,54,65,66,0],[66,77,66,78,0],[66,79,66,114,0],[66,115,66,116,0],[71,48,71,52,0],[71,53,71,65,0],[76,52,76,53,0],[76,54,76,79,0],[76,80,76,81,0],[81,53,81,57,0],[81,58,81,70,0],[83,50,83,54,0],[83,55,83,67,0],[84,77,84,78,0],[84,79,84,114,0],[84,115,84,116,0],[86,40,86,44,0],[86,45,86,57,0],[87,40,87,44,0],[87,45,87,57,0],[88,40,88,44,0],[88,45,88,57,0],[90,52,90,56,0],[90,57,90,69,0],[92,33,92,37,0],[92,38,92,50,0],[97,37,97,41,0],[97,42,97,54,0],[102,9,102,27,0],[103,9,103,10,0],[104,13,104,26,0],[105,9,105,10,0],[107,9,107,44,0],[108,9,108,10,0],[109,13,109,26,0],[110,13,110,44,0],[111,9,111,10,0],[114,9,114,10,0],[115,13,115,46,0],[116,13,116,47,0],[117,13,117,43,0],[118,13,118,43,0],[119,13,119,48,0],[120,9,120,10,0],[124,9,124,234,0],[125,9,125,10,0],[126,9,126,10,0],[145,9,145,285,0],[146,9,146,10,0],[147,13,147,46,0],[148,13,148,47,0],[149,13,149,43,0],[150,13,150,43,0],[151,13,151,48,0],[152,13,152,30,0],[153,13,153,36,0],[154,13,154,28,0],[155,13,155,36,0],[156,13,156,42,0],[157,13,157,56,0],[158,13,158,56,0],[159,13,159,56,0],[160,13,160,54,0],[161,13,161,34,0],[162,13,162,40,0],[163,13,163,36,0],[164,13,164,29,0],[165,13,165,36,0],[166,9,166,10,0],[177,9,177,10,0],[178,13,179,23,0],[179,23,179,60,0],[179,60,180,23,0],[180,23,180,63,0],[180,63,180,65,0],[178,13,180,65,0],[181,13,181,14,0],[182,17,182,34,0],[183,17,183,117,0],[184,17,184,18,0],[185,21,185,127,0],[187,21,187,58,0],[188,21,188,22,0],[190,25,190,26,0],[191,29,191,71,0],[192,29,192,49,0],[193,25,193,26,0],[194,25,194,52,0],[195,25,195,26,0],[196,29,196,123,0],[197,29,197,35,0],[199,21,199,22,0],[201,25,201,174,0],[202,17,202,18,0],[204,21,204,183,0],[205,17,205,32,0],[208,9,208,10,0],[216,9,216,10,0],[217,13,217,44,0],[218,9,218,10,0],[221,9,221,10,0],[223,13,223,125,0],[224,13,224,126,0],[225,13,225,132,0],[226,13,226,131,0],[227,13,227,121,0],[228,13,228,132,0],[229,13,229,124,0],[230,13,230,127,0],[232,13,232,37,0],[233,13,233,35,0],[235,13,235,92,0],[236,13,236,14,0],[237,17,237,99,0],[238,17,238,76,0],[239,17,239,137,0],[240,21,240,76,0],[241,13,241,14,0],[245,13,245,62,0],[246,13,246,46,0],[247,13,247,52,0],[248,13,248,48,0],[249,13,249,46,0],[250,13,250,48,0],[251,13,251,40,0],[252,13,252,44,0],[255,13,255,52,0],[256,13,256,114,0],[258,13,258,45,0],[259,13,259,52,0],[260,13,260,28,0],[262,13,262,36,0],[263,9,263,10,0],[266,9,266,10,0],[267,13,268,23,0],[268,23,268,110,0],[268,110,269,23,0],[269,23,269,87,0],[269,87,269,89,0],[267,13,269,89,0],[270,13,270,14,0],[272,17,272,67,0],[279,17,279,97,0],[282,17,282,18,0],[283,21,283,28,0],[283,30,283,39,0],[283,40,283,42,0],[283,43,283,87,0],[284,21,284,22,0],[285,25,285,117,0],[286,25,286,115,0],[287,25,287,117,0],[290,25,290,65,0],[291,29,291,65,0],[293,30,293,56,0],[294,29,294,51,0],[313,25,313,57,0],[316,25,316,165,0],[318,21,318,22,0],[321,21,321,28,0],[321,30,321,39,0],[321,40,321,42,0],[321,43,321,87,0],[322,21,322,22,0],[323,25,323,115,0],[324,25,324,53,0],[325,29,325,53,0],[326,21,326,22,0],[327,17,327,18,0],[328,17,328,44,0],[329,17,329,18,0],[330,21,330,84,0],[331,21,331,27,0],[335,17,335,41,0],[336,17,336,18,0],[337,21,339,65,0],[340,17,340,18,0],[342,17,342,32,0],[343,13,343,14,0],[344,9,344,10,0],[347,9,347,10,0],[348,13,349,23,0],[349,23,349,111,0],[349,111,350,23,0],[350,23,350,97,0],[350,97,350,99,0],[348,13,350,99,0],[351,13,351,14,0],[354,17,354,18,0],[356,21,356,67,0],[360,21,360,51,0],[365,21,365,106,0],[366,21,366,22,0],[367,25,367,131,0],[368,25,368,26,0],[369,29,369,62,0],[370,29,370,50,0],[371,33,371,56,0],[372,25,372,26,0],[373,21,373,22,0],[377,21,377,76,0],[378,21,378,97,0],[383,21,383,97,0],[384,21,384,49,0],[385,21,385,22,0],[386,25,386,127,0],[387,25,387,32,0],[387,34,387,56,0],[387,57,387,59,0],[387,60,387,79,0],[388,25,388,26,0],[389,29,389,118,0],[390,25,390,26,0],[391,21,391,22,0],[395,21,395,102,0],[396,21,396,54,0],[397,21,397,22,0],[398,25,398,104,0],[399,25,399,87,0],[399,87,399,130,0],[399,130,399,133,0],[399,25,399,133,0],[400,21,400,22,0],[405,21,405,110,0],[406,21,406,56,0],[407,21,407,22,0],[408,25,408,118,0],[409,25,409,99,0],[409,99,409,142,0],[409,142,409,145,0],[409,25,409,145,0],[410,21,410,22,0],[414,21,414,96,0],[415,21,415,51,0],[416,21,416,22,0],[417,25,417,95,0],[418,25,418,81,0],[418,81,418,124,0],[418,124,418,127,0],[418,25,418,127,0],[419,21,419,22,0],[423,21,423,97,0],[424,21,424,49,0],[425,21,425,22,0],[426,25,426,107,0],[427,25,427,32,0],[427,34,427,46,0],[427,47,427,49,0],[427,50,427,59,0],[428,25,428,26,0],[429,29,429,108,0],[430,25,430,26,0],[431,21,431,22,0],[436,21,439,85,0],[441,21,441,48,0],[442,21,442,22,0],[443,25,443,112,0],[444,25,444,32,0],[444,34,444,49,0],[444,50,444,52,0],[444,53,444,65,0],[445,25,445,26,0],[446,29,446,115,0],[448,25,448,26,0],[449,21,449,22,0],[453,21,453,28,0],[453,30,453,39,0],[453,40,453,42,0],[453,43,453,103,0],[454,21,454,22,0],[455,25,455,74,0],[457,25,457,99,0],[459,21,459,22,0],[465,21,465,99,0],[466,21,466,49,0],[467,21,467,22,0],[468,25,468,107,0],[469,25,469,64,0],[470,25,470,113,0],[471,21,471,22,0],[475,21,475,28,0],[475,30,475,39,0],[475,40,475,42,0],[475,43,475,95,0],[476,21,476,22,0],[477,25,477,98,0],[478,25,478,26,0],[479,29,479,64,0],[480,25,480,26,0],[484,25,484,103,0],[485,25,485,26,0],[486,29,486,106,0],[488,29,488,69,0],[489,29,489,30,0],[490,33,490,93,0],[491,29,491,30,0],[492,25,492,26,0],[493,21,493,22,0],[498,21,498,48,0],[499,21,499,52,0],[501,21,501,36,0],[502,17,502,18,0],[503,17,503,44,0],[504,17,504,18,0],[505,21,505,93,0],[506,21,506,27,0],[509,17,509,58,0],[510,13,510,14,0],[511,9,511,10,0],[519,9,519,10,0],[520,13,520,43,0],[521,13,521,14,0],[522,17,522,49,0],[523,13,523,14,0],[524,9,524,10,0],[531,9,531,10,0],[532,13,532,40,0],[533,13,533,80,0],[535,13,535,110,0],[536,13,536,116,0],[537,13,537,108,0],[538,13,538,116,0],[539,13,539,139,0],[541,13,541,148,0],[542,13,542,148,0],[543,13,543,148,0],[545,13,545,108,0],[546,13,548,43,0],[549,13,549,104,0],[550,13,550,65,0],[551,13,551,14,0],[552,17,552,53,0],[553,13,553,14,0],[555,13,555,111,0],[556,13,556,117,0],[558,13,558,90,0],[559,13,559,50,0],[561,13,561,20,0],[561,22,561,31,0],[561,32,561,34,0],[561,35,561,79,0],[562,13,562,14,0],[563,17,563,37,0],[564,17,564,109,0],[565,17,565,85,0],[566,17,566,63,0],[568,17,568,83,0],[569,17,569,18,0],[570,21,570,36,0],[571,17,571,18,0],[573,17,573,78,0],[574,17,574,18,0],[575,21,575,36,0],[576,17,576,18,0],[578,17,578,57,0],[579,17,579,18,0],[580,21,580,36,0],[581,21,581,69,0],[582,17,582,18,0],[584,17,584,29,0],[585,17,585,18,0],[586,21,586,50,0],[587,21,587,95,0],[588,17,588,18,0],[589,13,589,14,0],[591,13,591,39,0],[592,13,592,14,0],[595,17,595,152,0],[596,17,596,42,0],[597,17,597,18,0],[598,21,598,53,0],[599,21,599,63,0],[600,17,600,18,0],[601,17,601,52,0],[602,17,602,18,0],[603,21,603,58,0],[604,17,604,18,0],[605,13,605,14,0],[609,13,609,20,0],[609,22,609,31,0],[609,32,609,34,0],[609,35,609,80,0],[610,13,610,14,0],[611,17,611,67,0],[612,17,612,50,0],[613,17,613,18,0],[614,21,614,96,0],[615,21,615,35,0],[616,21,616,22,0],[617,25,617,54,0],[618,25,618,83,0],[619,25,619,26,0],[620,29,620,73,0],[621,25,621,26,0],[622,21,622,22,0],[623,17,623,18,0],[624,13,624,14,0],[626,13,626,20,0],[626,22,626,31,0],[626,32,626,34,0],[626,35,626,91,0],[627,13,627,14,0],[628,17,628,67,0],[629,17,629,50,0],[630,17,630,18,0],[631,21,631,56,0],[632,21,632,35,0],[633,21,633,22,0],[634,25,634,58,0],[635,25,635,86,0],[636,25,636,26,0],[637,29,637,76,0],[638,25,638,26,0],[639,21,639,22,0],[640,17,640,18,0],[641,13,641,14,0],[643,13,643,20,0],[643,22,643,31,0],[643,32,643,34,0],[643,35,643,95,0],[644,13,644,14,0],[645,17,645,66,0],[646,17,646,50,0],[647,17,647,18,0],[648,21,648,57,0],[649,21,649,35,0],[650,21,650,22,0],[651,25,651,59,0],[652,25,652,86,0],[653,25,653,26,0],[654,29,654,76,0],[655,25,655,26,0],[656,21,656,22,0],[657,17,657,18,0],[658,13,658,14,0],[660,13,660,97,0],[661,13,661,36,0],[662,13,662,14,0],[663,17,663,61,0],[664,13,664,14,0],[666,13,666,94,0],[667,13,667,37,0],[668,13,668,14,0],[669,17,669,63,0],[670,13,670,14,0],[671,9,671,10,0],[679,9,679,10,0],[681,13,681,89,0],[682,17,682,89,0],[684,13,684,49,0],[686,13,688,88,0],[690,13,690,52,0],[691,9,691,10,0],[706,9,706,10,0],[708,13,708,52,0],[710,13,710,37,0],[711,13,711,14,0],[713,17,713,78,0],[714,17,714,90,0],[715,17,715,76,0],[716,17,716,72,0],[717,13,717,14,0],[720,13,720,44,0],[724,13,724,60,0],[725,13,725,68,0],[727,13,727,44,0],[728,13,728,52,0],[731,13,731,89,0],[732,13,732,93,0],[735,13,735,35,0],[736,13,736,14,0],[737,17,737,46,0],[739,21,739,44,0],[740,17,740,53,0],[742,13,742,41,0],[744,17,744,40,0],[745,13,745,66,0],[746,9,746,10,0],[749,9,749,10,0],[755,13,755,77,0],[756,13,756,44,0],[757,13,757,59,0],[759,13,759,124,0],[761,13,761,43,0],[761,44,761,76,0],[762,13,762,48,0],[764,13,764,64,0],[767,13,767,58,0],[768,13,768,14,0],[769,17,769,67,0],[771,17,771,46,0],[772,17,772,18,0],[773,21,773,109,0],[775,21,775,37,0],[776,21,776,50,0],[777,21,777,33,0],[778,21,778,22,0],[779,25,779,61,0],[780,25,780,38,0],[781,25,781,26,0],[782,29,782,63,0],[783,25,783,26,0],[785,25,785,26,0],[786,29,786,35,0],[788,21,788,22,0],[790,21,790,42,0],[792,17,792,18,0],[793,13,793,14,0],[796,13,796,23,0],[798,13,798,28,0],[799,13,799,14,0],[800,17,800,38,0],[801,13,801,14,0],[804,13,804,28,0],[806,9,806,10,0],[813,9,813,10,0],[814,13,814,84,0],[815,13,815,33,0],[815,34,815,51,0],[816,9,816,10,0]]);
+    </script>
+  </body>
+</html>

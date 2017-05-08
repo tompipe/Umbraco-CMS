@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>c:\users\tom pipe\documents\hexadigital\code\umbraco\umbraco-cms\src\umbraco.tests.benchmarks\bulkinsertbenchmarks.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Data.SqlServerCe;
+using System.IO;
+using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Configs;
+using BenchmarkDotNet.Diagnostics.Windows;
+using BenchmarkDotNet.Jobs;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Migrations.Initial;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Tests.TestHelpers;
+using ILogger = Umbraco.Core.Logging.ILogger;
+
+namespace Umbraco.Tests.Benchmarks
+{
+    [Config(typeof(Config))]
+    public class BulkInsertBenchmarks
+    {
+        private class Config : ManualConfig
+        {
+            public Config()
+            {
+                Add(new MemoryDiagnoser());
+                //Add(ExecutionValidator.FailOnError);
+
+                //The &#39;quick and dirty&#39; settings, so it runs a little quicker
+                // see benchmarkdotnet FAQ
+                Add(Job.Default
+                    .WithLaunchCount(1) // benchmark process will be launched only once
+                    .WithIterationTime(100) // 100ms per iteration
+                    .WithWarmupCount(3) // 3 warmup iteration
+                    .WithTargetCount(3)); // 3 target iteration                
+            }
+        }
+
+        private static byte[] _initDbBytes = null;
+
+        [Setup]
+        public void Setup()
+        {
+            var logger = new DebugDiagnosticsLogger();
+            var path = TestHelper.CurrentAssemblyDirectory;
+
+            _sqlCeSyntax = new SqlCeSyntaxProvider();
+            _sqlServerSyntax = new SqlServerSyntaxProvider();
+
+            SetupSqlCe(path, logger);
+            SetupSqlServer(logger);
+
+            
+        }        
+
+        private void SetupSqlServer(ILogger logger)
+        {
+            //create the db
+            _dbSqlServer = new UmbracoDatabase(
+                &quot;server=.\\SQLExpress;database=YOURDB;user id=YOURUSER;password=YOURPASS&quot;,
+                Constants.DatabaseProviders.SqlServer,
+                logger);
+
+            //drop the table
+            // note: DROP TABLE IF EXISTS is SQL 2016+
+            _dbSqlServer.Execute(&quot;IF OBJECT_ID(&#39;dbo.umbracoServer&#39;, &#39;U&#39;) IS NOT NULL DROP TABLE [umbracoServer]&quot;);
+
+            //re-create it
+            _dbSqlServer.Execute(@&quot;CREATE TABLE [umbracoServer](
+	[id] [int] IDENTITY(1,1) NOT NULL,
+	[address] [nvarchar](500) NOT NULL,
+	[computerName] [nvarchar](255) NOT NULL,
+	[registeredDate] [datetime] NOT NULL CONSTRAINT [DF_umbracoServer_registeredDate]  DEFAULT (getdate()),
+	[lastNotifiedDate] [datetime] NOT NULL,
+	[isActive] [bit] NOT NULL,
+	[isMaster] [bit] NOT NULL,
+ CONSTRAINT [PK_umbracoServer] PRIMARY KEY CLUSTERED 
+(
+	[id] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
+)&quot;);
+        }
+
+        private void SetupSqlCe(string path, ILogger logger)
+        {
+            var dbName = string.Concat(&quot;Umb&quot;, Guid.NewGuid(), &quot;.sdf&quot;);
+            AppDomain.CurrentDomain.SetData(&quot;DataDirectory&quot;, path);
+            var sqlCeConnectionString = $&quot;Datasource=|DataDirectory|\\{dbName};Flush Interval=1;&quot;;
+            
+            _dbFile = Path.Combine(path, dbName);
+
+            //only create the db one time
+            if (_initDbBytes == null)
+            {
+                using (var engine = new SqlCeEngine(sqlCeConnectionString))
+                {
+                    engine.CreateDatabase();
+                }
+
+                //use the db  to create the initial schema so we can reuse in each bench
+                using (_dbSqlCe = new UmbracoDatabase(
+                    sqlCeConnectionString,
+                    Constants.DatabaseProviders.SqlCe,
+                    logger))
+                {
+                    var creation = new DatabaseSchemaCreation(_dbSqlCe, logger, _sqlCeSyntax);
+                    creation.InitializeDatabaseSchema();
+                }
+                _initDbBytes = File.ReadAllBytes(_dbFile);            
+            }
+            else
+            {
+                File.WriteAllBytes(_dbFile, _initDbBytes);
+            }            
+
+            //create the db
+            _dbSqlCe = new UmbracoDatabase(
+                sqlCeConnectionString,
+                Constants.DatabaseProviders.SqlCe,
+                logger);
+        }
+
+        private List&lt;ServerRegistrationDto&gt; GetData()
+        {
+            var data = new List&lt;ServerRegistrationDto&gt;();
+            for (var i = 0; i &lt; 1000; i++)
+            {
+                data.Add(new ServerRegistrationDto
+                {
+                    ServerAddress = &quot;address&quot; + Guid.NewGuid(),
+                    ServerIdentity = &quot;computer&quot; + Guid.NewGuid(),
+                    DateRegistered = DateTime.Now,
+                    IsActive = true,
+                    DateAccessed = DateTime.Now
+                });
+            }
+            return data;
+        }
+
+        [Cleanup]
+        public void Cleanup()
+        {
+            _dbSqlCe.Dispose();
+            _dbSqlServer.Dispose();
+            File.Delete(_dbFile);
+        }
+
+        private string _dbFile;
+        private UmbracoDatabase _dbSqlCe;
+        private UmbracoDatabase _dbSqlServer;
+        private ISqlSyntaxProvider _sqlCeSyntax;
+        private ISqlSyntaxProvider _sqlServerSyntax;
+
+        /// &lt;summary&gt;
+        /// Tests updating the existing XML way
+        /// &lt;/summary&gt;
+        [Benchmark(Baseline = true)]
+        public void SqlCeOneByOne()
+        {
+            using (var tr = _dbSqlCe.GetTransaction())
+            {
+                _dbSqlCe.BulkInsertRecords(GetData(), tr, _sqlCeSyntax, useNativeSqlPlatformBulkInsert: false);
+                tr.Complete();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Tests updating with only the object graph
+        /// &lt;/summary&gt;
+        [Benchmark]
+        public void SqlCeTableDirect()
+        {
+            using (var tr = _dbSqlCe.GetTransaction())
+            {
+                _dbSqlCe.BulkInsertRecords(GetData(), tr, _sqlCeSyntax, useNativeSqlPlatformBulkInsert: true);
+                tr.Complete();
+            }
+        }
+
+        [Benchmark]
+        public void SqlServerBulkInsertStatements()
+        {
+            using (var tr = _dbSqlServer.GetTransaction())
+            {
+                _dbSqlServer.BulkInsertRecords(GetData(), tr, _sqlServerSyntax, useNativeSqlPlatformBulkInsert: false);
+                tr.Complete();
+            }
+        }
+
+        [Benchmark]
+        public void SqlServerBulkCopy()
+        {
+            using (var tr = _dbSqlServer.GetTransaction())
+            {
+                _dbSqlServer.BulkInsertRecords(GetData(), tr, _sqlServerSyntax, useNativeSqlPlatformBulkInsert: true);
+                tr.Complete();
+            }
+        }
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,13,25,28,0],[26,13,26,14,0],[27,17,27,44,0],[32,17,36,42,0],[37,13,37,14,0],[40,9,40,51,0],[44,9,44,10,0],[45,13,45,55,0],[46,13,46,60,0],[48,13,48,54,0],[49,13,49,62,0],[51,13,51,38,0],[52,13,52,36,0],[55,9,55,10,0],[58,9,58,10,0],[60,13,63,25,0],[67,13,67,115,0],[70,13,82,5,0],[83,9,83,10,0],[86,9,86,10,0],[87,13,87,71,0],[88,13,88,68,0],[89,13,89,99,0],[91,13,91,50,0],[94,13,94,38,0],[95,13,95,14,0],[96,24,96,75,0],[97,17,97,18,0],[98,21,98,45,0],[99,17,99,18,0],[102,17,105,29,0],[106,17,106,18,0],[107,21,107,95,0],[108,21,108,57,0],[109,17,109,18,0],[110,17,110,59,0],[111,13,111,14,0],[113,13,113,14,0],[114,17,114,59,0],[115,13,115,14,0],[118,13,121,25,0],[122,9,122,10,0],[125,9,125,10,0],[126,13,126,58,0],[127,18,127,27,0],[127,29,127,37,0],[127,39,127,42,0],[128,13,128,14,0],[129,17,136,20,0],[137,13,137,14,0],[138,13,138,25,0],[139,9,139,10,0],[143,9,143,10,0],[144,13,144,32,0],[145,13,145,36,0],[146,13,146,34,0],[147,9,147,10,0],[160,9,160,10,0],[161,20,161,54,0],[162,13,162,14,0],[163,17,163,112,0],[164,17,164,31,0],[165,13,165,14,0],[166,9,166,10,0],[173,9,173,10,0],[174,20,174,54,0],[175,13,175,14,0],[176,17,176,111,0],[177,17,177,31,0],[178,13,178,14,0],[179,9,179,10,0],[183,9,183,10,0],[184,20,184,58,0],[185,13,185,14,0],[186,17,186,120,0],[187,17,187,31,0],[188,13,188,14,0],[189,9,189,10,0],[193,9,193,10,0],[194,20,194,58,0],[195,13,195,14,0],[196,17,196,119,0],[197,17,197,31,0],[198,13,198,14,0],[199,9,199,10,0]]);
+    </script>
+  </body>
+</html>

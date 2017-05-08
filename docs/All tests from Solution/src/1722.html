@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\RelationRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents a repository for doing CRUD operations for &lt;see cref=&quot;Relation&quot;/&gt;
+    /// &lt;/summary&gt;
+    internal class RelationRepository : PetaPocoRepositoryBase&lt;int, IRelation&gt;, IRelationRepository
+    {
+        private readonly IRelationTypeRepository _relationTypeRepository;
+
+        public RelationRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax, IRelationTypeRepository relationTypeRepository)
+            : base(work, cache, logger, sqlSyntax)
+        {
+            _relationTypeRepository = relationTypeRepository;
+        }
+
+        #region Overrides of RepositoryBase&lt;int,Relation&gt;
+
+        protected override IRelation PerformGet(int id)
+        {
+            var sql = GetBaseQuery(false);
+            sql.Where(GetBaseWhereClause(), new { Id = id });
+
+            var dto = Database.Fetch&lt;RelationDto&gt;(SqlSyntax.SelectTop(sql, 1)).FirstOrDefault();
+            if (dto == null)
+                return null;
+
+            var relationType = _relationTypeRepository.Get(dto.RelationType);
+            if (relationType == null)
+                throw new Exception(string.Format(&quot;RelationType with Id: {0} doesn&#39;t exist&quot;, dto.RelationType));
+
+            var factory = new RelationFactory(relationType);
+            return DtoToEntity(dto, factory);
+        }
+
+        protected override IEnumerable&lt;IRelation&gt; PerformGetAll(params int[] ids)
+        {
+            var sql = GetBaseQuery(false);
+            if (ids.Length &gt; 0)
+                sql.WhereIn&lt;RelationDto&gt;(x =&gt; x.Id, ids);
+            sql.OrderBy&lt;RelationDto&gt;(x =&gt; x.RelationType);
+            var dtos = Database.Fetch&lt;RelationDto&gt;(sql);
+            return DtosToEntities(dtos);
+        }
+
+        protected override IEnumerable&lt;IRelation&gt; PerformGetByQuery(IQuery&lt;IRelation&gt; query)
+        {
+            var sqlClause = GetBaseQuery(false);
+            var translator = new SqlTranslator&lt;IRelation&gt;(sqlClause, query);
+            var sql = translator.Translate();
+            sql.OrderBy&lt;RelationDto&gt;(x =&gt; x.RelationType);
+            var dtos = Database.Fetch&lt;RelationDto&gt;(sql);
+            return DtosToEntities(dtos);
+        }
+
+        private IEnumerable&lt;IRelation&gt; DtosToEntities(IEnumerable&lt;RelationDto&gt; dtos)
+        {
+            // in most cases, the relation type will be the same for all of them,
+            // plus we&#39;ve ordered the relations by type, so try to allocate as few
+            // factories as possible - bearing in mind that relation types are cached
+            RelationFactory factory = null;
+            var relationTypeId = -1;
+
+            return dtos.Select(x =&gt;
+            {
+                if (relationTypeId != x.RelationType)
+                    factory = new RelationFactory(_relationTypeRepository.Get(relationTypeId = x.RelationType));
+                return DtoToEntity(x, factory);
+            });
+        }
+
+        private static IRelation DtoToEntity(RelationDto dto, RelationFactory factory)
+        {
+            var entity = factory.BuildEntity(dto);
+
+            //on initial construction we don&#39;t want to have dirty properties tracked
+            // http://issues.umbraco.org/issue/U4-1946
+            ((TracksChangesEntityBase)entity).ResetDirtyProperties(false);
+
+            return entity;
+        }
+
+        #endregion
+
+        #region Overrides of PetaPocoRepositoryBase&lt;int,Relation&gt;
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+            sql.Select(isCount ? &quot;COUNT(*)&quot; : &quot;*&quot;)
+               .From&lt;RelationDto&gt;();
+            return sql;
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoRelation.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            var list = new List&lt;string&gt;
+                           {
+                               &quot;DELETE FROM umbracoRelation WHERE id = @Id&quot;
+                           };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { throw new NotImplementedException(); }
+        }
+
+        #endregion
+
+        #region Unit of Work Implementation
+
+        protected override void PersistNewItem(IRelation entity)
+        {
+            ((Entity)entity).AddingEntity();
+
+            var factory = new RelationFactory(entity.RelationType);
+            var dto = factory.BuildDto(entity);
+
+            var id = Convert.ToInt32(Database.Insert(dto));
+            entity.Id = id;
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(IRelation entity)
+        {
+            ((Entity)entity).UpdatingEntity();
+
+            var factory = new RelationFactory(entity.RelationType);
+            var dto = factory.BuildDto(entity);
+            Database.Update(dto);
+
+            entity.ResetDirtyProperties();
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Dispose disposable properties
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Ensure the unit of work is disposed
+        /// &lt;/remarks&gt;
+        protected override void DisposeResources()
+        {
+            _relationTypeRepository.Dispose();
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,15,24,51,1],[25,9,25,10,1],[26,13,26,62,1],[27,9,27,10,1],[32,9,32,10,1],[33,13,33,43,1],[34,13,34,62,1],[36,13,36,97,1],[37,13,37,29,1],[38,17,38,29,0],[40,13,40,78,1],[41,13,41,38,1],[42,17,42,113,0],[44,13,44,61,1],[45,13,45,46,1],[46,9,46,10,1],[49,9,49,10,1],[50,13,50,43,1],[51,13,51,32,1],[52,17,52,58,1],[53,13,53,59,1],[54,13,54,57,1],[55,13,55,41,1],[56,9,56,10,1],[59,9,59,10,1],[60,13,60,49,1],[61,13,61,77,1],[62,13,62,46,1],[63,13,63,59,1],[64,13,64,57,1],[65,13,65,41,1],[66,9,66,10,1],[69,9,69,10,1],[73,13,73,44,1],[74,13,74,37,1],[76,13,77,13,1],[77,13,77,14,1],[77,14,78,17,1],[78,17,78,54,1],[78,54,79,21,1],[79,21,79,113,1],[79,113,80,17,1],[80,17,80,48,1],[80,48,81,13,1],[81,13,81,14,1],[81,14,81,16,1],[76,13,81,16,1],[82,9,82,10,1],[85,9,85,10,1],[86,13,86,51,1],[90,13,90,75,1],[92,13,92,27,1],[93,9,93,10,1],[100,9,100,10,1],[101,13,101,33,1],[102,13,103,37,1],[104,13,104,24,1],[105,9,105,10,1],[108,9,108,10,1],[109,13,109,47,1],[110,9,110,10,1],[113,9,113,10,1],[114,13,117,30,1],[118,13,118,25,1],[119,9,119,10,1],[123,17,123,18,0],[123,19,123,55,0],[131,9,131,10,1],[132,13,132,45,1],[134,13,134,68,1],[135,13,135,48,1],[137,13,137,60,1],[138,13,138,28,1],[140,13,140,43,1],[141,9,141,10,1],[144,9,144,10,1],[145,13,145,47,1],[147,13,147,68,1],[148,13,148,48,1],[149,13,149,34,1],[151,13,151,43,1],[152,9,152,10,1],[163,9,163,10,1],[164,13,164,47,1],[165,9,165,10,1]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\UnitOfWork\PetaPocoUnitOfWork.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Models.EntityBase;
+
+namespace Umbraco.Core.Persistence.UnitOfWork
+{
+	/// &lt;summary&gt;
+	/// Represents the Unit of Work implementation for PetaPoco
+	/// &lt;/summary&gt;
+	internal class PetaPocoUnitOfWork : DisposableObject, IDatabaseUnitOfWork
+	{
+
+		/// &lt;summary&gt;
+		/// Used for testing
+		/// &lt;/summary&gt;
+		internal Guid InstanceId { get; private set; }
+
+		private Guid _key;
+        private readonly Queue&lt;Operation&gt; _operations = new Queue&lt;Operation&gt;();
+
+		/// &lt;summary&gt;
+		/// Creates a new unit of work instance
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;database&quot;&gt;&lt;/param&gt;
+		/// &lt;remarks&gt;
+		/// This should normally not be used directly and should be created with the UnitOfWorkProvider
+		/// &lt;/remarks&gt;
+		internal PetaPocoUnitOfWork(UmbracoDatabase database)
+		{
+			Database = database;
+			_key = Guid.NewGuid();
+			InstanceId = Guid.NewGuid();
+		}
+
+		/// &lt;summary&gt;
+		/// Registers an &lt;see cref=&quot;IEntity&quot; /&gt; instance to be added through this &lt;see cref=&quot;UnitOfWork&quot; /&gt;
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;entity&quot;&gt;The &lt;see cref=&quot;IEntity&quot; /&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;repository&quot;&gt;The &lt;see cref=&quot;IUnitOfWorkRepository&quot; /&gt; participating in the transaction&lt;/param&gt;
+		public void RegisterAdded(IEntity entity, IUnitOfWorkRepository repository)
+		{
+            _operations.Enqueue(new Operation
+            {
+                Entity = entity,
+                Repository = repository,
+                Type = TransactionType.Insert
+            });
+		}
+
+		/// &lt;summary&gt;
+		/// Registers an &lt;see cref=&quot;IEntity&quot; /&gt; instance to be changed through this &lt;see cref=&quot;UnitOfWork&quot; /&gt;
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;entity&quot;&gt;The &lt;see cref=&quot;IEntity&quot; /&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;repository&quot;&gt;The &lt;see cref=&quot;IUnitOfWorkRepository&quot; /&gt; participating in the transaction&lt;/param&gt;
+		public void RegisterChanged(IEntity entity, IUnitOfWorkRepository repository)
+		{
+		    _operations.Enqueue(
+		        new Operation
+		        {
+		            Entity = entity,
+		            Repository = repository,
+		            Type = TransactionType.Update
+		        });
+		}
+
+		/// &lt;summary&gt;
+		/// Registers an &lt;see cref=&quot;IEntity&quot; /&gt; instance to be removed through this &lt;see cref=&quot;UnitOfWork&quot; /&gt;
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;entity&quot;&gt;The &lt;see cref=&quot;IEntity&quot; /&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;repository&quot;&gt;The &lt;see cref=&quot;IUnitOfWorkRepository&quot; /&gt; participating in the transaction&lt;/param&gt;
+		public void RegisterRemoved(IEntity entity, IUnitOfWorkRepository repository)
+		{
+		    _operations.Enqueue(
+		        new Operation
+		        {
+		            Entity = entity,
+		            Repository = repository,
+		            Type = TransactionType.Delete
+		        });
+		}
+
+		/// &lt;summary&gt;
+		/// Commits all batched changes within the scope of a PetaPoco transaction &lt;see cref=&quot;Transaction&quot;/&gt;
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Unlike a typical unit of work, this UOW will let you commit more than once since a new transaction is creaed per
+		/// Commit() call instead of having one Transaction per UOW. 
+		/// &lt;/remarks&gt;
+		public void Commit()
+		{
+		    Commit(null);
+		}
+
+        /// &lt;summary&gt;
+        /// Commits all batched changes within the scope of a PetaPoco transaction &lt;see cref=&quot;Transaction&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;transactionCompleting&quot;&gt;
+        /// Allows you to set a callback which is executed before the transaction is committed, allow you to add additional SQL
+        /// operations to the overall commit process after the queue has been processed.
+        /// &lt;/param&gt;
+        internal void Commit(Action&lt;UmbracoDatabase&gt; transactionCompleting)
+        {
+            using (var transaction = Database.GetTransaction())
+            {
+                while (_operations.Count &gt; 0)
+                {
+                    var operation = _operations.Dequeue();
+                    switch (operation.Type)
+                    {
+                        case TransactionType.Insert:
+                            operation.Repository.PersistNewItem(operation.Entity);
+                            break;
+                        case TransactionType.Delete:
+                            operation.Repository.PersistDeletedItem(operation.Entity);
+                            break;
+                        case TransactionType.Update:
+                            operation.Repository.PersistUpdatedItem(operation.Entity);
+                            break;
+                    }
+                }
+
+                //Execute the callback if there is one
+                if (transactionCompleting != null)
+                {
+                    transactionCompleting(Database);    
+                }
+
+                transaction.Complete();
+            }
+
+            // Clear everything
+            _operations.Clear();
+            _key = Guid.NewGuid();
+        }
+
+		public object Key
+		{
+			get { return _key; }
+		}
+
+		public UmbracoDatabase Database { get; private set; }
+
+		#region Operation
+
+		/// &lt;summary&gt;
+		/// Provides a snapshot of an entity and the repository reference it belongs to.
+		/// &lt;/summary&gt;
+		private sealed class Operation
+		{
+			/// &lt;summary&gt;
+			/// Gets or sets the entity.
+			/// &lt;/summary&gt;
+			/// &lt;value&gt;The entity.&lt;/value&gt;
+			public IEntity Entity { get; set; }
+
+			/// &lt;summary&gt;
+			/// Gets or sets the repository.
+			/// &lt;/summary&gt;
+			/// &lt;value&gt;The repository.&lt;/value&gt;
+			public IUnitOfWorkRepository Repository { get; set; }
+
+			/// &lt;summary&gt;
+			/// Gets or sets the type of operation.
+			/// &lt;/summary&gt;
+			/// &lt;value&gt;The type of operation.&lt;/value&gt;
+			public TransactionType Type { get; set; }
+		}
+
+		#endregion
+
+		/// &lt;summary&gt;
+		/// Ensures disposable objects are disposed
+		/// &lt;/summary&gt;		
+		/// &lt;remarks&gt;
+		/// Ensures that the Transaction instance is disposed of
+		/// &lt;/remarks&gt;
+		protected override void DisposeResources()
+		{
+			_operations.Clear();
+		}
+	}
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[17,30,17,34,0],[17,35,17,47,1],[20,9,20,80,1],[29,3,29,56,1],[30,3,30,4,1],[31,4,31,24,1],[32,4,32,26,1],[33,4,33,32,1],[34,3,34,4,1],[42,3,42,4,1],[43,13,48,16,1],[49,3,49,4,1],[57,3,57,4,1],[58,7,64,14,1],[65,3,65,4,1],[73,3,73,4,1],[74,7,80,14,1],[81,3,81,4,1],[91,3,91,4,1],[92,7,92,20,1],[93,3,93,4,1],[103,9,103,10,1],[104,20,104,63,1],[105,13,105,14,1],[106,17,106,46,1],[107,17,107,18,1],[108,21,108,59,1],[109,21,109,44,1],[112,29,112,83,1],[113,29,113,35,1],[115,29,115,87,1],[116,29,116,35,1],[118,29,118,87,1],[119,29,119,35,1],[121,17,121,18,1],[124,17,124,51,1],[125,17,125,18,0],[126,21,126,53,0],[127,17,127,18,0],[129,17,129,40,1],[130,13,130,14,1],[133,13,133,33,1],[134,13,134,35,1],[135,9,135,10,1],[139,8,139,9,0],[139,10,139,22,0],[139,23,139,24,0],[142,37,142,41,1],[142,42,142,54,1],[155,28,155,32,1],[155,33,155,37,1],[161,46,161,50,1],[161,51,161,55,1],[167,34,167,38,1],[167,39,167,43,1],[179,3,179,4,1],[180,4,180,24,1],[181,3,181,4,1]]);
+    </script>
+  </body>
+</html>

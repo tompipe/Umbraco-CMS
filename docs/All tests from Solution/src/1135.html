@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Install\Controllers\InstallApiController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Reflection;
+using System.Text;
+using System.Web.Http;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Persistence;
+using Umbraco.Web.Install.Models;
+using Umbraco.Web.WebApi;
+
+namespace Umbraco.Web.Install.Controllers
+{
+    [AngularJsonOnlyConfiguration]
+    [HttpInstallAuthorize]
+    public class InstallApiController : ApiController
+    {
+        public InstallApiController()
+            : this(UmbracoContext.Current)
+        {
+
+        }
+
+        public InstallApiController(UmbracoContext umbracoContext)
+        {
+            if (umbracoContext == null) throw new ArgumentNullException(&quot;umbracoContext&quot;);
+            UmbracoContext = umbracoContext;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the current UmbracoContext
+        /// &lt;/summary&gt;
+        public UmbracoContext UmbracoContext { get; private set; }
+
+        public ApplicationContext ApplicationContext
+        {
+            get { return UmbracoContext.Application; }
+        }
+
+        private InstallHelper _helper;
+        internal InstallHelper InstallHelper
+        {
+            get
+            {
+                return _helper ?? (_helper = new InstallHelper(UmbracoContext));
+            }
+        }
+
+        public bool PostValidateDatabaseConnection(DatabaseModel model)
+        {
+            var dbHelper = new DatabaseHelper();
+            var canConnect = dbHelper.CheckConnection(model, ApplicationContext);
+            return canConnect;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the install setup
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public InstallSetup GetSetup()
+        {
+            var setup = new InstallSetup();
+
+            //TODO: Check for user/site token
+
+            var steps = new List&lt;InstallSetupStep&gt;();
+
+            var installSteps = InstallHelper.GetStepsForCurrentInstallType().ToArray();
+
+            //only get the steps that are targetting the current install type
+            steps.AddRange(installSteps);
+            setup.Steps = steps;
+
+            InstallStatusTracker.Initialize(setup.InstallId, installSteps);
+
+            return setup;
+        }
+        
+        public IEnumerable&lt;Package&gt; GetPackages()
+        {
+            var installHelper = new InstallHelper(UmbracoContext);
+            var starterKits = installHelper.GetStarterKits();
+            return starterKits;
+        }
+
+        /// &lt;summary&gt;
+        /// Does the install
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public InstallProgressResultModel PostPerformInstall(InstallInstructions installModel)
+        {
+            if (installModel == null) throw new ArgumentNullException(&quot;installModel&quot;);
+
+            var status = InstallStatusTracker.GetStatus().ToArray();
+            //there won&#39;t be any statuses returned if the app pool has restarted so we need to re-read from file.
+            if (status.Any() == false)
+            {
+                status = InstallStatusTracker.InitializeFromFile(installModel.InstallId).ToArray();
+            }
+
+            //create a new queue of the non-finished ones
+            var queue = new Queue&lt;InstallTrackingItem&gt;(status.Where(x =&gt; x.IsComplete == false));
+            while (queue.Count &gt; 0)
+            {
+                var stepStatus = queue.Dequeue();
+                
+                var step = InstallHelper.GetAllSteps().Single(x =&gt; x.Name == stepStatus.Name);
+
+                JToken instruction = null;
+                //If this step has any instructions then extract them
+                if (installModel.Instructions.Any(x =&gt; x.Key == step.Name))
+                {
+                    instruction = installModel.Instructions[step.Name];
+                }
+                
+                //If this step doesn&#39;t require execution then continue to the next one, this is just a fail-safe check.
+                if (StepRequiresExecution(step, instruction) == false)
+                {
+                    //set this as complete and continue
+                    InstallStatusTracker.SetComplete(installModel.InstallId, stepStatus.Name, null);
+                    continue;
+                }
+
+                try
+                {
+                    var setupData = ExecuteStep(step, instruction);
+
+                    //update the status
+                    InstallStatusTracker.SetComplete(installModel.InstallId, step.Name, setupData != null ? setupData.SavedStepData : null);
+
+                    //Determine&#39;s the next step in the queue and dequeue&#39;s any items that don&#39;t need to execute
+                    var nextStep = IterateNextRequiredStep(step, queue, installModel.InstallId, installModel);
+                    
+                    //check if there&#39;s a custom view to return for this step
+                    if (setupData != null &amp;&amp; setupData.View.IsNullOrWhiteSpace() == false)
+                    {
+                        return new InstallProgressResultModel(false, step.Name, nextStep, setupData.View, setupData.ViewModel);
+                    }
+
+                    return new InstallProgressResultModel(false, step.Name, nextStep);
+                }
+                catch (Exception ex)
+                {
+
+                    LogHelper.Error&lt;InstallApiController&gt;(&quot;An error occurred during installation step &quot; + step.Name, ex);
+
+                    if (ex is TargetInvocationException &amp;&amp; ex.InnerException != null)
+                    {
+                        ex = ex.InnerException;
+                    }
+
+                    var installException = ex as InstallException;
+                    if (installException != null)
+                    {
+                        throw new HttpResponseException(Request.CreateValidationErrorResponse(new
+                        {
+                            view = installException.View,
+                            model = installException.ViewModel,
+                            message = installException.Message
+                        }));
+                    }
+
+                    throw new HttpResponseException(Request.CreateValidationErrorResponse(new
+                    {
+                        step = step.Name,
+                        view = &quot;error&quot;,
+                        message = ex.Message
+                    }));
+                }
+            }
+
+            InstallStatusTracker.Reset();
+            return new InstallProgressResultModel(true, &quot;&quot;, &quot;&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// We&#39;ll peek ahead and check if it&#39;s RequiresExecution is returning true. If it
+        /// is not, we&#39;ll dequeue that step and peek ahead again (recurse)
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;current&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queue&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;installId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;installModel&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private string IterateNextRequiredStep(InstallSetupStep current, Queue&lt;InstallTrackingItem&gt; queue, Guid installId, InstallInstructions installModel)
+        {
+            if (queue.Count &gt; 0)
+            {
+                var next = queue.Peek();
+                var step = InstallHelper.GetAllSteps().Single(x =&gt; x.Name == next.Name);
+
+                //If the current step restarts the app pool then we must simply return the next one in the queue, 
+                // we cannot peek ahead as the next step might rely on the app restart and therefore RequiresExecution 
+                // will rely on that too.                
+                if (current.PerformsAppRestart)
+                {                    
+                    return step.Name;
+                }
+
+                JToken instruction = null;
+                //If this step has any instructions then extract them
+                if (installModel.Instructions.Any(x =&gt; x.Key == step.Name))
+                {
+                    instruction = installModel.Instructions[step.Name];
+                }
+
+                //if the step requires execution then return it&#39;s name
+                if (StepRequiresExecution(step, instruction))
+                {
+                    return step.Name;
+                }
+
+                //this step no longer requires execution, this could be due to a new config change during installation,
+                // so we&#39;ll dequeue this one from the queue and recurse
+                queue.Dequeue();
+
+                //set this as complete
+                InstallStatusTracker.SetComplete(installId, step.Name, null);
+
+                //recurse
+                return IterateNextRequiredStep(step, queue, installId, installModel);
+            }
+
+            //there is no more steps
+            return string.Empty;
+        }
+
+        /// &lt;summary&gt;
+        /// Check if the step requires execution
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;step&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;instruction&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal bool StepRequiresExecution(InstallSetupStep step, JToken instruction)
+        {
+            var model = instruction == null ? null : instruction.ToObject(step.StepType);
+            var genericStepType = typeof(InstallSetupStep&lt;&gt;);
+            Type[] typeArgs = { step.StepType };
+            var typedStepType = genericStepType.MakeGenericType(typeArgs);
+            try
+            {
+                var method = typedStepType.GetMethods().Single(x =&gt; x.Name == &quot;RequiresExecution&quot;);
+                return (bool)method.Invoke(step, new object[] { model });
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Error&lt;InstallApiController&gt;(&quot;Checking if step requires execution (&quot; + step.Name + &quot;) failed.&quot;, ex);
+                throw;
+            }
+        }
+
+        internal InstallSetupResult ExecuteStep(InstallSetupStep step, JToken instruction)
+        {
+            using (ApplicationContext.ProfilingLogger.TraceDuration&lt;InstallApiController&gt;(&quot;Executing installation step: &quot; + step.Name, &quot;Step completed&quot;))
+            {
+                var model = instruction == null ? null : instruction.ToObject(step.StepType);
+                var genericStepType = typeof(InstallSetupStep&lt;&gt;);
+                Type[] typeArgs = { step.StepType };
+                var typedStepType = genericStepType.MakeGenericType(typeArgs);
+                try
+                {
+                    var method = typedStepType.GetMethods().Single(x =&gt; x.Name == &quot;Execute&quot;);
+                    return (InstallSetupResult)method.Invoke(step, new object[] { model });
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.Error&lt;InstallApiController&gt;(&quot;Installation step &quot; + step.Name + &quot; failed.&quot;, ex);
+                    throw;
+                }
+            }
+        }
+
+        private HttpResponseMessage Json(object jsonObject, HttpStatusCode status)
+        {
+            var response = Request.CreateResponse(status);
+            var json = JObject.FromObject(jsonObject);
+            response.Content = new StringContent(json.ToString(), Encoding.UTF8, &quot;application/json&quot;);
+            return response;
+        }
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,15,25,43,0],[26,9,26,10,0],[28,9,28,10,0],[30,9,30,67,0],[31,9,31,10,0],[32,13,32,40,0],[32,41,32,91,0],[33,13,33,45,0],[34,9,34,10,0],[39,48,39,52,0],[39,53,39,65,0],[43,17,43,18,0],[43,19,43,53,0],[43,54,43,55,0],[50,13,50,14,0],[51,17,51,81,0],[52,13,52,14,0],[56,9,56,10,0],[57,13,57,49,0],[58,13,58,82,0],[59,13,59,31,0],[60,9,60,10,0],[67,9,67,10,0],[68,13,68,44,0],[72,13,72,54,0],[74,13,74,88,0],[77,13,77,42,0],[78,13,78,33,0],[80,13,80,76,0],[82,13,82,26,0],[83,9,83,10,0],[86,9,86,10,0],[87,13,87,67,0],[88,13,88,62,0],[89,13,89,32,0],[90,9,90,10,0],[97,9,97,10,0],[98,13,98,38,0],[98,39,98,87,0],[100,13,100,69,0],[102,13,102,39,0],[103,13,103,14,0],[104,17,104,100,0],[105,13,105,14,0],[108,13,108,74,0],[108,74,108,95,0],[108,95,108,98,0],[108,13,108,98,0],[109,13,109,36,0],[110,13,110,14,0],[111,17,111,50,0],[113,17,113,68,0],[113,68,113,93,0],[113,93,113,95,0],[113,17,113,95,0],[115,17,115,43,0],[117,17,117,56,0],[117,56,117,74,0],[117,74,117,76,0],[117,17,117,76,0],[118,17,118,18,0],[119,21,119,72,0],[120,17,120,18,0],[123,17,123,71,0],[124,17,124,18,0],[126,21,126,101,0],[127,21,127,30,0],[131,17,131,18,0],[132,21,132,68,0],[135,21,135,141,0],[138,21,138,111,0],[141,21,141,91,0],[142,21,142,22,0],[143,25,143,128,0],[146,21,146,87,0],[148,17,148,37,0],[149,17,149,18,0],[151,21,151,122,0],[153,21,153,86,0],[154,21,154,22,0],[155,25,155,48,0],[156,21,156,22,0],[158,21,158,67,0],[159,21,159,50,0],[160,21,160,22,0],[161,25,166,29,0],[169,21,174,25,0],[178,13,178,42,0],[179,13,179,65,0],[180,9,180,10,0],[192,9,192,10,0],[193,13,193,33,0],[194,13,194,14,0],[195,17,195,41,0],[196,17,196,68,0],[196,68,196,87,0],[196,87,196,89,0],[196,17,196,89,0],[201,17,201,48,0],[202,17,202,18,0],[203,21,203,38,0],[206,17,206,43,0],[208,17,208,56,0],[208,56,208,74,0],[208,74,208,76,0],[208,17,208,76,0],[209,17,209,18,0],[210,21,210,72,0],[211,17,211,18,0],[214,17,214,62,0],[215,17,215,18,0],[216,21,216,38,0],[221,17,221,33,0],[224,17,224,78,0],[227,17,227,86,0],[231,13,231,33,0],[232,9,232,10,0],[241,9,241,10,0],[242,13,242,90,0],[243,13,243,62,0],[244,13,244,49,0],[245,13,245,75,0],[247,13,247,14,0],[248,17,248,69,0],[248,69,248,98,0],[248,98,248,100,0],[248,17,248,100,0],[249,17,249,74,0],[251,13,251,33,0],[252,13,252,14,0],[253,17,253,126,0],[254,17,254,23,0],[256,9,256,10,0],[259,9,259,10,0],[260,13,260,154,0],[261,13,261,14,0],[262,17,262,94,0],[263,17,263,66,0],[264,17,264,53,0],[265,17,265,79,0],[267,17,267,18,0],[268,21,268,73,0],[268,73,268,92,0],[268,92,268,94,0],[268,21,268,94,0],[269,21,269,92,0],[271,17,271,37,0],[272,17,272,18,0],[273,21,273,110,0],[274,21,274,27,0],[277,9,277,10,0],[280,9,280,10,0],[281,13,281,59,0],[282,13,282,55,0],[283,13,283,102,0],[284,13,284,29,0],[285,9,285,10,0]]);
+    </script>
+  </body>
+</html>

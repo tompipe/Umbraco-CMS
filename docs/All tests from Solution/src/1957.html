@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Media\Exif\TIFFFile.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+
+namespace Umbraco.Core.Media.Exif
+{
+    /// &lt;summary&gt;
+    /// Represents the binary view of a TIFF file.
+    /// &lt;/summary&gt;
+    internal class TIFFFile : ImageFile
+    {
+        #region Properties
+        /// &lt;summary&gt;
+        /// Gets the TIFF header.
+        /// &lt;/summary&gt;
+        public TIFFHeader TIFFHeader { get; private set; }
+        /// &lt;summary&gt;
+        /// Gets the image file directories.
+        /// &lt;/summary&gt;
+        public List&lt;ImageFileDirectory&gt; IFDs { get; private set; }
+        #endregion
+
+        #region Constructor
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;JPEGFile&quot;/&gt; class from the
+        /// specified data stream.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;stream&quot;&gt;A &lt;see cref=&quot;Sytem.IO.Stream&quot;/&gt; that contains image data.&lt;/param&gt;
+        /// &lt;param name=&quot;encoding&quot;&gt;The encoding to be used for text metadata when the source encoding is unknown.&lt;/param&gt;
+        protected internal TIFFFile(Stream stream, System.Text.Encoding encoding)
+        {
+            Format = ImageFileFormat.TIFF;
+            IFDs = new List&lt;ImageFileDirectory&gt;();
+            Encoding = encoding;
+
+            // Read the entire stream
+            byte[] data = Utility.GetStreamBytes(stream);
+
+            // Read the TIFF header
+            TIFFHeader = TIFFHeader.FromBytes(data, 0);
+            uint nextIFDOffset = TIFFHeader.IFDOffset;
+            if (nextIFDOffset == 0)
+                throw new NotValidTIFFileException(&quot;The first IFD offset is zero.&quot;);
+
+            // Read IFDs in order
+            while (nextIFDOffset != 0)
+            {
+                ImageFileDirectory ifd = ImageFileDirectory.FromBytes(data, nextIFDOffset, TIFFHeader.ByteOrder);
+                nextIFDOffset = ifd.NextIFDOffset;
+                IFDs.Add(ifd);
+            }
+
+            // Process IFDs
+            // TODO: Add support for multiple frames
+            foreach (ImageFileDirectoryEntry field in IFDs[0].Fields)
+            {
+                Properties.Add(ExifPropertyFactory.Get(field.Tag, field.Type, field.Count, field.Data, BitConverterEx.SystemByteOrder, IFD.Zeroth, Encoding));
+            }
+        }
+        #endregion
+
+        #region Instance Methods
+        /// &lt;summary&gt;
+        /// Saves the &lt;see cref=&quot;ImageFile&quot;/&gt; to the given stream.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;stream&quot;&gt;The data stream used to save the image.&lt;/param&gt;
+        public override void Save(Stream stream)
+        {
+            BitConverterEx conv = BitConverterEx.SystemEndian;
+
+            // Write TIFF header
+            uint ifdoffset = 8;
+            // Byte order
+            stream.Write((BitConverterEx.SystemByteOrder == BitConverterEx.ByteOrder.LittleEndian ? new byte[] { 0x49, 0x49 } : new byte[] { 0x4D, 0x4D }), 0, 2);
+            // TIFF ID
+            stream.Write(conv.GetBytes((ushort)42), 0, 2);
+            // Offset to 0th IFD, will be corrected below
+            stream.Write(conv.GetBytes(ifdoffset), 0, 4);
+
+            // Write IFD sections
+            for (int i = 0; i &lt; IFDs.Count; i++)
+            {
+                ImageFileDirectory ifd = IFDs[i];
+
+                // Save the location of IFD offset
+                long ifdLocation = stream.Position - 4;
+
+                // Write strips first
+                byte[] stripOffsets = new byte[4 * ifd.Strips.Count];
+                byte[] stripLengths = new byte[4 * ifd.Strips.Count];
+                uint stripOffset = ifdoffset;
+                for (int j = 0; j &lt; ifd.Strips.Count; j++)
+                {
+                    byte[] stripData = ifd.Strips[j].Data;
+                    byte[] oBytes = BitConverter.GetBytes(stripOffset);
+                    byte[] lBytes = BitConverter.GetBytes((uint)stripData.Length);
+                    Array.Copy(oBytes, 0, stripOffsets, 4 * j, 4);
+                    Array.Copy(lBytes, 0, stripLengths, 4 * j, 4);
+                    stream.Write(stripData, 0, stripData.Length);
+                    stripOffset += (uint)stripData.Length;
+                }
+
+                // Remove old strip tags
+                for (int j = ifd.Fields.Count - 1; j &gt; 0; j--)
+                {
+                    ushort tag = ifd.Fields[j].Tag;
+                    if (tag == 273 || tag == 279)
+                        ifd.Fields.RemoveAt(j);
+                }
+                // Write new strip tags
+                ifd.Fields.Add(new ImageFileDirectoryEntry(273, 4, (uint)ifd.Strips.Count, stripOffsets));
+                ifd.Fields.Add(new ImageFileDirectoryEntry(279, 4, (uint)ifd.Strips.Count, stripLengths));
+
+                // Write fields after strips
+                ifdoffset = stripOffset;
+
+                // Correct IFD offset
+                long currentLocation = stream.Position;
+                stream.Seek(ifdLocation, SeekOrigin.Begin);
+                stream.Write(conv.GetBytes(ifdoffset), 0, 4);
+                stream.Seek(currentLocation, SeekOrigin.Begin);
+
+                // Offset to field data
+                uint dataOffset = ifdoffset + 2 + (uint)ifd.Fields.Count * 12 + 4;
+
+                // Field count
+                stream.Write(conv.GetBytes((ushort)ifd.Fields.Count), 0, 2);
+
+                // Fields
+                foreach (ImageFileDirectoryEntry field in ifd.Fields)
+                {
+                    // Tag
+                    stream.Write(conv.GetBytes(field.Tag), 0, 2);
+                    // Type
+                    stream.Write(conv.GetBytes(field.Type), 0, 2);
+                    // Count
+                    stream.Write(conv.GetBytes(field.Count), 0, 4);
+
+                    // Field data
+                    byte[] data = field.Data;
+                    if (data.Length &lt;= 4)
+                    {
+                        stream.Write(data, 0, data.Length);
+                        for (int j = data.Length; j &lt; 4; j++)
+                            stream.WriteByte(0);
+                    }
+                    else
+                    {
+                        stream.Write(conv.GetBytes(dataOffset), 0, 4);
+                        long currentOffset = stream.Position;
+                        stream.Seek(dataOffset, SeekOrigin.Begin);
+                        stream.Write(data, 0, data.Length);
+                        dataOffset += (uint)data.Length;
+                        stream.Seek(currentOffset, SeekOrigin.Begin);
+                    }
+                }
+
+                // Offset to next IFD
+                ifdoffset = dataOffset;
+                stream.Write(conv.GetBytes(i == IFDs.Count - 1 ? 0 : ifdoffset), 0, 4);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Converts the &lt;see cref=&quot;ImageFile&quot;/&gt; to a &lt;see cref=&quot;System.Drawing.Image&quot;/&gt;.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;Returns a &lt;see cref=&quot;System.Drawing.Image&quot;/&gt; containing image data.&lt;/returns&gt;
+        public override Image ToImage()
+        {
+            MemoryStream stream = new MemoryStream();
+            Save(stream);
+            return Image.FromStream(stream);
+        }
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[17,40,17,44,0],[17,45,17,57,0],[21,48,21,52,0],[21,53,21,65,0],[31,9,31,82,0],[32,9,32,10,0],[33,13,33,43,0],[34,13,34,51,0],[35,13,35,33,0],[38,13,38,58,0],[41,13,41,56,0],[42,13,42,55,0],[43,13,43,36,0],[44,17,44,85,0],[47,13,47,39,0],[48,13,48,14,0],[49,17,49,114,0],[50,17,50,51,0],[51,17,51,31,0],[52,13,52,14,0],[56,13,56,20,0],[56,22,56,51,0],[56,52,56,54,0],[56,55,56,69,0],[57,13,57,14,0],[58,17,58,159,0],[59,13,59,14,0],[60,9,60,10,0],[69,9,69,10,0],[70,13,70,63,0],[73,13,73,32,0],[75,13,75,163,0],[77,13,77,59,0],[79,13,79,58,0],[82,18,82,27,0],[82,29,82,43,0],[82,45,82,48,0],[83,13,83,14,0],[84,17,84,50,0],[87,17,87,56,0],[90,17,90,70,0],[91,17,91,70,0],[92,17,92,46,0],[93,22,93,31,0],[93,33,93,53,0],[93,55,93,58,0],[94,17,94,18,0],[95,21,95,59,0],[96,21,96,72,0],[97,21,97,83,0],[98,21,98,67,0],[99,21,99,67,0],[100,21,100,66,0],[101,21,101,59,0],[102,17,102,18,0],[105,22,105,50,0],[105,52,105,57,0],[105,59,105,62,0],[106,17,106,18,0],[107,21,107,52,0],[108,21,108,50,0],[109,25,109,48,0],[110,17,110,18,0],[112,17,112,107,0],[113,17,113,107,0],[116,17,116,41,0],[119,17,119,56,0],[120,17,120,60,0],[121,17,121,62,0],[122,17,122,64,0],[125,17,125,83,0],[128,17,128,77,0],[131,17,131,24,0],[131,26,131,55,0],[131,56,131,58,0],[131,59,131,69,0],[132,17,132,18,0],[134,21,134,66,0],[136,21,136,67,0],[138,21,138,68,0],[141,21,141,46,0],[142,21,142,42,0],[143,21,143,22,0],[144,25,144,60,0],[145,30,145,49,0],[145,51,145,56,0],[145,58,145,61,0],[146,29,146,49,0],[147,21,147,22,0],[149,21,149,22,0],[150,25,150,71,0],[151,25,151,62,0],[152,25,152,67,0],[153,25,153,60,0],[154,25,154,57,0],[155,25,155,70,0],[156,21,156,22,0],[157,17,157,18,0],[160,17,160,40,0],[161,17,161,88,0],[162,13,162,14,0],[163,9,163,10,0],[170,9,170,10,0],[171,13,171,54,0],[172,13,172,26,0],[173,13,173,45,0],[174,9,174,10,0]]);
+    </script>
+  </body>
+</html>

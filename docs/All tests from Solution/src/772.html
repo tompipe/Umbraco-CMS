@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Dynamics\DynamicQueryable.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+//Copyright (C) Microsoft Corporation.  All rights reserved.
+
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Diagnostics;
+using Umbraco.Core.Dynamics;
+using Umbraco.Web.Models;
+
+namespace Umbraco.Web.Dynamics
+{
+    //TODO: Much of this can move to Umbraco.Core.Dynamics - but somehow need to remove all the hard coded references to things like 
+    // dynamicnull, etc...
+    //NOTE:  The OrderBy stuff here seems to be a bit hacked with hard references to umbraco node objects so don&#39;t think it can be
+    // re-used which is why we have the OrderBy stuff that hasn&#39;t been hacked in teh Umbraco.Core.Dynamics
+
+    internal static class DynamicQueryable
+    {
+        public static IQueryable&lt;T&gt; Where&lt;T&gt;(this IQueryable&lt;T&gt; source, string predicate, params object[] values)
+        {
+            return (IQueryable&lt;T&gt;)Where&lt;T&gt;((IQueryable)source, predicate, values);
+        }
+
+        public static IQueryable Where&lt;T&gt;(this IQueryable source, string predicate, params object[] values)
+        {
+            if (source == null) throw new ArgumentNullException(&quot;source&quot;);
+            if (predicate == null) throw new ArgumentNullException(&quot;predicate&quot;);
+            LambdaExpression lambda = DynamicExpression.ParseLambda&lt;T&gt;(source.ElementType, typeof(bool), predicate, true, values);
+            if (lambda.Parameters.Count &gt; 0 &amp;&amp; lambda.Parameters[0].Type == typeof(T))
+            {
+                //source list is DynamicNode and the lambda returns a Func&lt;object&gt;
+                IQueryable&lt;T&gt; typedSource = source as IQueryable&lt;T&gt;;
+                var compiledFunc = lambda.Compile();
+                Func&lt;T, object&gt; func = null;
+                Func&lt;T, bool&gt; boolFunc = null;
+                if (compiledFunc is Func&lt;T, object&gt;)
+                {
+                    func = (Func&lt;T, object&gt;)compiledFunc;
+                }
+                if (compiledFunc is Func&lt;T, bool&gt;)
+                {
+                    boolFunc = (Func&lt;T, bool&gt;)compiledFunc;
+                }
+                return typedSource.Where(delegate(T node)
+                {
+                    object value = -1;
+                    //value = func(node);
+                    //I can&#39;t figure out why this is double func&lt;&gt;&#39;d
+                    try
+                    {
+                        if (func != null)
+                        {
+                            var firstFuncResult = func(node);
+                            if (firstFuncResult is Func&lt;T, object&gt;)
+                            {
+                                value = (firstFuncResult as Func&lt;T, object&gt;)(node);
+                            }
+                            if (firstFuncResult is Func&lt;T, bool&gt;)
+                            {
+                                value = (firstFuncResult as Func&lt;T, bool&gt;)(node);
+                            }
+                            if (firstFuncResult is bool)
+                            {
+                                return (bool)firstFuncResult;
+                            }
+                            if (value is bool)
+                            {
+                                return (bool)value;
+                            }
+                        }
+                        if (boolFunc != null)
+                        {
+                            return boolFunc(node);
+                        }
+                        return false;
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.WriteLine(ex.Message);
+                        return false;
+                    }
+                }).AsQueryable();
+            }
+            else
+            {
+                return source.Provider.CreateQuery(
+                    Expression.Call(
+                        typeof(Queryable), &quot;Where&quot;,
+                        new Type[] { source.ElementType },
+                        source.Expression, Expression.Quote(lambda)));
+            }
+        }
+
+        public static IQueryable Select&lt;T&gt;(this IQueryable&lt;T&gt; source, string selector, params object[] values)
+        {
+            if (source == null) throw new ArgumentNullException(&quot;source&quot;);
+            if (selector == null) throw new ArgumentNullException(&quot;selector&quot;);
+            LambdaExpression lambda = DynamicExpression.ParseLambda&lt;T&gt;(source.ElementType, typeof(object), selector, false, values);
+			if (lambda.Parameters.Count &gt; 0 &amp;&amp; lambda.Parameters[0].Type == typeof(T))
+            {
+                //source list is DynamicNode and the lambda returns a Func&lt;object&gt;
+				IQueryable&lt;T&gt; typedSource = source as IQueryable&lt;T&gt;;
+                var compiledFunc = lambda.Compile();
+				Func&lt;T, object&gt; func = null;
+				if (compiledFunc is Func&lt;T, object&gt;)
+                {
+					func = (Func&lt;T, object&gt;)compiledFunc;
+                }
+				return typedSource.Select(delegate(T node)
+                {
+                    object value = null;
+                    value = func(node);
+					if (value is Func&lt;T, object&gt;)
+                    {
+						var innerValue = (value as Func&lt;T, object&gt;)(node);
+                        return innerValue;
+                    }
+                    return value;
+                }).AsQueryable();
+            }
+            else
+            {
+                return source.Provider.CreateQuery(
+                    Expression.Call(
+                        typeof(Queryable), &quot;Select&quot;,
+                        new Type[] { source.ElementType, lambda.Body.Type },
+                        source.Expression, Expression.Quote(lambda)));
+            }
+        }
+
+        public static IQueryable&lt;T&gt; OrderBy&lt;T&gt;(this IQueryable&lt;T&gt; source, string ordering, Func&lt;Type&gt; getDynamicListTypeCallback, params object[] values)
+        {
+			return (IQueryable&lt;T&gt;)OrderBy&lt;T&gt;((IQueryable)source, ordering, getDynamicListTypeCallback, values);
+        }
+
+		public static IQueryable OrderBy&lt;T&gt;(this IQueryable source, string ordering, Func&lt;Type&gt; getDynamicListTypeCallback, params object[] values)
+        {
+            if (source == null) throw new ArgumentNullException(&quot;source&quot;);
+            if (ordering == null) throw new ArgumentNullException(&quot;ordering&quot;);
+
+			IQueryable&lt;T&gt; typedSource = source as IQueryable&lt;T&gt;;
+            if (!ordering.Contains(&quot;,&quot;))
+            {
+                bool descending = false;
+                if (ordering.IndexOf(&quot; descending&quot;, StringComparison.CurrentCultureIgnoreCase) &gt;= 0)
+                {
+                    ordering = ordering.Replace(&quot; descending&quot;, &quot;&quot;);
+                    descending = true;
+                }
+                if (ordering.IndexOf(&quot; desc&quot;, StringComparison.CurrentCultureIgnoreCase) &gt;= 0)
+                {
+                    ordering = ordering.Replace(&quot; desc&quot;, &quot;&quot;);
+                    descending = true;
+                }
+
+                LambdaExpression lambda = DynamicExpression.ParseLambda&lt;T&gt;(source.ElementType, typeof(object), ordering, false, values);
+				if (lambda.Parameters.Count &gt; 0 &amp;&amp; lambda.Parameters[0].Type == typeof(T))
+                {
+                    //source list is DynamicNode and the lambda returns a Func&lt;object&gt;
+					Func&lt;T, object&gt; func = (Func&lt;T, object&gt;)lambda.Compile();
+                    //get the values out
+                    var query = typedSource.ToList().ConvertAll(item =&gt; new { node = item, key = EvaluateDynamicNodeFunc(item, func) });
+                    if (query.Count == 0)
+                    {
+                        return source;
+                    }
+                    var types = from i in query
+                                group i by i.key.GetType() into g
+                                where g.Key != typeof(DynamicNull)
+                                orderby g.Count() descending
+                                select new { g, Instances = g.Count() };
+                    var dominantType = types.First().g.Key;
+
+                    // NH - add culture dependencies
+                    StringComparer comp = StringComparer.Create(CultureInfo.CurrentCulture, true);
+
+                    if (!descending)
+                    {
+                        // if the dominant type is a string we&#39;ll ensure that strings are sorted based on culture settings on node
+                        if (dominantType.FullName == &quot;System.String&quot;) 
+                            return query.OrderBy(item =&gt; item.key.ToString(), comp).Select(item =&gt; item.node).AsQueryable();
+                        else
+                            return query.OrderBy(item =&gt; GetObjectAsTypeOrDefault(item.key, dominantType)).Select(item =&gt; item.node).AsQueryable();
+                    }
+                    else
+                    {
+                        if (dominantType.FullName == &quot;System.String&quot;)
+                            return query.OrderByDescending(item =&gt; item.key.ToString(), comp).Select(item =&gt; item.node).AsQueryable();
+                        else
+                            return query.OrderByDescending(item =&gt; GetObjectAsTypeOrDefault(item.key, dominantType)).Select(item =&gt; item.node).AsQueryable();
+                    }
+                }
+            }
+
+            bool isDynamicNodeList = false;
+            if (typedSource != null)
+            {
+                isDynamicNodeList = true;
+            }
+
+            ParameterExpression[] parameters = new ParameterExpression[] {
+                Expression.Parameter(source.ElementType, &quot;&quot;) };
+            var parser = new ExpressionParser&lt;T&gt;(parameters, ordering, values, false);
+            IEnumerable&lt;DynamicOrdering&gt; orderings = parser.ParseOrdering();
+            Expression queryExpr = source.Expression;
+            string methodAsc = &quot;OrderBy&quot;;
+            string methodDesc = &quot;OrderByDescending&quot;;
+            foreach (DynamicOrdering o in orderings)
+            {
+                if (!isDynamicNodeList)
+                {
+                    queryExpr = Expression.Call(
+                        typeof(Queryable), o.Ascending ? methodAsc : methodDesc,
+                        new Type[] { source.ElementType, o.Selector.Type },
+                        queryExpr, Expression.Quote(Expression.Lambda(o.Selector, parameters)));
+                }
+                else
+                {
+                    //reroute each stacked Expression.Call into our own methods that know how to deal
+                    //with DynamicNode
+                    queryExpr = Expression.Call(
+							getDynamicListTypeCallback(),    
+                            o.Ascending ? methodAsc : methodDesc,
+                            null,
+                            queryExpr,
+                            Expression.Quote(Expression.Lambda(o.Selector, parameters))
+                        );
+                }
+                methodAsc = &quot;ThenBy&quot;;
+                methodDesc = &quot;ThenByDescending&quot;;
+            }
+            if (isDynamicNodeList)
+            {
+                return typedSource.Provider.CreateQuery(queryExpr);
+            }
+            return source.Provider.CreateQuery(queryExpr);
+
+        }
+        private static object GetObjectAsTypeOrDefault(object value, Type type)
+        {
+            if (type.IsAssignableFrom(value.GetType()))
+            {
+                return (object)Convert.ChangeType(value, type);
+            }
+            else
+            {
+                if (type.IsValueType)
+                {
+                    return Activator.CreateInstance(type);
+                }
+                return null;
+            }
+        }
+		private static object EvaluateDynamicNodeFunc&lt;T&gt;(T publishedContent, Func&lt;T, object&gt; func)
+        {
+            object value = -1;
+            var firstFuncResult = func(publishedContent);
+			if (firstFuncResult is Func&lt;T, object&gt;)
+            {
+				value = (firstFuncResult as Func&lt;T, object&gt;)(publishedContent);
+            }
+            if (firstFuncResult.GetType().IsValueType || firstFuncResult is string)
+            {
+                value = firstFuncResult;
+            }
+            return value;
+        }
+        public static IQueryable Take(this IQueryable source, int count)
+        {
+            if (source == null) throw new ArgumentNullException(&quot;source&quot;);
+            return source.Provider.CreateQuery(
+                Expression.Call(
+                    typeof(Queryable), &quot;Take&quot;,
+                    new Type[] { source.ElementType },
+                    source.Expression, Expression.Constant(count)));
+        }
+
+        public static IQueryable Skip(this IQueryable source, int count)
+        {
+            if (source == null) throw new ArgumentNullException(&quot;source&quot;);
+            return source.Provider.CreateQuery(
+                Expression.Call(
+                    typeof(Queryable), &quot;Skip&quot;,
+                    new Type[] { source.ElementType },
+                    source.Expression, Expression.Constant(count)));
+        }
+
+        public static IQueryable GroupBy&lt;T&gt;(this IQueryable source, string keySelector, string elementSelector, params object[] values)
+        {
+            if (source == null) throw new ArgumentNullException(&quot;source&quot;);
+            if (keySelector == null) throw new ArgumentNullException(&quot;keySelector&quot;);
+            if (elementSelector == null) throw new ArgumentNullException(&quot;elementSelector&quot;);
+            LambdaExpression keyLambda = DynamicExpression.ParseLambda&lt;T&gt;(source.ElementType, null, keySelector, true, values);
+            LambdaExpression elementLambda = DynamicExpression.ParseLambda&lt;T&gt;(source.ElementType, null, elementSelector, true, values);
+            return source.Provider.CreateQuery(
+                Expression.Call(
+                    typeof(Queryable), &quot;GroupBy&quot;,
+                    new Type[] { source.ElementType, keyLambda.Body.Type, elementLambda.Body.Type },
+                    source.Expression, Expression.Quote(keyLambda), Expression.Quote(elementLambda)));
+        }
+
+        public static bool Any(this IQueryable source)
+        {
+            if (source == null) throw new ArgumentNullException(&quot;source&quot;);
+            return (bool)source.Provider.Execute(
+                Expression.Call(
+                    typeof(Queryable), &quot;Any&quot;,
+                    new Type[] { source.ElementType }, source.Expression));
+        }
+
+        public static int Count(this IQueryable source)
+        {
+            if (source == null) throw new ArgumentNullException(&quot;source&quot;);
+            return (int)source.Provider.Execute(
+                Expression.Call(
+                    typeof(Queryable), &quot;Count&quot;,
+                    new Type[] { source.ElementType }, source.Expression));
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,9,22,10,1],[23,13,23,83,1],[24,9,24,10,1],[27,9,27,10,1],[28,13,28,32,1],[28,33,28,75,0],[29,13,29,35,1],[29,36,29,81,0],[30,13,30,131,1],[31,13,31,87,1],[32,13,32,14,1],[34,17,34,69,1],[35,17,35,53,1],[36,17,36,45,1],[37,17,37,47,1],[38,17,38,53,1],[39,17,39,18,1],[40,21,40,58,1],[41,17,41,18,1],[42,17,42,51,1],[43,17,43,18,1],[44,21,44,60,1],[45,17,45,18,1],[46,17,47,17,1],[47,17,47,18,1],[47,18,48,21,1],[48,21,48,39,1],[48,39,52,21,1],[52,21,52,22,1],[52,22,53,25,1],[53,25,53,42,1],[53,42,54,25,1],[54,25,54,26,1],[54,26,55,29,1],[55,29,55,62,1],[55,62,56,29,1],[56,29,56,68,1],[56,68,57,29,1],[57,29,57,30,0],[57,30,58,33,1],[58,33,58,84,0],[58,84,59,29,1],[59,29,59,30,0],[59,30,60,29,1],[60,29,60,66,1],[60,66,61,29,1],[61,29,61,30,1],[61,30,62,33,1],[62,33,62,82,1],[62,82,63,29,1],[63,29,63,30,1],[63,30,64,29,1],[64,29,64,57,1],[64,57,65,29,1],[65,29,65,30,0],[65,30,66,33,1],[66,33,66,62,0],[66,62,68,29,1],[68,29,68,47,1],[68,47,69,29,1],[69,29,69,30,1],[69,30,70,33,1],[70,33,70,52,1],[70,52,72,25,1],[72,25,72,26,0],[72,26,73,25,1],[73,25,73,46,1],[73,46,74,25,1],[74,25,74,26,1],[74,26,75,29,1],[75,29,75,51,1],[75,51,77,25,1],[77,25,77,38,0],[77,38,79,21,1],[79,21,79,41,1],[79,41,80,21,1],[80,21,80,22,1],[80,22,81,25,1],[81,25,81,53,1],[81,53,82,25,1],[82,25,82,38,1],[82,38,84,17,1],[84,17,84,18,1],[84,18,84,34,1],[46,17,84,34,1],[87,13,87,14,0],[88,17,92,71,0],[94,9,94,10,1],[97,9,97,10,1],[98,13,98,32,1],[98,33,98,75,0],[99,13,99,34,1],[99,35,99,79,0],[100,13,100,133,1],[101,4,101,78,1],[102,13,102,14,1],[104,5,104,57,1],[105,17,105,53,1],[106,5,106,33,1],[107,5,107,41,1],[108,17,108,18,1],[109,6,109,43,1],[110,17,110,18,1],[111,5,112,17,1],[112,17,112,18,1],[112,18,113,21,1],[113,21,113,41,1],[113,41,114,21,1],[114,21,114,40,1],[114,40,115,6,1],[115,6,115,35,1],[115,35,116,21,1],[116,21,116,22,0],[116,22,117,7,1],[117,7,117,57,0],[117,57,118,25,1],[118,25,118,43,0],[118,43,120,21,1],[120,21,120,34,1],[120,34,121,17,1],[121,17,121,18,1],[121,18,121,34,1],[111,5,121,34,1],[124,13,124,14,0],[125,17,129,71,0],[131,9,131,10,1],[134,9,134,10,1],[135,4,135,103,1],[136,9,136,10,1],[139,9,139,10,1],[140,13,140,32,1],[140,33,140,75,0],[141,13,141,34,1],[141,35,141,79,0],[143,4,143,56,1],[144,13,144,41,1],[145,13,145,14,1],[146,17,146,41,1],[147,17,147,101,1],[148,17,148,18,0],[149,21,149,68,0],[150,21,150,39,0],[151,17,151,18,0],[152,17,152,95,1],[153,17,153,18,1],[154,21,154,62,1],[155,21,155,39,1],[156,17,156,18,1],[158,17,158,137,1],[159,5,159,79,1],[160,17,160,18,1],[162,6,162,63,1],[164,21,164,73,1],[164,73,164,135,1],[164,135,164,137,1],[164,21,164,137,1],[165,21,165,42,1],[166,21,166,22,0],[167,25,167,39,0],[169,21,170,44,1],[170,44,170,59,1],[170,59,171,39,1],[171,39,171,67,1],[171,67,172,41,1],[172,41,172,50,1],[172,50,173,40,1],[173,40,173,72,1],[173,72,173,73,1],[169,21,173,73,1],[174,21,174,60,1],[177,21,177,99,1],[179,21,179,37,1],[180,21,180,22,1],[182,25,182,70,1],[183,29,183,58,0],[183,58,183,77,0],[183,77,183,100,0],[183,100,183,109,0],[183,109,183,125,0],[183,29,183,125,0],[185,29,185,58,1],[185,58,185,106,1],[185,106,185,123,1],[185,123,185,132,1],[185,132,185,148,1],[185,29,185,148,1],[188,21,188,22,1],[189,25,189,70,1],[190,29,190,68,0],[190,68,190,87,0],[190,87,190,110,0],[190,110,190,119,0],[190,119,190,135,0],[190,29,190,135,0],[192,29,192,68,1],[192,68,192,116,1],[192,116,192,133,1],[192,133,192,142,1],[192,142,192,158,1],[192,29,192,158,1],[195,13,195,14,0],[197,13,197,44,0],[198,13,198,37,0],[199,13,199,14,0],[200,17,200,42,0],[201,13,201,14,0],[203,13,204,64,0],[205,13,205,87,0],[206,13,206,77,0],[207,13,207,54,0],[208,13,208,42,0],[209,13,209,53,0],[210,13,210,20,0],[210,22,210,39,0],[210,40,210,42,0],[210,43,210,52,0],[211,13,211,14,0],[212,17,212,40,0],[213,17,213,18,0],[214,21,217,97,0],[218,17,218,18,0],[220,17,220,18,0],[223,21,229,27,0],[230,17,230,18,0],[231,17,231,38,0],[232,17,232,49,0],[233,13,233,14,0],[234,13,234,35,0],[235,13,235,14,0],[236,17,236,68,0],[238,13,238,59,0],[240,9,240,10,1],[242,9,242,10,1],[243,13,243,56,1],[244,13,244,14,1],[245,17,245,64,1],[248,13,248,14,0],[249,17,249,38,0],[250,17,250,18,0],[251,21,251,59,0],[253,17,253,29,0],[255,9,255,10,1],[257,9,257,10,1],[258,13,258,31,1],[259,13,259,58,1],[260,4,260,43,1],[261,13,261,14,0],[262,5,262,68,0],[263,13,263,14,0],[264,13,264,84,1],[265,13,265,14,1],[266,17,266,41,1],[267,13,267,14,1],[268,13,268,26,1],[269,9,269,10,1],[271,9,271,10,0],[272,13,272,32,0],[272,33,272,75,0],[273,13,277,69,0],[278,9,278,10,0],[281,9,281,10,0],[282,13,282,32,0],[282,33,282,75,0],[283,13,287,69,0],[288,9,288,10,0],[291,9,291,10,0],[292,13,292,32,0],[292,33,292,75,0],[293,13,293,37,0],[293,38,293,85,0],[294,13,294,41,0],[294,42,294,93,0],[295,13,295,128,0],[296,13,296,136,0],[297,13,301,103,0],[302,9,302,10,0],[305,9,305,10,0],[306,13,306,32,0],[306,33,306,75,0],[307,13,310,76,0],[311,9,311,10,0],[314,9,314,10,0],[315,13,315,32,0],[315,33,315,75,0],[316,13,319,76,0],[320,9,320,10,0]]);
+    </script>
+  </body>
+</html>

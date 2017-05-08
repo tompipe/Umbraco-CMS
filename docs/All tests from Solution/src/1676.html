@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\SqlSyntax\SqlServerSyntaxProvider.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+
+namespace Umbraco.Core.Persistence.SqlSyntax
+{
+    /// &lt;summary&gt;
+    /// Represents an SqlSyntaxProvider for Sql Server.
+    /// &lt;/summary&gt;
+    [SqlSyntaxProvider(Constants.DatabaseProviders.SqlServer)]
+    public class SqlServerSyntaxProvider : MicrosoftSqlSyntaxProviderBase&lt;SqlServerSyntaxProvider&gt;
+    {
+        /// &lt;summary&gt;
+        /// Gets/sets the version of the current SQL server instance
+        /// &lt;/summary&gt;
+        internal SqlServerVersionName GetVersionName(Database database)
+        {
+            if (_versionName.HasValue)
+                return _versionName.Value;
+
+            try
+            {
+                var version = database.ExecuteScalar&lt;string&gt;(&quot;SELECT SERVERPROPERTY(&#39;productversion&#39;)&quot;);
+                var firstPart = version.Split(&#39;.&#39;)[0];
+                switch (firstPart)
+                {
+                    case &quot;13&quot;:
+                        _versionName = SqlServerVersionName.V2016;
+                        break;
+                    case &quot;12&quot;:
+                        _versionName = SqlServerVersionName.V2014;
+                        break;
+                    case &quot;11&quot;:
+                        _versionName = SqlServerVersionName.V2012;
+                        break;
+                    case &quot;10&quot;:
+                        _versionName = SqlServerVersionName.V2008;
+                        break;
+                    case &quot;9&quot;:
+                        _versionName = SqlServerVersionName.V2005;
+                        break;
+                    case &quot;8&quot;:
+                        _versionName = SqlServerVersionName.V2000;
+                        break;
+                    case &quot;7&quot;:
+                        _versionName = SqlServerVersionName.V7;
+                        break;
+                    default:
+                        _versionName = SqlServerVersionName.Other;
+                        break;
+                }
+            }
+            catch (Exception)
+            {
+                _versionName = SqlServerVersionName.Invalid;
+            }
+
+            return _versionName.Value;
+        }
+
+        private SqlServerVersionName? _versionName;
+
+        /// &lt;summary&gt;
+        /// SQL Server stores default values assigned to columns as constraints, it also stores them with named values, this is the only
+        /// server type that does this, therefore this method doesn&#39;t exist on any other syntax provider
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;Tuple&lt;string, string, string, string&gt;&gt; GetDefaultConstraintsPerColumn(Database db)
+        {
+            var items = db.Fetch&lt;dynamic&gt;(&quot;SELECT TableName = t.Name,ColumnName = c.Name,dc.Name,dc.[Definition] FROM sys.tables t INNER JOIN sys.default_constraints dc ON t.object_id = dc.parent_object_id INNER JOIN sys.columns c ON dc.parent_object_id = c.object_id AND c.column_id = dc.parent_column_id&quot;);
+            return items.Select(x =&gt; new Tuple&lt;string, string, string, string&gt;(x.TableName, x.ColumnName, x.Name, x.Definition));
+        }
+
+        public override IEnumerable&lt;string&gt; GetTablesInSchema(Database db)
+        {
+            var items = db.Fetch&lt;dynamic&gt;(&quot;SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES&quot;);
+            return items.Select(x =&gt; x.TABLE_NAME).Cast&lt;string&gt;().ToList();
+        }
+
+        public override IEnumerable&lt;ColumnInfo&gt; GetColumnsInSchema(Database db)
+        {
+            var items = db.Fetch&lt;dynamic&gt;(&quot;SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS&quot;);
+            return
+                items.Select(
+                    item =&gt;
+                    new ColumnInfo(item.TABLE_NAME, item.COLUMN_NAME, item.ORDINAL_POSITION, item.COLUMN_DEFAULT,
+                                   item.IS_NULLABLE, item.DATA_TYPE)).ToList();
+        }
+
+        public override IEnumerable&lt;Tuple&lt;string, string&gt;&gt; GetConstraintsPerTable(Database db)
+        {
+            var items =
+                db.Fetch&lt;dynamic&gt;(
+                    &quot;SELECT TABLE_NAME, CONSTRAINT_NAME FROM INFORMATION_SCHEMA.CONSTRAINT_TABLE_USAGE&quot;);
+            return items.Select(item =&gt; new Tuple&lt;string, string&gt;(item.TABLE_NAME, item.CONSTRAINT_NAME)).ToList();
+        }
+
+        public override IEnumerable&lt;Tuple&lt;string, string, string&gt;&gt; GetConstraintsPerColumn(Database db)
+        {
+            var items =
+                db.Fetch&lt;dynamic&gt;(
+                    &quot;SELECT TABLE_NAME, COLUMN_NAME, CONSTRAINT_NAME FROM INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE&quot;);
+            return items.Select(item =&gt; new Tuple&lt;string, string, string&gt;(item.TABLE_NAME, item.COLUMN_NAME, item.CONSTRAINT_NAME)).ToList();
+        }
+
+        public override IEnumerable&lt;Tuple&lt;string, string, string, bool&gt;&gt; GetDefinedIndexes(Database db)
+        {
+            var items =
+                db.Fetch&lt;dynamic&gt;(
+                    @&quot;select T.name as TABLE_NAME, I.name as INDEX_NAME, AC.Name as COLUMN_NAME,
+CASE WHEN I.is_unique_constraint = 1 OR  I.is_unique = 1 THEN 1 ELSE 0 END AS [UNIQUE]
+from sys.tables as T inner join sys.indexes as I on T.[object_id] = I.[object_id] 
+   inner join sys.index_columns as IC on IC.[object_id] = I.[object_id] and IC.[index_id] = I.[index_id] 
+   inner join sys.all_columns as AC on IC.[object_id] = AC.[object_id] and IC.[column_id] = AC.[column_id] 
+WHERE I.name NOT LIKE &#39;PK_%&#39;
+order by T.name, I.name&quot;);
+            return items.Select(item =&gt; new Tuple&lt;string, string, string, bool&gt;(item.TABLE_NAME, item.INDEX_NAME, item.COLUMN_NAME,
+                item.UNIQUE == 1)).ToList();
+
+        }
+
+        public override bool DoesTableExist(Database db, string tableName)
+        {
+            var result =
+                db.ExecuteScalar&lt;long&gt;(&quot;SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = @TableName&quot;,
+                                       new { TableName = tableName });
+
+            return result &gt; 0;
+        }
+
+        public override string FormatColumnRename(string tableName, string oldName, string newName)
+        {
+            return string.Format(RenameColumn, tableName, oldName, newName);
+        }
+
+        public override string FormatTableRename(string oldName, string newName)
+        {
+            return string.Format(RenameTable, oldName, newName);
+        }
+
+        protected override string FormatIdentity(ColumnDefinition column)
+        {
+            return column.IsIdentity ? GetIdentityString(column) : string.Empty;
+        }
+
+        public override Sql SelectTop(Sql sql, int top)
+        {
+            return new Sql(sql.SQL.Insert(sql.SQL.IndexOf(&#39; &#39;), &quot; TOP &quot; + top), sql.Arguments);
+        }
+
+        private static string GetIdentityString(ColumnDefinition column)
+        {
+            return &quot;IDENTITY(1,1)&quot;;
+        }
+
+        protected override string FormatSystemMethods(SystemMethods systemMethod)
+        {
+            switch (systemMethod)
+            {
+                case SystemMethods.NewGuid:
+                    return &quot;NEWID()&quot;;
+                case SystemMethods.CurrentDateTime:
+                    return &quot;GETDATE()&quot;;
+                //case SystemMethods.NewSequentialId:
+                //    return &quot;NEWSEQUENTIALID()&quot;;
+                //case SystemMethods.CurrentUTCDateTime:
+                //    return &quot;GETUTCDATE()&quot;;
+            }
+
+            return null;
+        }
+
+        public override string DeleteDefaultConstraint
+        {
+            get { return &quot;ALTER TABLE [{0}] DROP CONSTRAINT [DF_{0}_{1}]&quot;; }
+        }
+
+
+        public override string DropIndex { get { return &quot;DROP INDEX {0} ON {1}&quot;; } }
+
+        public override string RenameColumn { get { return &quot;sp_rename &#39;{0}.{1}&#39;, &#39;{2}&#39;, &#39;COLUMN&#39;&quot;; } }
+
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[18,9,18,10,0],[19,13,19,39,0],[20,17,20,43,0],[23,13,23,14,0],[24,17,24,105,0],[25,17,25,55,0],[26,17,26,35,0],[29,25,29,67,0],[30,25,30,31,0],[32,25,32,67,0],[33,25,33,31,0],[35,25,35,67,0],[36,25,36,31,0],[38,25,38,67,0],[39,25,39,31,0],[41,25,41,67,0],[42,25,42,31,0],[44,25,44,67,0],[45,25,45,31,0],[47,25,47,64,0],[48,25,48,31,0],[50,25,50,67,0],[51,25,51,31,0],[53,13,53,14,0],[54,13,54,30,0],[55,13,55,14,0],[56,17,56,61,0],[57,13,57,14,0],[59,13,59,39,0],[60,9,60,10,0],[70,9,70,10,0],[71,13,71,309,0],[72,13,72,38,0],[72,38,72,128,0],[72,128,72,130,0],[72,13,72,130,0],[73,9,73,10,0],[76,9,76,10,0],[77,13,77,95,0],[78,13,78,38,0],[78,38,78,50,0],[78,50,78,76,0],[78,13,78,76,0],[79,9,79,10,0],[82,9,82,10,0],[83,13,83,167,0],[84,13,87,21,0],[87,21,88,69,0],[88,69,88,80,0],[84,13,88,80,0],[89,9,89,10,0],[92,9,92,10,0],[93,13,95,106,0],[96,13,96,41,0],[96,41,96,105,0],[96,105,96,116,0],[96,13,96,116,0],[97,9,97,10,0],[100,9,100,10,0],[101,13,103,120,0],[104,13,104,41,0],[104,41,104,131,0],[104,131,104,142,0],[104,13,104,142,0],[105,9,105,10,0],[108,9,108,10,0],[109,13,117,27,0],[118,13,118,41,0],[118,41,119,34,0],[119,34,119,45,0],[118,13,119,45,0],[121,9,121,10,0],[124,9,124,10,0],[125,13,127,71,0],[129,13,129,31,0],[130,9,130,10,0],[133,9,133,10,0],[134,13,134,77,0],[135,9,135,10,0],[138,9,138,10,0],[139,13,139,65,0],[140,9,140,10,0],[143,9,143,10,0],[144,13,144,81,0],[145,9,145,10,0],[148,9,148,10,0],[149,13,149,96,0],[150,9,150,10,0],[153,9,153,10,0],[154,13,154,36,0],[155,9,155,10,0],[158,9,158,10,0],[159,13,159,34,0],[162,21,162,38,0],[164,21,164,40,0],[171,13,171,25,0],[172,9,172,10,0],[176,17,176,18,0],[176,19,176,75,0],[176,76,176,77,0],[180,48,180,49,0],[180,50,180,81,0],[180,82,180,83,0],[182,51,182,52,0],[182,53,182,99,0],[182,100,182,101,0]]);
+    </script>
+  </body>
+</html>

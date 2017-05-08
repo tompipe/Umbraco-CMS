@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.editorControls\PickerRelations\PickerRelationsEventHandler.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+// ApplicationBase
+using umbraco.businesslogic;
+using umbraco.cms.businesslogic; // SaveEventArgs
+using umbraco.cms.businesslogic.media; // Media
+using umbraco.cms.businesslogic.member; // Member
+using umbraco.cms.businesslogic.web; // Documentusing umbraco.cms.businesslogic.propertytype;
+using umbraco.cms.businesslogic.property;
+using umbraco.cms.businesslogic.relation;
+using umbraco.DataLayer;
+using Umbraco.Core;
+using Application = umbraco.BusinessLogic.Application;
+
+namespace umbraco.editorControls.PickerRelations
+{
+	/// &lt;summary&gt;
+	/// Event handler that will convert a CSV into Relations
+	/// &lt;/summary&gt;
+    [Obsolete(&quot;IDataType and all other references to the legacy property editors are no longer used this will be removed from the codebase in future versions&quot;)]
+    public class PickerRelationsEventHandler : ApplicationStartupHandler
+	{
+        private enum PickerStorageFormat
+        {
+            Csv,
+            Xml
+        }
+
+		/// &lt;summary&gt;
+		/// Initializes a new instance of PickerRelationsEventHandler,
+		/// hooks into the after event of saving a Content node, Media item or a Member
+		/// &lt;/summary&gt;
+		public PickerRelationsEventHandler()
+		{
+			Document.AfterSave += new Document.SaveEventHandler(this.AfterSave);
+			Media.AfterSave += new Media.SaveEventHandler(this.AfterSave);
+			Member.AfterSave += new Member.SaveEventHandler(this.AfterSave);
+
+			Document.BeforeDelete += new Document.DeleteEventHandler(this.BeforeDelete);
+			Media.BeforeDelete += new Media.DeleteEventHandler(this.BeforeDelete);
+			Member.BeforeDelete += new Member.DeleteEventHandler(this.BeforeDelete);
+		}
+
+
+		/// &lt;summary&gt;
+		/// Event after all properties have been saved
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+		private void AfterSave(Content sender, SaveEventArgs e)
+		{
+			Guid pickerRelationsId  = new Guid(DataTypeGuids.PickerRelationsId);
+
+			// For each PickerRelations datatype
+			foreach (Property pickerRelationsProperty in from property in sender.GenericProperties
+															  where property.PropertyType.DataTypeDefinition.DataType.Id == pickerRelationsId
+															  select property)
+			{
+				// used to identify this datatype instance - relations created are marked with this in the comment field
+				string instanceIdentifier = &quot;[\&quot;PropertyTypeId\&quot;:&quot; + pickerRelationsProperty.PropertyType.Id.ToString() + &quot;]&quot;;
+
+				// get configuration options for datatype
+				PickerRelationsOptions options = ((PickerRelationsPreValueEditor)pickerRelationsProperty.PropertyType.DataTypeDefinition.DataType.PrevalueEditor).Options;
+
+				// find Picker source propertyAlias field on sender
+				Property pickerProperty = sender.getProperty(options.PropertyAlias);
+
+				if (pickerProperty != null)
+				{
+					// get relationType from options
+					RelationType relationType = RelationType.GetById(options.RelationTypeId);
+
+					if (relationType != null)
+					{
+						// validate: 1) check current type of sender matches that expected by the relationType, validation method is in the DataEditor
+						uQuery.UmbracoObjectType contextObjectType = uQuery.UmbracoObjectType.Unknown;
+						switch (sender.GetType().ToString())
+						{
+							case &quot;umbraco.cms.businesslogic.web.Document&quot;: contextObjectType = uQuery.UmbracoObjectType.Document; break;
+							case &quot;umbraco.cms.businesslogic.media.Media&quot;: contextObjectType = uQuery.UmbracoObjectType.Media; break;
+							case &quot;umbraco.cms.businesslogic.member.Member&quot;: contextObjectType = uQuery.UmbracoObjectType.Member; break;
+						}
+
+						if (((PickerRelationsDataEditor)pickerRelationsProperty.PropertyType.DataTypeDefinition.DataType.DataEditor)
+							.IsContextUmbracoObjectTypeValid(contextObjectType, relationType))
+						{
+
+							uQuery.UmbracoObjectType pickerUmbracoObjectType = uQuery.UmbracoObjectType.Unknown;
+
+							// Get the object type expected by the associated relation type and if this datatype has been configures as a rever index
+							pickerUmbracoObjectType = ((PickerRelationsDataEditor)pickerRelationsProperty.PropertyType.DataTypeDefinition.DataType.DataEditor)
+														.GetPickerUmbracoObjectType(relationType);
+
+
+							// clear all exisitng relations (or look to see previous verion of sender to delete changes ?)
+							DeleteRelations(relationType, sender.Id, options.ReverseIndexing, instanceIdentifier);
+
+							string pickerPropertyValue = pickerProperty.Value.ToString();
+
+							var pickerStorageFormat = PickerStorageFormat.Csv; // Assume default of csv
+
+                            if (xmlHelper.CouldItBeXml(pickerPropertyValue))
+							{
+                                pickerStorageFormat = PickerStorageFormat.Xml;
+							}
+
+							// Creating instances of Documents / Media / Members ensures the IDs are of a valid type - be quicker to check with GetUmbracoObjectType(int)
+							Dictionary&lt;int, string&gt; pickerItems = null;
+							switch (pickerUmbracoObjectType)
+							{
+								case uQuery.UmbracoObjectType.Document:
+									switch (pickerStorageFormat)
+									{
+                                        case PickerStorageFormat.Csv:
+											pickerItems = uQuery.GetDocumentsByCsv(pickerPropertyValue).ToNameIds();
+											break;
+                                        case PickerStorageFormat.Xml:
+											pickerItems = uQuery.GetDocumentsByXml(pickerPropertyValue).ToNameIds();
+											break;
+									}
+
+									break;
+								case uQuery.UmbracoObjectType.Media:
+									switch (pickerStorageFormat)
+									{
+                                        case PickerStorageFormat.Csv:
+											pickerItems = uQuery.GetMediaByCsv(pickerPropertyValue).ToNameIds();
+											break;
+                                        case PickerStorageFormat.Xml:
+											pickerItems = uQuery.GetMediaByXml(pickerPropertyValue).ToNameIds();
+											break;
+									}
+									break;
+								case uQuery.UmbracoObjectType.Member:
+									switch (pickerStorageFormat)
+									{
+                                        case PickerStorageFormat.Csv:
+											pickerItems = uQuery.GetMembersByCsv(pickerPropertyValue).ToNameIds();
+											break;
+                                        case PickerStorageFormat.Xml:
+											pickerItems = uQuery.GetMembersByXml(pickerPropertyValue).ToNameIds();
+											break;
+									}
+									break;
+							}
+							if (pickerItems != null)
+							{
+								foreach (KeyValuePair&lt;int, string&gt; pickerItem in pickerItems)
+								{
+									CreateRelation(relationType, sender.Id, pickerItem.Key, options.ReverseIndexing, instanceIdentifier);
+								}
+							}
+						}
+						else
+						{
+							// Error: content object type invalid with relation type
+						}
+					}
+					else
+					{
+						// Error: relation type is null
+					}
+				}
+				else
+				{
+					// Error: pickerProperty alias not found
+				}
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// Clears any existing relations when deleting a node with a PickerRelations datatype
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;sender&quot;&gt;The sender.&lt;/param&gt;
+		/// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;umbraco.cms.businesslogic.DeleteEventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+		private void BeforeDelete(Content sender, DeleteEventArgs e)
+		{
+			Guid pickerRelationsId = new Guid(DataTypeGuids.PickerRelationsId);
+
+			// Clean up any relations
+
+			// For each PickerRelations datatype
+			foreach (Property pickerRelationsProperty in from property in sender.GenericProperties
+															  where property.PropertyType.DataTypeDefinition.DataType.Id == pickerRelationsId
+															  select property)
+			{
+				// used to identify this datatype instance - relations created are marked with this in the comment field
+				string instanceIdentifier = &quot;[\&quot;PropertyTypeId\&quot;:&quot; + pickerRelationsProperty.PropertyType.Id.ToString() + &quot;]&quot;;
+
+				// get configuration options for datatype
+				PickerRelationsOptions options = ((PickerRelationsPreValueEditor)pickerRelationsProperty.PropertyType.DataTypeDefinition.DataType.PrevalueEditor).Options;
+
+				// get relationType from options
+				RelationType relationType = RelationType.GetById(options.RelationTypeId);
+
+				if (relationType != null)
+				{
+					// clear all exisitng relations
+					DeleteRelations(relationType, sender.Id, options.ReverseIndexing, instanceIdentifier);
+				}
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// Delete all relations using the content node for a given RelationType
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;relationType&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;contentNodeId&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;reverseIndexing&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;instanceIdentifier&quot;&gt;NOT USED ATM&lt;/param&gt;
+		private static void DeleteRelations(RelationType relationType, int contentNodeId, bool reverseIndexing, string instanceIdentifier)
+		{
+			//if relationType is bi-directional or a reverse index then we can&#39;t get at the relations via the API, so using SQL
+			string getRelationsSql = &quot;SELECT id FROM umbracoRelation WHERE relType = &quot; + relationType.Id + &quot; AND &quot;;
+
+			if (reverseIndexing || relationType.Dual)
+			{
+				getRelationsSql += &quot;childId = &quot; + contentNodeId.ToString();
+			}
+			if (relationType.Dual) // need to return relations where content node id is used on both sides
+			{
+				getRelationsSql += &quot; OR &quot;;
+			}
+			if (!reverseIndexing || relationType.Dual)
+			{
+				getRelationsSql += &quot;parentId = &quot; + contentNodeId.ToString();
+			}
+
+			getRelationsSql += &quot; AND comment = &#39;&quot; + instanceIdentifier + &quot;&#39;&quot;;
+
+		    var relationIds = ApplicationContext.Current.DatabaseContext.Database.Fetch&lt;int&gt;(
+		        getRelationsSql);
+		    foreach (var relationId in relationIds)
+		    {
+                var relation = new Relation(relationId);
+
+                // TODO: [HR] check to see if an instance identifier is used
+                relation.Delete();
+            }
+            
+		}
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;relationType&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;contentNodeId&quot;&gt;id sourced from the Content / Media / Member&lt;/param&gt;
+		/// &lt;param name=&quot;pickerNodeId&quot;&gt;id sourced from the Picker&lt;/param&gt;
+		/// &lt;param name=&quot;reverseIndexing&quot;&gt;if true, reverses the parentId and child Id&lt;/param&gt;
+		/// &lt;param name=&quot;instanceIdentifier&quot;&gt;JSON string with id of Picker Relations property instance&lt;/param&gt;
+		private static void CreateRelation(RelationType relationType, int contentNodeId, int pickerNodeId, bool reverseIndexing, string instanceIdentifier)
+		{
+			if (reverseIndexing)
+			{
+				Relation.MakeNew(pickerNodeId, contentNodeId, relationType, instanceIdentifier);
+			}
+			else
+			{
+				Relation.MakeNew(contentNodeId, pickerNodeId, relationType, instanceIdentifier);
+			}
+		}
+	}
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[35,3,35,39,0],[36,3,36,4,0],[37,4,37,72,0],[38,4,38,66,0],[39,4,39,68,0],[41,4,41,80,0],[42,4,42,74,0],[43,4,43,76,0],[44,3,44,4,0],[53,3,53,4,0],[54,4,54,72,0],[57,4,57,11,0],[57,13,57,45,0],[57,46,57,48,0],[57,49,58,24,0],[58,24,58,97,0],[58,97,59,33,0],[57,49,59,33,0],[60,4,60,5,0],[62,5,62,115,0],[65,5,65,159,0],[68,5,68,73,0],[70,5,70,32,0],[71,5,71,6,0],[73,6,73,79,0],[75,6,75,31,0],[76,6,76,7,0],[78,7,78,85,0],[79,7,79,43,0],[81,55,81,109,0],[81,110,81,116,0],[82,54,82,105,0],[82,106,82,112,0],[83,56,83,108,0],[83,109,83,115,0],[86,7,87,74,0],[88,7,88,8,0],[90,8,90,92,0],[93,8,94,57,0],[98,8,98,94,0],[100,8,100,69,0],[102,8,102,58,0],[104,29,104,77,0],[105,8,105,9,0],[106,33,106,79,0],[107,8,107,9,0],[110,8,110,51,0],[111,8,111,40,0],[114,10,114,38,0],[117,12,117,84,0],[118,12,118,18,0],[120,12,120,84,0],[121,12,121,18,0],[124,10,124,16,0],[126,10,126,38,0],[129,12,129,80,0],[130,12,130,18,0],[132,12,132,80,0],[133,12,133,18,0],[135,10,135,16,0],[137,10,137,38,0],[140,12,140,82,0],[141,12,141,18,0],[143,12,143,82,0],[144,12,144,18,0],[146,10,146,16,0],[148,8,148,32,0],[149,8,149,9,0],[150,9,150,16,0],[150,18,150,54,0],[150,55,150,57,0],[150,58,150,69,0],[151,9,151,10,0],[152,10,152,111,0],[153,9,153,10,0],[154,8,154,9,0],[155,7,155,8,0],[157,7,157,8,0],[159,7,159,8,0],[160,6,160,7,0],[162,6,162,7,0],[164,6,164,7,0],[165,5,165,6,0],[167,5,167,6,0],[169,5,169,6,0],[170,4,170,5,0],[171,3,171,4,0],[179,3,179,4,0],[180,4,180,71,0],[185,4,185,11,0],[185,13,185,45,0],[185,46,185,48,0],[185,49,186,24,0],[186,24,186,97,0],[186,97,187,33,0],[185,49,187,33,0],[188,4,188,5,0],[190,5,190,115,0],[193,5,193,159,0],[196,5,196,78,0],[198,5,198,30,0],[199,5,199,6,0],[201,6,201,92,0],[202,5,202,6,0],[203,4,203,5,0],[204,3,204,4,0],[214,3,214,4,0],[216,4,216,107,0],[218,4,218,45,0],[219,4,219,5,0],[220,5,220,64,0],[221,4,221,5,0],[222,4,222,26,0],[223,4,223,5,0],[224,5,224,31,0],[225,4,225,5,0],[226,4,226,46,0],[227,4,227,5,0],[228,5,228,65,0],[229,4,229,5,0],[231,4,231,69,0],[233,7,234,28,0],[235,7,235,14,0],[235,16,235,30,0],[235,31,235,33,0],[235,34,235,45,0],[236,7,236,8,0],[237,17,237,57,0],[240,17,240,35,0],[241,13,241,14,0],[243,3,243,4,0],[254,3,254,4,0],[255,4,255,24,0],[256,4,256,5,0],[257,5,257,85,0],[258,4,258,5,0],[260,4,260,5,0],[261,5,261,85,0],[262,4,262,5,0],[263,3,263,4,0]]);
+    </script>
+  </body>
+</html>

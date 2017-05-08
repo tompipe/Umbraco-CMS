@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\FaultHandling\ThrottlingCondition.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Data.SqlClient;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace Umbraco.Core.Persistence.FaultHandling
+{
+    /// &lt;summary&gt;
+    /// Defines the possible throttling modes in SQL Azure.
+    /// &lt;/summary&gt;
+    public enum ThrottlingMode
+    {
+        /// &lt;summary&gt;
+        /// Corresponds to &quot;No Throttling&quot; throttling mode whereby all SQL statements can be processed.
+        /// &lt;/summary&gt;
+        NoThrottling = 0,
+
+        /// &lt;summary&gt;
+        /// Corresponds to &quot;Reject Update / Insert&quot; throttling mode whereby SQL statements such as INSERT, UPDATE, CREATE TABLE and CREATE INDEX are rejected.
+        /// &lt;/summary&gt;
+        RejectUpdateInsert = 1,
+
+        /// &lt;summary&gt;
+        /// Corresponds to &quot;Reject All Writes&quot; throttling mode whereby SQL statements such as INSERT, UPDATE, DELETE, CREATE, DROP are rejected.
+        /// &lt;/summary&gt;
+        RejectAllWrites = 2,
+
+        /// &lt;summary&gt;
+        /// Corresponds to &quot;Reject All&quot; throttling mode whereby all SQL statements are rejected.
+        /// &lt;/summary&gt;
+        RejectAll = 3,
+
+        /// &lt;summary&gt;
+        /// Corresponds to an unknown throttling mode whereby throttling mode cannot be determined with certainty.
+        /// &lt;/summary&gt;
+        Unknown = -1
+    }
+
+    /// &lt;summary&gt;
+    /// Defines the possible throttling types in SQL Azure.
+    /// &lt;/summary&gt;
+    public enum ThrottlingType
+    {
+        /// &lt;summary&gt;
+        /// Indicates that no throttling was applied to a given resource.
+        /// &lt;/summary&gt;
+        None = 0,
+
+        /// &lt;summary&gt;
+        /// Corresponds to a Soft throttling type. Soft throttling is applied when machine resources such as, CPU, IO, storage, and worker threads exceed 
+        /// predefined safety thresholds despite the load balancer’s best efforts. 
+        /// &lt;/summary&gt;
+        Soft = 1,
+
+        /// &lt;summary&gt;
+        /// Corresponds to a Hard throttling type. Hard throttling is applied when the machine is out of resources, for example storage space.
+        /// With hard throttling, no new connections are allowed to the databases hosted on the machine until resources are freed up.
+        /// &lt;/summary&gt;
+        Hard = 2,
+
+        /// &lt;summary&gt;
+        /// Corresponds to an unknown throttling type in the event when the throttling type cannot be determined with certainty.
+        /// &lt;/summary&gt;
+        Unknown = 3
+    }
+
+    /// &lt;summary&gt;
+    /// Defines the types of resources in SQL Azure which may be subject to throttling conditions.
+    /// &lt;/summary&gt;
+    public enum ThrottledResourceType
+    {
+        /// &lt;summary&gt;
+        /// Corresponds to &quot;Physical Database Space&quot; resource which may be subject to throttling.
+        /// &lt;/summary&gt;
+        PhysicalDatabaseSpace = 0,
+
+        /// &lt;summary&gt;
+        /// Corresponds to &quot;Physical Log File Space&quot; resource which may be subject to throttling.
+        /// &lt;/summary&gt;
+        PhysicalLogSpace = 1,
+
+        /// &lt;summary&gt;
+        /// Corresponds to &quot;Transaction Log Write IO Delay&quot; resource which may be subject to throttling.
+        /// &lt;/summary&gt;
+        LogWriteIoDelay = 2,
+
+        /// &lt;summary&gt;
+        /// Corresponds to &quot;Database Read IO Delay&quot; resource which may be subject to throttling.
+        /// &lt;/summary&gt;
+        DataReadIoDelay = 3,
+
+        /// &lt;summary&gt;
+        /// Corresponds to &quot;CPU&quot; resource which may be subject to throttling.
+        /// &lt;/summary&gt;
+        Cpu = 4,
+
+        /// &lt;summary&gt;
+        /// Corresponds to &quot;Database Size&quot; resource which may be subject to throttling.
+        /// &lt;/summary&gt;
+        DatabaseSize = 5,
+
+        /// &lt;summary&gt;
+        /// Corresponds to &quot;SQL Worker Thread Pool&quot; resource which may be subject to throttling.
+        /// &lt;/summary&gt;
+        WorkerThreads = 7,
+
+        /// &lt;summary&gt;
+        /// Corresponds to an internal resource which may be subject to throttling.
+        /// &lt;/summary&gt;
+        Internal = 6,
+
+        /// &lt;summary&gt;
+        /// Corresponds to an unknown resource type in the event when the actual resource cannot be determined with certainty.
+        /// &lt;/summary&gt;
+        Unknown = -1
+    }
+
+    /// &lt;summary&gt;
+    /// Implements an object holding the decoded reason code returned from SQL Azure when encountering throttling conditions.
+    /// &lt;/summary&gt;
+    [Serializable]
+    public class ThrottlingCondition
+    {
+        /// &lt;summary&gt;
+        /// Gets the error number that corresponds to throttling conditions reported by SQL Azure.
+        /// &lt;/summary&gt;
+        public const int ThrottlingErrorNumber = 40501;
+
+        /// &lt;summary&gt;
+        /// Maintains a collection of key-value pairs where a key is resource type and a value is the type of throttling applied to the given resource type.
+        /// &lt;/summary&gt;
+        private readonly IList&lt;Tuple&lt;ThrottledResourceType, ThrottlingType&gt;&gt; throttledResources = new List&lt;Tuple&lt;ThrottledResourceType, ThrottlingType&gt;&gt;(9);
+
+        /// &lt;summary&gt;
+        /// Provides a compiled regular expression used for extracting the reason code from the error message.
+        /// &lt;/summary&gt;
+        private static readonly Regex sqlErrorCodeRegEx = new Regex(@&quot;Code:\s*(\d+)&quot;, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        /// &lt;summary&gt;
+        /// Gets an unknown throttling condition in the event the actual throttling condition cannot be determined.
+        /// &lt;/summary&gt;
+        public static ThrottlingCondition Unknown
+        {
+            get
+            {
+                var unknownCondition = new ThrottlingCondition { ThrottlingMode = ThrottlingMode.Unknown };
+                unknownCondition.throttledResources.Add(Tuple.Create(ThrottledResourceType.Unknown, ThrottlingType.Unknown));
+
+                return unknownCondition;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the value that reflects the throttling mode in SQL Azure.
+        /// &lt;/summary&gt;
+        public ThrottlingMode ThrottlingMode { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Gets a list of resources in SQL Azure that were subject to throttling conditions.
+        /// &lt;/summary&gt;
+        public IEnumerable&lt;Tuple&lt;ThrottledResourceType, ThrottlingType&gt;&gt; ThrottledResources
+        {
+            get { return this.throttledResources; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether physical data file space throttling was reported by SQL Azure.
+        /// &lt;/summary&gt;
+        public bool IsThrottledOnDataSpace
+        {
+            get { return this.throttledResources.Where(x =&gt; x.Item1 == ThrottledResourceType.PhysicalDatabaseSpace).Count() &gt; 0; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether physical log space throttling was reported by SQL Azure.
+        /// &lt;/summary&gt;
+        public bool IsThrottledOnLogSpace
+        {
+            get { return this.throttledResources.Where(x =&gt; x.Item1 == ThrottledResourceType.PhysicalLogSpace).Count() &gt; 0; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether transaction activity throttling was reported by SQL Azure.
+        /// &lt;/summary&gt;
+        public bool IsThrottledOnLogWrite
+        {
+            get { return this.throttledResources.Where(x =&gt; x.Item1 == ThrottledResourceType.LogWriteIoDelay).Count() &gt; 0; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether data read activity throttling was reported by SQL Azure.
+        /// &lt;/summary&gt;
+        public bool IsThrottledOnDataRead
+        {
+            get { return this.throttledResources.Where(x =&gt; x.Item1 == ThrottledResourceType.DataReadIoDelay).Count() &gt; 0; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether CPU throttling was reported by SQL Azure.
+        /// &lt;/summary&gt;
+        public bool IsThrottledOnCpu
+        {
+            get { return this.throttledResources.Where(x =&gt; x.Item1 == ThrottledResourceType.Cpu).Count() &gt; 0; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether database size throttling was reported by SQL Azure.
+        /// &lt;/summary&gt;
+        public bool IsThrottledOnDatabaseSize
+        {
+            get { return this.throttledResources.Where(x =&gt; x.Item1 == ThrottledResourceType.DatabaseSize).Count() &gt; 0; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether concurrent requests throttling was reported by SQL Azure.
+        /// &lt;/summary&gt;
+        public bool IsThrottledOnWorkerThreads
+        {
+            get { return this.throttledResources.Where(x =&gt; x.Item1 == ThrottledResourceType.WorkerThreads).Count() &gt; 0; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether throttling conditions were not determined with certainty.
+        /// &lt;/summary&gt;
+        public bool IsUnknown
+        {
+            get { return ThrottlingMode == ThrottlingMode.Unknown; }
+        }
+
+        /// &lt;summary&gt;
+        /// Determines throttling conditions from the specified SQL exception.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ex&quot;&gt;The &lt;see cref=&quot;SqlException&quot;/&gt; object containing information relevant to an error returned by SQL Server when encountering throttling conditions.&lt;/param&gt;
+        /// &lt;returns&gt;An instance of the object holding the decoded reason codes returned from SQL Azure upon encountering throttling conditions.&lt;/returns&gt;
+        public static ThrottlingCondition FromException(SqlException ex)
+        {
+            if (ex != null)
+            {
+                foreach (SqlError error in ex.Errors)
+                {
+                    if (error.Number == ThrottlingErrorNumber)
+                    {
+                        return FromError(error);
+                    }
+                }
+            }
+
+            return Unknown;
+        }
+
+        /// &lt;summary&gt;
+        /// Determines the throttling conditions from the specified SQL error.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;error&quot;&gt;The &lt;see cref=&quot;SqlError&quot;/&gt; object containing information relevant to a warning or error returned by SQL Server.&lt;/param&gt;
+        /// &lt;returns&gt;An instance of the object holding the decoded reason codes returned from SQL Azure when encountering throttling conditions.&lt;/returns&gt;
+        public static ThrottlingCondition FromError(SqlError error)
+        {
+            if (error != null)
+            {
+                var match = sqlErrorCodeRegEx.Match(error.Message);
+                int reasonCode;
+
+                if (match.Success &amp;&amp; int.TryParse(match.Groups[1].Value, out reasonCode))
+                {
+                    return FromReasonCode(reasonCode);
+                }
+            }
+
+            return Unknown;
+        }
+
+        /// &lt;summary&gt;
+        /// Determines the throttling conditions from the specified reason code.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;reasonCode&quot;&gt;The reason code returned by SQL Azure which contains the throttling mode and the exceeded resource types.&lt;/param&gt;
+        /// &lt;returns&gt;An instance of the object holding the decoded reason codes returned from SQL Azure when encountering throttling conditions.&lt;/returns&gt;
+        public static ThrottlingCondition FromReasonCode(int reasonCode)
+        {
+            if (reasonCode &gt; 0)
+            {
+                // Decode throttling mode from the last 2 bits.
+                var throttlingMode = (ThrottlingMode)(reasonCode &amp; 3);
+
+                var condition = new ThrottlingCondition { ThrottlingMode = throttlingMode };
+
+                // Shift 8 bits to truncate throttling mode.
+                var groupCode = reasonCode &gt;&gt; 8;
+
+                // Determine throttling type for all well-known resources that may be subject to throttling conditions.
+                condition.throttledResources.Add(Tuple.Create(ThrottledResourceType.PhysicalDatabaseSpace, (ThrottlingType)(groupCode &amp; 3)));
+                condition.throttledResources.Add(Tuple.Create(ThrottledResourceType.PhysicalLogSpace, (ThrottlingType)((groupCode = groupCode &gt;&gt; 2) &amp; 3)));
+                condition.throttledResources.Add(Tuple.Create(ThrottledResourceType.LogWriteIoDelay, (ThrottlingType)((groupCode = groupCode &gt;&gt; 2) &amp; 3)));
+                condition.throttledResources.Add(Tuple.Create(ThrottledResourceType.DataReadIoDelay, (ThrottlingType)((groupCode = groupCode &gt;&gt; 2) &amp; 3)));
+                condition.throttledResources.Add(Tuple.Create(ThrottledResourceType.Cpu, (ThrottlingType)((groupCode = groupCode &gt;&gt; 2) &amp; 3)));
+                condition.throttledResources.Add(Tuple.Create(ThrottledResourceType.DatabaseSize, (ThrottlingType)((groupCode = groupCode &gt;&gt; 2) &amp; 3)));
+                condition.throttledResources.Add(Tuple.Create(ThrottledResourceType.Internal, (ThrottlingType)((groupCode = groupCode &gt;&gt; 2) &amp; 3)));
+                condition.throttledResources.Add(Tuple.Create(ThrottledResourceType.WorkerThreads, (ThrottlingType)((groupCode = groupCode &gt;&gt; 2) &amp; 3)));
+                condition.throttledResources.Add(Tuple.Create(ThrottledResourceType.Internal, (ThrottlingType)((groupCode &gt;&gt; 2) &amp; 3)));
+
+                return condition;
+            }
+
+            return Unknown;
+        }
+
+        /// &lt;summary&gt;
+        ///  Returns a textual representation the current ThrottlingCondition object including the information held with respect to throttled resources.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;A string that represents the current ThrottlingCondition object.&lt;/returns&gt;
+        public override string ToString()
+        {
+            var result = new StringBuilder();
+
+            result.AppendFormat(CultureInfo.CurrentCulture, &quot;Mode: {0} | &quot;, ThrottlingMode);
+
+            var resources =
+                this.throttledResources
+                    .Where(x =&gt; x.Item1 != ThrottledResourceType.Internal)
+                    .Select(x =&gt; string.Format(CultureInfo.CurrentCulture, &quot;{0}: {1}&quot;, x.Item1, x.Item2))
+                    .OrderBy(x =&gt; x).ToArray();
+
+            result.Append(string.Join(&quot;, &quot;, resources));
+
+            return result.ToString();
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[135,9,135,157,0],[140,9,140,136,0],[148,13,148,14,0],[149,17,149,108,0],[150,17,150,126,0],[152,17,152,41,0],[153,13,153,14,0],[159,48,159,52,0],[159,53,159,65,0],[166,17,166,18,0],[166,19,166,50,0],[166,51,166,52,0],[174,17,174,18,0],[174,19,174,61,0],[174,61,174,115,0],[174,115,174,129,0],[174,19,174,129,0],[174,130,174,131,0],[182,17,182,18,0],[182,19,182,61,0],[182,61,182,110,0],[182,110,182,124,0],[182,19,182,124,0],[182,125,182,126,0],[190,17,190,18,0],[190,19,190,61,0],[190,61,190,109,0],[190,109,190,123,0],[190,19,190,123,0],[190,124,190,125,0],[198,17,198,18,0],[198,19,198,61,0],[198,61,198,109,0],[198,109,198,123,0],[198,19,198,123,0],[198,124,198,125,0],[206,17,206,18,0],[206,19,206,61,0],[206,61,206,97,0],[206,97,206,111,0],[206,19,206,111,0],[206,112,206,113,0],[214,17,214,18,0],[214,19,214,61,0],[214,61,214,106,0],[214,106,214,120,0],[214,19,214,120,0],[214,121,214,122,0],[222,17,222,18,0],[222,19,222,61,0],[222,61,222,107,0],[222,107,222,121,0],[222,19,222,121,0],[222,122,222,123,0],[230,17,230,18,0],[230,19,230,67,0],[230,68,230,69,0],[239,9,239,10,0],[240,13,240,28,0],[241,13,241,14,0],[242,17,242,24,0],[242,26,242,40,0],[242,41,242,43,0],[242,44,242,53,0],[243,17,243,18,0],[244,21,244,63,0],[245,21,245,22,0],[246,25,246,49,0],[248,17,248,18,0],[249,13,249,14,0],[251,13,251,28,0],[252,9,252,10,0],[260,9,260,10,0],[261,13,261,31,0],[262,13,262,14,0],[263,17,263,68,0],[266,17,266,90,0],[267,17,267,18,0],[268,21,268,55,0],[270,13,270,14,0],[272,13,272,28,0],[273,9,273,10,0],[281,9,281,10,0],[282,13,282,32,0],[283,13,283,14,0],[285,17,285,71,0],[287,17,287,93,0],[290,17,290,49,0],[293,17,293,142,0],[294,17,294,156,0],[295,17,295,155,0],[296,17,296,155,0],[297,17,297,143,0],[298,17,298,152,0],[299,17,299,148,0],[300,17,300,153,0],[301,17,301,136,0],[303,17,303,34,0],[306,13,306,28,0],[307,9,307,10,0],[314,9,314,10,0],[315,13,315,46,0],[317,13,317,93,0],[319,13,321,33,0],[321,33,321,74,0],[321,74,322,34,0],[322,34,322,105,0],[322,105,323,35,0],[323,35,323,36,0],[323,36,323,48,0],[319,13,323,48,0],[325,13,325,57,0],[327,13,327,38,0],[328,9,328,10,0]]);
+    </script>
+  </body>
+</html>

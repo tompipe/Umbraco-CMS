@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Services\ContentServicePerformanceTest.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using Moq;
+using NUnit.Framework;
+using Umbraco.Core;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Profiling;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Tests.TestHelpers.Entities;
+
+namespace Umbraco.Tests.Services
+{
+    [DatabaseTestBehavior(DatabaseBehavior.NewDbFileAndSchemaPerTest)]
+    [TestFixture, NUnit.Framework.Ignore]
+    public class ContentServicePerformanceTest : BaseDatabaseFactoryTest
+    {
+        [SetUp]
+        public override void Initialize()
+        {
+            base.Initialize();
+            CreateTestData();
+        }
+
+        protected override void FreezeResolution()
+        {
+            ProfilerResolver.Current = new ProfilerResolver(new TestProfiler());
+
+            base.FreezeResolution();
+        }
+
+        [Test]
+        public void Retrieving_All_Content_In_Site()
+        {
+            //NOTE: Doing this the old 1 by 1 way and based on the results of the ContentServicePerformanceTest.Retrieving_All_Content_In_Site
+            // the old way takes 143795ms, the new above way takes: 
+            // 14249ms 
+            //
+            // ... NOPE, made some new changes, it is now....
+            // 5290ms  !!!!!!
+            //
+            // that is a 96% savings of processing and sql calls!
+            //
+            // ... NOPE, made even more nice changes, it is now...
+            // 4452ms !!!!!!!
+
+            var contentType1 = MockedContentTypes.CreateTextpageContentType(&quot;test1&quot;, &quot;test1&quot;);
+            var contentType2 = MockedContentTypes.CreateTextpageContentType(&quot;test2&quot;, &quot;test2&quot;);
+            var contentType3 = MockedContentTypes.CreateTextpageContentType(&quot;test3&quot;, &quot;test3&quot;);
+            ServiceContext.ContentTypeService.Save(new[] { contentType1, contentType2, contentType3 });
+            contentType1.AllowedContentTypes = new[]
+            {
+                new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; contentType2.Id), 0, contentType2.Alias),
+                new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; contentType3.Id), 1, contentType3.Alias)
+            };
+            contentType2.AllowedContentTypes = new[]
+            {
+                new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; contentType1.Id), 0, contentType1.Alias),
+                new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; contentType3.Id), 1, contentType3.Alias)
+            };
+            contentType3.AllowedContentTypes = new[]
+            {
+                new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; contentType1.Id), 0, contentType1.Alias),
+                new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; contentType2.Id), 1, contentType2.Alias)
+            };
+            ServiceContext.ContentTypeService.Save(new[] { contentType1, contentType2, contentType3 });
+
+            var roots = MockedContent.CreateTextpageContent(contentType1, -1, 10);
+            ServiceContext.ContentService.Save(roots);
+            foreach (var root in roots)
+            {
+                var item1 = MockedContent.CreateTextpageContent(contentType1, root.Id, 10);
+                var item2 = MockedContent.CreateTextpageContent(contentType2, root.Id, 10);
+                var item3 = MockedContent.CreateTextpageContent(contentType3, root.Id, 10);
+
+                ServiceContext.ContentService.Save(item1.Concat(item2).Concat(item3));
+            }
+
+            var total = new List&lt;IContent&gt;();
+            using (DisposableTimer.TraceDuration&lt;ContentServicePerformanceTest&gt;(&quot;Getting all content in site&quot;))
+            {
+                TestProfiler.Enable();
+                total.AddRange(ServiceContext.ContentService.GetRootContent());
+                foreach (var content in total.ToArray())
+                {
+                    total.AddRange(ServiceContext.ContentService.GetDescendants(content));
+                }
+                TestProfiler.Disable();
+                LogHelper.Info&lt;ContentServicePerformanceTest&gt;(&quot;Returned &quot; + total.Count + &quot; items&quot;);
+            }
+
+        }
+
+        [Test]
+        public void Creating_100_Items()
+        {
+            // Arrange
+            var contentType = ServiceContext.ContentTypeService.GetContentType(NodeDto.NodeIdSeed);
+            var pages = MockedContent.CreateTextpageContent(contentType, -1, 100);
+
+            // Act
+            Stopwatch watch = Stopwatch.StartNew();
+            ServiceContext.ContentService.Save(pages, 0);
+            watch.Stop();
+            var elapsed = watch.ElapsedMilliseconds;
+
+            Debug.Print(&quot;100 content items saved in {0} ms&quot;, elapsed);
+
+            // Assert
+            Assert.That(pages.Any(x =&gt; x.HasIdentity == false), Is.False);
+        }
+
+        [Test]
+        public void Creating_1000_Items()
+        {
+            // Arrange
+            var contentType = ServiceContext.ContentTypeService.GetContentType(NodeDto.NodeIdSeed);
+            var pages = MockedContent.CreateTextpageContent(contentType, -1, 1000);
+
+            // Act
+            Stopwatch watch = Stopwatch.StartNew();
+            ServiceContext.ContentService.Save(pages, 0);
+            watch.Stop();
+            var elapsed = watch.ElapsedMilliseconds;
+
+            Debug.Print(&quot;100 content items saved in {0} ms&quot;, elapsed);
+
+            // Assert
+            Assert.That(pages.Any(x =&gt; x.HasIdentity == false), Is.False);
+        }
+
+        [Test]
+        public void Getting_100_Uncached_Items()
+        {
+            // Arrange
+            var contentType = ServiceContext.ContentTypeService.GetContentType(NodeDto.NodeIdSeed);
+            var pages = MockedContent.CreateTextpageContent(contentType, -1, 100);
+            ServiceContext.ContentService.Save(pages, 0);
+
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+
+            using (var tRepository = new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;ITemplatesSection&gt;()))
+            using (var tagRepo = new TagRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax))
+            using (var ctRepository = new ContentTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, tRepository))
+            using (var repository = new ContentRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, ctRepository, tRepository, tagRepo, Mock.Of&lt;IContentSection&gt;()))
+            {
+                // Act
+                Stopwatch watch = Stopwatch.StartNew();
+                var contents = repository.GetAll();
+                watch.Stop();
+                var elapsed = watch.ElapsedMilliseconds;
+
+                Debug.Print(&quot;100 content items retrieved in {0} ms without caching&quot;, elapsed);
+
+                // Assert
+                Assert.That(contents.Any(x =&gt; x.HasIdentity == false), Is.False);
+                Assert.That(contents.Any(x =&gt; x == null), Is.False);
+            }
+
+
+        }
+
+        [Test, NUnit.Framework.Ignore]
+        public void Getting_1000_Uncached_Items()
+        {
+            // Arrange
+            var contentType = ServiceContext.ContentTypeService.GetContentType(NodeDto.NodeIdSeed);
+            var pages = MockedContent.CreateTextpageContent(contentType, -1, 1000);
+            ServiceContext.ContentService.Save(pages, 0);
+
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var tRepository = new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;ITemplatesSection&gt;()))
+            using (var tagRepo = new TagRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax))
+            using (var ctRepository = new ContentTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, tRepository))
+            using (var repository = new ContentRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, ctRepository, tRepository, tagRepo, Mock.Of&lt;IContentSection&gt;()))
+            {
+                // Act
+                Stopwatch watch = Stopwatch.StartNew();
+                var contents = repository.GetAll();
+                watch.Stop();
+                var elapsed = watch.ElapsedMilliseconds;
+
+                Debug.Print(&quot;1000 content items retrieved in {0} ms without caching&quot;, elapsed);
+
+                // Assert
+                //Assert.That(contents.Any(x =&gt; x.HasIdentity == false), Is.False);
+                //Assert.That(contents.Any(x =&gt; x == null), Is.False);
+            }
+        }
+
+        [Test]
+        public void Getting_100_Cached_Items()
+        {
+            // Arrange
+            var contentType = ServiceContext.ContentTypeService.GetContentType(NodeDto.NodeIdSeed);
+            var pages = MockedContent.CreateTextpageContent(contentType, -1, 100);
+            ServiceContext.ContentService.Save(pages, 0);
+
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+
+            using (var tRepository = new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;ITemplatesSection&gt;()))
+            using (var tagRepo = new TagRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax))
+            using (var ctRepository = new ContentTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, tRepository))
+            using (var repository = new ContentRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, ctRepository, tRepository, tagRepo, Mock.Of&lt;IContentSection&gt;()))
+            {
+
+                // Act
+                var contents = repository.GetAll();
+
+                Stopwatch watch = Stopwatch.StartNew();
+                var contentsCached = repository.GetAll();
+                watch.Stop();
+                var elapsed = watch.ElapsedMilliseconds;
+
+                Debug.Print(&quot;100 content items retrieved in {0} ms with caching&quot;, elapsed);
+
+                // Assert
+                Assert.That(contentsCached.Any(x =&gt; x.HasIdentity == false), Is.False);
+                Assert.That(contentsCached.Any(x =&gt; x == null), Is.False);
+                Assert.That(contentsCached.Count(), Is.EqualTo(contents.Count()));
+            }
+        }
+
+        [Test, NUnit.Framework.Ignore]
+        public void Getting_1000_Cached_Items()
+        {
+            // Arrange
+            var contentType = ServiceContext.ContentTypeService.GetContentType(NodeDto.NodeIdSeed);
+            var pages = MockedContent.CreateTextpageContent(contentType, -1, 1000);
+            ServiceContext.ContentService.Save(pages, 0);
+
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var tRepository = new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;IFileSystem&gt;(), Mock.Of&lt;ITemplatesSection&gt;()))
+            using (var tagRepo = new TagRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax))
+            using (var ctRepository = new ContentTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, tRepository))
+            using (var repository = new ContentRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Logger, SqlSyntax, ctRepository, tRepository, tagRepo, Mock.Of&lt;IContentSection&gt;()))
+            {
+
+                // Act
+                var contents = repository.GetAll();
+
+                Stopwatch watch = Stopwatch.StartNew();
+                var contentsCached = repository.GetAll();
+                watch.Stop();
+                var elapsed = watch.ElapsedMilliseconds;
+
+                Debug.Print(&quot;1000 content items retrieved in {0} ms with caching&quot;, elapsed);
+
+                // Assert
+                //Assert.That(contentsCached.Any(x =&gt; x.HasIdentity == false), Is.False);
+                //Assert.That(contentsCached.Any(x =&gt; x == null), Is.False);
+                //Assert.That(contentsCached.Count(), Is.EqualTo(contents.Count()));
+            }
+        }
+
+        [TearDown]
+        public override void TearDown()
+        {
+            base.TearDown();
+        }
+
+        public void CreateTestData()
+        {
+            //Create and Save ContentType &quot;textpage&quot; -&gt; NodeDto.NodeIdSeed
+            ContentType contentType = MockedContentTypes.CreateTextpageContentType();
+            ServiceContext.ContentTypeService.Save(contentType);
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[28,9,28,10,0],[29,13,29,31,0],[30,13,30,30,0],[31,9,31,10,0],[34,9,34,10,0],[35,13,35,81,0],[37,13,37,37,0],[38,9,38,10,0],[42,9,42,10,0],[55,13,55,95,0],[56,13,56,95,0],[57,13,57,95,0],[58,13,58,104,0],[59,13,61,57,0],[61,57,61,72,0],[61,72,62,57,0],[62,57,62,72,0],[62,72,63,15,0],[59,13,63,15,0],[64,13,66,57,0],[66,57,66,72,0],[66,72,67,57,0],[67,57,67,72,0],[67,72,68,15,0],[64,13,68,15,0],[69,13,71,57,0],[71,57,71,72,0],[71,72,72,57,0],[72,57,72,72,0],[72,72,73,15,0],[69,13,73,15,0],[74,13,74,104,0],[76,13,76,83,0],[77,13,77,55,0],[78,13,78,20,0],[78,22,78,30,0],[78,31,78,33,0],[78,34,78,39,0],[79,13,79,14,0],[80,17,80,92,0],[81,17,81,92,0],[82,17,82,92,0],[84,17,84,87,0],[85,13,85,14,0],[87,13,87,46,0],[88,13,88,112,0],[89,13,89,14,0],[90,17,90,39,0],[91,17,91,80,0],[92,17,92,24,0],[92,26,92,37,0],[92,38,92,40,0],[92,41,92,56,0],[93,17,93,18,0],[94,21,94,91,0],[95,17,95,18,0],[96,17,96,40,0],[97,17,97,101,0],[98,13,98,14,0],[100,9,100,10,0],[104,9,104,10,0],[106,13,106,100,0],[107,13,107,83,0],[110,13,110,52,0],[111,13,111,58,0],[112,13,112,26,0],[113,13,113,53,0],[115,13,115,71,0],[118,13,118,40,0],[118,40,118,62,0],[118,62,118,75,0],[118,13,118,75,0],[119,9,119,10,0],[123,9,123,10,0],[125,13,125,100,0],[126,13,126,84,0],[129,13,129,52,0],[130,13,130,58,0],[131,13,131,26,0],[132,13,132,53,0],[134,13,134,71,0],[137,13,137,40,0],[137,40,137,62,0],[137,62,137,75,0],[137,13,137,75,0],[138,9,138,10,0],[142,9,142,10,0],[144,13,144,100,0],[145,13,145,83,0],[146,13,146,58,0],[148,13,148,67,0],[149,13,149,55,0],[151,20,151,210,0],[152,20,152,123,0],[153,20,153,149,0],[154,20,154,194,0],[155,13,155,14,0],[157,17,157,56,0],[158,17,158,52,0],[159,17,159,30,0],[160,17,160,57,0],[162,17,162,95,0],[165,17,165,47,0],[165,47,165,69,0],[165,69,165,82,0],[165,17,165,82,0],[166,17,166,47,0],[166,47,166,56,0],[166,56,166,69,0],[166,17,166,69,0],[167,13,167,14,0],[170,9,170,10,0],[174,9,174,10,0],[176,13,176,100,0],[177,13,177,84,0],[178,13,178,58,0],[180,13,180,67,0],[181,13,181,55,0],[182,20,182,210,0],[183,20,183,123,0],[184,20,184,149,0],[185,20,185,194,0],[186,13,186,14,0],[188,17,188,56,0],[189,17,189,52,0],[190,17,190,30,0],[191,17,191,57,0],[193,17,193,96,0],[198,13,198,14,0],[199,9,199,10,0],[203,9,203,10,0],[205,13,205,100,0],[206,13,206,83,0],[207,13,207,58,0],[209,13,209,67,0],[210,13,210,55,0],[212,20,212,210,0],[213,20,213,123,0],[214,20,214,149,0],[215,20,215,194,0],[216,13,216,14,0],[219,17,219,52,0],[221,17,221,56,0],[222,17,222,58,0],[223,17,223,30,0],[224,17,224,57,0],[226,17,226,92,0],[229,17,229,53,0],[229,53,229,75,0],[229,75,229,88,0],[229,17,229,88,0],[230,17,230,53,0],[230,53,230,62,0],[230,62,230,75,0],[230,17,230,75,0],[231,17,231,83,0],[232,13,232,14,0],[233,9,233,10,0],[237,9,237,10,0],[239,13,239,100,0],[240,13,240,84,0],[241,13,241,58,0],[243,13,243,67,0],[244,13,244,55,0],[245,20,245,210,0],[246,20,246,123,0],[247,20,247,149,0],[248,20,248,194,0],[249,13,249,14,0],[252,17,252,52,0],[254,17,254,56,0],[255,17,255,58,0],[256,17,256,30,0],[257,17,257,57,0],[259,17,259,93,0],[265,13,265,14,0],[266,9,266,10,0],[270,9,270,10,0],[271,13,271,29,0],[272,9,272,10,0],[275,9,275,10,0],[277,13,277,86,0],[278,13,278,65,0],[279,9,279,10,0]]);
+    </script>
+  </body>
+</html>

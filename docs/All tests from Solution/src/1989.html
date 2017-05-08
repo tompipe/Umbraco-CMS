@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Models\UmbracoEntityExtensions.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Web.UI.WebControls;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+namespace Umbraco.Core.Models
+{
+    internal static class UmbracoEntityExtensions
+    {
+        /// &lt;summary&gt;
+        /// Does a quick check on the entity&#39;s set path to ensure that it&#39;s valid and consistent
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static void ValidatePathWithException(this NodeDto entity)
+        {
+            //don&#39;t validate if it&#39;s empty and it has no id
+            if (entity.NodeId == default(int) &amp;&amp; entity.Path.IsNullOrWhiteSpace())
+                return;
+
+            if (entity.Path.IsNullOrWhiteSpace())
+                throw new InvalidDataException(string.Format(&quot;The content item {0} has an empty path: {1} with parentID: {2}&quot;, entity.NodeId, entity.Path, entity.ParentId));
+
+            var pathParts = entity.Path.Split(new[] { &#39;,&#39; }, StringSplitOptions.RemoveEmptyEntries);
+            if (pathParts.Length &lt; 2)
+            {
+                //a path cannot be less than 2 parts, at a minimum it must be root (-1) and it&#39;s own id
+                throw new InvalidDataException(string.Format(&quot;The content item {0} has an invalid path: {1} with parentID: {2}&quot;, entity.NodeId, entity.Path, entity.ParentId));
+            }
+
+            if (entity.ParentId != default(int) &amp;&amp; pathParts[pathParts.Length - 2] != entity.ParentId.ToInvariantString())
+            {
+                //the 2nd last id in the path must be it&#39;s parent id
+                throw new InvalidDataException(string.Format(&quot;The content item {0} has an invalid path: {1} with parentID: {2}&quot;, entity.NodeId, entity.Path, entity.ParentId));
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Does a quick check on the entity&#39;s set path to ensure that it&#39;s valid and consistent
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static bool ValidatePath(this IUmbracoEntity entity)
+        {
+            //don&#39;t validate if it&#39;s empty and it has no id
+            if (entity.HasIdentity == false &amp;&amp; entity.Path.IsNullOrWhiteSpace())
+                return true;
+
+            if (entity.Path.IsNullOrWhiteSpace())
+                return false;
+
+            var pathParts = entity.Path.Split(new[] { &#39;,&#39; }, StringSplitOptions.RemoveEmptyEntries);
+            if (pathParts.Length &lt; 2)
+            {
+                //a path cannot be less than 2 parts, at a minimum it must be root (-1) and it&#39;s own id
+                return false;
+            }
+
+            if (entity.ParentId != default(int) &amp;&amp; pathParts[pathParts.Length - 2] != entity.ParentId.ToInvariantString())
+            {
+                //the 2nd last id in the path must be it&#39;s parent id
+                return false;
+            }
+
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// This will validate the entity&#39;s path and if it&#39;s invalid it will fix it, if fixing is required it will recursively 
+        /// check and fix all ancestors if required.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;getParent&quot;&gt;A callback specified to retrieve the parent entity of the entity&lt;/param&gt;
+        /// &lt;param name=&quot;update&quot;&gt;A callback specified to update a fixed entity&lt;/param&gt;
+        public static void EnsureValidPath&lt;T&gt;(this T entity, 
+            ILogger logger, 
+            Func&lt;T, T&gt; getParent,
+            Action&lt;T&gt; update)
+            where T: IUmbracoEntity
+        {
+            if (entity.HasIdentity == false)
+                throw new InvalidOperationException(&quot;Could not ensure the entity path, the entity has not been assigned an identity&quot;);
+
+            if (entity.ValidatePath() == false)
+            {
+                logger.Warn(typeof(UmbracoEntityExtensions), string.Format(&quot;The content item {0} has an invalid path: {1} with parentID: {2}&quot;, entity.Id, entity.Path, entity.ParentId));
+                if (entity.ParentId == -1)
+                {
+                    entity.Path = string.Concat(&quot;-1,&quot;, entity.Id);
+                    //path changed, update it
+                    update(entity);
+                }
+                else
+                {
+                    var parent = getParent(entity);
+                    if (parent == null)
+                        throw new NullReferenceException(&quot;Could not ensure path for entity &quot; + entity.Id + &quot; could not resolve it&#39;s parent &quot; + entity.ParentId);
+
+                    //the parent must also be valid!
+                    parent.EnsureValidPath(logger, getParent, update);
+
+                    entity.Path = string.Concat(parent.Path, &quot;,&quot;, entity.Id);
+                    //path changed, update it
+                    update(entity);
+                }
+            }
+        }
+
+        public static bool HasChildren(this IUmbracoEntity entity)
+        {
+            if (entity.AdditionalData.ContainsKey(&quot;HasChildren&quot;))
+            {
+                var convert = entity.AdditionalData[&quot;HasChildren&quot;].TryConvertTo&lt;bool&gt;();
+                if (convert)
+                {
+                    return convert.Result;
+                }
+            }
+            return false;
+        }
+
+    
+        public static object GetAdditionalDataValueIgnoreCase(this IUmbracoEntity entity, string key, object defaultVal)
+        {
+            if (entity.AdditionalData.ContainsKeyIgnoreCase(key) == false) return defaultVal;
+            return entity.AdditionalData.GetValueIgnoreCase(key, defaultVal);
+        }
+
+        public static bool IsContainer(this IUmbracoEntity entity)
+        {
+            if (entity.AdditionalData.ContainsKeyIgnoreCase(&quot;IsContainer&quot;) == false) return false;
+            var val = entity.AdditionalData.GetValueIgnoreCase(&quot;IsContainer&quot;, null);
+            if (val is bool &amp;&amp; (bool) val)
+            {
+                return true;
+            }
+            return false;
+        }
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,9,22,10,1],[24,13,24,83,1],[25,17,25,24,0],[27,13,27,50,1],[28,17,28,174,0],[30,13,30,101,1],[31,13,31,38,1],[32,13,32,14,0],[34,17,34,176,0],[37,13,37,123,1],[38,13,38,14,0],[40,17,40,176,0],[42,9,42,10,1],[50,9,50,10,1],[52,13,52,81,1],[53,17,53,29,1],[55,13,55,50,1],[56,17,56,30,1],[58,13,58,101,1],[59,13,59,38,1],[60,13,60,14,1],[62,17,62,30,1],[65,13,65,123,1],[66,13,66,14,0],[68,17,68,30,0],[71,13,71,25,1],[72,9,72,10,1],[87,9,87,10,1],[88,13,88,45,1],[89,17,89,135,1],[91,13,91,48,1],[92,13,92,14,1],[93,17,93,186,1],[94,17,94,43,1],[95,17,95,18,1],[96,21,96,67,1],[98,21,98,36,1],[99,17,99,18,1],[101,17,101,18,1],[102,21,102,52,1],[103,21,103,40,1],[104,25,104,161,1],[107,21,107,71,1],[109,21,109,78,1],[111,21,111,36,1],[112,17,112,18,1],[113,13,113,14,1],[114,9,114,10,1],[117,9,117,10,0],[118,13,118,66,0],[119,13,119,14,0],[120,17,120,89,0],[121,17,121,29,0],[122,17,122,18,0],[123,21,123,43,0],[125,13,125,14,0],[126,13,126,26,0],[127,9,127,10,0],[131,9,131,10,0],[132,13,132,75,0],[132,76,132,94,0],[133,13,133,78,0],[134,9,134,10,0],[137,9,137,10,0],[138,13,138,85,0],[138,86,138,99,0],[139,13,139,85,0],[140,13,140,43,0],[141,13,141,14,0],[142,17,142,29,0],[144,13,144,26,0],[145,9,145,10,0]]);
+    </script>
+  </body>
+</html>

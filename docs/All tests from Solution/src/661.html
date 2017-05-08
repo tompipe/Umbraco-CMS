@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\developer\Macros\editMacro.aspx.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Web.UI;
+using System.Web.UI.WebControls;
+using System.Web.UI.HtmlControls;
+using System.IO;
+using Umbraco.Core;
+using Umbraco.Core.IO;
+using Umbraco.Core.Models;
+using Umbraco.Core.PropertyEditors;
+using umbraco.BasePages;
+using umbraco.uicontrols;
+using umbraco.DataLayer;
+using umbraco.cms.presentation.Trees;
+using System.Linq;
+
+namespace umbraco.cms.presentation.developer
+{
+	/// &lt;summary&gt;
+	/// Summary description for editMacro.
+	/// &lt;/summary&gt;
+	public partial class editMacro : UmbracoEnsuredPage
+	{
+		public editMacro()
+		{
+			CurrentApp = BusinessLogic.DefaultApps.developer.ToString();
+		}
+
+		protected PlaceHolder Buttons;
+		protected Table MacroElements;
+
+		public TabPage InfoTabPage;
+		public TabPage Parameters;
+
+	    private IMacro _macro;
+
+		protected void Page_Load(object sender, EventArgs e)
+		{
+		    _macro = Services.MacroService.GetById(Convert.ToInt32(Request.QueryString[&quot;macroID&quot;]));
+
+			if (IsPostBack == false)
+			{
+				ClientTools
+					.SetActiveTreeType(TreeDefinitionCollection.Instance.FindTree&lt;loadMacros&gt;().Tree.Alias)
+                    .SyncTree(&quot;-1,init,&quot; + _macro.Id, false);
+
+                string tempMacroAssembly = _macro.ControlAssembly ?? &quot;&quot;;
+                string tempMacroType = _macro.ControlType ?? &quot;&quot;;
+
+                PopulateFieldsOnLoad(_macro, tempMacroAssembly, tempMacroType);
+
+				// Check for assemblyBrowser
+				if (tempMacroType.IndexOf(&quot;.ascx&quot;, StringComparison.Ordinal) &gt; 0)
+					assemblyBrowserUserControl.Controls.Add(
+						new LiteralControl(&quot;&lt;br/&gt;&lt;button onClick=\&quot;UmbClientMgr.openModalWindow(&#39;&quot; + IOHelper.ResolveUrl(SystemDirectories.Umbraco) + &quot;/developer/macros/assemblyBrowser.aspx?fileName=&quot; + macroUserControl.Text +
+                                           &quot;&amp;macroID=&quot; + _macro.Id.ToInvariantString() +
+										   &quot;&#39;, &#39;Browse Properties&#39;, true, 475,500); return false;\&quot; class=\&quot;guiInputButton\&quot;&gt;&lt;img src=\&quot;../../images/editor/propertiesNew.gif\&quot; align=\&quot;absmiddle\&quot; style=\&quot;width: 18px; height: 17px; padding-right: 5px;\&quot;/&gt; Browse properties&lt;/button&gt;&quot;));
+				else if (tempMacroType != string.Empty &amp;&amp; tempMacroAssembly != string.Empty)
+					assemblyBrowser.Controls.Add(
+						new LiteralControl(&quot;&lt;br/&gt;&lt;button onClick=\&quot;UmbClientMgr.openModalWindow(&#39;&quot; + IOHelper.ResolveUrl(SystemDirectories.Umbraco) + &quot;/developer/macros/assemblyBrowser.aspx?fileName=&quot; + macroAssembly.Text +
+                                           &quot;&amp;macroID=&quot; + _macro.Id.ToInvariantString() + &quot;&amp;type=&quot; + macroType.Text +
+										   &quot;&#39;, &#39;Browse Properties&#39;, true, 475,500); return false\&quot; class=\&quot;guiInputButton\&quot;&gt;&lt;img src=\&quot;../../images/editor/propertiesNew.gif\&quot; align=\&quot;absmiddle\&quot; style=\&quot;width: 18px; height: 17px; padding-right: 5px;\&quot;/&gt; Browse properties&lt;/button&gt;&quot;));
+
+				// Load elements from macro
+				macroPropertyBind();
+
+				// Load xslt files from default dir
+				PopulateXsltFiles();
+
+				// Load razor script files from default dir
+                PopulateMacroScriptFiles();
+
+				// Load usercontrols
+				PopulateUserControls(IOHelper.MapPath(SystemDirectories.UserControls));
+				userControlList.Items.Insert(0, new ListItem(&quot;Browse usercontrols on server...&quot;, string.Empty));
+
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// Populates the control (textbox) values on page load
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;macro&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;macroAssemblyValue&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;macroTypeValue&quot;&gt;&lt;/param&gt;
+		protected virtual void PopulateFieldsOnLoad(IMacro macro, string macroAssemblyValue, string macroTypeValue)
+		{
+			macroName.Text = macro.Name;
+			macroAlias.Text = macro.Alias;
+			macroXslt.Text = macro.XsltPath;
+			macroPython.Text = macro.ScriptPath;
+		    cachePeriod.Text = macro.CacheDuration.ToInvariantString();
+			macroRenderContent.Checked = macro.DontRender == false;
+			macroEditor.Checked = macro.UseInEditor;
+			cacheByPage.Checked = macro.CacheByPage;
+			cachePersonalized.Checked = macro.CacheByMember;
+
+			// Populate either user control or custom control
+			if (macroTypeValue != string.Empty &amp;&amp; macroAssemblyValue != string.Empty)
+			{
+				macroAssembly.Text = macroAssemblyValue;
+				macroType.Text = macroTypeValue;
+			}
+			else
+			{
+				macroUserControl.Text = macroTypeValue;
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// Sets the values on the Macro object from the values posted back before saving the macro
+		/// &lt;/summary&gt;
+		protected virtual void SetMacroValuesFromPostBack(IMacro macro, int macroCachePeriod, string macroAssemblyValue, string macroTypeValue)
+		{
+			macro.UseInEditor = macroEditor.Checked;
+			macro.DontRender = macroRenderContent.Checked == false;
+			macro.CacheByPage = cacheByPage.Checked;
+			macro.CacheByMember = cachePersonalized.Checked;
+			macro.CacheDuration = macroCachePeriod;
+			macro.Alias = macroAlias.Text;
+			macro.Name = macroName.Text;
+			macro.ControlAssembly = macroAssemblyValue;
+			macro.ControlType = macroTypeValue;
+			macro.XsltPath = macroXslt.Text;
+			macro.ScriptPath = macroPython.Text;
+		}
+
+		private static void GetXsltFilesFromDir(string orgPath, string path, ArrayList files)
+		{
+			var dirInfo = new DirectoryInfo(path);
+
+		    if (dirInfo.Exists == false) return;
+
+			// Populate subdirectories
+			var dirInfos = dirInfo.GetDirectories();
+			foreach (var dir in dirInfos)
+				GetXsltFilesFromDir(orgPath, path + &quot;/&quot; + dir.Name, files);
+
+			var fileInfo = dirInfo.GetFiles(&quot;*.xsl*&quot;);
+
+			foreach (var file in fileInfo)
+				files.Add((path.Replace(orgPath, string.Empty).Trim(&#39;/&#39;) + &quot;/&quot; + file.Name).Trim(&#39;/&#39;));
+		}
+
+		private void PopulateXsltFiles()
+		{
+			var xslts = new ArrayList();
+			var xsltDir = IOHelper.MapPath(SystemDirectories.Xslt + &quot;/&quot;);
+			GetXsltFilesFromDir(xsltDir, xsltDir, xslts);
+			xsltFiles.DataSource = xslts;
+			xsltFiles.DataBind();
+			xsltFiles.Items.Insert(0, new ListItem(&quot;Browse xslt files on server...&quot;, string.Empty));
+		}
+
+		private static void GetMacroScriptFilesFromDir(string orgPath, string path, ArrayList files)
+		{
+			var dirInfo = new DirectoryInfo(path);
+			if (dirInfo.Exists == false)
+				return;
+
+			var fileInfo = dirInfo.GetFiles(&quot;*.*&quot;).Where(f =&gt; f.Name.ToLowerInvariant() != &quot;web.config&quot;.ToLowerInvariant());
+			foreach (var file in fileInfo)
+				files.Add(path.Replace(orgPath, string.Empty) + file.Name);
+
+			// Populate subdirectories
+			var dirInfos = dirInfo.GetDirectories();
+			foreach (var dir in dirInfos)
+				GetMacroScriptFilesFromDir(orgPath, path + &quot;/&quot; + dir.Name + &quot;/&quot;, files);
+		}
+
+        private void PopulateMacroScriptFiles()
+		{
+			var razors = new ArrayList();
+			var razorDir = IOHelper.MapPath(SystemDirectories.MacroScripts + &quot;/&quot;);
+			GetMacroScriptFilesFromDir(razorDir, razorDir, razors);
+			pythonFiles.DataSource = razors;
+			pythonFiles.DataBind();
+			pythonFiles.Items.Insert(0, new ListItem(&quot;Browse scripting files on server...&quot;, string.Empty));
+		}
+
+		public void deleteMacroProperty(object sender, EventArgs e)
+		{
+			var macroPropertyId = (HtmlInputHidden)((Control)sender).Parent.FindControl(&quot;macroPropertyID&quot;);
+
+		    var property = _macro.Properties.Single(x =&gt; x.Id == int.Parse(macroPropertyId.Value));
+		    _macro.Properties.Remove(property);
+
+		    Services.MacroService.Save(_macro);
+
+			macroPropertyBind();
+		}
+
+		public void macroPropertyBind()
+		{
+			macroProperties.DataSource = _macro.Properties.OrderBy(x =&gt; x.SortOrder);
+			macroProperties.DataBind();
+		}
+
+		public object CheckNull(object test)
+		{
+		    return Convert.IsDBNull(test) ? 0 : test;
+		}
+
+	    [Obsolete(&quot;No longer used and will be removed in the future.&quot;)]
+		public IRecordsReader GetMacroPropertyTypes()
+        {
+            return null;
+        }
+
+        protected IEnumerable&lt;IParameterEditor&gt; GetMacroParameterEditors()
+        {
+            return ParameterEditorResolver.Current.ParameterEditors;
+        }
+
+		public void macroPropertyCreate(object sender, EventArgs e)
+		{
+            //enable add validators
+            var val1 = (RequiredFieldValidator)((Control)sender).Parent.FindControl(&quot;RequiredFieldValidator1&quot;);
+            var val2 = (RequiredFieldValidator)((Control)sender).Parent.FindControl(&quot;RequiredFieldValidator4&quot;);
+            var val3 = (RequiredFieldValidator)((Control)sender).Parent.FindControl(&quot;RequiredFieldValidator5&quot;);
+		    val1.Enabled = true;
+            val2.Enabled = true;
+            val3.Enabled = true;
+
+            Page.Validate();
+
+            if (Page.IsValid == false)
+            {
+                return;
+            }
+
+			var macroPropertyAliasNew = (TextBox)((Control)sender).Parent.FindControl(&quot;macroPropertyAliasNew&quot;);
+			var macroPropertyNameNew = (TextBox)((Control)sender).Parent.FindControl(&quot;macroPropertyNameNew&quot;);
+			var macroPropertyTypeNew = (DropDownList)((Control)sender).Parent.FindControl(&quot;macroPropertyTypeNew&quot;);
+			
+			if (macroPropertyAliasNew.Text != ui.Text(&quot;general&quot;, &quot;new&quot;, UmbracoUser) + &quot; &quot; + ui.Text(&quot;general&quot;, &quot;alias&quot;, UmbracoUser))
+			{
+                if (_macro.Properties.ContainsKey(macroPropertyAliasNew.Text.Trim()))
+                {
+                    //don&#39;t continue
+                    return;
+                }
+
+			    _macro.Properties.Add(new MacroProperty(
+			                              macroPropertyAliasNew.Text.Trim(),
+			                              macroPropertyNameNew.Text.Trim(),
+                                          _macro.Properties.Any() ? _macro.Properties.Max(x =&gt; x.SortOrder) + 1  : 0,
+			                              macroPropertyTypeNew.SelectedValue));
+
+			    Services.MacroService.Save(_macro);
+
+                macroPropertyBind();
+			}
+		}
+
+		public bool macroIsVisible(object isChecked)
+		{
+		    return Convert.ToBoolean(isChecked);
+		}
+
+	    public void AddChooseList(Object sender, EventArgs e)
+		{
+			if (IsPostBack == false)
+			{
+				var dropDown = (DropDownList)sender;
+				dropDown.Items.Insert(0, new ListItem(&quot;Choose...&quot;, string.Empty));
+			}
+		}
+
+		private void PopulateUserControls(string path)
+		{
+			var directoryInfo = new DirectoryInfo(path);
+		    if (directoryInfo.Exists == false) return;
+
+			var rootDir = IOHelper.MapPath(SystemDirectories.UserControls);
+
+			foreach (var uc in directoryInfo.GetFiles(&quot;*.ascx&quot;))
+			{
+			    userControlList.Items.Add(
+			        new ListItem(SystemDirectories.UserControls +
+			                     uc.FullName.Substring(rootDir.Length).Replace(IOHelper.DirSepChar, &#39;/&#39;)));
+
+			}
+			foreach (var dir in directoryInfo.GetDirectories())
+				PopulateUserControls(dir.FullName);
+		}
+
+		protected override void OnInit(EventArgs e)
+		{			
+			base.OnInit(e);
+            EnsureChildControls();
+		}
+
+	    protected override void CreateChildControls()
+	    {
+	        base.CreateChildControls();
+
+            // Tab setup
+            InfoTabPage = TabView1.NewTabPage(&quot;Macro Properties&quot;);
+            InfoTabPage.Controls.Add(Pane1);
+            InfoTabPage.Controls.Add(Pane1_2);
+            InfoTabPage.Controls.Add(Pane1_3);
+            InfoTabPage.Controls.Add(Pane1_4);
+
+            Parameters = TabView1.NewTabPage(&quot;Parameters&quot;);
+            Parameters.Controls.Add(Panel2);
+
+            var save = TabView1.Menu.NewButton();
+            save.ButtonType = MenuButtonType.Primary;
+            save.Text = ui.Text(&quot;save&quot;);
+            save.ID = &quot;save&quot;;
+            save.Click += Save_Click;
+	    }
+
+        void Save_Click(object sender, EventArgs e)
+        {
+
+            Page.Validate();
+
+            ClientTools
+                .SetActiveTreeType(TreeDefinitionCollection.Instance.FindTree&lt;loadMacros&gt;().Tree.Alias)
+                .SyncTree(&quot;-1,init,&quot; + _macro.Id.ToInvariantString(), true); //true forces the reload
+
+            var tempMacroAssembly = macroAssembly.Text;
+            var tempMacroType = macroType.Text;
+            var tempCachePeriod = cachePeriod.Text;
+            if (tempCachePeriod == string.Empty)
+                tempCachePeriod = &quot;0&quot;;
+            if (tempMacroAssembly == string.Empty &amp;&amp; macroUserControl.Text != string.Empty)
+                tempMacroType = macroUserControl.Text;
+
+            SetMacroValuesFromPostBack(_macro, Convert.ToInt32(tempCachePeriod), tempMacroAssembly, tempMacroType);
+
+            // Save elements
+            foreach (RepeaterItem item in macroProperties.Items)
+            {
+                var macroPropertyId = (HtmlInputHidden)item.FindControl(&quot;macroPropertyID&quot;);
+                var macroElementName = (TextBox)item.FindControl(&quot;macroPropertyName&quot;);
+                var macroElementAlias = (TextBox)item.FindControl(&quot;macroPropertyAlias&quot;);
+                var macroElementSortOrder = (TextBox)item.FindControl(&quot;macroPropertySortOrder&quot;);
+                var macroElementType = (DropDownList)item.FindControl(&quot;macroPropertyType&quot;);
+
+                var prop = _macro.Properties.Single(x =&gt; x.Id == int.Parse(macroPropertyId.Value));
+                var sortOrder = 0;
+                int.TryParse(macroElementSortOrder.Text, out sortOrder);
+
+                _macro.Properties.UpdateProperty(
+                    prop.Alias,
+                    macroElementName.Text.Trim(),
+                    sortOrder,
+                    macroElementType.SelectedValue,                    
+                    macroElementAlias.Text.Trim());
+
+            }
+
+            Services.MacroService.Save(_macro);
+
+            ClientTools.ShowSpeechBubble(speechBubbleIcon.save, &quot;Macro saved&quot;, &quot;&quot;);
+
+            // Check for assemblyBrowser
+            if (tempMacroType.IndexOf(&quot;.ascx&quot;, StringComparison.Ordinal) &gt; 0)
+                assemblyBrowserUserControl.Controls.Add(
+                    new LiteralControl(&quot;&lt;br/&gt;&lt;button onClick=\&quot;UmbClientMgr.openModalWindow(&#39;developer/macros/assemblyBrowser.aspx?fileName=&quot; + macroUserControl.Text +
+                        &quot;&amp;macroID=&quot; + Request.QueryString[&quot;macroID&quot;] +
+                            &quot;&#39;, &#39;Browse Properties&#39;, true, 500, 475); return false\&quot; class=\&quot;guiInputButton\&quot;&gt;&lt;img src=\&quot;../../images/editor/propertiesNew.gif\&quot; align=\&quot;absmiddle\&quot; style=\&quot;width: 18px; height: 17px; padding-right: 5px;\&quot;/&gt; Browse properties&lt;/button&gt;&quot;));
+            else if (tempMacroType != string.Empty &amp;&amp; tempMacroAssembly != string.Empty)
+                assemblyBrowser.Controls.Add(
+                    new LiteralControl(&quot;&lt;br/&gt;&lt;button onClick=\&quot;UmbClientMgr.openModalWindow(&#39;developer/macros/assemblyBrowser.aspx?fileName=&quot; + macroAssembly.Text +
+                        &quot;&amp;macroID=&quot; + Request.QueryString[&quot;macroID&quot;] + &quot;&amp;type=&quot; + macroType.Text +
+                            &quot;&#39;, &#39;Browse Properties&#39;, true, 500, 475); return false\&quot; class=\&quot;guiInputButton\&quot;&gt;&lt;img src=\&quot;../../images/editor/propertiesNew.gif\&quot; align=\&quot;absmiddle\&quot; style=\&quot;width: 18px; height: 17px; padding-right: 5px;\&quot;/&gt; Browse properties&lt;/button&gt;&quot;));
+
+            macroPropertyBind();
+        }
+
+	    /// &lt;summary&gt;
+		/// TabView1 control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::umbraco.uicontrols.TabView TabView1;
+
+		/// &lt;summary&gt;
+		/// Pane1 control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::umbraco.uicontrols.Pane Pane1;
+
+		/// &lt;summary&gt;
+		/// macroPane control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.HtmlControls.HtmlTable macroPane;
+
+		/// &lt;summary&gt;
+		/// macroName control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.TextBox macroName;
+
+		/// &lt;summary&gt;
+		/// macroAlias control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.TextBox macroAlias;
+
+		/// &lt;summary&gt;
+		/// Pane1_2 control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::umbraco.uicontrols.Pane Pane1_2;
+
+		/// &lt;summary&gt;
+		/// macroXslt control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.TextBox macroXslt;
+
+		/// &lt;summary&gt;
+		/// xsltFiles control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.DropDownList xsltFiles;
+
+		/// &lt;summary&gt;
+		/// macroUserControl control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.TextBox macroUserControl;
+
+		/// &lt;summary&gt;
+		/// userControlList control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.DropDownList userControlList;
+
+		/// &lt;summary&gt;
+		/// assemblyBrowserUserControl control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.PlaceHolder assemblyBrowserUserControl;
+
+		/// &lt;summary&gt;
+		/// macroAssembly control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.TextBox macroAssembly;
+
+		/// &lt;summary&gt;
+		/// macroType control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.TextBox macroType;
+
+		/// &lt;summary&gt;
+		/// assemblyBrowser control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.PlaceHolder assemblyBrowser;
+
+		/// &lt;summary&gt;
+		/// macroPython control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.TextBox macroPython;
+
+		/// &lt;summary&gt;
+		/// pythonFiles control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.DropDownList pythonFiles;
+
+		/// &lt;summary&gt;
+		/// Pane1_3 control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::umbraco.uicontrols.Pane Pane1_3;
+
+		/// &lt;summary&gt;
+		/// Table1 control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.HtmlControls.HtmlTable Table1;
+
+		/// &lt;summary&gt;
+		/// macroEditor control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.CheckBox macroEditor;
+
+		/// &lt;summary&gt;
+		/// macroRenderContent control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.CheckBox macroRenderContent;
+
+		/// &lt;summary&gt;
+		/// Pane1_4 control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::umbraco.uicontrols.Pane Pane1_4;
+
+		/// &lt;summary&gt;
+		/// Table3 control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.HtmlControls.HtmlTable Table3;
+
+		/// &lt;summary&gt;
+		/// cachePeriod control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.TextBox cachePeriod;
+
+		/// &lt;summary&gt;
+		/// cacheByPage control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.CheckBox cacheByPage;
+
+		/// &lt;summary&gt;
+		/// cachePersonalized control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.CheckBox cachePersonalized;
+
+		/// &lt;summary&gt;
+		/// Panel2 control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::umbraco.uicontrols.Pane Panel2;
+
+		/// &lt;summary&gt;
+		/// macroProperties control.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// Auto-generated field.
+		/// To modify move field declaration from designer file to code-behind file.
+		/// &lt;/remarks&gt;
+		protected global::System.Web.UI.WebControls.Repeater macroProperties;
+	}
+
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,3,25,21,0],[26,3,26,4,0],[27,4,27,64,0],[28,3,28,4,0],[39,3,39,4,0],[40,7,40,95,0],[42,4,42,28,0],[43,4,43,5,0],[44,5,46,62,0],[48,17,48,73,0],[49,17,49,65,0],[51,17,51,80,0],[54,5,54,70,0],[55,6,58,256,0],[59,10,59,81,0],[60,6,63,255,0],[66,5,66,25,0],[69,5,69,25,0],[72,17,72,44,0],[75,5,75,76,0],[76,5,76,101,0],[78,4,78,5,0],[79,3,79,4,0],[88,3,88,4,0],[89,4,89,32,0],[90,4,90,34,0],[91,4,91,36,0],[92,4,92,40,0],[93,7,93,66,0],[94,4,94,59,0],[95,4,95,44,0],[96,4,96,44,0],[97,4,97,52,0],[100,4,100,77,0],[101,4,101,5,0],[102,5,102,45,0],[103,5,103,37,0],[104,4,104,5,0],[106,4,106,5,0],[107,5,107,44,0],[108,4,108,5,0],[109,3,109,4,0],[115,3,115,4,0],[116,4,116,44,0],[117,4,117,59,0],[118,4,118,44,0],[119,4,119,52,0],[120,4,120,43,0],[121,4,121,34,0],[122,4,122,32,0],[123,4,123,47,0],[124,4,124,39,0],[125,4,125,36,0],[126,4,126,40,0],[127,3,127,4,0],[130,3,130,4,0],[131,4,131,42,0],[133,7,133,35,0],[133,36,133,43,0],[136,4,136,44,0],[137,4,137,11,0],[137,13,137,20,0],[137,21,137,23,0],[137,24,137,32,0],[138,5,138,64,0],[140,4,140,46,0],[142,4,142,11,0],[142,13,142,21,0],[142,22,142,24,0],[142,25,142,33,0],[143,5,143,92,0],[144,3,144,4,0],[147,3,147,4,0],[148,4,148,32,0],[149,4,149,65,0],[150,4,150,49,0],[151,4,151,33,0],[152,4,152,25,0],[153,4,153,92,0],[154,3,154,4,0],[157,3,157,4,0],[158,4,158,42,0],[159,4,159,32,0],[160,5,160,12,0],[162,4,162,54,0],[162,54,162,114,0],[162,114,162,116,0],[162,4,162,116,0],[163,4,163,11,0],[163,13,163,21,0],[163,22,163,24,0],[163,25,163,33,0],[164,5,164,64,0],[167,4,167,44,0],[168,4,168,11,0],[168,13,168,20,0],[168,21,168,23,0],[168,24,168,32,0],[169,5,169,77,0],[170,3,170,4,0],[173,3,173,4,0],[174,4,174,33,0],[175,4,175,74,0],[176,4,176,59,0],[177,4,177,36,0],[178,4,178,27,0],[179,4,179,99,0],[180,3,180,4,0],[183,3,183,4,0],[184,4,184,99,0],[186,7,186,52,0],[186,52,186,92,0],[186,92,186,94,0],[186,7,186,94,0],[187,7,187,42,0],[189,7,189,42,0],[191,4,191,24,0],[192,3,192,4,0],[195,3,195,4,0],[196,4,196,64,0],[196,64,196,75,0],[196,75,196,77,0],[196,4,196,77,0],[197,4,197,31,0],[198,3,198,4,0],[201,3,201,4,0],[202,7,202,48,0],[203,3,203,4,0],[207,9,207,10,0],[208,13,208,25,0],[209,9,209,10,0],[212,9,212,10,0],[213,13,213,69,0],[214,9,214,10,0],[217,3,217,4,0],[219,13,219,112,0],[220,13,220,112,0],[221,13,221,112,0],[222,7,222,27,0],[223,13,223,33,0],[224,13,224,33,0],[226,13,226,29,0],[228,13,228,39,0],[229,13,229,14,0],[230,17,230,24,0],[233,4,233,103,0],[234,4,234,101,0],[235,4,235,106,0],[237,4,237,126,0],[238,4,238,5,0],[239,17,239,86,0],[240,17,240,18,0],[242,21,242,28,0],[245,8,248,96,0],[248,96,248,107,0],[248,107,249,71,0],[245,8,249,71,0],[251,8,251,43,0],[253,17,253,37,0],[254,4,254,5,0],[255,3,255,4,0],[258,3,258,4,0],[259,7,259,43,0],[260,3,260,4,0],[263,3,263,4,0],[264,4,264,28,0],[265,4,265,5,0],[266,5,266,41,0],[267,5,267,71,0],[268,4,268,5,0],[269,3,269,4,0],[272,3,272,4,0],[273,4,273,48,0],[274,7,274,41,0],[274,42,274,49,0],[276,4,276,67,0],[278,4,278,11,0],[278,13,278,19,0],[278,20,278,22,0],[278,23,278,55,0],[279,4,279,5,0],[280,8,282,99,0],[284,4,284,5,0],[285,4,285,11,0],[285,13,285,20,0],[285,21,285,23,0],[285,24,285,54,0],[286,5,286,40,0],[287,3,287,4,0],[290,3,290,4,0],[291,4,291,19,0],[292,13,292,35,0],[293,3,293,4,0],[296,6,296,7,0],[297,10,297,37,0],[300,13,300,67,0],[301,13,301,45,0],[302,13,302,47,0],[303,13,303,47,0],[304,13,304,47,0],[306,13,306,60,0],[307,13,307,45,0],[309,13,309,50,0],[310,13,310,54,0],[311,13,311,41,0],[312,13,312,30,0],[313,13,313,38,0],[314,6,314,7,0],[317,9,317,10,0],[319,13,319,29,0],[321,13,323,77,0],[325,13,325,56,0],[326,13,326,48,0],[327,13,327,52,0],[328,13,328,49,0],[329,17,329,39,0],[330,13,330,92,0],[331,17,331,55,0],[333,13,333,116,0],[336,13,336,20,0],[336,22,336,39,0],[336,40,336,42,0],[336,43,336,64,0],[337,13,337,14,0],[338,17,338,92,0],[339,17,339,87,0],[340,17,340,89,0],[341,17,341,97,0],[342,17,342,92,0],[344,17,344,58,0],[344,58,344,98,0],[344,98,344,100,0],[344,17,344,100,0],[345,17,345,35,0],[346,17,346,73,0],[348,17,353,52,0],[355,13,355,14,0],[357,13,357,48,0],[359,13,359,84,0],[362,13,362,78,0],[363,17,366,271,0],[367,18,367,89,0],[368,17,371,271,0],[373,13,373,33,0],[374,9,374,10,0]]);
+    </script>
+  </body>
+</html>

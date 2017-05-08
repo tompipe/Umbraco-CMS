@@ -1,0 +1,866 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Persistence\Repositories\TemplateRepositoryTest.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using Moq;
+using NUnit.Framework;
+using Umbraco.Core;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Persistence;
+
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Services;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Tests.TestHelpers.Entities;
+
+namespace Umbraco.Tests.Persistence.Repositories
+{
+    [DatabaseTestBehavior(DatabaseBehavior.NewDbFileAndSchemaPerTest)]
+    [TestFixture]
+    public class TemplateRepositoryTest : BaseDatabaseFactoryTest
+    {
+        private IFileSystem _masterPageFileSystem;
+        private IFileSystem _viewsFileSystem;
+
+        private ITemplateRepository CreateRepository(IDatabaseUnitOfWork unitOfWork, ITemplatesSection templatesSection = null)
+        {
+            return new TemplateRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, _masterPageFileSystem, _viewsFileSystem,
+                templatesSection ?? Mock.Of&lt;ITemplatesSection&gt;(t =&gt; t.DefaultRenderingEngine == RenderingEngine.Mvc));
+        }
+
+        [SetUp]
+        public override void Initialize()
+        {
+            base.Initialize();
+
+            _masterPageFileSystem = new PhysicalFileSystem(SystemDirectories.Masterpages);
+            _viewsFileSystem = new PhysicalFileSystem(SystemDirectories.MvcViews);
+        }
+
+        [Test]
+        public void Can_Instantiate_Repository()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+
+            // Act
+            using (var repository = CreateRepository(unitOfWork))
+            {
+
+                // Assert
+                Assert.That(repository, Is.Not.Null);
+            }
+
+        }
+
+        [Test]
+        public void Can_Perform_Add_MasterPage_Detect_Content()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var template = new Template(&quot;test&quot;, &quot;test&quot;)
+                {
+                    Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+                };
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                //Assert
+                Assert.That(repository.Get(&quot;test&quot;), Is.Not.Null);
+                Assert.That(_masterPageFileSystem.FileExists(&quot;test.master&quot;), Is.True);
+            }
+
+        }
+
+        [Test]
+        public void Can_Perform_Add_MasterPage_With_Default_Content()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork, Mock.Of&lt;ITemplatesSection&gt;(x =&gt; x.DefaultRenderingEngine == RenderingEngine.WebForms)))
+            {
+                // Act
+                var template = new Template(&quot;test&quot;, &quot;test&quot;);
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                //Assert
+                Assert.That(repository.Get(&quot;test&quot;), Is.Not.Null);
+                Assert.That(_masterPageFileSystem.FileExists(&quot;test.master&quot;), Is.True);
+                Assert.AreEqual(@&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; MasterPageFile=&quot;&quot;~/umbraco/masterpages/default.master&quot;&quot; AutoEventWireup=&quot;&quot;true&quot;&quot; %&gt;
+
+&lt;asp:Content ContentPlaceHolderID=&quot;&quot;ContentPlaceHolderDefault&quot;&quot; runat=&quot;&quot;server&quot;&quot;&gt;
+
+&lt;/asp:Content&gt;
+&quot;.StripWhitespace(), template.Content.StripWhitespace());
+            }
+
+        }
+
+        [Test]
+        public void Can_Perform_Add_MasterPage_With_Default_Content_With_Parent()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork, Mock.Of&lt;ITemplatesSection&gt;(x =&gt; x.DefaultRenderingEngine == RenderingEngine.WebForms)))
+            {
+                //NOTE: This has to be persisted first
+                var template = new Template(&quot;test&quot;, &quot;test&quot;);
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                // Act
+                var template2 = new Template(&quot;test2&quot;, &quot;test2&quot;);
+                template2.SetMasterTemplate(template);
+                repository.AddOrUpdate(template2);
+                unitOfWork.Commit();
+
+                //Assert
+                Assert.That(repository.Get(&quot;test2&quot;), Is.Not.Null);
+                Assert.That(_masterPageFileSystem.FileExists(&quot;test2.master&quot;), Is.True);
+                Assert.AreEqual(@&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; MasterPageFile=&quot;&quot;~/masterpages/test.master&quot;&quot; AutoEventWireup=&quot;&quot;true&quot;&quot; %&gt;
+
+&quot;.StripWhitespace(), template2.Content.StripWhitespace());
+            }
+
+        }
+
+        [Test]
+        public void Can_Perform_Add_View()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var template = new Template(&quot;test&quot;, &quot;test&quot;);
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                //Assert
+                Assert.That(repository.Get(&quot;test&quot;), Is.Not.Null);
+                Assert.That(_viewsFileSystem.FileExists(&quot;test.cshtml&quot;), Is.True);
+            }
+
+        }
+
+        [Test]
+        public void Can_Perform_Add_View_With_Default_Content()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var template = new Template(&quot;test&quot;, &quot;test&quot;)
+                {
+                    Content = ViewHelper.GetDefaultFileContent()
+                };
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                //Assert
+                Assert.That(repository.Get(&quot;test&quot;), Is.Not.Null);
+                Assert.That(_viewsFileSystem.FileExists(&quot;test.cshtml&quot;), Is.True);
+                Assert.AreEqual(
+                    @&quot;@inherits Umbraco.Web.Mvc.UmbracoTemplatePage @{ Layout = null;}&quot;.StripWhitespace(), 
+                    template.Content.StripWhitespace());
+            }
+
+        }
+
+        [Test]
+        public void Can_Perform_Add_View_With_Default_Content_With_Parent()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                //NOTE: This has to be persisted first
+                var template = new Template(&quot;test&quot;, &quot;test&quot;);
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                // Act
+                var template2 = new Template(&quot;test2&quot;, &quot;test2&quot;);
+                template2.SetMasterTemplate(template);
+                repository.AddOrUpdate(template2);
+                unitOfWork.Commit();
+
+                //Assert
+                Assert.That(repository.Get(&quot;test2&quot;), Is.Not.Null);
+                Assert.That(_viewsFileSystem.FileExists(&quot;test2.cshtml&quot;), Is.True);
+                Assert.AreEqual(
+                    &quot;@inherits Umbraco.Web.Mvc.UmbracoTemplatePage @{ Layout = \&quot;test.cshtml\&quot;;}&quot;.StripWhitespace(),
+                    template2.Content.StripWhitespace());
+            }
+        }
+
+        [Test]
+        public void Can_Perform_Add_Unique_Alias()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var template = new Template(&quot;test&quot;, &quot;test&quot;)
+                {
+                    Content = ViewHelper.GetDefaultFileContent()
+                };
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                var template2 = new Template(&quot;test&quot;, &quot;test&quot;)
+                {
+                    Content = ViewHelper.GetDefaultFileContent()
+                };
+                repository.AddOrUpdate(template2);
+                unitOfWork.Commit();
+
+                //Assert
+                Assert.AreEqual(&quot;test1&quot;, template2.Alias);
+            }
+
+        }
+
+        [Test]
+        public void Can_Perform_Update_Unique_Alias()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var template = new Template(&quot;test&quot;, &quot;test&quot;)
+                {
+                    Content = ViewHelper.GetDefaultFileContent()
+                };
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                var template2 = new Template(&quot;test1&quot;, &quot;test1&quot;)
+                {
+                    Content = ViewHelper.GetDefaultFileContent()
+                };
+                repository.AddOrUpdate(template2);
+                unitOfWork.Commit();
+
+                template.Alias = &quot;test1&quot;;
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                //Assert
+                Assert.AreEqual(&quot;test11&quot;, template.Alias);
+                Assert.That(_viewsFileSystem.FileExists(&quot;test11.cshtml&quot;), Is.True);
+                Assert.That(_viewsFileSystem.FileExists(&quot;test.cshtml&quot;), Is.False);
+            }
+
+        }
+
+        [Test]
+        public void Can_Perform_Update_MasterPage()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var template = new Template(&quot;test&quot;, &quot;test&quot;)
+                {
+                    Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+                };
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                template.Content = @&quot;&lt;%@ Master Language=&quot;&quot;VB&quot;&quot; %&gt;&quot;;
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                var updated = repository.Get(&quot;test&quot;);
+
+                // Assert
+                Assert.That(_masterPageFileSystem.FileExists(&quot;test.master&quot;), Is.True);
+                Assert.That(updated.Content, Is.EqualTo(@&quot;&lt;%@ Master Language=&quot;&quot;VB&quot;&quot; %&gt;&quot;));
+            }
+
+
+        }
+
+        [Test]
+        public void Can_Perform_Update_View()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                // Act
+                var template = new Template(&quot;test&quot;, &quot;test&quot;)
+                {
+                    Content = ViewHelper.GetDefaultFileContent()
+                };
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                template.Content += &quot;&lt;html&gt;&lt;/html&gt;&quot;;
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                var updated = repository.Get(&quot;test&quot;);
+
+                // Assert
+                Assert.That(_viewsFileSystem.FileExists(&quot;test.cshtml&quot;), Is.True);
+                Assert.That(updated.Content, Is.EqualTo(ViewHelper.GetDefaultFileContent() + &quot;&lt;html&gt;&lt;/html&gt;&quot;));
+            }
+
+
+        }
+
+        [Test]
+        public void Can_Perform_Delete_MasterPage()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var template = new Template(&quot;test&quot;, &quot;test&quot;)
+                {
+                    Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+                };
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                // Act
+                var templates = repository.Get(&quot;test&quot;);
+                Assert.That(_masterPageFileSystem.FileExists(&quot;test.master&quot;), Is.True);
+                repository.Delete(templates);
+                unitOfWork.Commit();
+
+                // Assert
+                Assert.IsNull(repository.Get(&quot;test&quot;));
+                Assert.That(_masterPageFileSystem.FileExists(&quot;test.master&quot;), Is.False);
+            }
+
+
+        }
+
+        [Test]
+        public void Can_Perform_Delete_View()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var template = new Template(&quot;test&quot;, &quot;test&quot;)
+                {
+                    Content = ViewHelper.GetDefaultFileContent()
+                };
+                repository.AddOrUpdate(template);
+                unitOfWork.Commit();
+
+                // Act
+                var templates = repository.Get(&quot;test&quot;);
+                Assert.That(_viewsFileSystem.FileExists(&quot;test.cshtml&quot;), Is.True);
+                repository.Delete(templates);
+                unitOfWork.Commit();
+
+                // Assert
+                Assert.IsNull(repository.Get(&quot;test&quot;));
+                Assert.That(_viewsFileSystem.FileExists(&quot;test.cshtml&quot;), Is.False);
+            }
+
+
+        }
+
+        [Test]
+        public void Can_Perform_Delete_When_Assigned_To_Doc()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+
+            using (var templateRepository = CreateRepository(unitOfWork))
+            {
+                var tagRepository = new TagRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax);
+                var contentTypeRepository = new ContentTypeRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, templateRepository);
+                var contentRepo = new ContentRepository(unitOfWork, CacheHelper.CreateDisabledCacheHelper(), Mock.Of&lt;ILogger&gt;(), SqlSyntax, contentTypeRepository, templateRepository, tagRepository, Mock.Of&lt;IContentSection&gt;());
+
+                using (contentRepo)
+                {
+                    var contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbTextpage2&quot;, &quot;Textpage&quot;);
+                    var textpage = MockedContent.CreateSimpleContent(contentType);
+                    contentTypeRepository.AddOrUpdate(contentType);
+                    contentRepo.AddOrUpdate(textpage);
+                    unitOfWork.Commit();
+
+
+                    var template = new Template(&quot;test&quot;, &quot;test&quot;)
+                    {
+                        Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+                    };
+                    templateRepository.AddOrUpdate(template);
+                    unitOfWork.Commit();
+
+                    textpage.Template = template;
+                    contentRepo.AddOrUpdate(textpage);
+                    unitOfWork.Commit();
+
+                    // Act
+                    var templates = templateRepository.Get(&quot;test&quot;);
+                    templateRepository.Delete(templates);
+                    unitOfWork.Commit();
+
+                    // Assert
+                    Assert.IsNull(templateRepository.Get(&quot;test&quot;));
+                }
+            }
+
+        }
+
+        [Test]
+        public void Can_Perform_Delete_On_Nested_Templates()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var parent = new Template(&quot;parent&quot;, &quot;parent&quot;)
+                {
+                    Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+                };
+                var child = new Template(&quot;child&quot;, &quot;child&quot;)
+                {
+                    Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+                };
+                var baby = new Template(&quot;baby&quot;, &quot;baby&quot;)
+                {
+                    Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+                };
+                child.MasterTemplateAlias = parent.Alias;
+                child.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; parent.Id);
+                baby.MasterTemplateAlias = child.Alias;
+                baby.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; child.Id);
+                repository.AddOrUpdate(parent);
+                repository.AddOrUpdate(child);
+                repository.AddOrUpdate(baby);
+                unitOfWork.Commit();
+
+                // Act
+                var templates = repository.Get(&quot;parent&quot;);
+                repository.Delete(templates);
+                unitOfWork.Commit();
+
+                // Assert
+                Assert.IsNull(repository.Get(&quot;test&quot;));
+            }
+
+
+        }
+
+        [Test]
+        public void Can_Get_Template_Tree()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                CreateHierarchy(repository, unitOfWork);
+
+                // Act
+                var rootNode = repository.GetTemplateNode(&quot;parent&quot;);
+
+                // Assert
+                Assert.IsNotNull(repository.FindTemplateInTree(rootNode, &quot;parent&quot;));
+                Assert.IsNotNull(repository.FindTemplateInTree(rootNode, &quot;child1&quot;));
+                Assert.IsNotNull(repository.FindTemplateInTree(rootNode, &quot;child2&quot;));
+                Assert.IsNotNull(repository.FindTemplateInTree(rootNode, &quot;toddler1&quot;));
+                Assert.IsNotNull(repository.FindTemplateInTree(rootNode, &quot;toddler2&quot;));
+                Assert.IsNotNull(repository.FindTemplateInTree(rootNode, &quot;toddler3&quot;));
+                Assert.IsNotNull(repository.FindTemplateInTree(rootNode, &quot;toddler4&quot;));
+                Assert.IsNotNull(repository.FindTemplateInTree(rootNode, &quot;baby1&quot;));
+                Assert.IsNotNull(repository.FindTemplateInTree(rootNode, &quot;baby2&quot;));
+            }
+        }
+
+        [Test]
+        public void Can_Get_All()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var created = CreateHierarchy(repository, unitOfWork).ToArray();
+
+                // Act
+                var all = repository.GetAll();
+                var allByAlias = repository.GetAll(&quot;parent&quot;, &quot;child2&quot;, &quot;baby2&quot;, &quot;notFound&quot;);
+                var allById = repository.GetAll(created[0].Id, created[2].Id, created[4].Id, created[5].Id, 999999);
+
+                // Assert
+                Assert.AreEqual(9, all.Count());
+                Assert.AreEqual(9, all.DistinctBy(x =&gt; x.Id).Count());
+
+                Assert.AreEqual(3, allByAlias.Count());
+                Assert.AreEqual(3, allByAlias.DistinctBy(x =&gt; x.Id).Count());
+
+                Assert.AreEqual(4, allById.Count());
+                Assert.AreEqual(4, allById.DistinctBy(x =&gt; x.Id).Count());
+            }
+        }
+
+        [Test]
+        public void Can_Get_Children()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var created = CreateHierarchy(repository, unitOfWork).ToArray();
+
+                // Act
+                var childrenById = repository.GetChildren(created[1].Id);
+                var childrenByAlias = repository.GetChildren(created[1].Alias);
+
+
+                // Assert
+                Assert.AreEqual(2, childrenById.Count());
+                Assert.AreEqual(2, childrenById.DistinctBy(x =&gt; x.Id).Count());
+                Assert.AreEqual(2, childrenByAlias.Count());
+                Assert.AreEqual(2, childrenByAlias.DistinctBy(x =&gt; x.Id).Count());
+
+            }
+        }
+
+        [Test]
+        public void Can_Get_Children_At_Root()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                CreateHierarchy(repository, unitOfWork).ToArray();
+
+                // Act
+                var children = repository.GetChildren(-1);
+
+
+                // Assert
+                Assert.AreEqual(1, children.Count());
+                Assert.AreEqual(1, children.DistinctBy(x =&gt; x.Id).Count());
+
+            }
+        }
+
+        [Test]
+        public void Can_Get_Descendants()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var created = CreateHierarchy(repository, unitOfWork).ToArray();
+
+                // Act
+                var descendantsById = repository.GetDescendants(created[1].Id);
+                var descendantsByAlias = repository.GetDescendants(created[1].Alias);
+
+
+                // Assert
+                Assert.AreEqual(3, descendantsById.Count());
+                Assert.AreEqual(3, descendantsById.DistinctBy(x =&gt; x.Id).Count());
+
+                Assert.AreEqual(3, descendantsByAlias.Count());
+                Assert.AreEqual(3, descendantsByAlias.DistinctBy(x =&gt; x.Id).Count());
+            }
+        }
+
+        [Test]
+        public void Path_Is_Set_Correctly_On_Creation()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var parent = new Template(&quot;parent&quot;, &quot;parent&quot;);
+                var child1 = new Template(&quot;child1&quot;, &quot;child1&quot;);
+                var toddler1 = new Template(&quot;toddler1&quot;, &quot;toddler1&quot;);
+                var toddler2 = new Template(&quot;toddler2&quot;, &quot;toddler2&quot;);
+                var baby1 = new Template(&quot;baby1&quot;, &quot;baby1&quot;);
+                var child2 = new Template(&quot;child2&quot;, &quot;child2&quot;);
+                var toddler3 = new Template(&quot;toddler3&quot;, &quot;toddler3&quot;);
+                var toddler4 = new Template(&quot;toddler4&quot;, &quot;toddler4&quot;);
+                var baby2 = new Template(&quot;baby2&quot;, &quot;baby2&quot;);
+
+                child1.MasterTemplateAlias = parent.Alias;
+                child1.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; parent.Id);
+                child2.MasterTemplateAlias = parent.Alias;
+                child2.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; parent.Id);
+                toddler1.MasterTemplateAlias = child1.Alias;
+                toddler1.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; child1.Id);
+                toddler2.MasterTemplateAlias = child1.Alias;
+                toddler2.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; child1.Id);
+                toddler3.MasterTemplateAlias = child2.Alias;
+                toddler3.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; child2.Id);
+                toddler4.MasterTemplateAlias = child2.Alias;
+                toddler4.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; child2.Id);
+                baby1.MasterTemplateAlias = toddler2.Alias;
+                baby1.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; toddler2.Id);
+                baby2.MasterTemplateAlias = toddler4.Alias;
+                baby2.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; toddler4.Id);
+
+
+                // Act
+                repository.AddOrUpdate(parent);
+                repository.AddOrUpdate(child1);
+                repository.AddOrUpdate(child2);
+                repository.AddOrUpdate(toddler1);
+                repository.AddOrUpdate(toddler2);
+                repository.AddOrUpdate(toddler3);
+                repository.AddOrUpdate(toddler4);
+                repository.AddOrUpdate(baby1);
+                repository.AddOrUpdate(baby2);
+                unitOfWork.Commit();
+
+                // Assert
+                Assert.AreEqual(string.Format(&quot;-1,{0}&quot;, parent.Id), parent.Path);
+                Assert.AreEqual(string.Format(&quot;-1,{0},{1}&quot;, parent.Id, child1.Id), child1.Path);
+                Assert.AreEqual(string.Format(&quot;-1,{0},{1}&quot;, parent.Id, child2.Id), child2.Path);
+                Assert.AreEqual(string.Format(&quot;-1,{0},{1}&quot;, parent.Id, child2.Id), child2.Path);
+                Assert.AreEqual(string.Format(&quot;-1,{0},{1},{2}&quot;, parent.Id, child1.Id, toddler1.Id), toddler1.Path);
+                Assert.AreEqual(string.Format(&quot;-1,{0},{1},{2}&quot;, parent.Id, child1.Id, toddler2.Id), toddler2.Path);
+                Assert.AreEqual(string.Format(&quot;-1,{0},{1},{2}&quot;, parent.Id, child2.Id, toddler3.Id), toddler3.Path);
+                Assert.AreEqual(string.Format(&quot;-1,{0},{1},{2}&quot;, parent.Id, child2.Id, toddler4.Id), toddler4.Path);
+                Assert.AreEqual(string.Format(&quot;-1,{0},{1},{2},{3}&quot;, parent.Id, child1.Id, toddler2.Id, baby1.Id), baby1.Path);
+                Assert.AreEqual(string.Format(&quot;-1,{0},{1},{2},{3}&quot;, parent.Id, child2.Id, toddler4.Id, baby2.Id), baby2.Path);
+            }
+
+
+        }
+
+        [Test]
+        public void Path_Is_Set_Correctly_On_Update()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var parent = new Template(&quot;parent&quot;, &quot;parent&quot;);
+                var child1 = new Template(&quot;child1&quot;, &quot;child1&quot;);
+                var child2 = new Template(&quot;child2&quot;, &quot;child2&quot;);
+                var toddler1 = new Template(&quot;toddler1&quot;, &quot;toddler1&quot;);
+                var toddler2 = new Template(&quot;toddler2&quot;, &quot;toddler2&quot;);
+
+                child1.MasterTemplateAlias = parent.Alias;
+                child1.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; parent.Id);
+                child2.MasterTemplateAlias = parent.Alias;
+                child2.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; parent.Id);
+                toddler1.MasterTemplateAlias = child1.Alias;
+                toddler1.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; child1.Id);
+                toddler2.MasterTemplateAlias = child1.Alias;
+                toddler2.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; child1.Id);
+
+                repository.AddOrUpdate(parent);
+                repository.AddOrUpdate(child1);
+                repository.AddOrUpdate(child2);
+                repository.AddOrUpdate(toddler1);
+                repository.AddOrUpdate(toddler2);
+                unitOfWork.Commit();
+
+                //Act
+                toddler2.SetMasterTemplate(child2);
+                repository.AddOrUpdate(toddler2);
+                unitOfWork.Commit();
+
+                //Assert
+                Assert.AreEqual(string.Format(&quot;-1,{0},{1},{2}&quot;, parent.Id, child2.Id, toddler2.Id), toddler2.Path);
+
+            }
+        }
+
+        [Test]
+        public void Path_Is_Set_Correctly_On_Update_With_Master_Template_Removal()
+        {
+            // Arrange
+            var provider = new PetaPocoUnitOfWorkProvider(Logger);
+            var unitOfWork = provider.GetUnitOfWork();
+            using (var repository = CreateRepository(unitOfWork))
+            {
+                var parent = new Template(&quot;parent&quot;, &quot;parent&quot;);
+                var child1 = new Template(&quot;child1&quot;, &quot;child1&quot;);
+
+                child1.MasterTemplateAlias = parent.Alias;
+                child1.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; parent.Id);               
+
+                repository.AddOrUpdate(parent);
+                repository.AddOrUpdate(child1);
+                unitOfWork.Commit();
+
+                //Act
+                child1.SetMasterTemplate(null);
+                repository.AddOrUpdate(child1);
+                unitOfWork.Commit();
+
+                //Assert
+                Assert.AreEqual(string.Format(&quot;-1,{0}&quot;, child1.Id), child1.Path);
+
+            }
+        }
+
+
+        [TearDown]
+        public override void TearDown()
+        {
+            base.TearDown();
+
+            _masterPageFileSystem = null;
+            _viewsFileSystem = null;
+            //Delete all files
+            var fsMaster = new PhysicalFileSystem(SystemDirectories.Masterpages);
+            var masterPages = fsMaster.GetFiles(&quot;&quot;, &quot;*.master&quot;);
+            foreach (var file in masterPages)
+            {
+                fsMaster.DeleteFile(file);
+            }
+            var fsViews = new PhysicalFileSystem(SystemDirectories.MvcViews);
+            var views = fsMaster.GetFiles(&quot;&quot;, &quot;*.cshtml&quot;);
+            foreach (var file in views)
+            {
+                fsMaster.DeleteFile(file);
+            }
+        }
+
+        protected Stream CreateStream(string contents = null)
+        {
+            if (string.IsNullOrEmpty(contents))
+                contents = &quot;/* test */&quot;;
+
+            var bytes = Encoding.UTF8.GetBytes(contents);
+            var stream = new MemoryStream(bytes);
+
+            return stream;
+        }
+
+        private IEnumerable&lt;ITemplate&gt; CreateHierarchy(ITemplateRepository repository, IDatabaseUnitOfWork unitOfWork)
+        {
+            var parent = new Template(&quot;parent&quot;, &quot;parent&quot;)
+            {
+                Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+            };
+
+            var child1 = new Template(&quot;child1&quot;, &quot;child1&quot;)
+            {
+                Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+            };
+            var toddler1 = new Template(&quot;toddler1&quot;, &quot;toddler1&quot;)
+            {
+                Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+            };
+            var toddler2 = new Template(&quot;toddler2&quot;, &quot;toddler2&quot;)
+            {
+                Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+            };
+            var baby1 = new Template(&quot;baby1&quot;, &quot;baby1&quot;)
+            {
+                Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+            };
+
+            var child2 = new Template(&quot;child2&quot;, &quot;child2&quot;)
+            {
+                Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+            };
+            var toddler3 = new Template(&quot;toddler3&quot;, &quot;toddler3&quot;)
+            {
+                Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+            };
+            var toddler4 = new Template(&quot;toddler4&quot;, &quot;toddler4&quot;)
+            {
+                Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+            };
+            var baby2 = new Template(&quot;baby2&quot;, &quot;baby2&quot;)
+            {
+                Content = @&quot;&lt;%@ Master Language=&quot;&quot;C#&quot;&quot; %&gt;&quot;
+            };
+
+
+            child1.MasterTemplateAlias = parent.Alias;
+            child1.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; parent.Id);
+            child2.MasterTemplateAlias = parent.Alias;
+            child2.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; parent.Id);
+
+            toddler1.MasterTemplateAlias = child1.Alias;
+            toddler1.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; child1.Id);
+            toddler2.MasterTemplateAlias = child1.Alias;
+            toddler2.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; child1.Id);
+
+            toddler3.MasterTemplateAlias = child2.Alias;
+            toddler3.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; child2.Id);
+            toddler4.MasterTemplateAlias = child2.Alias;
+            toddler4.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; child2.Id);
+
+            baby1.MasterTemplateAlias = toddler2.Alias;
+            baby1.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; toddler2.Id);
+
+            baby2.MasterTemplateAlias = toddler4.Alias;
+            baby2.MasterTemplateId = new Lazy&lt;int&gt;(() =&gt; toddler4.Id);
+
+            repository.AddOrUpdate(parent);
+            repository.AddOrUpdate(child1);
+            repository.AddOrUpdate(child2);
+            repository.AddOrUpdate(toddler1);
+            repository.AddOrUpdate(toddler2);
+            repository.AddOrUpdate(toddler3);
+            repository.AddOrUpdate(toddler4);
+            repository.AddOrUpdate(baby1);
+            repository.AddOrUpdate(baby2);
+            unitOfWork.Commit();
+
+            return new[] {parent, child1, child2, toddler1, toddler2, toddler3, toddler4, baby1, baby2};
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[32,9,32,10,1],[33,13,34,119,1],[35,9,35,10,1],[39,9,39,10,1],[40,13,40,31,1],[42,13,42,91,1],[43,13,43,83,1],[44,9,44,10,1],[48,9,48,10,1],[50,13,50,67,1],[51,13,51,55,1],[54,20,54,65,1],[55,13,55,14,1],[58,17,58,54,1],[59,13,59,14,1],[61,9,61,10,1],[65,9,65,10,1],[67,13,67,67,1],[68,13,68,55,1],[69,20,69,65,1],[70,13,70,14,1],[72,17,75,19,1],[76,17,76,50,1],[77,17,77,37,1],[80,17,80,66,1],[81,17,81,87,1],[82,13,82,14,1],[84,9,84,10,1],[88,9,88,10,1],[90,13,90,67,1],[91,13,91,55,1],[92,20,92,152,1],[93,13,93,14,1],[95,17,95,61,1],[96,17,96,50,1],[97,17,97,37,1],[100,17,100,66,1],[101,17,101,87,1],[102,17,107,58,1],[108,13,108,14,1],[110,9,110,10,1],[114,9,114,10,1],[116,13,116,67,1],[117,13,117,55,1],[118,20,118,152,1],[119,13,119,14,1],[121,17,121,61,1],[122,17,122,50,1],[123,17,123,37,1],[126,17,126,64,1],[127,17,127,55,1],[128,17,128,51,1],[129,17,129,37,1],[132,17,132,67,1],[133,17,133,88,1],[134,17,136,59,1],[137,13,137,14,1],[139,9,139,10,1],[143,9,143,10,1],[145,13,145,67,1],[146,13,146,55,1],[147,20,147,65,1],[148,13,148,14,1],[150,17,150,61,1],[151,17,151,50,1],[152,17,152,37,1],[155,17,155,66,1],[156,17,156,82,1],[157,13,157,14,1],[159,9,159,10,1],[163,9,163,10,1],[165,13,165,67,1],[166,13,166,55,1],[167,20,167,65,1],[168,13,168,14,1],[170,17,173,19,1],[174,17,174,50,1],[175,17,175,37,1],[178,17,178,66,1],[179,17,179,82,1],[180,17,182,57,1],[183,13,183,14,1],[185,9,185,10,1],[189,9,189,10,1],[191,13,191,67,1],[192,13,192,55,1],[193,20,193,65,1],[194,13,194,14,1],[196,17,196,61,1],[197,17,197,50,1],[198,17,198,37,1],[201,17,201,64,1],[202,17,202,55,1],[203,17,203,51,1],[204,17,204,37,1],[207,17,207,67,1],[208,17,208,83,1],[209,17,211,58,1],[212,13,212,14,1],[213,9,213,10,1],[217,9,217,10,1],[219,13,219,67,1],[220,13,220,55,1],[221,20,221,65,1],[222,13,222,14,1],[224,17,227,19,1],[228,17,228,50,1],[229,17,229,37,1],[231,17,234,19,1],[235,17,235,51,1],[236,17,236,37,1],[239,17,239,59,1],[240,13,240,14,1],[242,9,242,10,1],[246,9,246,10,1],[248,13,248,67,1],[249,13,249,55,1],[250,20,250,65,1],[251,13,251,14,1],[253,17,256,19,1],[257,17,257,50,1],[258,17,258,37,1],[260,17,263,19,1],[264,17,264,51,1],[265,17,265,37,1],[267,17,267,42,1],[268,17,268,50,1],[269,17,269,37,1],[272,17,272,59,1],[273,17,273,84,1],[274,17,274,83,1],[275,13,275,14,1],[277,9,277,10,1],[281,9,281,10,1],[283,13,283,67,1],[284,13,284,55,1],[285,20,285,65,1],[286,13,286,14,1],[288,17,291,19,1],[292,17,292,50,1],[293,17,293,37,1],[295,17,295,69,1],[296,17,296,50,1],[297,17,297,37,1],[299,17,299,54,1],[302,17,302,87,1],[303,17,303,92,1],[304,13,304,14,1],[307,9,307,10,1],[311,9,311,10,1],[313,13,313,67,1],[314,13,314,55,1],[315,20,315,65,1],[316,13,316,14,1],[318,17,321,19,1],[322,17,322,50,1],[323,17,323,37,1],[325,17,325,53,1],[326,17,326,50,1],[327,17,327,37,1],[329,17,329,54,1],[332,17,332,82,1],[333,17,333,112,1],[334,13,334,14,1],[337,9,337,10,1],[341,9,341,10,1],[343,13,343,67,1],[344,13,344,55,1],[345,20,345,65,1],[346,13,346,14,1],[347,17,350,19,1],[351,17,351,50,1],[352,17,352,37,1],[355,17,355,56,1],[356,17,356,87,1],[357,17,357,46,1],[358,17,358,37,1],[361,17,361,55,1],[362,17,362,88,1],[363,13,363,14,1],[366,9,366,10,1],[370,9,370,10,1],[372,13,372,67,1],[373,13,373,55,1],[374,20,374,65,1],[375,13,375,14,1],[376,17,379,19,1],[380,17,380,50,1],[381,17,381,37,1],[384,17,384,56,1],[385,17,385,82,1],[386,17,386,46,1],[387,17,387,37,1],[390,17,390,55,1],[391,17,391,83,1],[392,13,392,14,1],[395,9,395,10,1],[399,9,399,10,1],[401,13,401,67,1],[402,13,402,55,1],[404,20,404,73,1],[405,13,405,14,1],[406,17,406,139,1],[407,17,407,175,1],[408,17,408,227,1],[410,17,410,36,1],[411,17,411,18,1],[412,21,412,110,1],[413,21,413,83,1],[414,21,414,68,1],[415,21,415,55,1],[416,21,416,41,1],[419,21,422,23,1],[423,21,423,62,1],[424,21,424,41,1],[426,21,426,50,1],[427,21,427,55,1],[428,21,428,41,1],[431,21,431,68,1],[432,21,432,58,1],[433,21,433,41,1],[436,21,436,67,1],[437,17,437,18,1],[438,13,438,14,1],[440,9,440,10,1],[444,9,444,10,1],[446,13,446,67,1],[447,13,447,55,1],[448,20,448,65,1],[449,13,449,14,1],[450,17,453,19,1],[454,17,457,19,1],[458,17,461,19,1],[462,17,462,58,1],[463,17,463,62,1],[463,62,463,71,1],[463,71,463,73,1],[463,17,463,73,1],[464,17,464,56,1],[465,17,465,61,1],[465,61,465,69,1],[465,69,465,71,1],[465,17,465,71,1],[466,17,466,48,1],[467,17,467,47,1],[468,17,468,46,1],[469,17,469,37,1],[472,17,472,58,1],[473,17,473,46,1],[474,17,474,37,1],[477,17,477,55,1],[478,13,478,14,1],[481,9,481,10,1],[485,9,485,10,1],[487,13,487,67,1],[488,13,488,55,1],[489,20,489,65,1],[490,13,490,14,1],[491,17,491,57,1],[494,17,494,69,1],[497,17,497,85,1],[498,17,498,85,1],[499,17,499,85,1],[500,17,500,87,1],[501,17,501,87,1],[502,17,502,87,1],[503,17,503,87,1],[504,17,504,84,1],[505,17,505,84,1],[506,13,506,14,1],[507,9,507,10,1],[511,9,511,10,1],[513,13,513,67,1],[514,13,514,55,1],[515,20,515,65,1],[516,13,516,14,1],[517,17,517,81,1],[520,17,520,47,1],[521,17,521,93,1],[522,17,522,117,1],[525,17,525,49,1],[526,17,526,56,1],[526,56,526,60,1],[526,60,526,71,1],[526,17,526,71,1],[528,17,528,56,1],[529,17,529,63,1],[529,63,529,67,1],[529,67,529,78,1],[529,17,529,78,1],[531,17,531,53,1],[532,17,532,60,1],[532,60,532,64,1],[532,64,532,75,1],[532,17,532,75,1],[533,13,533,14,1],[534,9,534,10,1],[538,9,538,10,1],[540,13,540,67,1],[541,13,541,55,1],[542,20,542,65,1],[543,13,543,14,1],[544,17,544,81,1],[547,17,547,74,1],[548,17,548,80,1],[552,17,552,58,1],[553,17,553,65,1],[553,65,553,69,1],[553,69,553,80,1],[553,17,553,80,1],[554,17,554,61,1],[555,17,555,68,1],[555,68,555,72,1],[555,72,555,83,1],[555,17,555,83,1],[557,13,557,14,1],[558,9,558,10,1],[562,9,562,10,1],[564,13,564,67,1],[565,13,565,55,1],[566,20,566,65,1],[567,13,567,14,1],[568,17,568,67,1],[571,17,571,59,1],[575,17,575,54,1],[576,17,576,61,1],[576,61,576,65,1],[576,65,576,76,1],[576,17,576,76,1],[578,13,578,14,1],[579,9,579,10,1],[583,9,583,10,1],[585,13,585,67,1],[586,13,586,55,1],[587,20,587,65,1],[588,13,588,14,1],[589,17,589,81,1],[592,17,592,80,1],[593,17,593,86,1],[597,17,597,61,1],[598,17,598,68,1],[598,68,598,72,1],[598,72,598,83,1],[598,17,598,83,1],[600,17,600,64,1],[601,17,601,71,1],[601,71,601,75,1],[601,75,601,86,1],[601,17,601,86,1],[602,13,602,14,1],[603,9,603,10,1],[607,9,607,10,1],[609,13,609,67,1],[610,13,610,55,1],[611,20,611,65,1],[612,13,612,14,1],[613,17,613,63,1],[614,17,614,63,1],[615,17,615,69,1],[616,17,616,69,1],[617,17,617,60,1],[618,17,618,63,1],[619,17,619,69,1],[620,17,620,69,1],[621,17,621,60,1],[623,17,623,59,1],[624,17,624,63,1],[624,63,624,72,1],[624,72,624,74,1],[624,17,624,74,1],[625,17,625,59,1],[626,17,626,63,1],[626,63,626,72,1],[626,72,626,74,1],[626,17,626,74,1],[627,17,627,61,1],[628,17,628,65,1],[628,65,628,74,1],[628,74,628,76,1],[628,17,628,76,1],[629,17,629,61,1],[630,17,630,65,1],[630,65,630,74,1],[630,74,630,76,1],[630,17,630,76,1],[631,17,631,61,1],[632,17,632,65,1],[632,65,632,74,1],[632,74,632,76,1],[632,17,632,76,1],[633,17,633,61,1],[634,17,634,65,1],[634,65,634,74,1],[634,74,634,76,1],[634,17,634,76,1],[635,17,635,60,1],[636,17,636,62,1],[636,62,636,73,1],[636,73,636,75,1],[636,17,636,75,1],[637,17,637,60,1],[638,17,638,62,1],[638,62,638,73,1],[638,73,638,75,1],[638,17,638,75,1],[642,17,642,48,1],[643,17,643,48,1],[644,17,644,48,1],[645,17,645,50,1],[646,17,646,50,1],[647,17,647,50,1],[648,17,648,50,1],[649,17,649,47,1],[650,17,650,47,1],[651,17,651,37,1],[654,17,654,82,1],[655,17,655,97,1],[656,17,656,97,1],[657,17,657,97,1],[658,17,658,116,1],[659,17,659,116,1],[660,17,660,116,1],[661,17,661,116,1],[662,17,662,127,1],[663,17,663,127,1],[664,13,664,14,1],[667,9,667,10,1],[671,9,671,10,1],[673,13,673,67,1],[674,13,674,55,1],[675,20,675,65,1],[676,13,676,14,1],[677,17,677,63,1],[678,17,678,63,1],[679,17,679,63,1],[680,17,680,69,1],[681,17,681,69,1],[683,17,683,59,1],[684,17,684,63,1],[684,63,684,72,1],[684,72,684,74,1],[684,17,684,74,1],[685,17,685,59,1],[686,17,686,63,1],[686,63,686,72,1],[686,72,686,74,1],[686,17,686,74,1],[687,17,687,61,1],[688,17,688,65,1],[688,65,688,74,1],[688,74,688,76,1],[688,17,688,76,1],[689,17,689,61,1],[690,17,690,65,1],[690,65,690,74,1],[690,74,690,76,1],[690,17,690,76,1],[692,17,692,48,1],[693,17,693,48,1],[694,17,694,48,1],[695,17,695,50,1],[696,17,696,50,1],[697,17,697,37,1],[700,17,700,52,1],[701,17,701,50,1],[702,17,702,37,1],[705,17,705,116,1],[707,13,707,14,1],[708,9,708,10,1],[712,9,712,10,1],[714,13,714,67,1],[715,13,715,55,1],[716,20,716,65,1],[717,13,717,14,1],[718,17,718,63,1],[719,17,719,63,1],[721,17,721,59,1],[722,17,722,63,1],[722,63,722,72,1],[722,72,722,74,1],[722,17,722,74,1],[724,17,724,48,1],[725,17,725,48,1],[726,17,726,37,1],[729,17,729,48,1],[730,17,730,48,1],[731,17,731,37,1],[734,17,734,82,1],[736,13,736,14,1],[737,9,737,10,1],[742,9,742,10,1],[743,13,743,29,1],[745,13,745,42,1],[746,13,746,37,1],[748,13,748,82,1],[749,13,749,65,1],[750,13,750,20,1],[750,22,750,30,0],[750,31,750,33,1],[750,34,750,45,1],[751,13,751,14,0],[752,17,752,43,0],[753,13,753,14,0],[754,13,754,78,1],[755,13,755,59,1],[756,13,756,20,1],[756,22,756,30,0],[756,31,756,33,1],[756,34,756,39,1],[757,13,757,14,0],[758,17,758,43,0],[759,13,759,14,0],[760,9,760,10,1],[763,9,763,10,0],[764,13,764,48,0],[765,17,765,41,0],[767,13,767,58,0],[768,13,768,50,0],[770,13,770,27,0],[771,9,771,10,0],[774,9,774,10,1],[775,13,778,15,1],[780,13,783,15,1],[784,13,787,15,1],[788,13,791,15,1],[792,13,795,15,1],[797,13,800,15,1],[801,13,804,15,1],[805,13,808,15,1],[809,13,812,15,1],[815,13,815,55,1],[816,13,816,59,1],[816,59,816,68,1],[816,68,816,70,1],[816,13,816,70,1],[817,13,817,55,1],[818,13,818,59,1],[818,59,818,68,1],[818,68,818,70,1],[818,13,818,70,1],[820,13,820,57,1],[821,13,821,61,1],[821,61,821,70,1],[821,70,821,72,1],[821,13,821,72,1],[822,13,822,57,1],[823,13,823,61,1],[823,61,823,70,1],[823,70,823,72,1],[823,13,823,72,1],[825,13,825,57,1],[826,13,826,61,1],[826,61,826,70,1],[826,70,826,72,1],[826,13,826,72,1],[827,13,827,57,1],[828,13,828,61,1],[828,61,828,70,1],[828,70,828,72,1],[828,13,828,72,1],[830,13,830,56,1],[831,13,831,58,1],[831,58,831,69,1],[831,69,831,71,1],[831,13,831,71,1],[833,13,833,56,1],[834,13,834,58,1],[834,58,834,69,1],[834,69,834,71,1],[834,13,834,71,1],[836,13,836,44,1],[837,13,837,44,1],[838,13,838,44,1],[839,13,839,46,1],[840,13,840,46,1],[841,13,841,46,1],[842,13,842,46,1],[843,13,843,43,1],[844,13,844,43,1],[845,13,845,33,1],[847,13,847,105,1],[848,9,848,10,1]]);
+    </script>
+  </body>
+</html>

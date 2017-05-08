@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\CacheHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Web;
+using System.Web.Caching;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Core
+{
+	/// &lt;summary&gt;
+	/// Class that is exposed by the ApplicationContext for application wide caching purposes
+	/// &lt;/summary&gt;
+    public class CacheHelper
+	{
+        private static readonly ICacheProvider NullRequestCache = new NullCacheProvider();
+        private static readonly ICacheProvider NullStaticCache = new NullCacheProvider();
+        private static readonly IRuntimeCacheProvider NullRuntimeCache = new NullCacheProvider();
+        
+        /// &lt;summary&gt;
+        /// Creates a cache helper with disabled caches
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Good for unit testing
+        /// &lt;/remarks&gt;
+        public static CacheHelper CreateDisabledCacheHelper()
+        {
+            return new CacheHelper(NullRuntimeCache, NullStaticCache, NullRequestCache, new IsolatedRuntimeCache(t =&gt; NullRuntimeCache));
+        }
+
+	    /// &lt;summary&gt;
+	    /// Initializes a new instance for use in the web
+	    /// &lt;/summary&gt;
+	    public CacheHelper()
+	        : this(
+	            new HttpRuntimeCacheProvider(HttpRuntime.Cache),
+	            new StaticCacheProvider(),
+                new HttpRequestCacheProvider(),
+                new IsolatedRuntimeCache(t =&gt; new ObjectCacheRuntimeCacheProvider()))
+	    {
+	    }
+
+	    /// &lt;summary&gt;
+	    /// Initializes a new instance for use in the web
+	    /// &lt;/summary&gt;
+	    /// &lt;param name=&quot;cache&quot;&gt;&lt;/param&gt;
+	    public CacheHelper(System.Web.Caching.Cache cache)
+	        : this(
+	            new HttpRuntimeCacheProvider(cache),
+	            new StaticCacheProvider(),
+                new HttpRequestCacheProvider(),
+                new IsolatedRuntimeCache(t =&gt; new ObjectCacheRuntimeCacheProvider()))
+	    {
+	    }
+
+	    [Obsolete(&quot;Use the constructor the specifies all dependencies&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public CacheHelper(
+            IRuntimeCacheProvider httpCacheProvider, 
+            ICacheProvider staticCacheProvider, 
+            ICacheProvider requestCacheProvider)
+            : this(httpCacheProvider, staticCacheProvider, requestCacheProvider, new IsolatedRuntimeCache(t =&gt; new ObjectCacheRuntimeCacheProvider()))
+        {            
+        }
+
+	    /// &lt;summary&gt;
+	    /// Initializes a new instance based on the provided providers
+	    /// &lt;/summary&gt;
+	    /// &lt;param name=&quot;httpCacheProvider&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;staticCacheProvider&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;requestCacheProvider&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;isolatedCacheManager&quot;&gt;&lt;/param&gt;
+	    public CacheHelper(
+            IRuntimeCacheProvider httpCacheProvider,
+            ICacheProvider staticCacheProvider,
+            ICacheProvider requestCacheProvider,
+            IsolatedRuntimeCache isolatedCacheManager)            
+        {
+	        if (httpCacheProvider == null) throw new ArgumentNullException(&quot;httpCacheProvider&quot;);
+	        if (staticCacheProvider == null) throw new ArgumentNullException(&quot;staticCacheProvider&quot;);
+	        if (requestCacheProvider == null) throw new ArgumentNullException(&quot;requestCacheProvider&quot;);
+	        if (isolatedCacheManager == null) throw new ArgumentNullException(&quot;isolatedCacheManager&quot;);
+	        RuntimeCache = httpCacheProvider;
+            StaticCache = staticCacheProvider;
+            RequestCache = requestCacheProvider;
+            IsolatedRuntimeCache = isolatedCacheManager;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the current Request cache
+        /// &lt;/summary&gt;
+        public ICacheProvider RequestCache { get; internal set; }
+        
+        /// &lt;summary&gt;
+        /// Returns the current Runtime cache
+        /// &lt;/summary&gt;
+        public ICacheProvider StaticCache { get; internal set; }
+
+        /// &lt;summary&gt;
+        /// Returns the current Runtime cache
+        /// &lt;/summary&gt;
+	    public IRuntimeCacheProvider RuntimeCache { get; internal set; }
+
+        /// &lt;summary&gt;
+        /// Returns the current Isolated Runtime cache manager
+        /// &lt;/summary&gt;
+        public IsolatedRuntimeCache IsolatedRuntimeCache { get; internal set; }
+
+        #region Legacy Runtime/Http Cache accessors
+
+        /// &lt;summary&gt;
+        /// Clears the item in umbraco&#39;s runtime cache
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public void ClearAllCache()
+        {
+            RuntimeCache.ClearAllCache();
+            IsolatedRuntimeCache.ClearAllCaches();
+        }
+
+        /// &lt;summary&gt;
+        /// Clears the item in umbraco&#39;s runtime cache with the given key 
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;key&quot;&gt;Key&lt;/param&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public void ClearCacheItem(string key)
+        {
+            RuntimeCache.ClearCacheItem(key);
+        }
+
+
+        /// &lt;summary&gt;
+        /// Clears all objects in the System.Web.Cache with the System.Type name as the
+        /// input parameter. (using [object].GetType())
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;typeName&quot;&gt;The name of the System.Type which should be cleared from cache ex &quot;System.Xml.XmlDocument&quot;&lt;/param&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        public void ClearCacheObjectTypes(string typeName)
+        {
+            RuntimeCache.ClearCacheObjectTypes(typeName);
+        }
+
+        /// &lt;summary&gt;
+        /// Clears all objects in the System.Web.Cache with the System.Type specified
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public void ClearCacheObjectTypes&lt;T&gt;()
+        {
+            RuntimeCache.ClearCacheObjectTypes&lt;T&gt;();
+        }
+
+        /// &lt;summary&gt;
+        /// Clears all cache items that starts with the key passed.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;keyStartsWith&quot;&gt;The start of the key&lt;/param&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public void ClearCacheByKeySearch(string keyStartsWith)
+        {
+            RuntimeCache.ClearCacheByKeySearch(keyStartsWith);
+        }
+
+        /// &lt;summary&gt;
+        /// Clears all cache items that have a key that matches the regular expression
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;regexString&quot;&gt;&lt;/param&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public void ClearCacheByKeyExpression(string regexString)
+        {
+            RuntimeCache.ClearCacheByKeyExpression(regexString);
+        }
+
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public IEnumerable&lt;T&gt; GetCacheItemsByKeySearch&lt;T&gt;(string keyStartsWith)
+        {
+            return RuntimeCache.GetCacheItemsByKeySearch&lt;T&gt;(keyStartsWith);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a cache item by key, does not update the cache if it isn&#39;t there.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TT&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public TT GetCacheItem&lt;TT&gt;(string cacheKey)
+        {
+            return RuntimeCache.GetCacheItem&lt;TT&gt;(cacheKey);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets (and adds if necessary) an item from the cache with all of the default parameters
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TT&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;getCacheItem&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public TT GetCacheItem&lt;TT&gt;(string cacheKey, Func&lt;TT&gt; getCacheItem)
+        {
+            return RuntimeCache.GetCacheItem&lt;TT&gt;(cacheKey, getCacheItem);
+
+        }
+
+        /// &lt;summary&gt;
+        /// Gets (and adds if necessary) an item from the cache with the specified absolute expiration date (from NOW)
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TT&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;timeout&quot;&gt;This will set an absolute expiration from now until the timeout&lt;/param&gt;
+        /// &lt;param name=&quot;getCacheItem&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public TT GetCacheItem&lt;TT&gt;(string cacheKey,
+            TimeSpan timeout, Func&lt;TT&gt; getCacheItem)
+        {
+            return RuntimeCache.GetCacheItem&lt;TT&gt;(cacheKey, getCacheItem, timeout);
+
+        }
+
+        /// &lt;summary&gt;
+        /// Gets (and adds if necessary) an item from the cache with the specified absolute expiration date (from NOW)
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TT&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;refreshAction&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;timeout&quot;&gt;This will set an absolute expiration from now until the timeout&lt;/param&gt;
+        /// &lt;param name=&quot;getCacheItem&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public TT GetCacheItem&lt;TT&gt;(string cacheKey,
+            CacheItemRemovedCallback refreshAction, TimeSpan timeout,
+            Func&lt;TT&gt; getCacheItem)
+        {
+            return RuntimeCache.GetCacheItem&lt;TT&gt;(cacheKey, getCacheItem, timeout, removedCallback: refreshAction);
+
+        }
+
+        /// &lt;summary&gt;
+        /// Gets (and adds if necessary) an item from the cache with the specified absolute expiration date (from NOW)
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TT&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;priority&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;refreshAction&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;timeout&quot;&gt;This will set an absolute expiration from now until the timeout&lt;/param&gt;
+        /// &lt;param name=&quot;getCacheItem&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public TT GetCacheItem&lt;TT&gt;(string cacheKey,
+            CacheItemPriority priority, CacheItemRemovedCallback refreshAction, TimeSpan timeout,
+            Func&lt;TT&gt; getCacheItem)
+        {
+            return RuntimeCache.GetCacheItem&lt;TT&gt;(cacheKey, getCacheItem, timeout, false, priority, refreshAction);
+
+        }
+
+        /// &lt;summary&gt;
+        /// Gets (and adds if necessary) an item from the cache with the specified absolute expiration date (from NOW)
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TT&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;priority&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;refreshAction&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;cacheDependency&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;timeout&quot;&gt;This will set an absolute expiration from now until the timeout&lt;/param&gt;
+        /// &lt;param name=&quot;getCacheItem&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;Do not use this method, we no longer support the caching overloads with references to CacheDependency, use the overloads specifying a file collection instead&quot;)]
+        public TT GetCacheItem&lt;TT&gt;(string cacheKey,
+            CacheItemPriority priority,
+            CacheItemRemovedCallback refreshAction,
+            CacheDependency cacheDependency,
+            TimeSpan timeout,
+            Func&lt;TT&gt; getCacheItem)
+        {
+            var cache = GetHttpRuntimeCacheProvider(RuntimeCache);
+            if (cache != null)
+            {
+                var result = cache.GetCacheItem(cacheKey, () =&gt; getCacheItem(), timeout, false, priority, refreshAction, cacheDependency);
+                return result == null ? default(TT) : result.TryConvertTo&lt;TT&gt;().Result;
+            }
+            throw new InvalidOperationException(&quot;Cannot use this obsoleted overload when the current provider is not of type &quot; + typeof(HttpRuntimeCacheProvider));
+        }
+
+        /// &lt;summary&gt;
+        /// Gets (and adds if necessary) an item from the cache
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TT&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;priority&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;cacheDependency&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;getCacheItem&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;Do not use this method, we no longer support the caching overloads with references to CacheDependency, use the overloads specifying a file collection instead&quot;)]
+        public TT GetCacheItem&lt;TT&gt;(string cacheKey,
+            CacheItemPriority priority,
+            CacheDependency cacheDependency,
+            Func&lt;TT&gt; getCacheItem)
+        {
+            var cache = GetHttpRuntimeCacheProvider(RuntimeCache);
+            if (cache != null)
+            {
+                var result = cache.GetCacheItem(cacheKey, () =&gt; getCacheItem(), null, false, priority, null, cacheDependency);
+                return result == null ? default(TT) : result.TryConvertTo&lt;TT&gt;().Result;
+            }
+            throw new InvalidOperationException(&quot;Cannot use this obsoleted overload when the current provider is not of type &quot; + typeof(HttpRuntimeCacheProvider));
+        }
+
+        /// &lt;summary&gt;
+        /// Inserts an item into the cache, if it already exists in the cache it will be replaced
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;priority&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;getCacheItem&quot;&gt;&lt;/param&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public void InsertCacheItem&lt;T&gt;(string cacheKey,
+                                       CacheItemPriority priority,
+                                       Func&lt;T&gt; getCacheItem)
+        {
+            RuntimeCache.InsertCacheItem&lt;T&gt;(cacheKey, getCacheItem, priority: priority);
+
+        }
+
+        /// &lt;summary&gt;
+        /// Inserts an item into the cache, if it already exists in the cache it will be replaced
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;priority&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;timeout&quot;&gt;This will set an absolute expiration from now until the timeout&lt;/param&gt;
+        /// &lt;param name=&quot;getCacheItem&quot;&gt;&lt;/param&gt;
+        [Obsolete(&quot;Do not use this method, access the runtime cache from the RuntimeCache property&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public void InsertCacheItem&lt;T&gt;(string cacheKey,
+                                       CacheItemPriority priority,
+                                       TimeSpan timeout,
+                                       Func&lt;T&gt; getCacheItem)
+        {
+            RuntimeCache.InsertCacheItem&lt;T&gt;(cacheKey, getCacheItem, timeout, priority: priority);
+        }
+
+        /// &lt;summary&gt;
+        /// Inserts an item into the cache, if it already exists in the cache it will be replaced
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;priority&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;cacheDependency&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;timeout&quot;&gt;This will set an absolute expiration from now until the timeout&lt;/param&gt;
+        /// &lt;param name=&quot;getCacheItem&quot;&gt;&lt;/param&gt;
+        [Obsolete(&quot;Do not use this method, we no longer support the caching overloads with references to CacheDependency, use the overloads specifying a file collection instead&quot;)]
+        public void InsertCacheItem&lt;T&gt;(string cacheKey,
+                                       CacheItemPriority priority,
+                                       CacheDependency cacheDependency,
+                                       TimeSpan timeout,
+                                       Func&lt;T&gt; getCacheItem)
+        {
+            var cache = GetHttpRuntimeCacheProvider(RuntimeCache);
+            if (cache != null)
+            {
+                cache.InsertCacheItem(cacheKey, () =&gt; getCacheItem(), timeout, false, priority, null, cacheDependency);
+            }
+            throw new InvalidOperationException(&quot;Cannot use this obsoleted overload when the current provider is not of type &quot; + typeof(HttpRuntimeCacheProvider));
+        }
+
+        /// &lt;summary&gt;
+        /// Inserts an item into the cache, if it already exists in the cache it will be replaced
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cacheKey&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;priority&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;refreshAction&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;cacheDependency&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;timeout&quot;&gt;This will set an absolute expiration from now until the timeout&lt;/param&gt;
+        /// &lt;param name=&quot;getCacheItem&quot;&gt;&lt;/param&gt;
+        [Obsolete(&quot;Do not use this method, we no longer support the caching overloads with references to CacheDependency, use the overloads specifying a file collection instead&quot;)]
+        public void InsertCacheItem&lt;T&gt;(string cacheKey,
+                                       CacheItemPriority priority,
+                                       CacheItemRemovedCallback refreshAction,
+                                       CacheDependency cacheDependency,
+                                       TimeSpan? timeout,
+                                       Func&lt;T&gt; getCacheItem)
+        {
+            var cache = GetHttpRuntimeCacheProvider(RuntimeCache);
+            if (cache != null)
+            {
+                cache.InsertCacheItem(cacheKey, () =&gt; getCacheItem(), timeout, false, priority, refreshAction, cacheDependency);
+            }
+            throw new InvalidOperationException(&quot;Cannot use this obsoleted overload when the current provider is not of type &quot; + typeof(HttpRuntimeCacheProvider));
+        } 
+        #endregion
+
+	    private HttpRuntimeCacheProvider GetHttpRuntimeCacheProvider(IRuntimeCacheProvider runtimeCache)
+	    {
+	        HttpRuntimeCacheProvider cache;
+            var wrapper = RuntimeCache as IRuntimeCacheProviderWrapper;
+	        if (wrapper != null)
+	        {
+	            cache = wrapper.InnerProvider as HttpRuntimeCacheProvider;
+	        }
+	        else
+	        {
+                cache = RuntimeCache as HttpRuntimeCacheProvider;
+            }
+	        return cache;
+	    }
+    }
+
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[21,9,21,91,1],[22,9,22,90,1],[23,9,23,98,1],[33,9,33,10,1],[34,13,34,119,1],[34,119,34,135,1],[34,135,34,138,1],[34,13,34,138,1],[35,9,35,10,1],[41,12,45,47,1],[45,47,45,84,0],[45,84,45,86,1],[41,12,45,86,1],[46,6,46,7,1],[47,6,47,7,1],[54,12,58,47,0],[58,47,58,84,0],[58,84,58,86,0],[54,12,58,86,0],[59,6,59,7,0],[60,6,60,7,0],[68,15,68,112,0],[68,112,68,149,0],[68,149,68,151,0],[68,15,68,151,0],[69,9,69,10,0],[70,9,70,10,0],[79,6,83,55,1],[84,9,84,10,1],[85,10,85,40,1],[85,41,85,94,0],[86,10,86,42,1],[86,43,86,98,0],[87,10,87,43,1],[87,44,87,100,0],[88,10,88,43,1],[88,44,88,100,0],[89,10,89,43,1],[90,13,90,47,1],[91,13,91,49,1],[92,13,92,57,1],[93,9,93,10,1],[98,46,98,50,1],[98,51,98,64,1],[103,45,103,49,1],[103,50,103,63,1],[108,50,108,54,1],[108,55,108,68,1],[113,60,113,64,1],[113,65,113,78,1],[123,9,123,10,0],[124,13,124,42,0],[125,13,125,51,0],[126,9,126,10,0],[135,9,135,10,0],[136,13,136,46,0],[137,9,137,10,0],[147,9,147,10,0],[148,13,148,58,0],[149,9,149,10,0],[157,9,157,10,0],[158,13,158,53,0],[159,9,159,10,0],[168,9,168,10,0],[169,13,169,63,0],[170,9,170,10,0],[179,9,179,10,0],[180,13,180,65,0],[181,9,181,10,0],[186,9,186,10,0],[187,13,187,76,0],[188,9,188,10,0],[199,9,199,10,0],[200,13,200,60,0],[201,9,201,10,0],[213,9,213,10,0],[214,13,214,74,0],[216,9,216,10,0],[230,9,230,10,0],[231,13,231,83,0],[233,9,233,10,0],[249,9,249,10,0],[250,13,250,115,0],[252,9,252,10,0],[269,9,269,10,0],[270,13,270,115,0],[272,9,272,10,0],[292,9,292,10,0],[293,13,293,67,0],[294,13,294,31,0],[295,13,295,14,0],[296,17,296,65,0],[296,65,296,79,0],[296,79,296,139,0],[296,17,296,139,0],[297,17,297,88,0],[299,13,299,164,0],[300,9,300,10,0],[316,9,316,10,0],[317,13,317,67,0],[318,13,318,31,0],[319,13,319,14,0],[320,17,320,65,0],[320,65,320,79,0],[320,79,320,127,0],[320,17,320,127,0],[321,17,321,88,0],[323,13,323,164,0],[324,9,324,10,0],[338,9,338,10,0],[339,13,339,89,0],[341,9,341,10,0],[357,9,357,10,0],[358,13,358,98,0],[359,9,359,10,0],[376,9,376,10,0],[377,13,377,67,0],[378,13,378,31,0],[379,13,379,14,0],[380,17,380,55,0],[380,55,380,69,0],[380,69,380,120,0],[380,17,380,120,0],[381,13,381,14,0],[382,13,382,164,0],[402,9,402,10,0],[403,13,403,67,0],[404,13,404,31,0],[405,13,405,14,0],[406,17,406,55,0],[406,55,406,69,0],[406,69,406,129,0],[406,17,406,129,0],[407,13,407,14,0],[408,13,408,164,0],[413,6,413,7,0],[415,13,415,72,0],[416,10,416,30,0],[417,10,417,11,0],[418,14,418,72,0],[419,10,419,11,0],[421,10,421,11,0],[422,17,422,66,0],[423,13,423,14,0],[424,10,424,23,0],[425,6,425,7,0]]);
+    </script>
+  </body>
+</html>

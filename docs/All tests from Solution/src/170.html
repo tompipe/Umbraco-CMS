@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Services\PerformanceTests.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Data.SqlServerCe;
+using System.Globalization;
+using System.Linq;
+using System.Threading;
+using System.Xml.Linq;
+using NUnit.Framework;
+using Umbraco.Core;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Services;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Tests.TestHelpers.Entities;
+
+namespace Umbraco.Tests.Services
+{
+	/// &lt;summary&gt;
+    /// Tests covering all methods in the ContentService class.
+    /// This is more of an integration test as it involves multiple layers
+    /// as well as configuration.
+    /// &lt;/summary&gt;
+    [DatabaseTestBehavior(DatabaseBehavior.NewDbFileAndSchemaPerTest)]
+    [TestFixture, RequiresSTA]
+    [NUnit.Framework.Ignore(&quot;These should not be run by the server, only directly as they are only benchmark tests&quot;)]
+    public class PerformanceTests : BaseDatabaseFactoryTest
+    {
+        [SetUp]
+        public override void Initialize()
+        {
+	        base.Initialize();
+        }
+
+        protected override string GetDbConnectionString()
+        {
+            return @&quot;server=.\SQLEXPRESS;database=UmbTest;user id=sa;password=test&quot;;
+        }
+
+        protected override string GetDbProviderName()
+        {
+            return Constants.DatabaseProviders.SqlServer;
+        }
+
+
+        /// &lt;summary&gt;
+        /// don&#39;t create anything, we&#39;re testing against our own server
+        /// &lt;/summary&gt;
+        protected override void CreateSqlCeDatabase()
+        {
+        }
+
+		[TearDown]
+		public override void TearDown()
+		{   
+      		base.TearDown();
+		}
+
+        [Test]
+        public void Get_All_Published_Content()
+        {
+            var result = PrimeDbWithLotsOfContent();
+            var contentSvc = (ContentService) ServiceContext.ContentService;
+
+            var countOfPublished = result.Count(x =&gt; x.Published);
+            var contentTypeId = result.First().ContentTypeId;
+
+            using (DisposableTimer.DebugDuration&lt;PerformanceTests&gt;(&quot;Getting published content normally&quot;))
+            {
+                //do this 10x!
+                for (var i = 0; i &lt; 10; i++)
+                {
+
+                    var published = new List&lt;IContent&gt;();
+                    //get all content items that are published
+                    var rootContent = contentSvc.GetRootContent();
+                    foreach (var content in rootContent.Where(content =&gt; content.Published))
+                    {
+                        published.Add(content);
+                        published.AddRange(contentSvc.GetPublishedDescendants(content));
+                    }
+                    Assert.AreEqual(countOfPublished, published.Count(x =&gt; x.ContentTypeId == contentTypeId));
+                }
+                
+            }
+
+            using (DisposableTimer.DebugDuration&lt;PerformanceTests&gt;(&quot;Getting published content optimized&quot;))
+            {
+
+                //do this 10x!
+                for (var i = 0; i &lt; 10; i++)
+                {
+
+                    //get all content items that are published
+                    var published = contentSvc.GetAllPublished();
+
+                    Assert.AreEqual(countOfPublished, published.Count(x =&gt; x.ContentTypeId == contentTypeId));
+                }
+            }
+        }
+
+        [Test]
+        public void Get_All_Published_Content_Of_Type()
+        {
+            var result = PrimeDbWithLotsOfContent();
+            var contentSvc = (ContentService)ServiceContext.ContentService;
+
+            var countOfPublished = result.Count(x =&gt; x.Published);
+            var contentTypeId = result.First().ContentTypeId;
+
+            using (DisposableTimer.DebugDuration&lt;PerformanceTests&gt;(&quot;Getting published content of type normally&quot;))
+            {
+                //do this 10x!
+                for (var i = 0; i &lt; 10; i++)
+                {
+                    
+                    //get all content items that are published of this type
+                    var published = contentSvc.GetContentOfContentType(contentTypeId).Where(content =&gt; content.Published);
+                    Assert.AreEqual(countOfPublished, published.Count(x =&gt; x.ContentTypeId == contentTypeId));
+                }
+            }
+
+            using (DisposableTimer.DebugDuration&lt;PerformanceTests&gt;(&quot;Getting published content of type optimized&quot;))
+            {
+
+                //do this 10x!
+                for (var i = 0; i &lt; 10; i++)
+                {
+                    //get all content items that are published of this type
+                    var published = contentSvc.GetPublishedContentOfContentType(contentTypeId);
+                    Assert.AreEqual(countOfPublished, published.Count(x =&gt; x.ContentTypeId == contentTypeId));
+                }
+            }
+        }
+
+        [Test]
+        public void Truncate_Insert_Vs_Update_Insert()
+        {
+            var customObjectType = Guid.NewGuid();
+            //chuck lots of data in the db
+            var nodes = PrimeDbWithLotsOfContentXmlRecords(customObjectType);
+
+            //now we need to test the difference between truncating all records and re-inserting them as we do now, 
+            //vs updating them (which might result in checking if they exist for or listening on an exception).
+            using (DisposableTimer.DebugDuration&lt;PerformanceTests&gt;(&quot;Starting truncate + normal insert test&quot;))
+            {
+                //do this 10x!
+                for (var i = 0; i &lt; 10; i++)
+                {
+                    //clear all the xml entries
+                    DatabaseContext.Database.Execute(@&quot;DELETE FROM cmsContentXml WHERE nodeId IN
+                                                (SELECT DISTINCT cmsContentXml.nodeId FROM cmsContentXml 
+                                                    INNER JOIN cmsContent ON cmsContentXml.nodeId = cmsContent.nodeId)&quot;);
+
+                    //now we insert each record for the ones we&#39;ve deleted like we do in the content service.
+                    var xmlItems = nodes.Select(node =&gt; new ContentXmlDto { NodeId = node.NodeId, Xml = UpdatedXmlStructure }).ToList();
+                    foreach (var xml in xmlItems)
+                    {
+                        var result = DatabaseContext.Database.Insert(xml);
+                    }
+                }
+            }
+
+            //now, isntead of truncating, we&#39;ll attempt to update and if it doesn&#39;t work then we insert
+            using (DisposableTimer.DebugDuration&lt;PerformanceTests&gt;(&quot;Starting update test&quot;))
+            {           
+                //do this 10x!
+                for (var i = 0; i &lt; 10; i++)
+                {
+                    //now we insert each record for the ones we&#39;ve deleted like we do in the content service.
+                    var xmlItems = nodes.Select(node =&gt; new ContentXmlDto { NodeId = node.NodeId, Xml = UpdatedXmlStructure }).ToList();
+                    foreach (var xml in xmlItems)
+                    {
+                        var result = DatabaseContext.Database.Update(xml);
+                    }
+                }
+            }
+
+            //now, test truncating but then do bulk insertion of records
+            using (DisposableTimer.DebugDuration&lt;PerformanceTests&gt;(&quot;Starting truncate + bulk insert test&quot;))
+            {
+                //do this 10x!
+                for (var i = 0; i &lt; 10; i++)
+                {
+                    //clear all the xml entries
+                    DatabaseContext.Database.Execute(@&quot;DELETE FROM cmsContentXml WHERE nodeId IN
+                                                (SELECT DISTINCT cmsContentXml.nodeId FROM cmsContentXml 
+                                                    INNER JOIN cmsContent ON cmsContentXml.nodeId = cmsContent.nodeId)&quot;);
+
+                    //now we insert each record for the ones we&#39;ve deleted like we do in the content service.
+                    var xmlItems = nodes.Select(node =&gt; new ContentXmlDto { NodeId = node.NodeId, Xml = UpdatedXmlStructure }).ToList();
+                    DatabaseContext.Database.BulkInsertRecords(xmlItems);
+                }
+            }
+
+            //now, test truncating but then do bulk insertion of records
+            using (DisposableTimer.DebugDuration&lt;PerformanceTests&gt;(&quot;Starting truncate + bulk insert test in one transaction&quot;))
+            {
+                //do this 10x!
+                for (var i = 0; i &lt; 10; i++)
+                {
+                    //now we insert each record for the ones we&#39;ve deleted like we do in the content service.
+                    var xmlItems = nodes.Select(node =&gt; new ContentXmlDto { NodeId = node.NodeId, Xml = UpdatedXmlStructure }).ToList();
+
+                    using (var tr = DatabaseContext.Database.GetTransaction())
+                    {
+                        //clear all the xml entries
+                        DatabaseContext.Database.Execute(@&quot;DELETE FROM cmsContentXml WHERE nodeId IN
+                                                (SELECT DISTINCT cmsContentXml.nodeId FROM cmsContentXml 
+                                                    INNER JOIN cmsContent ON cmsContentXml.nodeId = cmsContent.nodeId)&quot;);
+
+
+                        DatabaseContext.Database.BulkInsertRecords(xmlItems, tr);
+
+                        tr.Complete();
+                    }
+                }
+            }
+            
+
+        }
+
+        private IEnumerable&lt;IContent&gt; PrimeDbWithLotsOfContent()
+        {
+            var contentType1 = MockedContentTypes.CreateSimpleContentType();
+            contentType1.AllowedAsRoot = true;            
+            ServiceContext.ContentTypeService.Save(contentType1);
+            contentType1.AllowedContentTypes = new List&lt;ContentTypeSort&gt;
+                {
+                    new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; contentType1.Id), 0, contentType1.Alias)
+                };
+            var result = new List&lt;IContent&gt;();
+            ServiceContext.ContentTypeService.Save(contentType1);            
+            IContent lastParent = MockedContent.CreateSimpleContent(contentType1);
+            ServiceContext.ContentService.SaveAndPublish(lastParent);
+            result.Add(lastParent);
+            //create 20 deep
+            for (var i = 0; i &lt; 20; i++)
+            {
+                //for each level, create 20
+                IContent content = null;
+                for (var j = 1; j &lt;= 10; j++)
+                {
+                    content = MockedContent.CreateSimpleContent(contentType1, &quot;Name&quot; + j, lastParent);
+                    //only publish evens
+                    if (j % 2 == 0)
+                    {
+                        ServiceContext.ContentService.SaveAndPublish(content);        
+                    }
+                    else
+                    {
+                        ServiceContext.ContentService.Save(content);
+                    }
+                    result.Add(content);
+                }
+                
+                //assign the last one as the next parent
+                lastParent = content;
+            }
+            return result;
+        } 
+
+        private IEnumerable&lt;NodeDto&gt; PrimeDbWithLotsOfContentXmlRecords(Guid customObjectType)
+        {
+            var nodes = new List&lt;NodeDto&gt;();
+            for (var i = 1; i &lt; 10000; i++)
+            {
+                nodes.Add(new NodeDto
+                {
+                    Level = 1,
+                    ParentId = -1,
+                    NodeObjectType = customObjectType,
+                    Text = i.ToString(CultureInfo.InvariantCulture),
+                    UserId = 0,
+                    CreateDate = DateTime.Now,
+                    Trashed = false,
+                    SortOrder = 0,
+                    Path = &quot;&quot;
+                });
+            }
+            DatabaseContext.Database.BulkInsertRecords(nodes);
+
+            //re-get the nodes with ids
+            var sql = new Sql();
+            sql.Select(&quot;*&quot;).From&lt;NodeDto&gt;().Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == customObjectType);
+            nodes = DatabaseContext.Database.Fetch&lt;NodeDto&gt;(sql);
+
+            //create the cmsContent data, each with a new content type id (so we can query on it later if needed)
+            var contentTypeId = 0;
+            var cmsContentItems = nodes.Select(node =&gt; new ContentDto { NodeId = node.NodeId, ContentTypeId = contentTypeId++ }).ToList();
+            DatabaseContext.Database.BulkInsertRecords(cmsContentItems);
+
+            //create the xml data
+            var xmlItems = nodes.Select(node =&gt; new ContentXmlDto { NodeId = node.NodeId, Xml = TestXmlStructure }).ToList();
+            DatabaseContext.Database.BulkInsertRecords(xmlItems);
+
+            return nodes;
+        }
+
+        private const string TestXmlStructure = @&quot;&lt;Homepage id=&#39;1231&#39; parentID=&#39;-1&#39; level=&#39;1&#39; creatorID=&#39;0&#39; sortOrder=&#39;0&#39; createDate=&#39;2013-07-05T12:05:28&#39; updateDate=&#39;2013-07-26T11:58:52&#39; nodeName=&#39;Home (1)&#39; urlName=&#39;home-(1)&#39; path=&#39;-1,1231&#39; isDoc=&#39;&#39; nodeType=&#39;1221&#39; creatorName=&#39;admin&#39; writerName=&#39;admin&#39; writerID=&#39;0&#39; template=&#39;2629&#39; nodeTypeAlias=&#39;Homepage&#39;&gt;
+  &lt;umbracoNaviHide&gt;0&lt;/umbracoNaviHide&gt;
+  &lt;title&gt;Standard Site for Umbraco by Koiak&lt;/title&gt;
+  &lt;description&gt;&lt;![CDATA[]]&gt;&lt;/description&gt;
+  &lt;keywords&gt;&lt;![CDATA[]]&gt;&lt;/keywords&gt;
+  &lt;slideshow&gt;&lt;![CDATA[1250,1251,1252]]&gt;&lt;/slideshow&gt;
+  &lt;panelContent1&gt;&lt;![CDATA[&lt;h2&gt;Built by Creative Founds&lt;/h2&gt;
+&lt;p&gt;&lt;img src=&#39;/images/web_applications.jpg&#39; alt=&#39;Web Applications&#39; class=&#39;fr&#39;/&gt;&lt;strong&gt;Creative Founds&lt;/strong&gt; design and build first class software solutions that deliver big results.&#160;We provide ASP.NET web and mobile applications, Umbraco development service &amp;amp; technical consultancy.&lt;/p&gt;
+&lt;p&gt;&lt;a href=&#39;http://www.creativefounds.co.uk&#39; target=&#39;_blank&#39;&gt;www.creativefounds.co.uk&lt;/a&gt;&lt;/p&gt;]]&gt;&lt;/panelContent1&gt;
+  &lt;panelContent2&gt;&lt;![CDATA[&lt;h2&gt;Umbraco Development&lt;/h2&gt;
+&lt;p&gt;&lt;img src=&#39;/images/umbraco_square.jpg&#39; alt=&#39;Umbraco&#39; class=&#39;fr&#39;/&gt;Umbraco the the leading ASP.NET open source CMS, under pinning over 150,000 websites. Our Certified Developers are experts in developing high performance and feature rich websites.&lt;/p&gt;]]&gt;&lt;/panelContent2&gt;
+  &lt;panelContent3&gt;&lt;![CDATA[&lt;h2&gt;Contact Us&lt;/h2&gt;
+&lt;p&gt;&lt;a href=&#39;http://www.twitter.com/chriskoiak&#39; target=&#39;_blank&#39;&gt;&lt;img src=&#39;/images/twitter_square.png&#39; alt=&#39;Contact Us on Twitter&#39; class=&#39;fr&#39;/&gt;&lt;/a&gt;We&#39;d love to hear how this package has helped you and how it can be improved. Get in touch on the &lt;a href=&#39;http://our.umbraco.org/projects/starter-kits/standard-website-mvc&#39; target=&#39;_blank&#39;&gt;project website&lt;/a&gt; or via &lt;a href=&#39;http://www.twitter.com/chriskoiak&#39; target=&#39;_blank&#39;&gt;twitter&lt;/a&gt;&lt;/p&gt;]]&gt;&lt;/panelContent3&gt;
+  &lt;primaryNavigation&gt;&lt;![CDATA[1231,1232,1236,1238,1239]]&gt;&lt;/primaryNavigation&gt;
+  &lt;address&gt;Standard Website MVC, Company Address, Glasgow, Postcode&lt;/address&gt;
+  &lt;copyright&gt;Copyright &amp;amp;copy; 2012 Your Company&lt;/copyright&gt;
+  &lt;affiliationLink1&gt;http://www.umbraco.org&lt;/affiliationLink1&gt;
+  &lt;affiliationImage1&gt;/media/1477/umbraco_logo.png&lt;/affiliationImage1&gt;
+  &lt;affiliationLink2&gt;&lt;/affiliationLink2&gt;
+  &lt;affiliationImage2&gt;&lt;/affiliationImage2&gt;
+  &lt;affiliationLink3&gt;&lt;/affiliationLink3&gt;
+  &lt;affiliationImage3&gt;&lt;/affiliationImage3&gt;
+  &lt;headerNavigation&gt;&lt;![CDATA[1242,1243]]&gt;&lt;/headerNavigation&gt;
+  &lt;myList&gt;&lt;![CDATA[]]&gt;&lt;/myList&gt;
+  &lt;myDate&gt;2013-07-01T00:00:00&lt;/myDate&gt;
+&lt;/Homepage&gt;&quot;;
+
+        private const string UpdatedXmlStructure = @&quot;&lt;Standard id=&#39;1238&#39; parentID=&#39;1231&#39; level=&#39;2&#39; creatorID=&#39;0&#39; sortOrder=&#39;2&#39; createDate=&#39;2013-07-05T12:05:29&#39; updateDate=&#39;2013-07-05T12:05:34&#39; nodeName=&#39;Clients&#39; urlName=&#39;clients&#39; path=&#39;-1,1231,1238&#39; isDoc=&#39;&#39; nodeType=&#39;1217&#39; creatorName=&#39;admin&#39; writerName=&#39;admin&#39; writerID=&#39;0&#39; template=&#39;1213&#39; nodeTypeAlias=&#39;Standard&#39;&gt;
+  &lt;umbracoNaviHide&gt;0&lt;/umbracoNaviHide&gt;
+  &lt;title&gt;&lt;/title&gt;
+  &lt;description&gt;&lt;![CDATA[]]&gt;&lt;/description&gt;
+  &lt;keywords&gt;&lt;![CDATA[]]&gt;&lt;/keywords&gt;
+  &lt;bodyText&gt;&lt;![CDATA[&lt;h2&gt;Clients&lt;/h2&gt;
+&lt;p&gt;&lt;strong&gt;This is a standard content page.&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;&lt;span&gt;Vestibulum malesuada aliquet ante, vitae ullamcorper felis faucibus vel. Vestibulum condimentum faucibus tellus porta ultrices. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. &lt;/span&gt;&lt;/p&gt;
+&lt;p&gt;&lt;span&gt;Cras at auctor orci. Praesent facilisis erat nec odio consequat at posuere ligula pretium. Nulla eget felis id nisl volutpat pellentesque. Ut id augue id ligula placerat rutrum a nec purus. Maecenas sed lectus ac mi pellentesque luctus quis sit amet turpis. Vestibulum adipiscing convallis vestibulum. &lt;/span&gt;&lt;/p&gt;
+&lt;p&gt;&lt;span&gt;Duis condimentum lectus at orci placerat vitae imperdiet lorem cursus. Duis hendrerit porta lorem, non suscipit quam consectetur vitae. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Aenean elit augue, tincidunt nec tincidunt id, elementum vel est.&lt;/span&gt;&lt;/p&gt;]]&gt;&lt;/bodyText&gt;
+  &lt;contentPanels&gt;&lt;![CDATA[]]&gt;&lt;/contentPanels&gt;
+&lt;/Standard&gt;&quot;;
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[36,9,36,10,0],[37,10,37,28,0],[38,9,38,10,0],[41,9,41,10,0],[42,13,42,85,0],[43,9,43,10,0],[46,9,46,10,0],[47,13,47,58,0],[48,9,48,10,0],[55,9,55,10,0],[56,9,56,10,0],[60,3,60,4,0],[61,9,61,25,0],[62,3,62,4,0],[66,9,66,10,0],[67,13,67,53,0],[68,13,68,77,0],[70,13,70,54,0],[70,54,70,65,0],[70,65,70,67,0],[70,13,70,67,0],[71,13,71,62,0],[73,13,73,106,0],[74,13,74,14,0],[76,22,76,31,0],[76,33,76,39,0],[76,41,76,44,0],[77,17,77,18,0],[79,21,79,58,0],[81,21,81,67,0],[82,21,82,28,0],[82,30,82,41,0],[82,42,82,44,0],[82,45,82,74,0],[82,74,82,91,0],[82,91,82,92,0],[82,45,82,92,0],[83,21,83,22,0],[84,25,84,48,0],[85,25,85,89,0],[86,21,86,22,0],[87,21,87,76,0],[87,76,87,108,0],[87,108,87,111,0],[87,21,87,111,0],[88,17,88,18,0],[90,13,90,14,0],[92,13,92,107,0],[93,13,93,14,0],[96,22,96,31,0],[96,33,96,39,0],[96,41,96,44,0],[97,17,97,18,0],[100,21,100,66,0],[102,21,102,76,0],[102,76,102,108,0],[102,108,102,111,0],[102,21,102,111,0],[103,17,103,18,0],[104,13,104,14,0],[105,9,105,10,0],[109,9,109,10,0],[110,13,110,53,0],[111,13,111,76,0],[113,13,113,54,0],[113,54,113,65,0],[113,65,113,67,0],[113,13,113,67,0],[114,13,114,62,0],[116,13,116,114,0],[117,13,117,14,0],[119,22,119,31,0],[119,33,119,39,0],[119,41,119,44,0],[120,17,120,18,0],[123,21,123,104,0],[123,104,123,121,0],[123,121,123,123,0],[123,21,123,123,0],[124,21,124,76,0],[124,76,124,108,0],[124,108,124,111,0],[124,21,124,111,0],[125,17,125,18,0],[126,13,126,14,0],[128,13,128,115,0],[129,13,129,14,0],[132,22,132,31,0],[132,33,132,39,0],[132,41,132,44,0],[133,17,133,18,0],[135,21,135,96,0],[136,21,136,76,0],[136,76,136,108,0],[136,108,136,111,0],[136,21,136,111,0],[137,17,137,18,0],[138,13,138,14,0],[139,9,139,10,0],[143,9,143,10,0],[144,13,144,51,0],[146,13,146,78,0],[150,13,150,110,0],[151,13,151,14,0],[153,22,153,31,0],[153,33,153,39,0],[153,41,153,44,0],[154,17,154,18,0],[156,21,158,122,0],[161,21,161,57,0],[161,57,161,126,0],[161,126,161,137,0],[161,21,161,137,0],[162,21,162,28,0],[162,30,162,37,0],[162,38,162,40,0],[162,41,162,49,0],[163,21,163,22,0],[164,25,164,75,0],[165,21,165,22,0],[166,17,166,18,0],[167,13,167,14,0],[170,13,170,92,0],[171,13,171,14,0],[173,22,173,31,0],[173,33,173,39,0],[173,41,173,44,0],[174,17,174,18,0],[176,21,176,57,0],[176,57,176,126,0],[176,126,176,137,0],[176,21,176,137,0],[177,21,177,28,0],[177,30,177,37,0],[177,38,177,40,0],[177,41,177,49,0],[178,21,178,22,0],[179,25,179,75,0],[180,21,180,22,0],[181,17,181,18,0],[182,13,182,14,0],[185,13,185,108,0],[186,13,186,14,0],[188,22,188,31,0],[188,33,188,39,0],[188,41,188,44,0],[189,17,189,18,0],[191,21,193,122,0],[196,21,196,57,0],[196,57,196,126,0],[196,126,196,137,0],[196,21,196,137,0],[197,21,197,74,0],[198,17,198,18,0],[199,13,199,14,0],[202,13,202,127,0],[203,13,203,14,0],[205,22,205,31,0],[205,33,205,39,0],[205,41,205,44,0],[206,17,206,18,0],[208,21,208,57,0],[208,57,208,126,0],[208,126,208,137,0],[208,21,208,137,0],[210,28,210,78,0],[211,21,211,22,0],[213,25,215,122,0],[218,25,218,82,0],[220,25,220,39,0],[221,21,221,22,0],[222,17,222,18,0],[223,13,223,14,0],[226,9,226,10,0],[229,9,229,10,0],[230,13,230,77,0],[231,13,231,47,0],[232,13,232,66,0],[233,13,235,61,0],[235,61,235,76,0],[235,76,236,19,0],[233,13,236,19,0],[237,13,237,47,0],[238,13,238,66,0],[239,13,239,83,0],[240,13,240,70,0],[241,13,241,36,0],[243,18,243,27,0],[243,29,243,35,0],[243,37,243,40,0],[244,13,244,14,0],[246,17,246,41,0],[247,22,247,31,0],[247,33,247,40,0],[247,42,247,45,0],[248,17,248,18,0],[249,21,249,103,0],[251,21,251,36,0],[252,21,252,22,0],[253,25,253,79,0],[254,21,254,22,0],[256,21,256,22,0],[257,25,257,69,0],[258,21,258,22,0],[259,21,259,41,0],[260,17,260,18,0],[263,17,263,38,0],[264,13,264,14,0],[265,13,265,27,0],[266,9,266,10,0],[269,9,269,10,0],[270,13,270,45,0],[271,18,271,27,0],[271,29,271,38,0],[271,40,271,43,0],[272,13,272,14,0],[273,17,284,20,0],[285,13,285,14,0],[286,13,286,63,0],[289,13,289,33,0],[290,13,290,103,0],[291,13,291,66,0],[294,13,294,35,0],[295,13,295,56,0],[295,56,295,128,0],[295,128,295,139,0],[295,13,295,139,0],[296,13,296,73,0],[299,13,299,49,0],[299,49,299,115,0],[299,115,299,126,0],[299,13,299,126,0],[300,13,300,66,0],[302,13,302,26,0],[303,9,303,10,0]]);
+    </script>
+  </body>
+</html>

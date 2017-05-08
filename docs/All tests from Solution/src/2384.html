@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\workflow\Notification.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Net.Mail;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Web;
+using Umbraco.Core.Configuration;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using umbraco.BusinessLogic;
+using umbraco.cms.businesslogic.property;
+using umbraco.cms.businesslogic.web;
+using Umbraco.Core.Models.Rdbms;
+using umbraco.DataLayer;
+using umbraco.interfaces;
+using Umbraco.Core.IO;
+
+namespace umbraco.cms.businesslogic.workflow
+{
+    //TODO: Update this to wrap new services/repo!
+
+    /// &lt;summary&gt;
+    /// Notifications are a part of the umbraco workflow.
+    /// A notification is created every time an action on a node occurs and a umbraco user has subscribed to this specific action on this specific node.
+    /// Notifications generates an email, which is send to the subscribing users.
+    /// &lt;/summary&gt;
+    public class Notification
+    {
+        /// &lt;summary&gt;
+        /// Private constructor as this object should not be allowed to be created currently
+        /// &lt;/summary&gt;
+        private Notification()
+        {
+        }
+
+        public int NodeId { get; private set; }
+        public int UserId { get; private set; }
+        public char ActionId { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Unused, please do not use
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Obsolete, For querying the database use the new UmbracoDatabase object ApplicationContext.Current.DatabaseContext.Database&quot;, false)]
+        protected static ISqlHelper SqlHelper
+        {
+            get { return Application.SqlHelper; }
+        }
+
+        /// &lt;summary&gt;
+        /// Sends the notifications for the specified user regarding the specified node and action.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;node&quot;&gt;The node.&lt;/param&gt;
+        /// &lt;param name=&quot;user&quot;&gt;The user.&lt;/param&gt;
+        /// &lt;param name=&quot;action&quot;&gt;The action.&lt;/param&gt;
+        public static void GetNotifications(CMSNode node, User user, IAction action)
+        {
+            User[] allUsers = User.getAll();
+            foreach (User u in allUsers)
+            {
+                try
+                {
+                    if (u.Disabled == false &amp;&amp; u.GetNotifications(node.Path).IndexOf(action.Letter.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal) &gt; -1)
+                    {
+                        LogHelper.Debug&lt;Notification&gt;(string.Format(&quot;Notification about {0} sent to {1} ({2})&quot;, ui.Text(action.Alias, u), u.Name, u.Email));
+                        SendNotification(user, u, (Document)node, action);
+                    }
+                }
+                catch (Exception notifyExp)
+                {
+					LogHelper.Error&lt;Notification&gt;(&quot;Error in notification&quot;, notifyExp);
+                }
+            }
+        }
+
+        //TODO: Include update with html mail notification and document contents
+        private static void SendNotification(User performingUser, User mailingUser, Document documentObject, IAction action)
+        {
+            var nService = ApplicationContext.Current.Services.NotificationService;
+            var pUser = ApplicationContext.Current.Services.UserService.GetUserById(performingUser.Id);
+
+            nService.SendNotifications(
+                pUser, documentObject.ContentEntity, action.Letter.ToString(CultureInfo.InvariantCulture), ui.Text(action.Alias), 
+                new HttpContextWrapper(HttpContext.Current),
+                (user, strings) =&gt; ui.Text(&quot;notifications&quot;, &quot;mailSubject&quot;, strings, mailingUser),
+                (user, strings) =&gt; UmbracoSettings.NotificationDisableHtmlEmail
+                    ? ui.Text(&quot;notifications&quot;, &quot;mailBody&quot;, strings, mailingUser)
+                    : ui.Text(&quot;notifications&quot;, &quot;mailBodyHtml&quot;, strings, mailingUser));
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the notifications for a user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Notification&gt; GetUserNotifications(User user)
+        {
+            var items = new List&lt;Notification&gt;();
+            var dtos = ApplicationContext.Current.DatabaseContext.Database.Fetch&lt;User2NodeNotifyDto&gt;(
+                &quot;WHERE userId = @UserId ORDER BY nodeId&quot;, new { UserId = user.Id });
+
+            foreach (var dto in dtos)
+            {
+                items.Add(new Notification
+                          {
+                              NodeId = dto.NodeId,
+                              ActionId = Convert.ToChar(dto.Action),
+                              UserId = dto.UserId
+                          });
+            }
+
+            return items;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the notifications for a node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;node&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Notification&gt; GetNodeNotifications(CMSNode node)
+        {
+            var items = new List&lt;Notification&gt;();
+            var dtos = ApplicationContext.Current.DatabaseContext.Database.Fetch&lt;User2NodeNotifyDto&gt;(
+                &quot;WHERE userId = @UserId ORDER BY nodeId&quot;, new { nodeId = node.Id });
+
+            foreach (var dto in dtos)
+            {
+                items.Add(new Notification
+                {
+                    NodeId = dto.NodeId,
+                    ActionId = Convert.ToChar(dto.Action),
+                    UserId = dto.UserId
+                });
+            }
+            return items;
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes notifications by node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;node&quot;&gt;&lt;/param&gt;
+        public static void DeleteNotifications(CMSNode node)
+        {
+            // delete all settings on the node for this node id
+            ApplicationContext.Current.DatabaseContext.Database.Delete&lt;User2NodeNotifyDto&gt;(&quot;WHERE nodeId = @nodeId&quot;,
+                new {nodeId = node.Id});
+        }
+
+        /// &lt;summary&gt;
+        /// Delete notifications by user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;/param&gt;
+        public static void DeleteNotifications(User user)
+        {
+            // delete all settings on the node for this node id
+            ApplicationContext.Current.DatabaseContext.Database.Delete&lt;User2NodeNotifyDto&gt;(&quot;WHERE userId = @userId&quot;,
+                new { userId = user.Id });
+        }
+
+        /// &lt;summary&gt;
+        /// Delete notifications by user and node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;node&quot;&gt;&lt;/param&gt;
+        public static void DeleteNotifications(User user, CMSNode node)
+        {
+            // delete all settings on the node for this user
+            ApplicationContext.Current.DatabaseContext.Database.Delete&lt;User2NodeNotifyDto&gt;(
+                &quot;WHERE userId = @userId AND nodeId = @nodeId&quot;, new {userId = user.Id, nodeId = node.Id});
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new notification
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;The user.&lt;/param&gt;
+        /// &lt;param name=&quot;node&quot;&gt;The node.&lt;/param&gt;
+        /// &lt;param name=&quot;actionLetter&quot;&gt;The action letter.&lt;/param&gt;
+        [MethodImpl(MethodImplOptions.Synchronized)]
+        public static void MakeNew(User user, CMSNode node, char actionLetter)
+        {
+            bool exists = ApplicationContext.Current.DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                &quot;SELECT COUNT(userId) FROM umbracoUser2nodeNotify WHERE userId = @userId AND nodeId = @nodeId AND action = @action&quot;, 
+                new { userId = user.Id, nodeId = node.Id, action = actionLetter.ToString()}) &gt; 0;
+
+            if (exists == false)
+            {
+                ApplicationContext.Current.DatabaseContext.Database.Insert(new User2NodeNotifyDto
+                                                                           {
+                                                                               Action = actionLetter.ToString(),
+                                                                               NodeId = node.Id,
+                                                                               UserId = user.Id
+                                                                           });
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Updates the notifications.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;The user.&lt;/param&gt;
+        /// &lt;param name=&quot;node&quot;&gt;The node.&lt;/param&gt;
+        /// &lt;param name=&quot;notifications&quot;&gt;The notifications.&lt;/param&gt;
+        [MethodImpl(MethodImplOptions.Synchronized)]
+        public static void UpdateNotifications(User user, CMSNode node, string notifications)
+        {
+            // delete all settings on the node for this user
+            DeleteNotifications(user, node);
+
+            // Loop through the permissions and create them
+            foreach (char c in notifications)
+                MakeNew(user, node, c);
+        }
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[33,9,33,31,0],[34,9,34,10,0],[35,9,35,10,0],[37,29,37,33,0],[37,34,37,46,0],[38,29,38,33,0],[38,34,38,46,0],[39,32,39,36,0],[39,37,39,49,0],[47,17,47,18,0],[47,19,47,48,0],[47,49,47,50,0],[57,9,57,10,0],[58,13,58,45,0],[59,13,59,20,0],[59,22,59,28,0],[59,29,59,31,0],[59,32,59,40,0],[60,13,60,14,0],[62,17,62,18,0],[63,21,63,171,0],[64,21,64,22,0],[65,25,65,157,0],[66,25,66,75,0],[67,21,67,22,0],[68,17,68,18,0],[69,17,69,44,0],[70,17,70,18,0],[71,6,71,72,0],[72,17,72,18,0],[73,13,73,14,0],[74,9,74,10,0],[78,9,78,10,0],[79,13,79,84,0],[80,13,80,104,0],[82,13,85,36,0],[85,36,85,97,0],[85,97,86,36,0],[86,36,88,85,0],[88,85,88,87,0],[82,13,88,87,0],[89,9,89,10,0],[97,9,97,10,0],[98,13,98,50,0],[99,13,100,85,0],[102,13,102,20,0],[102,22,102,29,0],[102,30,102,32,0],[102,33,102,37,0],[103,13,103,14,0],[104,17,109,30,0],[110,13,110,14,0],[112,13,112,26,0],[113,9,113,10,0],[121,9,121,10,0],[122,13,122,50,0],[123,13,124,85,0],[126,13,126,20,0],[126,22,126,29,0],[126,30,126,32,0],[126,33,126,37,0],[127,13,127,14,0],[128,17,133,20,0],[134,13,134,14,0],[135,13,135,26,0],[136,9,136,10,0],[143,9,143,10,0],[145,13,146,41,0],[147,9,147,10,0],[154,9,154,10,0],[156,13,157,43,0],[158,9,158,10,0],[166,9,166,10,0],[168,13,169,106,0],[170,9,170,10,0],[180,9,180,10,0],[181,13,183,98,0],[185,13,185,33,0],[186,13,186,14,0],[187,17,192,79,0],[193,13,193,14,0],[194,9,194,10,0],[204,9,204,10,0],[206,13,206,45,0],[209,13,209,20,0],[209,22,209,28,0],[209,29,209,31,0],[209,32,209,45,0],[210,17,210,40,0],[211,9,211,10,0]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\BatchedDatabaseServerMessenger.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Web;
+using Newtonsoft.Json;
+using umbraco.interfaces;
+using Umbraco.Core;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Sync;
+using Umbraco.Web.Routing;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Web
+{
+    /// &lt;summary&gt;
+    /// An &lt;see cref=&quot;IServerMessenger&quot;/&gt; implementation that works by storing messages in the database.
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// This binds to appropriate umbraco events in order to trigger the Boot(), Sync() &amp; FlushBatch() calls
+    /// &lt;/remarks&gt;
+    public class BatchedDatabaseServerMessenger : DatabaseServerMessenger
+    {
+        public BatchedDatabaseServerMessenger(ApplicationContext appContext, bool enableDistCalls, DatabaseServerMessengerOptions options)
+            : base(appContext, enableDistCalls, options)
+        { }
+
+        // invoked by BatchedDatabaseServerMessengerStartup which is an ApplicationEventHandler
+        // with default &quot;ShouldExecute&quot;, so that method will run if app IsConfigured and database
+        // context IsDatabaseConfigured - we still want to check CanConnect though to be safe
+        internal void Startup()
+        {
+            UmbracoModule.EndRequest += UmbracoModule_EndRequest;
+            UmbracoModule.RouteAttempt += UmbracoModule_RouteAttempt;
+
+            if (ApplicationContext.DatabaseContext.CanConnect == false)
+            {
+                ApplicationContext.ProfilingLogger.Logger.Warn&lt;BatchedDatabaseServerMessenger&gt;(
+                    &quot;Cannot connect to the database, distributed calls will not be enabled for this server.&quot;);
+            }
+            else
+            {
+                Boot();
+            }
+        }
+
+        private void UmbracoModule_RouteAttempt(object sender, RoutableAttemptEventArgs e)
+        {
+            // as long as umbraco is ready &amp; configured, sync
+            switch (e.Outcome)
+            {
+                case EnsureRoutableOutcome.IsRoutable:
+                case EnsureRoutableOutcome.NotDocumentRequest:
+                case EnsureRoutableOutcome.NoContent:
+                    Sync();
+                    break;
+                //case EnsureRoutableOutcome.NotReady:
+                //case EnsureRoutableOutcome.NotConfigured:
+                //default:
+                //    break;
+            }
+        }
+
+        private void UmbracoModule_EndRequest(object sender, UmbracoRequestEventArgs e)
+        {
+            // will clear the batch - will remain in HttpContext though - that&#39;s ok
+            FlushBatch();
+        }
+
+        protected override void DeliverRemote(IEnumerable&lt;IServerAddress&gt; servers, ICacheRefresher refresher, MessageType messageType, IEnumerable&lt;object&gt; ids = null, string json = null)
+        {
+            var idsA = ids == null ? null : ids.ToArray();
+
+            Type arrayType;
+            if (GetArrayType(idsA, out arrayType) == false)
+                throw new ArgumentException(&quot;All items must be of the same type, either int or Guid.&quot;, &quot;ids&quot;);
+
+            BatchMessage(servers, refresher, messageType, idsA, arrayType, json);
+        }
+
+        public void FlushBatch()
+        {
+            var batch = GetBatch(false);
+            if (batch == null) return;
+
+            var instructions = batch.SelectMany(x =&gt; x.Instructions).ToArray();
+            batch.Clear();
+
+            //Write the instructions but only create JSON blobs with a max instruction count equal to MaxProcessingInstructionCount
+            foreach (var instructionsBatch in instructions.InGroupsOf(Options.MaxProcessingInstructionCount))
+            {
+                WriteInstructions(instructionsBatch);
+            }
+            
+        }
+
+        private void WriteInstructions(IEnumerable&lt;RefreshInstruction&gt; instructions)
+        {
+            var dto = new CacheInstructionDto
+            {
+                UtcStamp = DateTime.UtcNow,
+                Instructions = JsonConvert.SerializeObject(instructions, Formatting.None),
+                OriginIdentity = LocalIdentity
+            };
+
+            ApplicationContext.DatabaseContext.Database.Insert(dto);
+        }
+
+        protected ICollection&lt;RefreshInstructionEnvelope&gt; GetBatch(bool create)
+        {
+            // try get the http context from the UmbracoContext, we do this because in the case we are launching an async
+            // thread and we know that the cache refreshers will execute, we will ensure the UmbracoContext and therefore we
+            // can get the http context from it
+            var httpContext = (UmbracoContext.Current == null ? null : UmbracoContext.Current.HttpContext)
+                // if this is null, it could be that an async thread is calling this method that we weren&#39;t aware of and the UmbracoContext
+                // wasn&#39;t ensured at the beginning of the thread. We can try to see if the HttpContext.Current is available which might be 
+                // the case if the asp.net synchronization context has kicked in
+                ?? (HttpContext.Current == null ? null : new HttpContextWrapper(HttpContext.Current));
+
+            // if no context was found, return null - we cannot not batch
+            if (httpContext == null) return null;
+
+            var key = typeof (BatchedDatabaseServerMessenger).Name;
+
+            // no thread-safety here because it&#39;ll run in only 1 thread (request) at a time
+            var batch = (ICollection&lt;RefreshInstructionEnvelope&gt;)httpContext.Items[key];
+            if (batch == null &amp;&amp; create)
+                httpContext.Items[key] = batch = new List&lt;RefreshInstructionEnvelope&gt;();
+            return batch;
+        }
+
+        protected void BatchMessage(
+            IEnumerable&lt;IServerAddress&gt; servers,
+            ICacheRefresher refresher,
+            MessageType messageType,
+            IEnumerable&lt;object&gt; ids = null,
+            Type idType = null,
+            string json = null)
+        {
+            var batch = GetBatch(true);
+            var instructions = RefreshInstruction.GetInstructions(refresher, messageType, ids, idType, json);
+
+            // batch if we can, else write to DB immediately
+            if (batch == null)
+            {
+                //only write the json blob with a maximum count of the MaxProcessingInstructionCount
+                foreach (var maxBatch in instructions.InGroupsOf(Options.MaxProcessingInstructionCount))
+                {
+                    WriteInstructions(maxBatch);
+                }
+            }
+            else
+            {
+                batch.Add(new RefreshInstructionEnvelope(servers, refresher, instructions));
+            }
+                
+        }        
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,15,24,57,0],[25,9,25,10,0],[25,11,25,12,0],[31,9,31,10,0],[32,13,32,66,0],[33,13,33,70,0],[35,13,35,72,0],[36,13,36,14,0],[37,17,38,111,0],[39,13,39,14,0],[41,13,41,14,0],[42,17,42,24,0],[43,13,43,14,0],[44,9,44,10,0],[47,9,47,10,0],[49,13,49,31,0],[54,21,54,28,0],[55,21,55,27,0],[61,9,61,10,0],[64,9,64,10,0],[66,13,66,26,0],[67,9,67,10,0],[70,9,70,10,0],[71,13,71,59,0],[74,13,74,60,0],[75,17,75,111,0],[77,13,77,82,0],[78,9,78,10,0],[81,9,81,10,0],[82,13,82,41,0],[83,13,83,31,0],[83,32,83,39,0],[85,13,85,54,0],[85,54,85,68,0],[85,68,85,80,0],[85,13,85,80,0],[86,13,86,27,0],[89,13,89,20,0],[89,22,89,43,0],[89,44,89,46,0],[89,47,89,109,0],[90,13,90,14,0],[91,17,91,54,0],[92,13,92,14,0],[94,9,94,10,0],[97,9,97,10,0],[98,13,103,15,0],[105,13,105,69,0],[106,9,106,10,0],[109,9,109,10,0],[113,13,117,103,0],[120,13,120,37,0],[120,38,120,50,0],[122,13,122,68,0],[125,13,125,89,0],[126,13,126,41,0],[127,17,127,89,0],[128,13,128,26,0],[129,9,129,10,0],[138,9,138,10,0],[139,13,139,40,0],[140,13,140,110,0],[143,13,143,31,0],[144,13,144,14,0],[146,17,146,24,0],[146,26,146,38,0],[146,39,146,41,0],[146,42,146,104,0],[147,17,147,18,0],[148,21,148,49,0],[149,17,149,18,0],[150,13,150,14,0],[152,13,152,14,0],[153,17,153,93,0],[154,13,154,14,0],[156,9,156,10,0]]);
+    </script>
+  </body>
+</html>

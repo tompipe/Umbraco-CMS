@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\NotificationService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Net.Mail;
+using System.Text;
+using System.Threading;
+using System.Web;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Strings;
+
+namespace Umbraco.Core.Services
+{
+    public class NotificationService : INotificationService
+    {
+        private readonly IDatabaseUnitOfWorkProvider _uowProvider;
+        private readonly IUserService _userService;
+        private readonly IContentService _contentService;
+        private readonly ILogger _logger;
+
+        public NotificationService(IDatabaseUnitOfWorkProvider provider, IUserService userService, IContentService contentService, ILogger logger)
+        {
+            if (provider == null) throw new ArgumentNullException(&quot;provider&quot;);
+            if (userService == null) throw new ArgumentNullException(&quot;userService&quot;);
+            if (contentService == null) throw new ArgumentNullException(&quot;contentService&quot;);
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            _uowProvider = provider;
+            _userService = userService;
+            _contentService = contentService;
+            _logger = logger;
+        }
+
+        /// &lt;summary&gt;
+        /// Sends the notifications for the specified user regarding the specified node and action.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;operatingUser&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;action&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;actionName&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;http&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;createSubject&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;createBody&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// Currently this will only work for Content entities!
+        /// &lt;/remarks&gt;
+        public void SendNotifications(IUser operatingUser, IUmbracoEntity entity, string action, string actionName, HttpContextBase http,
+            Func&lt;IUser, string[], string&gt; createSubject,
+            Func&lt;IUser, string[], string&gt; createBody)
+        {
+            if (entity is IContent == false)
+                throw new NotSupportedException();
+
+            var content = (IContent) entity;
+
+            // lazily get previous version
+            IContentBase prevVersion = null;
+
+            // do not load *all* users in memory at once
+            // do not load notifications *per user* (N+1 select)
+            // cannot load users &amp; notifications in 1 query (combination btw User2AppDto and User2NodeNotifyDto)
+            // =&gt; get batches of users, get all their notifications in 1 query
+            // re. users:
+            //  users being (dis)approved = not an issue, filtered in memory not in SQL
+            //  users being modified or created = not an issue, ordering by ID, as long as we don&#39;t *insert* low IDs
+            //  users being deleted = not an issue for GetNextUsers
+            var id = 0;
+            var nodeIds = content.Path.Split(&#39;,&#39;).Select(int.Parse).ToArray();
+            const int pagesz = 400; // load batches of 400 users
+            do
+            {
+                // users are returned ordered by id, notifications are returned ordered by user id
+                var users = ((UserService) _userService).GetNextUsers(id, pagesz).Where(x =&gt; x.IsApproved).ToList();
+                var notifications = GetUsersNotifications(users.Select(x =&gt; x.Id), action, nodeIds, Constants.ObjectTypes.DocumentGuid).ToList();
+                if (notifications.Count == 0) break;
+
+                var i = 0;
+                foreach (var user in users)
+                {
+                    // continue if there&#39;s no notification for this user
+                    if (notifications[i].UserId != user.Id) continue; // next user
+
+                    // lazy load prev version
+                    if (prevVersion == null)
+                    {
+                        prevVersion = GetPreviousVersion(entity.Id);
+                    }
+
+                    // queue notification
+                    var req = CreateNotificationRequest(operatingUser, user, content, prevVersion, actionName, http, createSubject, createBody);
+                    Enqueue(req);
+
+                    // skip other notifications for this user
+                    while (i &lt; notifications.Count &amp;&amp; notifications[i++].UserId == user.Id) ;
+                    if (i &gt;= notifications.Count) break; // break if no more notifications
+                }
+
+                // load more users if any
+                id = users.Count == pagesz ? users.Last().Id + 1 : -1;
+
+            } while (id &gt; 0);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the previous version to the latest version of the content item if there is one
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentId&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IContentBase GetPreviousVersion(int contentId)
+        {
+            // Regarding this: http://issues.umbraco.org/issue/U4-5180
+            // we know they are descending from the service so we know that newest is first
+            // we are only selecting the top 2 rows since that is all we need
+            var allVersions = _contentService.GetVersionIds(contentId, 2).ToList();
+            var prevVersionIndex = allVersions.Count &gt; 1 ? 1 : 0;
+            return _contentService.GetByVersion(allVersions[prevVersionIndex]);
+        }
+
+        /// &lt;summary&gt;
+        /// Sends the notifications for the specified user regarding the specified node and action.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entities&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;operatingUser&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;action&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;actionName&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;http&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;createSubject&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;createBody&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// Currently this will only work for Content entities!
+        /// &lt;/remarks&gt;
+        public void SendNotifications(IUser operatingUser, IEnumerable&lt;IUmbracoEntity&gt; entities, string action, string actionName, HttpContextBase http,
+            Func&lt;IUser, string[], string&gt; createSubject,
+            Func&lt;IUser, string[], string&gt; createBody)
+        {
+            if (entities is IEnumerable&lt;IContent&gt; == false)
+                throw new NotSupportedException();
+
+            var entitiesL = entities as List&lt;IContent&gt; ?? entities.Cast&lt;IContent&gt;().ToList();
+
+            //exit if there are no entities
+            if (entitiesL.Count == 0) return;
+
+            //put all entity&#39;s paths into a list with the same indicies
+            var paths = entitiesL.Select(x =&gt; x.Path.Split(&#39;,&#39;).Select(int.Parse).ToArray()).ToArray();
+
+            // lazily get versions
+            var prevVersionDictionary = new Dictionary&lt;int, IContentBase&gt;();
+
+            // see notes above
+            var id = 0;
+            const int pagesz = 400; // load batches of 400 users
+            do
+            {
+                // users are returned ordered by id, notifications are returned ordered by user id
+                var users = ((UserService)_userService).GetNextUsers(id, pagesz).Where(x =&gt; x.IsApproved).ToList();
+                var notifications = GetUsersNotifications(users.Select(x =&gt; x.Id), action, Enumerable.Empty&lt;int&gt;(), Constants.ObjectTypes.DocumentGuid).ToList();
+                if (notifications.Count == 0) break;
+
+                var i = 0;
+                foreach (var user in users)
+                {
+                    // continue if there&#39;s no notification for this user
+                    if (notifications[i].UserId != user.Id) continue; // next user
+
+                    for (var j = 0; j &lt; entitiesL.Count; j++)
+                    {
+                        var content = entitiesL[j];
+                        var path = paths[j];
+                        
+                        // test if the notification applies to the path ie to this entity
+                        if (path.Contains(notifications[i].EntityId) == false) continue; // next entity
+                        
+                        if (prevVersionDictionary.ContainsKey(content.Id) == false)
+                        {
+                            prevVersionDictionary[content.Id] = GetPreviousVersion(content.Id);
+                        }
+                        
+                        // queue notification
+                        var req = CreateNotificationRequest(operatingUser, user, content, prevVersionDictionary[content.Id], actionName, http, createSubject, createBody);
+                        Enqueue(req);
+                    }
+
+                    // skip other notifications for this user, essentially this means moving i to the next index of notifications
+                    // for the next user.
+                    do
+                    {
+                        i++;
+                    } while (i &lt; notifications.Count &amp;&amp; notifications[i].UserId == user.Id);
+                    
+                    if (i &gt;= notifications.Count) break; // break if no more notifications
+                }
+
+                // load more users if any
+                id = users.Count == pagesz ? users.Last().Id + 1 : -1;
+
+            } while (id &gt; 0);
+        }
+
+        private IEnumerable&lt;Notification&gt; GetUsersNotifications(IEnumerable&lt;int&gt; userIds, string action, IEnumerable&lt;int&gt; nodeIds, Guid objectType)
+        {
+            var uow = _uowProvider.GetUnitOfWork();
+            var repository = new NotificationsRepository(uow);
+            return repository.GetUsersNotifications(userIds, action, nodeIds, objectType);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the notifications for the user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;Notification&gt; GetUserNotifications(IUser user)
+        {
+            var uow = _uowProvider.GetUnitOfWork();
+            var repository = new NotificationsRepository(uow);
+            return repository.GetUserNotifications(user);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the notifications for the user based on the specified node path
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;path&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Notifications are inherited from the parent so any child node will also have notifications assigned based on it&#39;s parent (ancestors)
+        /// &lt;/remarks&gt;
+        public IEnumerable&lt;Notification&gt; GetUserNotifications(IUser user, string path)
+        {
+            var userNotifications = GetUserNotifications(user);
+            return FilterUserNotificationsByPath(userNotifications, path);
+        }
+
+        /// &lt;summary&gt;
+        /// Filters a userNotifications collection by a path
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userNotifications&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;path&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;Notification&gt; FilterUserNotificationsByPath(IEnumerable&lt;Notification&gt; userNotifications, string path)
+        {
+            var pathParts = path.Split(new[] {&#39;,&#39;}, StringSplitOptions.RemoveEmptyEntries);
+            return userNotifications.Where(r =&gt; pathParts.InvariantContains(r.EntityId.ToString(CultureInfo.InvariantCulture))).ToList();
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes notifications by entity
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        public IEnumerable&lt;Notification&gt; GetEntityNotifications(IEntity entity)
+        {
+            var uow = _uowProvider.GetUnitOfWork();
+            var repository = new NotificationsRepository(uow);
+            return repository.GetEntityNotifications(entity);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes notifications by entity
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        public void DeleteNotifications(IEntity entity)
+        {
+            var uow = _uowProvider.GetUnitOfWork();
+            var repository = new NotificationsRepository(uow);
+            repository.DeleteNotifications(entity);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes notifications by user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;/param&gt;
+        public void DeleteNotifications(IUser user)
+        {
+            var uow = _uowProvider.GetUnitOfWork();
+            var repository = new NotificationsRepository(uow);
+            repository.DeleteNotifications(user);
+        }
+
+        /// &lt;summary&gt;
+        /// Delete notifications by user and entity
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        public void DeleteNotifications(IUser user, IEntity entity)
+        {
+            var uow = _uowProvider.GetUnitOfWork();
+            var repository = new NotificationsRepository(uow);
+            repository.DeleteNotifications(user, entity);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new notification
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;action&quot;&gt;The action letter - note: this is a string for future compatibility&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public Notification CreateNotification(IUser user, IEntity entity, string action)
+        {
+            var uow = _uowProvider.GetUnitOfWork();
+            var repository = new NotificationsRepository(uow);
+            return repository.CreateNotification(user, entity, action);
+        }
+
+        #region private methods
+
+        /// &lt;summary&gt;
+        /// Sends the notification
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;performingUser&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;mailingUser&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;oldDoc&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;actionName&quot;&gt;The action readable name - currently an action is just a single letter, this is the name associated with the letter &lt;/param&gt;
+        /// &lt;param name=&quot;http&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;createSubject&quot;&gt;Callback to create the mail subject&lt;/param&gt;
+        /// &lt;param name=&quot;createBody&quot;&gt;Callback to create the mail body&lt;/param&gt;
+        private NotificationRequest CreateNotificationRequest(IUser performingUser, IUser mailingUser, IContentBase content, IContentBase oldDoc,            
+            string actionName, HttpContextBase http,
+            Func&lt;IUser, string[], string&gt; createSubject,
+            Func&lt;IUser, string[], string&gt; createBody)
+        {
+            if (performingUser == null) throw new ArgumentNullException(&quot;performingUser&quot;);
+            if (mailingUser == null) throw new ArgumentNullException(&quot;mailingUser&quot;);
+            if (content == null) throw new ArgumentNullException(&quot;content&quot;);
+            if (http == null) throw new ArgumentNullException(&quot;http&quot;);
+            if (createSubject == null) throw new ArgumentNullException(&quot;createSubject&quot;);
+            if (createBody == null) throw new ArgumentNullException(&quot;createBody&quot;);            
+            
+            // build summary
+            var summary = new StringBuilder();
+            var props = content.Properties.ToArray();
+            foreach (var p in props)
+            {
+                var newText = p.Value != null ? p.Value.ToString() : &quot;&quot;;
+                var oldText = newText;
+
+                // check if something was changed and display the changes otherwise display the fields
+                if (oldDoc.Properties.Contains(p.PropertyType.Alias))
+                {
+                    var oldProperty = oldDoc.Properties[p.PropertyType.Alias];
+                    oldText = oldProperty.Value != null ? oldProperty.Value.ToString() : &quot;&quot;;
+
+                    // replace html with char equivalent
+                    ReplaceHtmlSymbols(ref oldText);
+                    ReplaceHtmlSymbols(ref newText);
+                }
+
+
+                // make sure to only highlight changes done using TinyMCE editor... other changes will be displayed using default summary
+                // TODO: We should probably allow more than just tinymce??
+                if ((p.PropertyType.PropertyEditorAlias == Constants.PropertyEditors.TinyMCEAlias)
+                    &amp;&amp; string.CompareOrdinal(oldText, newText) != 0)
+                {
+                    summary.Append(&quot;&lt;tr&gt;&quot;);
+                    summary.Append(&quot;&lt;th style=&#39;text-align: left; vertical-align: top; width: 25%;&#39;&gt; Note: &lt;/th&gt;&quot;);
+                    summary.Append(
+                        &quot;&lt;td style=&#39;text-align: left; vertical-align: top;&#39;&gt; &lt;span style=&#39;background-color:red;&#39;&gt;Red for deleted characters&lt;/span&gt;&amp;nbsp;&lt;span style=&#39;background-color:yellow;&#39;&gt;Yellow for inserted characters&lt;/span&gt;&lt;/td&gt;&quot;);
+                    summary.Append(&quot;&lt;/tr&gt;&quot;);
+                    summary.Append(&quot;&lt;tr&gt;&quot;);
+                    summary.Append(&quot;&lt;th style=&#39;text-align: left; vertical-align: top; width: 25%;&#39;&gt; New &quot;);
+                    summary.Append(p.PropertyType.Name);
+                    summary.Append(&quot;&lt;/th&gt;&quot;);
+                    summary.Append(&quot;&lt;td style=&#39;text-align: left; vertical-align: top;&#39;&gt;&quot;);
+                    summary.Append(ReplaceLinks(CompareText(oldText, newText, true, false, &quot;&lt;span style=&#39;background-color:yellow;&#39;&gt;&quot;, string.Empty), http.Request));
+                    summary.Append(&quot;&lt;/td&gt;&quot;);
+                    summary.Append(&quot;&lt;/tr&gt;&quot;);
+                    summary.Append(&quot;&lt;tr&gt;&quot;);
+                    summary.Append(&quot;&lt;th style=&#39;text-align: left; vertical-align: top; width: 25%;&#39;&gt; Old &quot;);
+                    summary.Append(p.PropertyType.Name);
+                    summary.Append(&quot;&lt;/th&gt;&quot;);
+                    summary.Append(&quot;&lt;td style=&#39;text-align: left; vertical-align: top;&#39;&gt;&quot;);
+                    summary.Append(ReplaceLinks(CompareText(newText, oldText, true, false, &quot;&lt;span style=&#39;background-color:red;&#39;&gt;&quot;, string.Empty), http.Request));
+                    summary.Append(&quot;&lt;/td&gt;&quot;);
+                    summary.Append(&quot;&lt;/tr&gt;&quot;);
+                }
+                else
+                {
+                    summary.Append(&quot;&lt;tr&gt;&quot;);
+                    summary.Append(&quot;&lt;th style=&#39;text-align: left; vertical-align: top; width: 25%;&#39;&gt;&quot;);
+                    summary.Append(p.PropertyType.Name);
+                    summary.Append(&quot;&lt;/th&gt;&quot;);
+                    summary.Append(&quot;&lt;td style=&#39;text-align: left; vertical-align: top;&#39;&gt;&quot;);
+                    summary.Append(newText);
+                    summary.Append(&quot;&lt;/td&gt;&quot;);
+                    summary.Append(&quot;&lt;/tr&gt;&quot;);
+                }
+                summary.Append(
+                    &quot;&lt;tr&gt;&lt;td colspan=\&quot;2\&quot; style=\&quot;border-bottom: 1px solid #CCC; font-size: 2px;\&quot;&gt;&amp;nbsp;&lt;/td&gt;&lt;/tr&gt;&quot;);
+            }
+
+            string protocol = GlobalSettings.UseSSL ? &quot;https&quot; : &quot;http&quot;;
+
+
+            string[] subjectVars = {
+                                       string.Concat(http.Request.ServerVariables[&quot;SERVER_NAME&quot;], &quot;:&quot;, http.Request.Url.Port, IOHelper.ResolveUrl(SystemDirectories.Umbraco)),
+                                       actionName,
+                                       content.Name
+                                   };
+            string[] bodyVars = {
+                                    mailingUser.Name,
+                                    actionName,
+                                    content.Name,
+                                    performingUser.Name,
+                                    string.Concat(http.Request.ServerVariables[&quot;SERVER_NAME&quot;], &quot;:&quot;, http.Request.Url.Port, IOHelper.ResolveUrl(SystemDirectories.Umbraco)),
+                                    content.Id.ToString(CultureInfo.InvariantCulture), summary.ToString(),
+                                    string.Format(&quot;{2}://{0}/{1}&quot;,
+                                                  string.Concat(http.Request.ServerVariables[&quot;SERVER_NAME&quot;], &quot;:&quot;, http.Request.Url.Port),
+                                                  //TODO: RE-enable this so we can have a nice url
+                                                  /*umbraco.library.NiceUrl(documentObject.Id))*/
+                                                  string.Concat(content.Id, &quot;.aspx&quot;),
+                                                  protocol)
+
+                                };
+
+            // create the mail message
+            var mail = new MailMessage(UmbracoConfig.For.UmbracoSettings().Content.NotificationEmailAddress, mailingUser.Email);
+
+            // populate the message
+            mail.Subject = createSubject(mailingUser, subjectVars);
+            if (UmbracoConfig.For.UmbracoSettings().Content.DisableHtmlEmail)
+            {
+                mail.IsBodyHtml = false;
+                mail.Body = createBody(mailingUser, bodyVars);
+            }
+            else
+            {
+                mail.IsBodyHtml = true;
+                mail.Body =
+                    string.Concat(@&quot;&lt;html&gt;&lt;head&gt;
+&lt;/head&gt;
+&lt;body style=&#39;font-family: Trebuchet MS, arial, sans-serif; font-color: black;&#39;&gt;
+&quot;, createBody(mailingUser, bodyVars));
+            }
+
+            // nh, issue 30724. Due to hardcoded http strings in resource files, we need to check for https replacements here
+            // adding the server name to make sure we don&#39;t replace external links
+            if (GlobalSettings.UseSSL &amp;&amp; string.IsNullOrEmpty(mail.Body) == false)
+            {
+                string serverName = http.Request.ServerVariables[&quot;SERVER_NAME&quot;];
+                mail.Body = mail.Body.Replace(
+                    string.Format(&quot;http://{0}&quot;, serverName),
+                    string.Format(&quot;https://{0}&quot;, serverName));
+            }
+
+            return new NotificationRequest(mail, actionName, mailingUser.Name, mailingUser.Email);
+        }
+
+        private static string ReplaceLinks(string text, HttpRequestBase request)
+        {
+            var sb = new StringBuilder(GlobalSettings.UseSSL ? &quot;https://&quot; : &quot;http://&quot;);
+            sb.Append(request.ServerVariables[&quot;SERVER_NAME&quot;]);
+            sb.Append(&quot;:&quot;);
+            sb.Append(request.Url.Port);
+            sb.Append(&quot;/&quot;);
+            var domain = sb.ToString();
+            text = text.Replace(&quot;href=\&quot;/&quot;, &quot;href=\&quot;&quot; + domain);
+            text = text.Replace(&quot;src=\&quot;/&quot;, &quot;src=\&quot;&quot; + domain);
+            return text;
+        }
+
+        /// &lt;summary&gt;
+        /// Replaces the HTML symbols with the character equivalent.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;oldString&quot;&gt;The old string.&lt;/param&gt;
+        private static void ReplaceHtmlSymbols(ref string oldString)
+        {
+            oldString = oldString.Replace(&quot;&amp;nbsp;&quot;, &quot; &quot;);
+            oldString = oldString.Replace(&quot;&amp;rsquo;&quot;, &quot;&#39;&quot;);
+            oldString = oldString.Replace(&quot;&amp;amp;&quot;, &quot;&amp;&quot;);
+            oldString = oldString.Replace(&quot;&amp;ldquo;&quot;, &quot;“&quot;);
+            oldString = oldString.Replace(&quot;&amp;rdquo;&quot;, &quot;”&quot;);
+            oldString = oldString.Replace(&quot;&amp;quot;&quot;, &quot;\&quot;&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Compares the text.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;oldText&quot;&gt;The old text.&lt;/param&gt;
+        /// &lt;param name=&quot;newText&quot;&gt;The new text.&lt;/param&gt;
+        /// &lt;param name=&quot;displayInsertedText&quot;&gt;if set to &lt;c&gt;true&lt;/c&gt; [display inserted text].&lt;/param&gt;
+        /// &lt;param name=&quot;displayDeletedText&quot;&gt;if set to &lt;c&gt;true&lt;/c&gt; [display deleted text].&lt;/param&gt;
+        /// &lt;param name=&quot;insertedStyle&quot;&gt;The inserted style.&lt;/param&gt;
+        /// &lt;param name=&quot;deletedStyle&quot;&gt;The deleted style.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private static string CompareText(string oldText, string newText, bool displayInsertedText,
+                                          bool displayDeletedText, string insertedStyle, string deletedStyle)
+        {
+            var sb = new StringBuilder();
+            var diffs = Diff.DiffText1(oldText, newText);
+
+            int pos = 0;
+            for (int n = 0; n &lt; diffs.Length; n++)
+            {
+                Diff.Item it = diffs[n];
+
+                // write unchanged chars
+                while ((pos &lt; it.StartB) &amp;&amp; (pos &lt; newText.Length))
+                {
+                    sb.Append(newText[pos]);
+                    pos++;
+                } // while
+
+                // write deleted chars
+                if (displayDeletedText &amp;&amp; it.DeletedA &gt; 0)
+                {
+                    sb.Append(deletedStyle);
+                    for (int m = 0; m &lt; it.DeletedA; m++)
+                    {
+                        sb.Append(oldText[it.StartA + m]);
+                    } // for
+                    sb.Append(&quot;&lt;/span&gt;&quot;);
+                }
+
+                // write inserted chars
+                if (displayInsertedText &amp;&amp; pos &lt; it.StartB + it.InsertedB)
+                {
+                    sb.Append(insertedStyle);
+                    while (pos &lt; it.StartB + it.InsertedB)
+                    {
+                        sb.Append(newText[pos]);
+                        pos++;
+                    } // while
+                    sb.Append(&quot;&lt;/span&gt;&quot;);
+                } // if
+            } // while
+
+            // write rest of unchanged chars
+            while (pos &lt; newText.Length)
+            {
+                sb.Append(newText[pos]);
+                pos++;
+            } // while
+
+            return sb.ToString();
+        }
+
+        // manage notifications
+        // ideally, would need to use IBackgroundTasks - but they are not part of Core!
+
+        private static readonly object Locker = new object();
+        private static readonly BlockingCollection&lt;NotificationRequest&gt; Queue = new BlockingCollection&lt;NotificationRequest&gt;();
+        private static volatile bool _running;
+
+        private void Enqueue(NotificationRequest notification)
+        {
+            Queue.Add(notification);
+            if (_running) return;
+            lock (Locker)
+            {
+                if (_running) return;
+                Process(Queue);
+                _running = true;
+            }
+        }
+
+        private class NotificationRequest
+        {
+            public NotificationRequest(MailMessage mail, string action, string userName, string email)
+            {
+                Mail = mail;
+                Action = action;
+                UserName = userName;
+                Email = email;
+            }
+
+            public MailMessage Mail { get; private set; }
+
+            public string Action { get; private set; }
+
+            public string UserName { get; private set; }
+
+            public string Email { get; private set; }
+        }
+
+        private void Process(BlockingCollection&lt;NotificationRequest&gt; notificationRequests)
+        {
+            ThreadPool.QueueUserWorkItem(state =&gt;
+            {
+                var s = new SmtpClient();
+                try
+                {
+                    _logger.Debug&lt;NotificationService&gt;(&quot;Begin processing notifications.&quot;);
+                    while (true)
+                    {
+                        NotificationRequest request;
+                        while (notificationRequests.TryTake(out request, 8 * 1000)) // stay on for 8s
+                        {
+                            try
+                            {
+                                if (Sendmail != null) Sendmail(s, request.Mail, _logger); else s.Send(request.Mail);
+                                _logger.Debug&lt;NotificationService&gt;(string.Format(&quot;Notification \&quot;{0}\&quot; sent to {1} ({2})&quot;, request.Action, request.UserName, request.Email));
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.Error&lt;NotificationService&gt;(&quot;An error occurred sending notification&quot;, ex);
+                                s.Dispose();
+                                s = new SmtpClient();
+                            }
+                            finally
+                            {
+                                request.Mail.Dispose();
+                            }
+                        }
+                        lock (Locker)
+                        {
+                            if (notificationRequests.Count &gt; 0) continue; // last chance
+                            _running = false; // going down
+                            break;
+                        }
+                    }
+                }
+                finally
+                {
+                    s.Dispose();
+                }
+                _logger.Debug&lt;NotificationService&gt;(&quot;Done processing notifications.&quot;);
+            });
+        }
+
+        // for tests
+        internal static Action&lt;SmtpClient, MailMessage, ILogger&gt; Sendmail;
+            //= (_, msg, logger) =&gt; logger.Debug&lt;NotificationService&gt;(&quot;Email &quot; + msg.To.ToString());
+
+        #endregion
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[29,9,29,147,1],[30,9,30,10,1],[31,13,31,34,1],[31,35,31,79,0],[32,13,32,37,1],[32,38,32,85,0],[33,13,33,40,1],[33,41,33,91,0],[34,13,34,32,1],[34,33,34,75,0],[35,13,35,37,1],[36,13,36,40,1],[37,13,37,46,1],[38,13,38,30,1],[39,9,39,10,1],[57,9,57,10,0],[58,13,58,45,0],[59,17,59,51,0],[61,13,61,45,0],[64,13,64,45,0],[74,13,74,24,0],[75,13,75,79,0],[78,13,78,14,0],[80,17,80,94,0],[80,94,80,106,0],[80,106,80,117,0],[80,17,80,117,0],[81,17,81,77,0],[81,77,81,81,0],[81,81,81,146,0],[81,17,81,146,0],[82,17,82,46,0],[82,47,82,53,0],[84,17,84,27,0],[85,17,85,24,0],[85,26,85,34,0],[85,35,85,37,0],[85,38,85,43,0],[86,17,86,18,0],[88,21,88,60,0],[88,61,88,70,0],[91,21,91,45,0],[92,21,92,22,0],[93,25,93,69,0],[94,21,94,22,0],[97,21,97,145,0],[98,21,98,34,0],[101,21,101,92,0],[101,93,101,94,0],[102,21,102,50,0],[102,51,102,57,0],[103,17,103,18,0],[106,17,106,71,0],[108,13,108,14,0],[108,15,108,30,0],[109,9,109,10,0],[117,9,117,10,0],[121,13,121,84,0],[122,13,122,66,0],[123,13,123,80,0],[124,9,124,10,0],[142,9,142,10,0],[143,13,143,60,0],[144,17,144,51,0],[146,13,146,94,0],[149,13,149,38,0],[149,39,149,46,0],[152,13,152,47,0],[152,47,152,92,0],[152,92,152,104,0],[152,13,152,104,0],[155,13,155,77,0],[158,13,158,24,0],[161,13,161,14,0],[163,17,163,93,0],[163,93,163,105,0],[163,105,163,116,0],[163,17,163,116,0],[164,17,164,77,0],[164,77,164,81,0],[164,81,164,162,0],[164,17,164,162,0],[165,17,165,46,0],[165,47,165,53,0],[167,17,167,27,0],[168,17,168,24,0],[168,26,168,34,0],[168,35,168,37,0],[168,38,168,43,0],[169,17,169,18,0],[171,21,171,60,0],[171,61,171,70,0],[173,26,173,35,0],[173,37,173,56,0],[173,58,173,61,0],[174,21,174,22,0],[175,25,175,52,0],[176,25,176,45,0],[179,25,179,79,0],[179,80,179,89,0],[181,25,181,84,0],[182,25,182,26,0],[183,29,183,96,0],[184,25,184,26,0],[187,25,187,171,0],[188,25,188,38,0],[189,21,189,22,0],[194,21,194,22,0],[195,25,195,29,0],[196,21,196,22,0],[196,23,196,93,0],[198,21,198,50,0],[198,51,198,57,0],[199,17,199,18,0],[202,17,202,71,0],[204,13,204,14,0],[204,15,204,30,0],[205,9,205,10,0],[208,9,208,10,0],[209,13,209,52,0],[210,13,210,63,0],[211,13,211,91,0],[212,9,212,10,0],[220,9,220,10,0],[221,13,221,52,0],[222,13,222,63,0],[223,13,223,58,0],[224,9,224,10,0],[236,9,236,10,0],[237,13,237,64,0],[238,13,238,75,0],[239,9,239,10,0],[248,9,248,10,0],[249,13,249,92,0],[250,13,250,49,0],[250,49,250,127,0],[250,127,250,138,0],[250,13,250,138,0],[251,9,251,10,0],[258,9,258,10,0],[259,13,259,52,0],[260,13,260,63,0],[261,13,261,62,0],[262,9,262,10,0],[269,9,269,10,0],[270,13,270,52,0],[271,13,271,63,0],[272,13,272,52,0],[273,9,273,10,0],[280,9,280,10,0],[281,13,281,52,0],[282,13,282,63,0],[283,13,283,50,0],[284,9,284,10,0],[292,9,292,10,0],[293,13,293,52,0],[294,13,294,63,0],[295,13,295,58,0],[296,9,296,10,0],[306,9,306,10,1],[307,13,307,52,1],[308,13,308,63,1],[309,13,309,72,1],[310,9,310,10,1],[329,9,329,10,0],[330,13,330,40,0],[330,41,330,91,0],[331,13,331,37,0],[331,38,331,85,0],[332,13,332,33,0],[332,34,332,77,0],[333,13,333,30,0],[333,31,333,71,0],[334,13,334,39,0],[334,40,334,89,0],[335,13,335,36,0],[335,37,335,83,0],[338,13,338,47,0],[339,13,339,54,0],[340,13,340,20,0],[340,22,340,27,0],[340,28,340,30,0],[340,31,340,36,0],[341,13,341,14,0],[342,17,342,73,0],[343,17,343,39,0],[346,17,346,70,0],[347,17,347,18,0],[348,21,348,79,0],[349,21,349,93,0],[352,21,352,53,0],[353,21,353,53,0],[354,17,354,18,0],[359,17,360,69,0],[361,17,361,18,0],[362,21,362,44,0],[363,21,363,115,0],[364,21,365,237,0],[366,21,366,45,0],[367,21,367,44,0],[368,21,368,108,0],[369,21,369,57,0],[370,21,370,45,0],[371,21,371,91,0],[372,21,372,165,0],[373,21,373,45,0],[374,21,374,45,0],[375,21,375,44,0],[376,21,376,108,0],[377,21,377,57,0],[378,21,378,45,0],[379,21,379,91,0],[380,21,380,162,0],[381,21,381,45,0],[382,21,382,45,0],[383,17,383,18,0],[385,17,385,18,0],[386,21,386,44,0],[387,21,387,103,0],[388,21,388,57,0],[389,21,389,45,0],[390,21,390,91,0],[391,21,391,45,0],[392,21,392,45,0],[393,21,393,45,0],[394,17,394,18,0],[395,17,396,120,0],[397,13,397,14,0],[399,13,399,72,0],[402,13,406,38,0],[407,13,421,35,0],[424,13,424,129,0],[427,13,427,68,0],[428,13,428,78,0],[429,13,429,14,0],[430,17,430,41,0],[431,17,431,63,0],[432,13,432,14,0],[434,13,434,14,0],[435,17,435,40,0],[436,17,440,39,0],[441,13,441,14,0],[445,13,445,83,0],[446,13,446,14,0],[447,17,447,81,0],[448,17,450,63,0],[451,13,451,14,0],[453,13,453,99,0],[454,9,454,10,0],[457,9,457,10,0],[458,13,458,88,0],[459,13,459,63,0],[460,13,460,28,0],[461,13,461,41,0],[462,13,462,28,0],[463,13,463,40,0],[464,13,464,65,0],[465,13,465,63,0],[466,13,466,25,0],[467,9,467,10,0],[474,9,474,10,0],[475,13,475,58,0],[476,13,476,59,0],[477,13,477,57,0],[478,13,478,59,0],[479,13,479,59,0],[480,13,480,59,0],[481,9,481,10,0],[495,9,495,10,0],[496,13,496,42,0],[497,13,497,58,0],[499,13,499,25,0],[500,18,500,27,0],[500,29,500,45,0],[500,47,500,50,0],[501,13,501,14,0],[502,17,502,41,0],[505,17,505,68,0],[506,17,506,18,0],[507,21,507,45,0],[508,21,508,27,0],[509,17,509,18,0],[512,17,512,59,0],[513,17,513,18,0],[514,21,514,45,0],[515,26,515,35,0],[515,37,515,52,0],[515,54,515,57,0],[516,21,516,22,0],[517,25,517,59,0],[518,21,518,22,0],[519,21,519,42,0],[520,17,520,18,0],[523,17,523,75,0],[524,17,524,18,0],[525,21,525,46,0],[526,21,526,59,0],[527,21,527,22,0],[528,25,528,49,0],[529,25,529,31,0],[530,21,530,22,0],[531,21,531,42,0],[532,17,532,18,0],[533,13,533,14,0],[536,13,536,41,0],[537,13,537,14,0],[538,17,538,41,0],[539,17,539,23,0],[540,13,540,14,0],[542,13,542,34,0],[543,9,543,10,0],[548,9,548,62,1],[549,9,549,127,1],[553,9,553,10,0],[554,13,554,37,0],[555,13,555,26,0],[555,27,555,34,0],[556,13,556,26,0],[557,13,557,14,0],[558,17,558,30,0],[558,31,558,38,0],[559,17,559,32,0],[560,17,560,33,0],[561,13,561,14,0],[562,9,562,10,0],[566,13,566,103,0],[567,13,567,14,0],[568,17,568,29,0],[569,17,569,33,0],[570,17,570,37,0],[571,17,571,31,0],[572,13,572,14,0],[574,39,574,43,0],[574,44,574,56,0],[576,36,576,40,0],[576,41,576,53,0],[578,38,578,42,0],[578,43,578,55,0],[580,35,580,39,0],[580,40,580,52,0],[584,9,584,10,0],[585,13,586,13,0],[586,13,586,14,0],[586,14,587,17,0],[587,17,587,42,0],[587,42,589,17,0],[589,17,589,18,0],[589,18,590,21,0],[590,21,590,91,0],[590,91,591,21,0],[591,21,591,33,0],[591,33,592,21,0],[592,21,592,22,0],[592,22,594,25,0],[594,25,594,84,0],[594,84,595,25,0],[595,25,595,26,0],[595,26,597,29,0],[597,29,597,30,0],[597,30,598,33,0],[598,33,598,54,0],[598,54,598,55,0],[598,55,598,90,0],[598,90,598,96,0],[598,96,598,117,0],[598,117,599,33,0],[599,33,599,174,0],[599,174,600,29,0],[600,29,600,30,0],[600,30,601,29,0],[601,29,601,49,0],[601,49,602,29,0],[602,29,602,30,0],[602,30,603,33,0],[603,33,603,114,0],[603,114,604,33,0],[604,33,604,45,0],[604,45,605,33,0],[605,33,605,54,0],[605,54,606,29,0],[606,29,606,30,0],[606,30,608,29,0],[608,29,608,30,0],[608,30,609,33,0],[609,33,609,56,0],[609,56,610,29,0],[610,29,610,30,0],[610,30,611,25,0],[611,25,611,26,0],[611,26,612,25,0],[612,25,612,38,0],[612,38,613,25,0],[613,25,613,26,0],[613,26,614,29,0],[614,29,614,64,0],[614,64,614,65,0],[614,65,614,74,0],[614,74,615,29,0],[615,29,615,46,0],[615,46,616,29,0],[616,29,616,35,0],[616,35,619,17,0],[619,17,619,18,0],[619,18,621,17,0],[621,17,621,18,0],[621,18,622,21,0],[622,21,622,33,0],[622,33,623,17,0],[623,17,623,18,0],[623,18,624,17,0],[624,17,624,86,0],[624,86,625,13,0],[625,13,625,14,0],[625,14,625,16,0],[585,13,625,16,0],[626,9,626,10,0]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,1363 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\MemberService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Threading;
+using System.Web.Security;
+using System.Xml.Linq;
+using Umbraco.Core.Auditing;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Events;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+using System.Linq;
+using Umbraco.Core.Security;
+
+namespace Umbraco.Core.Services
+{
+    /// &lt;summary&gt;
+    /// Represents the MemberService.
+    /// &lt;/summary&gt;
+    public class MemberService : RepositoryService, IMemberService
+    {
+        private readonly IMemberGroupService _memberGroupService;
+        private readonly EntityXmlSerializer _entitySerializer = new EntityXmlSerializer();
+        private readonly IDataTypeService _dataTypeService;
+        private static readonly ReaderWriterLockSlim Locker = new ReaderWriterLockSlim();
+
+        public MemberService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory, ILogger logger, IEventMessagesFactory eventMessagesFactory, IMemberGroupService memberGroupService, IDataTypeService dataTypeService)
+            : base(provider, repositoryFactory, logger, eventMessagesFactory)
+        {
+            if (memberGroupService == null) throw new ArgumentNullException(&quot;memberGroupService&quot;);
+            if (dataTypeService == null) throw new ArgumentNullException(&quot;dataTypeService&quot;);
+            _memberGroupService = memberGroupService;
+            _dataTypeService = dataTypeService;
+        }
+
+        #region IMemberService Implementation
+
+        /// &lt;summary&gt;
+        /// Gets the default MemberType alias
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;By default we&#39;ll return the &#39;writer&#39;, but we need to check it exists. If it doesn&#39;t we&#39;ll 
+        /// return the first type that is not an admin, otherwise if there&#39;s only one we will return that one.&lt;/remarks&gt;
+        /// &lt;returns&gt;Alias of the default MemberType&lt;/returns&gt;
+        public string GetDefaultMemberType()
+        {
+            using (var repository = RepositoryFactory.CreateMemberTypeRepository(UowProvider.GetUnitOfWork()))
+            {
+                var types = repository.GetAll(new int[] { }).Select(x =&gt; x.Alias).ToArray();
+
+                if (types.Any() == false)
+                {
+                    throw new InvalidOperationException(&quot;No member types could be resolved&quot;);
+                }
+
+                if (types.InvariantContains(&quot;Member&quot;))
+                {
+                    return types.First(x =&gt; x.InvariantEquals(&quot;Member&quot;));
+                }
+
+                return types.First();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if a Member with the username exists
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username to check&lt;/param&gt;
+        /// &lt;returns&gt;&lt;c&gt;True&lt;/c&gt; if the Member exists otherwise &lt;c&gt;False&lt;/c&gt;&lt;/returns&gt;
+        public bool Exists(string username)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.Exists(username);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This is simply a helper method which essentially just wraps the MembershipProvider&#39;s ChangePassword method
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;This method exists so that Umbraco developers can use one entry point to create/update 
+        /// Members if they choose to. &lt;/remarks&gt;
+        /// &lt;param name=&quot;member&quot;&gt;The Member to save the password for&lt;/param&gt;
+        /// &lt;param name=&quot;password&quot;&gt;The password to encrypt and save&lt;/param&gt;
+        public void SavePassword(IMember member, string password)
+        {
+            if (member == null) throw new ArgumentNullException(&quot;member&quot;);
+
+            var provider = MembershipProviderExtensions.GetMembersMembershipProvider();
+            if (provider.IsUmbracoMembershipProvider())
+            {
+                provider.ChangePassword(member.Username, &quot;&quot;, password);
+            }
+            else
+            {
+                throw new NotSupportedException(&quot;When using a non-Umbraco membership provider you must change the member password by using the MembershipProvider.ChangePassword method&quot;);
+            }
+
+            //go re-fetch the member and update the properties that may have changed
+            var result = GetByUsername(member.Username);
+
+            //should never be null but it could have been deleted by another thread.
+            if (result == null)
+                return;
+
+            member.RawPasswordValue = result.RawPasswordValue;
+            member.LastPasswordChangeDate = result.LastPasswordChangeDate;
+            member.UpdateDate = result.UpdateDate;
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if a Member with the id exists
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the Member&lt;/param&gt;
+        /// &lt;returns&gt;&lt;c&gt;True&lt;/c&gt; if the Member exists otherwise &lt;c&gt;False&lt;/c&gt;&lt;/returns&gt;
+        public bool Exists(int id)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.Exists(id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a Member by its integer id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;see cref=&quot;System.int&quot;/&gt; Id&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        public IMember GetById(int id)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.Get(id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a Member by the unique key
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;The guid key corresponds to the unique id in the database
+        /// and the user id in the membership provider.&lt;/remarks&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;see cref=&quot;Guid&quot;/&gt; Id&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        public IMember GetByKey(Guid id)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IMember&gt;.Builder.Where(x =&gt; x.Key == id);
+                var member = repository.GetByQuery(query).FirstOrDefault();
+                return member;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all Members for the specified MemberType alias
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;memberTypeAlias&quot;&gt;Alias of the MemberType&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; GetMembersByMemberType(string memberTypeAlias)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IMember&gt;.Builder.Where(x =&gt; x.ContentTypeAlias == memberTypeAlias);
+                var members = repository.GetByQuery(query);
+                return members;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all Members for the MemberType id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;memberTypeId&quot;&gt;Id of the MemberType&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; GetMembersByMemberType(int memberTypeId)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                repository.Get(memberTypeId);
+                var query = Query&lt;IMember&gt;.Builder.Where(x =&gt; x.ContentTypeId == memberTypeId);
+                var members = repository.GetByQuery(query);
+                return members;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all Members within the specified MemberGroup name
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;memberGroupName&quot;&gt;Name of the MemberGroup&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; GetMembersByGroup(string memberGroupName)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetByMemberGroup(memberGroupName);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all Members with the ids specified
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;If no Ids are specified all Members will be retrieved&lt;/remarks&gt;
+        /// &lt;param name=&quot;ids&quot;&gt;Optional list of Member Ids&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; GetAllMembers(params int[] ids)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetAll(ids);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Delete Members of the specified MemberType id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;memberTypeId&quot;&gt;Id of the MemberType&lt;/param&gt;
+        public void DeleteMembersOfType(int memberTypeId)
+        {
+            using (new WriteLock(Locker))
+            {
+                using (var uow = UowProvider.GetUnitOfWork())
+                {
+                    var repository = RepositoryFactory.CreateMemberRepository(uow);
+                    //TODO: What about content that has the contenttype as part of its composition?
+                    var query = Query&lt;IMember&gt;.Builder.Where(x =&gt; x.ContentTypeId == memberTypeId);
+                    var members = repository.GetByQuery(query).ToArray();
+
+                    if (Deleting.IsRaisedEventCancelled(new DeleteEventArgs&lt;IMember&gt;(members), this))
+                        return;
+
+                    foreach (var member in members)
+                    {
+                        //Permantly delete the member
+                        Delete(member);
+                    }
+                }
+            }
+        }
+
+        [Obsolete(&quot;Use the overload with &#39;long&#39; parameter types instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public IEnumerable&lt;IMember&gt; FindMembersByDisplayName(string displayNameToMatch, int pageIndex, int pageSize, out int totalRecords, StringPropertyMatchType matchType = StringPropertyMatchType.StartsWith)
+        {
+            long total;
+            var result = FindMembersByDisplayName(displayNameToMatch, Convert.ToInt64(pageIndex), pageSize, out total, matchType);
+            totalRecords = Convert.ToInt32(total);
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Finds Members based on their display name
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;displayNameToMatch&quot;&gt;Display name to match&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Current page index&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Size of the page&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total number of records found (out)&lt;/param&gt;
+        /// &lt;param name=&quot;matchType&quot;&gt;The type of match to make as &lt;see cref=&quot;StringPropertyMatchType&quot;/&gt;. Default is &lt;see cref=&quot;StringPropertyMatchType.StartsWith&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; FindMembersByDisplayName(string displayNameToMatch, long pageIndex, int pageSize, out long totalRecords, StringPropertyMatchType matchType = StringPropertyMatchType.StartsWith)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                var query = new Query&lt;IMember&gt;();
+
+                switch (matchType)
+                {
+                    case StringPropertyMatchType.Exact:
+                        query.Where(member =&gt; member.Name.Equals(displayNameToMatch));
+                        break;
+                    case StringPropertyMatchType.Contains:
+                        query.Where(member =&gt; member.Name.Contains(displayNameToMatch));
+                        break;
+                    case StringPropertyMatchType.StartsWith:
+                        query.Where(member =&gt; member.Name.StartsWith(displayNameToMatch));
+                        break;
+                    case StringPropertyMatchType.EndsWith:
+                        query.Where(member =&gt; member.Name.EndsWith(displayNameToMatch));
+                        break;
+                    case StringPropertyMatchType.Wildcard:
+                        query.Where(member =&gt; member.Name.SqlWildcard(displayNameToMatch, TextColumnType.NVarchar));
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;matchType&quot;);
+                }
+
+                return repository.GetPagedResultsByQuery(query, pageIndex, pageSize, out totalRecords, &quot;Name&quot;, Direction.Ascending, true);
+            }
+        }
+
+        [Obsolete(&quot;Use the overload with &#39;long&#39; parameter types instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public IEnumerable&lt;IMember&gt; FindByEmail(string emailStringToMatch, int pageIndex, int pageSize, out int totalRecords, StringPropertyMatchType matchType = StringPropertyMatchType.StartsWith)
+        {
+            long total;
+            var result = FindByEmail(emailStringToMatch, Convert.ToInt64(pageIndex), pageSize, out total, matchType);
+            totalRecords = Convert.ToInt32(total);
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Finds a list of &lt;see cref=&quot;IMember&quot;/&gt; objects by a partial email string
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;emailStringToMatch&quot;&gt;Partial email string to match&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Current page index&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Size of the page&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total number of records found (out)&lt;/param&gt;
+        /// &lt;param name=&quot;matchType&quot;&gt;The type of match to make as &lt;see cref=&quot;StringPropertyMatchType&quot;/&gt;. Default is &lt;see cref=&quot;StringPropertyMatchType.StartsWith&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; FindByEmail(string emailStringToMatch, long pageIndex, int pageSize, out long totalRecords, StringPropertyMatchType matchType = StringPropertyMatchType.StartsWith)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                var query = new Query&lt;IMember&gt;();
+
+                switch (matchType)
+                {
+                    case StringPropertyMatchType.Exact:
+                        query.Where(member =&gt; member.Email.Equals(emailStringToMatch));
+                        break;
+                    case StringPropertyMatchType.Contains:
+                        query.Where(member =&gt; member.Email.Contains(emailStringToMatch));
+                        break;
+                    case StringPropertyMatchType.StartsWith:
+                        query.Where(member =&gt; member.Email.StartsWith(emailStringToMatch));
+                        break;
+                    case StringPropertyMatchType.EndsWith:
+                        query.Where(member =&gt; member.Email.EndsWith(emailStringToMatch));
+                        break;
+                    case StringPropertyMatchType.Wildcard:
+                        query.Where(member =&gt; member.Email.SqlWildcard(emailStringToMatch, TextColumnType.NVarchar));
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;matchType&quot;);
+                }
+
+                return repository.GetPagedResultsByQuery(query, pageIndex, pageSize,  out totalRecords, &quot;Email&quot;, Direction.Ascending, true);
+            }
+        }
+
+        [Obsolete(&quot;Use the overload with &#39;long&#39; parameter types instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public IEnumerable&lt;IMember&gt; FindByUsername(string login, int pageIndex, int pageSize, out int totalRecords, StringPropertyMatchType matchType = StringPropertyMatchType.StartsWith)
+        {
+            long total;
+            var result = FindByUsername(login, Convert.ToInt64(pageIndex), pageSize, out total, matchType);
+            totalRecords = Convert.ToInt32(total);
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Finds a list of &lt;see cref=&quot;IMember&quot;/&gt; objects by a partial username
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;login&quot;&gt;Partial username to match&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Current page index&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Size of the page&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total number of records found (out)&lt;/param&gt;
+        /// &lt;param name=&quot;matchType&quot;&gt;The type of match to make as &lt;see cref=&quot;StringPropertyMatchType&quot;/&gt;. Default is &lt;see cref=&quot;StringPropertyMatchType.StartsWith&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; FindByUsername(string login, long pageIndex, int pageSize, out long totalRecords, StringPropertyMatchType matchType = StringPropertyMatchType.StartsWith)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                var query = new Query&lt;IMember&gt;();
+
+                switch (matchType)
+                {
+                    case StringPropertyMatchType.Exact:
+                        query.Where(member =&gt; member.Username.Equals(login));
+                        break;
+                    case StringPropertyMatchType.Contains:
+                        query.Where(member =&gt; member.Username.Contains(login));
+                        break;
+                    case StringPropertyMatchType.StartsWith:
+                        query.Where(member =&gt; member.Username.StartsWith(login));
+                        break;
+                    case StringPropertyMatchType.EndsWith:
+                        query.Where(member =&gt; member.Username.EndsWith(login));
+                        break;
+                    case StringPropertyMatchType.Wildcard:
+                        query.Where(member =&gt; member.Email.SqlWildcard(login, TextColumnType.NVarchar));
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;matchType&quot;);
+                }
+
+                return repository.GetPagedResultsByQuery(query, pageIndex, pageSize, out totalRecords, &quot;LoginName&quot;, Direction.Ascending, true);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a list of Members based on a property search
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;propertyTypeAlias&quot;&gt;Alias of the PropertyType to search for&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;&lt;see cref=&quot;System.string&quot;/&gt; Value to match&lt;/param&gt;
+        /// &lt;param name=&quot;matchType&quot;&gt;The type of match to make as &lt;see cref=&quot;StringPropertyMatchType&quot;/&gt;. Default is &lt;see cref=&quot;StringPropertyMatchType.Exact&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; GetMembersByPropertyValue(string propertyTypeAlias, string value, StringPropertyMatchType matchType = StringPropertyMatchType.Exact)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                IQuery&lt;IMember&gt; query;
+
+                switch (matchType)
+                {
+                    case StringPropertyMatchType.Exact:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                (((Member)x).LongStringPropertyValue.SqlEquals(value, TextColumnType.NText) ||
+                                 ((Member)x).ShortStringPropertyValue.SqlEquals(value, TextColumnType.NVarchar)));
+                        break;
+                    case StringPropertyMatchType.Contains:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                (((Member)x).LongStringPropertyValue.SqlContains(value, TextColumnType.NText) ||
+                                 ((Member)x).ShortStringPropertyValue.SqlContains(value, TextColumnType.NVarchar)));
+                        break;
+                    case StringPropertyMatchType.StartsWith:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                (((Member)x).LongStringPropertyValue.SqlStartsWith(value, TextColumnType.NText) ||
+                                 ((Member)x).ShortStringPropertyValue.SqlStartsWith(value, TextColumnType.NVarchar)));
+                        break;
+                    case StringPropertyMatchType.EndsWith:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                (((Member)x).LongStringPropertyValue.SqlEndsWith(value, TextColumnType.NText) ||
+                                 ((Member)x).ShortStringPropertyValue.SqlEndsWith(value, TextColumnType.NVarchar)));
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;matchType&quot;);
+                }
+
+                var members = repository.GetByQuery(query);
+                return members;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a list of Members based on a property search
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;propertyTypeAlias&quot;&gt;Alias of the PropertyType to search for&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;&lt;see cref=&quot;System.int&quot;/&gt; Value to match&lt;/param&gt;
+        /// &lt;param name=&quot;matchType&quot;&gt;The type of match to make as &lt;see cref=&quot;StringPropertyMatchType&quot;/&gt;. Default is &lt;see cref=&quot;StringPropertyMatchType.Exact&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; GetMembersByPropertyValue(string propertyTypeAlias, int value, ValuePropertyMatchType matchType = ValuePropertyMatchType.Exact)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                IQuery&lt;IMember&gt; query;
+
+                switch (matchType)
+                {
+                    case ValuePropertyMatchType.Exact:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                ((Member)x).IntegerPropertyValue == value);
+                        break;
+                    case ValuePropertyMatchType.GreaterThan:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                ((Member)x).IntegerPropertyValue &gt; value);
+                        break;
+                    case ValuePropertyMatchType.LessThan:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                ((Member)x).IntegerPropertyValue &lt; value);
+                        break;
+                    case ValuePropertyMatchType.GreaterThanOrEqualTo:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                ((Member)x).IntegerPropertyValue &gt;= value);
+                        break;
+                    case ValuePropertyMatchType.LessThanOrEqualTo:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                ((Member)x).IntegerPropertyValue &lt;= value);
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;matchType&quot;);
+                }
+
+                var members = repository.GetByQuery(query);
+                return members;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a list of Members based on a property search
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;propertyTypeAlias&quot;&gt;Alias of the PropertyType to search for&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;&lt;see cref=&quot;System.bool&quot;/&gt; Value to match&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; GetMembersByPropertyValue(string propertyTypeAlias, bool value)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query =
+                    Query&lt;IMember&gt;.Builder.Where(
+                        x =&gt;
+                            ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                            ((Member)x).BoolPropertyValue == value);
+
+                var members = repository.GetByQuery(query);
+                return members;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a list of Members based on a property search
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;propertyTypeAlias&quot;&gt;Alias of the PropertyType to search for&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;&lt;see cref=&quot;System.DateTime&quot;/&gt; Value to match&lt;/param&gt;
+        /// &lt;param name=&quot;matchType&quot;&gt;The type of match to make as &lt;see cref=&quot;StringPropertyMatchType&quot;/&gt;. Default is &lt;see cref=&quot;StringPropertyMatchType.Exact&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; GetMembersByPropertyValue(string propertyTypeAlias, DateTime value, ValuePropertyMatchType matchType = ValuePropertyMatchType.Exact)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                IQuery&lt;IMember&gt; query;
+
+                switch (matchType)
+                {
+                    case ValuePropertyMatchType.Exact:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                ((Member)x).DateTimePropertyValue == value);
+                        break;
+                    case ValuePropertyMatchType.GreaterThan:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                ((Member)x).DateTimePropertyValue &gt; value);
+                        break;
+                    case ValuePropertyMatchType.LessThan:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                ((Member)x).DateTimePropertyValue &lt; value);
+                        break;
+                    case ValuePropertyMatchType.GreaterThanOrEqualTo:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                ((Member)x).DateTimePropertyValue &gt;= value);
+                        break;
+                    case ValuePropertyMatchType.LessThanOrEqualTo:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == propertyTypeAlias &amp;&amp;
+                                ((Member)x).DateTimePropertyValue &lt;= value);
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;matchType&quot;);
+                }
+
+                //TODO: Since this is by property value, we need a GetByPropertyQuery on the repo!
+                var members = repository.GetByQuery(query);
+                return members;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Rebuilds all xml content in the cmsContentXml table for all members
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;memberTypeIds&quot;&gt;
+        /// Only rebuild the xml structures for the content type ids passed in, if none then rebuilds the structures
+        /// for all members = USE WITH CARE!
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;True if publishing succeeded, otherwise False&lt;/returns&gt;
+        public void RebuildXmlStructures(params int[] memberTypeIds)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                repository.RebuildXmlStructures(
+                    member =&gt; _entitySerializer.Serialize(_dataTypeService, member),
+                    contentTypeIds: memberTypeIds.Length == 0 ? null : memberTypeIds);
+            }
+
+            Audit(AuditType.Publish, &quot;MemberService.RebuildXmlStructures completed, the xml has been regenerated in the database&quot;, 0, -1);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets paged member descendants as XML by path
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Page number&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Page size&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total records the query would return without paging&lt;/param&gt;
+        /// &lt;returns&gt;A paged enumerable of XML entries of member items&lt;/returns&gt;
+        public IEnumerable&lt;XElement&gt; GetPagedXmlEntries(long pageIndex, int pageSize, out long totalRecords)
+        {
+            Mandate.ParameterCondition(pageIndex &gt;= 0, &quot;pageIndex&quot;);
+            Mandate.ParameterCondition(pageSize &gt; 0, &quot;pageSize&quot;);
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                var contents = repository.GetPagedXmlEntriesByPath(&quot;-1&quot;, pageIndex, pageSize, null, out totalRecords);
+                return contents;
+            }
+        }
+
+        #endregion
+
+        #region IMembershipMemberService Implementation
+
+        /// &lt;summary&gt;
+        /// Gets the total number of Members based on the count type
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// The way the Online count is done is the same way that it is done in the MS SqlMembershipProvider - We query for any members
+        /// that have their last active date within the Membership.UserIsOnlineTimeWindow (which is in minutes). It isn&#39;t exact science
+        /// but that is how MS have made theirs so we&#39;ll follow that principal.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;countType&quot;&gt;&lt;see cref=&quot;MemberCountType&quot;/&gt; to count by&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;System.int&quot;/&gt; with number of Members for passed in type&lt;/returns&gt;
+        public int GetCount(MemberCountType countType)
+        {
+            using (var repository = RepositoryFactory.CreateMemberRepository(UowProvider.GetUnitOfWork()))
+            {
+                IQuery&lt;IMember&gt; query;
+
+                switch (countType)
+                {
+                    case MemberCountType.All:
+                        query = new Query&lt;IMember&gt;();
+                        return repository.Count(query);
+                    case MemberCountType.Online:
+                        var fromDate = DateTime.Now.AddMinutes(-Membership.UserIsOnlineTimeWindow);
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == Constants.Conventions.Member.LastLoginDate &amp;&amp;
+                                ((Member)x).DateTimePropertyValue &gt; fromDate);
+                        return repository.GetCountByQuery(query);
+                    case MemberCountType.LockedOut:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == Constants.Conventions.Member.IsLockedOut &amp;&amp;
+                                ((Member)x).BoolPropertyValue == true);
+                        return repository.GetCountByQuery(query);
+                    case MemberCountType.Approved:
+                        query =
+                            Query&lt;IMember&gt;.Builder.Where(
+                                x =&gt;
+                                ((Member)x).PropertyTypeAlias == Constants.Conventions.Member.IsApproved &amp;&amp;
+                                ((Member)x).BoolPropertyValue == true);
+                        return repository.GetCountByQuery(query);
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;countType&quot;);
+                }
+            }
+
+        }
+
+        [Obsolete(&quot;Use the overload with &#39;long&#39; parameter types instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public IEnumerable&lt;IMember&gt; GetAll(int pageIndex, int pageSize, out int totalRecords)
+        {
+            long total;
+            var result = GetAll(Convert.ToInt64(pageIndex), pageSize, out total);
+            totalRecords = Convert.ToInt32(total);
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a list of paged &lt;see cref=&quot;IMember&quot;/&gt; objects
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Current page index&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Size of the page&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total number of records found (out)&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMember&gt; GetAll(long pageIndex, int pageSize, out long totalRecords)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                return repository.GetPagedResultsByQuery(null, pageIndex, pageSize, out totalRecords, &quot;LoginName&quot;, Direction.Ascending, true);
+            }
+        }
+
+        [Obsolete(&quot;Use the overload with &#39;long&#39; parameter types instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public IEnumerable&lt;IMember&gt; GetAll(int pageIndex, int pageSize, out int totalRecords,
+            string orderBy, Direction orderDirection, string memberTypeAlias = null, string filter = &quot;&quot;)
+        {
+            long total;
+            var result = GetAll(Convert.ToInt64(pageIndex), pageSize, out total, orderBy, orderDirection, true, memberTypeAlias, filter);
+            totalRecords = Convert.ToInt32(total);
+            return result;
+        }
+
+        public IEnumerable&lt;IMember&gt; GetAll(long pageIndex, int pageSize, out long totalRecords,
+            string orderBy, Direction orderDirection, string memberTypeAlias = null, string filter = &quot;&quot;)
+        {
+            return GetAll(pageIndex, pageSize, out totalRecords, orderBy, orderDirection, true, memberTypeAlias, filter);
+        }
+
+        public IEnumerable&lt;IMember&gt; GetAll(long pageIndex, int pageSize, out long totalRecords,
+            string orderBy, Direction orderDirection, bool orderBySystemField, string memberTypeAlias, string filter)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                if (memberTypeAlias == null)
+                {
+                    return repository.GetPagedResultsByQuery(null, pageIndex, pageSize, out totalRecords, orderBy, orderDirection, orderBySystemField, filter);    
+                }
+                var query = new Query&lt;IMember&gt;().Where(x =&gt; x.ContentTypeAlias == memberTypeAlias);
+                return repository.GetPagedResultsByQuery(query, pageIndex, pageSize, out totalRecords, orderBy, orderDirection, orderBySystemField, filter);    
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the count of Members by an optional MemberType alias
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;If no alias is supplied then the count for all Member will be returned&lt;/remarks&gt;
+        /// &lt;param name=&quot;memberTypeAlias&quot;&gt;Optional alias for the MemberType when counting number of Members&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;System.int&quot;/&gt; with number of Members&lt;/returns&gt;
+        public int Count(string memberTypeAlias = null)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                return repository.Count(memberTypeAlias);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Creates an &lt;see cref=&quot;IMember&quot;/&gt; object without persisting it
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;This method is convenient for when you need to add properties to a new Member
+        /// before persisting it in order to limit the amount of times its saved.
+        /// Also note that the returned &lt;see cref=&quot;IMember&quot;/&gt; will not have an Id until its saved.&lt;/remarks&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Name of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;memberTypeAlias&quot;&gt;Alias of the MemberType the Member should be based on&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        public IMember CreateMember(string username, string email, string name, string memberTypeAlias)
+        {
+            var memberType = FindMemberTypeByAlias(memberTypeAlias);
+            return CreateMember(username, email, name, memberType);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates an &lt;see cref=&quot;IMember&quot;/&gt; object without persisting it
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;This method is convenient for when you need to add properties to a new Member
+        /// before persisting it in order to limit the amount of times its saved.
+        /// Also note that the returned &lt;see cref=&quot;IMember&quot;/&gt; will not have an Id until its saved.&lt;/remarks&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Name of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;memberType&quot;&gt;MemberType the Member should be based on&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        public IMember CreateMember(string username, string email, string name, IMemberType memberType)
+        {
+            var member = new Member(name, email.ToLower().Trim(), username, memberType);
+
+            Created.RaiseEvent(new NewEventArgs&lt;IMember&gt;(member, false, memberType.Alias, -1), this);
+
+            return member;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and persists a Member
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Using this method will persist the Member object before its returned 
+        /// meaning that it will have an Id available (unlike the CreateMember method)&lt;/remarks&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Name of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;memberTypeAlias&quot;&gt;Alias of the MemberType the Member should be based on&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        public IMember CreateMemberWithIdentity(string username, string email, string name, string memberTypeAlias)
+        {
+            var memberType = FindMemberTypeByAlias(memberTypeAlias);
+            return CreateMemberWithIdentity(username, email, name, memberType);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and persists a Member
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Using this method will persist the Member object before its returned 
+        /// meaning that it will have an Id available (unlike the CreateMember method)&lt;/remarks&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;memberType&quot;&gt;MemberType the Member should be based on&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        public IMember CreateMemberWithIdentity(string username, string email, IMemberType memberType)
+        {
+            return CreateMemberWithIdentity(username, email, username, memberType);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and persists a Member
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Using this method will persist the Member object before its returned 
+        /// meaning that it will have an Id available (unlike the CreateMember method)&lt;/remarks&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Name of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;memberType&quot;&gt;MemberType the Member should be based on&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        public IMember CreateMemberWithIdentity(string username, string email, string name, IMemberType memberType)
+        {
+            return CreateMemberWithIdentity(username, email, name, &quot;&quot;, memberType);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and persists a new &lt;see cref=&quot;IMember&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;An &lt;see cref=&quot;IMembershipUser&quot;/&gt; can be of type &lt;see cref=&quot;IMember&quot;/&gt; or &lt;see cref=&quot;IUser&quot;/&gt;&lt;/remarks&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username of the &lt;see cref=&quot;IMembershipUser&quot;/&gt; to create&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email of the &lt;see cref=&quot;IMembershipUser&quot;/&gt; to create&lt;/param&gt;
+        /// &lt;param name=&quot;passwordValue&quot;&gt;This value should be the encoded/encrypted/hashed value for the password that will be stored in the database&lt;/param&gt;
+        /// &lt;param name=&quot;memberTypeAlias&quot;&gt;Alias of the Type&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        IMember IMembershipMemberService&lt;IMember&gt;.CreateWithIdentity(string username, string email, string passwordValue, string memberTypeAlias)
+        {
+            var memberType = FindMemberTypeByAlias(memberTypeAlias);
+            return CreateMemberWithIdentity(username, email, username, passwordValue, memberType);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and persists a Member
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Using this method will persist the Member object before its returned 
+        /// meaning that it will have an Id available (unlike the CreateMember method)&lt;/remarks&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Name of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;passwordValue&quot;&gt;This value should be the encoded/encrypted/hashed value for the password that will be stored in the database&lt;/param&gt;
+        /// &lt;param name=&quot;memberType&quot;&gt;MemberType the Member should be based on&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        private IMember CreateMemberWithIdentity(string username, string email, string name, string passwordValue, IMemberType memberType)
+        {
+            if (memberType == null) throw new ArgumentNullException(&quot;memberType&quot;);
+
+            var member = new Member(name, email.ToLower().Trim(), username, passwordValue, memberType);
+
+            if (Saving.IsRaisedEventCancelled(new SaveEventArgs&lt;IMember&gt;(member), this))
+            {
+                member.WasCancelled = true;
+                return member;
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                repository.AddOrUpdate(member);
+                //insert the xml
+                repository.AddOrUpdateContentXml(member, m =&gt; _entitySerializer.Serialize(_dataTypeService, m));
+                // generate preview for blame history?
+                if (UmbracoConfig.For.UmbracoSettings().Content.GlobalPreviewStorageEnabled)
+                {
+                    repository.AddOrUpdatePreviewXml(member, m =&gt; _entitySerializer.Serialize(_dataTypeService, m));
+                }
+
+                uow.Commit();
+            }
+
+            Saved.RaiseEvent(new SaveEventArgs&lt;IMember&gt;(member, false), this);
+            Created.RaiseEvent(new NewEventArgs&lt;IMember&gt;(member, false, memberType.Alias, -1), this);
+
+            return member;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an &lt;see cref=&quot;IMember&quot;/&gt; by its provider key
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id to use for retrieval&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        public IMember GetByProviderKey(object id)
+        {
+            var asGuid = id.TryConvertTo&lt;Guid&gt;();
+            if (asGuid.Success)
+            {
+                return GetByKey((Guid)id);
+            }
+            var asInt = id.TryConvertTo&lt;int&gt;();
+            if (asInt.Success)
+            {
+                return GetById((int)id);
+            }
+
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// Get an &lt;see cref=&quot;IMember&quot;/&gt; by email
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email to use for retrieval&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        public IMember GetByEmail(string email)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                var query = Query&lt;IMember&gt;.Builder.Where(x =&gt; x.Email.Equals(email));
+                var member = repository.GetByQuery(query).FirstOrDefault();
+
+                return member;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Get an &lt;see cref=&quot;IMember&quot;/&gt; by username
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username to use for retrieval&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IMember&quot;/&gt;&lt;/returns&gt;
+        public IMember GetByUsername(string username)
+        {
+            //TODO: Somewhere in here, whether at this level or the repository level, we need to add 
+            // a caching mechanism since this method is used by all the membership providers and could be
+            // called quite a bit when dealing with members.
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                var query = Query&lt;IMember&gt;.Builder.Where(x =&gt; x.Username.Equals(username));
+                var member = repository.GetByQuery(query).FirstOrDefault();
+
+                return member;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes an &lt;see cref=&quot;IMember&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;member&quot;&gt;&lt;see cref=&quot;IMember&quot;/&gt; to Delete&lt;/param&gt;
+        public void Delete(IMember member)
+        {
+            if (Deleting.IsRaisedEventCancelled(new DeleteEventArgs&lt;IMember&gt;(member), this))
+                return;
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                repository.Delete(member);
+                uow.Commit();
+
+                var args = new DeleteEventArgs&lt;IMember&gt;(member, false);
+                Deleted.RaiseEvent(args, this);
+
+                //remove any flagged media files
+                repository.DeleteMediaFiles(args.MediaFilesToDelete);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Saves an &lt;see cref=&quot;IMember&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;see cref=&quot;IMember&quot;/&gt; to Save&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter to raise events. 
+        /// Default is &lt;c&gt;True&lt;/c&gt; otherwise set to &lt;c&gt;False&lt;/c&gt; to not raise events&lt;/param&gt;
+        public void Save(IMember entity, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (Saving.IsRaisedEventCancelled(new SaveEventArgs&lt;IMember&gt;(entity), this))
+                {
+                    return;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(entity.Name))
+            {
+                throw new ArgumentException(&quot;Cannot save member with empty name.&quot;);
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                repository.AddOrUpdate(entity);
+                repository.AddOrUpdateContentXml(entity, m =&gt; _entitySerializer.Serialize(_dataTypeService, m));
+                // generate preview for blame history?
+                if (UmbracoConfig.For.UmbracoSettings().Content.GlobalPreviewStorageEnabled)
+                {
+                    repository.AddOrUpdatePreviewXml(entity, m =&gt; _entitySerializer.Serialize(_dataTypeService, m));
+                }
+
+                uow.Commit();
+            }
+
+            if (raiseEvents)
+                Saved.RaiseEvent(new SaveEventArgs&lt;IMember&gt;(entity, false), this);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a list of &lt;see cref=&quot;IMember&quot;/&gt; objects
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entities&quot;&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter to raise events. 
+        /// Default is &lt;c&gt;True&lt;/c&gt; otherwise set to &lt;c&gt;False&lt;/c&gt; to not raise events&lt;/param&gt;
+        public void Save(IEnumerable&lt;IMember&gt; entities, bool raiseEvents = true)
+        {
+            var asArray = entities.ToArray();
+
+            if (raiseEvents)
+            {
+                if (Saving.IsRaisedEventCancelled(new SaveEventArgs&lt;IMember&gt;(asArray), this))
+                    return;
+            }
+            using (new WriteLock(Locker))
+            {
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+                {
+                    foreach (var member in asArray)
+                    {
+                        repository.AddOrUpdate(member);
+                        repository.AddOrUpdateContentXml(member, m =&gt; _entitySerializer.Serialize(_dataTypeService, m));
+                        // generate preview for blame history?
+                        if (UmbracoConfig.For.UmbracoSettings().Content.GlobalPreviewStorageEnabled)
+                        {
+                            repository.AddOrUpdatePreviewXml(member, m =&gt; _entitySerializer.Serialize(_dataTypeService, m));
+                        }
+                    }
+
+                    //commit the whole lot in one go
+                    uow.Commit();
+                }
+
+                if (raiseEvents)
+                    Saved.RaiseEvent(new SaveEventArgs&lt;IMember&gt;(asArray, false), this);
+            }
+        }
+
+        #endregion
+
+        #region IMembershipRoleService Implementation
+
+        public void AddRole(string roleName)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberGroupRepository(uow))
+            {
+                repository.CreateIfNotExists(roleName);
+            }
+        }
+
+        public IEnumerable&lt;string&gt; GetAllRoles()
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberGroupRepository(uow))
+            {
+                var result = repository.GetAll();
+                return result.Select(x =&gt; x.Name).Distinct();
+            }
+        }
+
+        public IEnumerable&lt;string&gt; GetAllRoles(int memberId)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberGroupRepository(uow))
+            {
+                var result = repository.GetMemberGroupsForMember(memberId);
+                return result.Select(x =&gt; x.Name).Distinct();
+            }
+        }
+
+        public IEnumerable&lt;string&gt; GetAllRoles(string username)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberGroupRepository(uow))
+            {
+                var result = repository.GetMemberGroupsForMember(username);
+                return result.Select(x =&gt; x.Name).Distinct();
+            }
+        }
+
+        public IEnumerable&lt;IMember&gt; GetMembersInRole(string roleName)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                return repository.GetByMemberGroup(roleName);
+            }
+        }
+
+        public IEnumerable&lt;IMember&gt; FindMembersInRole(string roleName, string usernameToMatch, StringPropertyMatchType matchType = StringPropertyMatchType.StartsWith)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberRepository(uow))
+            {
+                return repository.FindMembersInRole(roleName, usernameToMatch, matchType);
+            }
+        }
+
+        public bool DeleteRole(string roleName, bool throwIfBeingUsed)
+        {
+            using (new WriteLock(Locker))
+            {
+                if (throwIfBeingUsed)
+                {
+                    var inRole = GetMembersInRole(roleName);
+                    if (inRole.Any())
+                    {
+                        throw new InvalidOperationException(&quot;The role &quot; + roleName + &quot; is currently assigned to members&quot;);
+                    }
+                }
+
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateMemberGroupRepository(uow))
+                {
+                    var qry = new Query&lt;IMemberGroup&gt;().Where(g =&gt; g.Name == roleName);
+                    var found = repository.GetByQuery(qry).ToArray();
+
+                    foreach (var memberGroup in found)
+                    {
+                        _memberGroupService.Delete(memberGroup);
+                    }
+                    return found.Any();
+                }
+            }
+        }
+        public void AssignRole(string username, string roleName)
+        {
+            AssignRoles(new[] { username }, new[] { roleName });
+        }
+
+        public void AssignRoles(string[] usernames, string[] roleNames)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberGroupRepository(uow))
+            {
+                repository.AssignRoles(usernames, roleNames);
+            }
+        }
+
+        public void DissociateRole(string username, string roleName)
+        {
+            DissociateRoles(new[] { username }, new[] { roleName });
+        }
+
+        public void DissociateRoles(string[] usernames, string[] roleNames)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberGroupRepository(uow))
+            {
+                repository.DissociateRoles(usernames, roleNames);
+            }
+        }
+
+        public void AssignRole(int memberId, string roleName)
+        {
+            AssignRoles(new[] { memberId }, new[] { roleName });
+        }
+
+        public void AssignRoles(int[] memberIds, string[] roleNames)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberGroupRepository(uow))
+            {
+                repository.AssignRoles(memberIds, roleNames);
+            }
+        }
+
+        public void DissociateRole(int memberId, string roleName)
+        {
+            DissociateRoles(new[] { memberId }, new[] { roleName });
+        }
+
+        public void DissociateRoles(int[] memberIds, string[] roleNames)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMemberGroupRepository(uow))
+            {
+                repository.DissociateRoles(memberIds, roleNames);
+            }
+        }
+
+
+
+        #endregion
+
+        private IMemberType FindMemberTypeByAlias(string memberTypeAlias)
+        {
+            using (var repository = RepositoryFactory.CreateMemberTypeRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IMemberType&gt;.Builder.Where(x =&gt; x.Alias == memberTypeAlias);
+                var types = repository.GetByQuery(query);
+
+                if (types.Any() == false)
+                    throw new Exception(
+                        string.Format(&quot;No MemberType matching the passed in Alias: &#39;{0}&#39; was found&quot;,
+                                      memberTypeAlias));
+
+                var contentType = types.First();
+
+                if (contentType == null)
+                    throw new Exception(string.Format(&quot;MemberType matching the passed in Alias: &#39;{0}&#39; was null&quot;,
+                                                      memberTypeAlias));
+
+                return contentType;
+            }
+        }
+
+        private void Audit(AuditType type, string message, int userId, int objectId)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var auditRepo = RepositoryFactory.CreateAuditRepository(uow))
+            {
+                auditRepo.AddOrUpdate(new AuditItem(objectId, message, type, userId));
+                uow.Commit();
+            }
+        }
+
+        #region Event Handlers
+
+        /// &lt;summary&gt;
+        /// Occurs before Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IMemberService, DeleteEventArgs&lt;IMember&gt;&gt; Deleting;
+
+        /// &lt;summary&gt;
+        /// Occurs after Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IMemberService, DeleteEventArgs&lt;IMember&gt;&gt; Deleted;
+
+        /// &lt;summary&gt;
+        /// Occurs before Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IMemberService, SaveEventArgs&lt;IMember&gt;&gt; Saving;
+
+        /// &lt;summary&gt;
+        /// Occurs after Create
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Please note that the Member object has been created, but might not have been saved
+        /// so it does not have an identity yet (meaning no Id has been set).
+        /// &lt;/remarks&gt;
+        public static event TypedEventHandler&lt;IMemberService, NewEventArgs&lt;IMember&gt;&gt; Created;
+
+        /// &lt;summary&gt;
+        /// Occurs after Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IMemberService, SaveEventArgs&lt;IMember&gt;&gt; Saved;
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// A helper method that will create a basic/generic member for use with a generic membership provider
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static IMember CreateGenericMembershipProviderMember(string name, string email, string username, string password)
+        {
+            var identity = int.MaxValue;
+
+            var memType = new MemberType(-1);
+            var propGroup = new PropertyGroup
+            {
+                Name = &quot;Membership&quot;,
+                Id = --identity
+            };
+            propGroup.PropertyTypes.Add(new PropertyType(Constants.PropertyEditors.TextboxAlias, DataTypeDatabaseType.Ntext, Constants.Conventions.Member.Comments)
+            {
+                Name = Constants.Conventions.Member.CommentsLabel,
+                SortOrder = 0,
+                Id = --identity,
+                Key = identity.ToGuid()
+            });
+            propGroup.PropertyTypes.Add(new PropertyType(Constants.PropertyEditors.TrueFalseAlias, DataTypeDatabaseType.Integer, Constants.Conventions.Member.IsApproved)
+            {
+                Name = Constants.Conventions.Member.IsApprovedLabel,
+                SortOrder = 3,
+                Id = --identity,
+                Key = identity.ToGuid()
+            });
+            propGroup.PropertyTypes.Add(new PropertyType(Constants.PropertyEditors.TrueFalseAlias, DataTypeDatabaseType.Integer, Constants.Conventions.Member.IsLockedOut)
+            {
+                Name = Constants.Conventions.Member.IsLockedOutLabel,
+                SortOrder = 4,
+                Id = --identity,
+                Key = identity.ToGuid()
+            });
+            propGroup.PropertyTypes.Add(new PropertyType(Constants.PropertyEditors.NoEditAlias, DataTypeDatabaseType.Date, Constants.Conventions.Member.LastLockoutDate)
+            {
+                Name = Constants.Conventions.Member.LastLockoutDateLabel,
+                SortOrder = 5,
+                Id = --identity,
+                Key = identity.ToGuid()
+            });
+            propGroup.PropertyTypes.Add(new PropertyType(Constants.PropertyEditors.NoEditAlias, DataTypeDatabaseType.Date, Constants.Conventions.Member.LastLoginDate)
+            {
+                Name = Constants.Conventions.Member.LastLoginDateLabel,
+                SortOrder = 6,
+                Id = --identity,
+                Key = identity.ToGuid()
+            });
+            propGroup.PropertyTypes.Add(new PropertyType(Constants.PropertyEditors.NoEditAlias, DataTypeDatabaseType.Date, Constants.Conventions.Member.LastPasswordChangeDate)
+            {
+                Name = Constants.Conventions.Member.LastPasswordChangeDateLabel,
+                SortOrder = 7,
+                Id = --identity,
+                Key = identity.ToGuid()
+            });
+
+            memType.PropertyGroups.Add(propGroup);
+
+            var member = new Member(name, email, username, password, memType);
+
+            //we&#39;ve assigned ids to the property types and groups but we also need to assign fake ids to the properties themselves.
+            foreach (var property in member.Properties)
+            {
+                property.Id = --identity;
+            }
+
+            return member;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[30,9,30,92,1],[32,9,32,90,1],[35,15,35,78,1],[36,9,36,10,1],[37,13,37,44,1],[37,45,37,99,0],[38,13,38,41,1],[38,42,38,93,0],[39,13,39,54,1],[40,13,40,48,1],[41,9,41,10,1],[52,9,52,10,0],[53,20,53,110,0],[54,13,54,14,0],[55,17,55,74,0],[55,74,55,81,0],[55,81,55,93,0],[55,17,55,93,0],[57,17,57,42,0],[58,17,58,18,0],[59,21,59,94,0],[62,17,62,55,0],[63,17,63,18,0],[64,21,64,45,0],[64,45,64,72,0],[64,72,64,74,0],[64,21,64,74,0],[67,17,67,38,0],[69,9,69,10,0],[77,9,77,10,1],[78,20,78,106,1],[79,13,79,14,1],[80,17,80,52,1],[82,9,82,10,1],[92,9,92,10,0],[93,13,93,32,0],[93,33,93,75,0],[95,13,95,88,0],[96,13,96,56,0],[97,13,97,14,0],[98,17,98,72,0],[99,13,99,14,0],[101,13,101,14,0],[102,17,102,187,0],[106,13,106,57,0],[109,13,109,32,0],[110,17,110,24,0],[112,13,112,63,0],[113,13,113,75,0],[114,13,114,51,0],[115,9,115,10,0],[123,9,123,10,1],[124,20,124,106,1],[125,13,125,14,1],[126,17,126,46,1],[128,9,128,10,1],[136,9,136,10,1],[137,20,137,106,1],[138,13,138,14,1],[139,17,139,43,1],[141,9,141,10,1],[151,9,151,10,0],[152,20,152,106,0],[153,13,153,14,0],[154,17,154,76,0],[155,17,155,76,0],[156,17,156,31,0],[158,9,158,10,0],[166,9,166,10,0],[167,20,167,106,0],[168,13,168,14,0],[169,17,169,102,0],[170,17,170,60,0],[171,17,171,32,0],[173,9,173,10,0],[181,9,181,10,0],[182,20,182,106,0],[183,13,183,14,0],[184,17,184,46,0],[185,17,185,96,0],[186,17,186,60,0],[187,17,187,32,0],[189,9,189,10,0],[197,9,197,10,0],[198,20,198,106,0],[199,13,199,14,0],[200,17,200,69,0],[202,9,202,10,0],[211,9,211,10,0],[212,20,212,106,0],[213,13,213,14,0],[214,17,214,47,0],[216,9,216,10,0],[223,9,223,10,0],[224,13,224,42,0],[225,13,225,14,0],[226,24,226,61,0],[227,17,227,18,0],[228,21,228,84,0],[230,21,230,100,0],[231,21,231,74,0],[233,21,233,102,0],[234,25,234,32,0],[236,21,236,28,0],[236,30,236,40,0],[236,41,236,43,0],[236,44,236,51,0],[237,21,237,22,0],[239,25,239,40,0],[240,21,240,22,0],[241,17,241,18,0],[242,13,242,14,0],[243,9,243,10,0],[248,9,248,10,1],[250,13,250,131,1],[251,13,251,51,1],[252,13,252,27,1],[253,9,253,10,1],[265,9,265,10,1],[266,13,266,51,1],[267,20,267,82,1],[268,13,268,14,1],[269,17,269,50,1],[271,17,271,35,1],[274,25,274,87,0],[275,25,275,31,0],[277,25,277,89,0],[278,25,278,31,0],[280,25,280,91,1],[281,25,281,31,1],[283,25,283,89,0],[284,25,284,31,0],[286,25,286,117,0],[287,25,287,31,0],[289,25,289,76,0],[292,17,292,139,1],[294,9,294,10,1],[299,9,299,10,1],[301,13,301,118,1],[302,13,302,51,1],[303,13,303,27,1],[304,9,304,10,1],[316,9,316,10,1],[317,13,317,51,1],[318,20,318,82,1],[319,13,319,14,1],[320,17,320,50,1],[322,17,322,35,1],[325,25,325,88,1],[326,25,326,31,1],[328,25,328,90,1],[329,25,329,31,1],[331,25,331,92,1],[332,25,332,31,1],[334,25,334,90,1],[335,25,335,31,1],[337,25,337,118,0],[338,25,338,31,0],[340,25,340,76,0],[343,17,343,141,1],[345,9,345,10,1],[350,9,350,10,1],[352,13,352,108,1],[353,13,353,51,1],[354,13,354,27,1],[355,9,355,10,1],[367,9,367,10,1],[368,13,368,51,1],[369,20,369,82,1],[370,13,370,14,1],[371,17,371,50,1],[373,17,373,35,1],[376,25,376,78,1],[377,25,377,31,1],[379,25,379,80,1],[380,25,380,31,1],[382,25,382,82,1],[383,25,383,31,1],[385,25,385,80,1],[386,25,386,31,1],[388,25,388,105,0],[389,25,389,31,0],[391,25,391,76,0],[394,17,394,144,1],[396,9,396,10,1],[406,9,406,10,1],[407,20,407,106,1],[408,13,408,14,1],[411,17,411,35,1],[414,25,419,115,1],[420,25,420,31,1],[422,25,427,117,1],[428,25,428,31,1],[430,25,435,119,1],[436,25,436,31,1],[438,25,443,117,1],[444,25,444,31,1],[446,25,446,76,0],[449,17,449,60,1],[450,17,450,32,1],[452,9,452,10,1],[462,9,462,10,1],[463,20,463,106,1],[464,13,464,14,1],[467,17,467,35,1],[470,25,474,76,1],[475,25,475,31,1],[477,25,481,75,1],[482,25,482,31,1],[484,25,488,75,1],[489,25,489,31,1],[491,25,495,76,1],[496,25,496,31,1],[498,25,502,76,1],[503,25,503,31,1],[505,25,505,76,0],[508,17,508,60,1],[509,17,509,32,1],[511,9,511,10,1],[520,9,520,10,0],[521,20,521,106,0],[522,13,522,14,0],[523,17,527,69,0],[529,17,529,60,0],[530,17,530,32,0],[532,9,532,10,0],[542,9,542,10,1],[543,20,543,106,1],[544,13,544,14,1],[547,17,547,35,1],[550,25,554,77,1],[555,25,555,31,1],[557,25,561,76,1],[562,25,562,31,1],[564,25,568,76,1],[569,25,569,31,1],[571,25,575,77,1],[576,25,576,31,1],[578,25,582,77,1],[583,25,583,31,1],[585,25,585,76,0],[589,17,589,60,1],[590,17,590,32,1],[592,9,592,10,1],[603,9,603,10,1],[604,13,604,51,1],[605,20,605,82,1],[606,13,606,14,1],[607,17,608,31,1],[608,31,608,84,1],[608,84,609,87,1],[607,17,609,87,1],[610,13,610,14,1],[612,13,612,139,1],[613,9,613,10,1],[623,9,623,10,0],[624,13,624,69,0],[625,13,625,66,0],[627,13,627,51,0],[628,20,628,82,0],[629,13,629,14,0],[630,17,630,119,0],[631,17,631,33,0],[633,9,633,10,0],[650,9,650,10,1],[651,20,651,106,1],[652,13,652,14,1],[655,17,655,35,1],[658,25,658,54,1],[659,25,659,56,1],[661,25,661,100,1],[662,25,666,79,1],[667,25,667,66,1],[669,25,673,72,1],[674,25,674,66,1],[676,25,680,72,1],[681,25,681,66,1],[683,25,683,76,0],[687,9,687,10,1],[692,9,692,10,1],[694,13,694,82,1],[695,13,695,51,1],[696,13,696,27,1],[697,9,697,10,1],[707,9,707,10,1],[708,13,708,51,1],[709,20,709,82,1],[710,13,710,14,1],[711,17,711,143,1],[713,9,713,10,1],[719,9,719,10,0],[721,13,721,138,0],[722,13,722,51,0],[723,13,723,27,0],[724,9,724,10,0],[728,9,728,10,0],[729,13,729,122,0],[730,9,730,10,0],[734,9,734,10,0],[735,13,735,51,0],[736,20,736,82,0],[737,13,737,14,0],[738,17,738,45,0],[739,17,739,18,0],[740,21,740,160,0],[742,17,742,100,0],[743,17,743,157,0],[745,9,745,10,0],[754,9,754,10,0],[755,13,755,51,0],[756,20,756,82,0],[757,13,757,14,0],[758,17,758,58,0],[760,9,760,10,0],[774,9,774,10,0],[775,13,775,69,0],[776,13,776,68,0],[777,9,777,10,0],[791,9,791,10,1],[792,13,792,89,1],[794,13,794,102,1],[796,13,796,27,1],[797,9,797,10,1],[810,9,810,10,0],[811,13,811,69,0],[812,13,812,80,0],[813,9,813,10,0],[825,9,825,10,0],[826,13,826,84,0],[827,9,827,10,0],[840,9,840,10,0],[841,13,841,84,0],[842,9,842,10,0],[854,9,854,10,0],[855,13,855,69,0],[856,13,856,99,0],[857,9,857,10,0],[871,9,871,10,0],[872,13,872,36,0],[872,37,872,83,0],[874,13,874,104,0],[876,13,876,89,0],[877,13,877,14,0],[878,17,878,44,0],[879,17,879,31,0],[882,13,882,51,0],[883,20,883,82,0],[884,13,884,14,0],[885,17,885,48,0],[887,17,887,63,0],[887,63,887,111,0],[887,111,887,113,0],[887,17,887,113,0],[889,17,889,93,0],[890,17,890,18,0],[891,21,891,67,0],[891,67,891,115,0],[891,115,891,117,0],[891,21,891,117,0],[892,17,892,18,0],[894,17,894,30,0],[895,13,895,14,0],[897,13,897,79,0],[898,13,898,102,0],[900,13,900,27,0],[901,9,901,10,0],[909,9,909,10,0],[910,13,910,50,0],[911,13,911,32,0],[912,13,912,14,0],[913,17,913,43,0],[915,13,915,48,0],[916,13,916,31,0],[917,13,917,14,0],[918,17,918,41,0],[921,13,921,25,0],[922,9,922,10,0],[930,9,930,10,1],[931,13,931,51,1],[932,20,932,82,1],[933,13,933,14,1],[934,17,934,86,1],[935,17,935,76,1],[937,17,937,31,1],[939,9,939,10,1],[947,9,947,10,1],[952,13,952,51,1],[953,20,953,82,1],[954,13,954,14,1],[955,17,955,92,1],[956,17,956,76,1],[958,17,958,31,1],[960,9,960,10,1],[967,9,967,10,1],[968,13,968,93,1],[969,17,969,24,0],[971,13,971,51,1],[972,20,972,82,1],[973,13,973,14,1],[974,17,974,43,1],[975,17,975,30,1],[977,17,977,72,1],[978,17,978,48,1],[981,17,981,70,1],[982,13,982,14,1],[983,9,983,10,1],[992,9,992,10,1],[993,13,993,29,1],[994,13,994,14,1],[995,17,995,93,1],[996,17,996,18,0],[997,21,997,28,0],[999,13,999,14,1],[1001,13,1001,56,1],[1002,13,1002,14,1],[1003,17,1003,84,1],[1006,13,1006,51,1],[1007,20,1007,82,1],[1008,13,1008,14,1],[1009,17,1009,48,1],[1010,17,1010,63,1],[1010,63,1010,111,1],[1010,111,1010,113,1],[1010,17,1010,113,1],[1012,17,1012,93,1],[1013,17,1013,18,0],[1014,21,1014,67,0],[1014,67,1014,115,0],[1014,115,1014,117,0],[1014,21,1014,117,0],[1015,17,1015,18,0],[1017,17,1017,30,1],[1018,13,1018,14,1],[1020,13,1020,29,1],[1021,17,1021,83,1],[1022,9,1022,10,1],[1031,9,1031,10,1],[1032,13,1032,46,1],[1034,13,1034,29,1],[1035,13,1035,14,1],[1036,17,1036,94,1],[1037,21,1037,28,0],[1038,13,1038,14,1],[1039,13,1039,42,1],[1040,13,1040,14,1],[1041,17,1041,55,1],[1042,24,1042,86,1],[1043,17,1043,18,1],[1044,21,1044,28,1],[1044,30,1044,40,1],[1044,41,1044,43,1],[1044,44,1044,51,1],[1045,21,1045,22,1],[1046,25,1046,56,1],[1047,25,1047,71,1],[1047,71,1047,119,1],[1047,119,1047,121,1],[1047,25,1047,121,1],[1049,25,1049,101,1],[1050,25,1050,26,0],[1051,29,1051,75,0],[1051,75,1051,123,0],[1051,123,1051,125,0],[1051,29,1051,125,0],[1052,25,1052,26,0],[1053,21,1053,22,1],[1056,21,1056,34,1],[1057,17,1057,18,1],[1059,17,1059,33,1],[1060,21,1060,88,1],[1061,13,1061,14,1],[1062,9,1062,10,1],[1069,9,1069,10,1],[1070,13,1070,51,1],[1071,20,1071,87,1],[1072,13,1072,14,1],[1073,17,1073,56,1],[1074,13,1074,14,1],[1075,9,1075,10,1],[1078,9,1078,10,1],[1079,13,1079,51,1],[1080,20,1080,87,1],[1081,13,1081,14,1],[1082,17,1082,50,1],[1083,17,1083,43,1],[1083,43,1083,49,1],[1083,49,1083,62,1],[1083,17,1083,62,1],[1085,9,1085,10,1],[1088,9,1088,10,1],[1089,13,1089,51,1],[1090,20,1090,87,1],[1091,13,1091,14,1],[1092,17,1092,76,1],[1093,17,1093,43,1],[1093,43,1093,49,1],[1093,49,1093,62,1],[1093,17,1093,62,1],[1095,9,1095,10,1],[1098,9,1098,10,1],[1099,13,1099,51,1],[1100,20,1100,87,1],[1101,13,1101,14,1],[1102,17,1102,76,1],[1103,17,1103,43,1],[1103,43,1103,49,1],[1103,49,1103,62,1],[1103,17,1103,62,1],[1105,9,1105,10,1],[1108,9,1108,10,1],[1109,13,1109,51,1],[1110,20,1110,82,1],[1111,13,1111,14,1],[1112,17,1112,62,1],[1114,9,1114,10,1],[1117,9,1117,10,1],[1118,13,1118,51,1],[1119,20,1119,82,1],[1120,13,1120,14,1],[1121,17,1121,91,1],[1123,9,1123,10,1],[1126,9,1126,10,1],[1127,13,1127,42,1],[1128,13,1128,14,1],[1129,17,1129,38,1],[1130,17,1130,18,1],[1131,21,1131,61,1],[1132,21,1132,38,1],[1133,21,1133,22,1],[1134,25,1134,123,1],[1136,17,1136,18,0],[1138,17,1138,55,1],[1139,24,1139,91,1],[1140,17,1140,18,1],[1141,21,1141,88,1],[1142,21,1142,70,1],[1144,21,1144,28,1],[1144,30,1144,45,1],[1144,46,1144,48,1],[1144,49,1144,54,1],[1145,21,1145,22,1],[1146,25,1146,65,1],[1147,21,1147,22,1],[1148,21,1148,40,1],[1151,9,1151,10,1],[1153,9,1153,10,0],[1154,13,1154,65,0],[1155,9,1155,10,0],[1158,9,1158,10,1],[1159,13,1159,51,1],[1160,20,1160,87,1],[1161,13,1161,14,1],[1162,17,1162,62,1],[1163,13,1163,14,1],[1164,9,1164,10,1],[1167,9,1167,10,0],[1168,13,1168,69,0],[1169,9,1169,10,0],[1172,9,1172,10,1],[1173,13,1173,51,1],[1174,20,1174,87,1],[1175,13,1175,14,1],[1176,17,1176,66,1],[1177,13,1177,14,1],[1178,9,1178,10,1],[1181,9,1181,10,0],[1182,13,1182,65,0],[1183,9,1183,10,0],[1186,9,1186,10,1],[1187,13,1187,51,1],[1188,20,1188,87,1],[1189,13,1189,14,1],[1190,17,1190,62,1],[1191,13,1191,14,1],[1192,9,1192,10,1],[1195,9,1195,10,0],[1196,13,1196,69,0],[1197,9,1197,10,0],[1200,9,1200,10,1],[1201,13,1201,51,1],[1202,20,1202,87,1],[1203,13,1203,14,1],[1204,17,1204,66,1],[1205,13,1205,14,1],[1206,9,1206,10,1],[1213,9,1213,10,0],[1214,20,1214,110,0],[1215,13,1215,14,0],[1216,17,1216,95,0],[1217,17,1217,58,0],[1219,17,1219,42,0],[1220,21,1222,57,0],[1224,17,1224,49,0],[1226,17,1226,41,0],[1227,21,1228,73,0],[1230,17,1230,36,0],[1232,9,1232,10,0],[1235,9,1235,10,1],[1236,13,1236,51,1],[1237,20,1237,80,1],[1238,13,1238,14,1],[1239,17,1239,87,1],[1240,17,1240,30,1],[1241,13,1241,14,1],[1242,9,1242,10,1],[1282,9,1282,10,0],[1283,13,1283,41,0],[1285,13,1285,46,0],[1286,13,1290,15,0],[1291,13,1297,16,0],[1298,13,1304,16,0],[1305,13,1311,16,0],[1312,13,1318,16,0],[1319,13,1325,16,0],[1326,13,1332,16,0],[1334,13,1334,51,0],[1336,13,1336,79,0],[1339,13,1339,20,0],[1339,22,1339,34,0],[1339,35,1339,37,0],[1339,38,1339,55,0],[1340,13,1340,14,0],[1341,17,1341,42,0],[1342,13,1342,14,0],[1344,13,1344,27,0],[1345,9,1345,10,0]]);
+    </script>
+  </body>
+</html>

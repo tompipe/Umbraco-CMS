@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Editors\MediaController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Formatting;
+using System.Text;
+using System.Threading.Tasks;
+using System.Web.Http;
+using System.Web.Http.ModelBinding;
+using AutoMapper;
+using Umbraco.Core;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Services;
+using Umbraco.Web.Models.ContentEditing;
+using Umbraco.Web.Models.Mapping;
+using Umbraco.Web.Mvc;
+using Umbraco.Web.WebApi;
+using System.Linq;
+using System.Web.Http.Controllers;
+using Umbraco.Web.WebApi.Binders;
+using Umbraco.Web.WebApi.Filters;
+using Constants = Umbraco.Core.Constants;
+using Umbraco.Core.Configuration;
+using Umbraco.Web.UI;
+using Notification = Umbraco.Web.Models.ContentEditing.Notification;
+using Umbraco.Core.Persistence;
+
+namespace Umbraco.Web.Editors
+{
+    /// &lt;remarks&gt;
+    /// This controller is decorated with the UmbracoApplicationAuthorizeAttribute which means that any user requesting
+    /// access to ALL of the methods on this controller will need access to the media application.
+    /// &lt;/remarks&gt;
+    [PluginController(&quot;UmbracoApi&quot;)]
+    [UmbracoApplicationAuthorize(Constants.Applications.Media)]
+    [MediaControllerControllerConfiguration]
+    public class MediaController : ContentControllerBase
+    {
+        /// &lt;summary&gt;
+        /// Configures this controller with a custom action selector
+        /// &lt;/summary&gt;
+        private class MediaControllerControllerConfigurationAttribute : Attribute, IControllerConfiguration
+        {
+            public void Initialize(HttpControllerSettings controllerSettings, HttpControllerDescriptor controllerDescriptor)
+            {
+                controllerSettings.Services.Replace(typeof(IHttpActionSelector), new ParameterSwapControllerActionSelector(
+                    new ParameterSwapControllerActionSelector.ParameterSwapInfo(&quot;GetChildren&quot;, &quot;id&quot;, typeof(int), typeof(Guid), typeof(string))));
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        public MediaController()
+            : this(UmbracoContext.Current)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbracoContext&quot;&gt;&lt;/param&gt;
+        public MediaController(UmbracoContext umbracoContext)
+            : base(umbracoContext)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an empty content item for the
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentTypeAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [OutgoingEditorModelEvent]
+        public MediaItemDisplay GetEmpty(string contentTypeAlias, int parentId)
+        {
+            var contentType = Services.ContentTypeService.GetMediaType(contentTypeAlias);
+            if (contentType == null)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+
+            var emptyContent = Services.MediaService.CreateMedia(&quot;&quot;, parentId, contentType.Alias, UmbracoUser.Id);
+            var mapped = Mapper.Map&lt;IMedia, MediaItemDisplay&gt;(emptyContent);
+
+            //remove this tab if it exists: umbContainerView
+            var containerTab = mapped.Tabs.FirstOrDefault(x =&gt; x.Alias == Constants.Conventions.PropertyGroups.ListViewGroupName);
+            mapped.Tabs = mapped.Tabs.Except(new[] { containerTab });
+            return mapped;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns an item to be used to display the recycle bin for media
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public ContentItemDisplay GetRecycleBin()
+        {
+            var display = new ContentItemDisplay
+            {
+                Id = Constants.System.RecycleBinMedia,
+                Alias = &quot;recycleBin&quot;,
+                ParentId = -1,
+                Name = Services.TextService.Localize(&quot;general/recycleBin&quot;),
+                ContentTypeAlias = &quot;recycleBin&quot;,
+                CreateDate = DateTime.Now,
+                IsContainer = true,
+                Path = &quot;-1,&quot; + Constants.System.RecycleBinMedia
+            };
+
+            TabsAndPropertiesResolver.AddListView(display, &quot;media&quot;, Services.DataTypeService, Services.TextService);
+
+            return display;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the content json for the content id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [OutgoingEditorModelEvent]
+        [EnsureUserPermissionForMedia(&quot;id&quot;)]
+        public MediaItemDisplay GetById(int id)
+        {
+            var foundContent = GetObjectFromRequest(() =&gt; Services.MediaService.GetById(id));
+
+            if (foundContent == null)
+            {
+                HandleContentNotFound(id);
+                //HandleContentNotFound will throw an exception
+                return null;
+            }
+            return Mapper.Map&lt;IMedia, MediaItemDisplay&gt;(foundContent);
+        }
+
+        /// &lt;summary&gt;
+        /// Return media for the specified ids
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ids&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [FilterAllowedOutgoingMedia(typeof(IEnumerable&lt;MediaItemDisplay&gt;))]
+        public IEnumerable&lt;MediaItemDisplay&gt; GetByIds([FromUri]int[] ids)
+        {
+            var foundMedia = Services.MediaService.GetByIds(ids);
+            return foundMedia.Select(Mapper.Map&lt;IMedia, MediaItemDisplay&gt;);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns media items known to be of a &quot;Folder&quot; type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [Obsolete(&quot;This is no longer used and shouldn&#39;t be because it performs poorly when there are a lot of media items&quot;)]
+        [FilterAllowedOutgoingMedia(typeof(IEnumerable&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt;))]
+        public IEnumerable&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt; GetChildFolders(int id = -1)
+        {
+            //we are only allowing a max of 500 to be returned here, if more is required it needs to be paged
+            var result = GetChildFolders(id, 1, 500);
+            return result.Items;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a paged result of media items known to be of a &quot;Folder&quot; type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;pageNumber&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public PagedResult&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt; GetChildFolders(int id, int pageNumber, int pageSize)
+        {
+            //Suggested convention for folder mediatypes - we can make this more or less complicated as long as we document it...
+            //if you create a media type, which has an alias that ends with ...Folder then its a folder: ex: &quot;secureFolder&quot;, &quot;bannerFolder&quot;, &quot;Folder&quot;
+            var folderTypes = Services.ContentTypeService
+                .GetAllMediaTypes()
+                .Where(x =&gt; x.Alias.EndsWith(&quot;Folder&quot;))
+                .Select(x =&gt; x.Id)
+                .ToArray();
+
+            if (folderTypes.Length == 0)
+            {
+                return new PagedResult&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt;(0, pageNumber, pageSize);
+            }
+
+            long total;
+            var children = Services.MediaService.GetPagedChildren(id, pageNumber - 1, pageSize, out total, &quot;Name&quot;, Direction.Ascending, true, null, folderTypes.ToArray());
+            
+            return new PagedResult&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt;(total, pageNumber, pageSize)
+            {
+                Items = children.Select(Mapper.Map&lt;IMedia, ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt;)
+            };
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the root media objects
+        /// &lt;/summary&gt;
+        [FilterAllowedOutgoingMedia(typeof(IEnumerable&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt;))]
+        public IEnumerable&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt; GetRootMedia()
+        {
+            //TODO: Add permissions check!
+
+            return Services.MediaService.GetRootMedia()
+                           .Select(Mapper.Map&lt;IMedia, ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt;);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the child media objects - using the entity INT id
+        /// &lt;/summary&gt;
+        [FilterAllowedOutgoingMedia(typeof(IEnumerable&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt;), &quot;Items&quot;)]
+        public PagedResult&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt; GetChildren(int id,
+            int pageNumber = 0,
+            int pageSize = 0,
+            string orderBy = &quot;SortOrder&quot;,
+            Direction orderDirection = Direction.Ascending,
+            bool orderBySystemField = true,
+            string filter = &quot;&quot;)
+        {
+            long totalChildren;
+            IMedia[] children;
+            if (pageNumber &gt; 0 &amp;&amp; pageSize &gt; 0)
+            {
+                children = Services.MediaService
+                 .GetPagedChildren(id, (pageNumber - 1), pageSize, out totalChildren
+                 , orderBy, orderDirection, orderBySystemField, filter).ToArray();
+            }
+            else
+            {
+                children = Services.MediaService.GetChildren(id).ToArray();
+                totalChildren = children.Length;
+            }
+
+            if (totalChildren == 0)
+            {
+                return new PagedResult&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt;(0, 0, 0);
+            }
+
+            var pagedResult = new PagedResult&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt;(totalChildren, pageNumber, pageSize);
+            pagedResult.Items = children
+                .Select(Mapper.Map&lt;IMedia, ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt;);
+
+            return pagedResult;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the child media objects - using the entity GUID id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;pageNumber&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;orderDirection&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;orderBySystemField&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;filter&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [FilterAllowedOutgoingMedia(typeof(IEnumerable&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt;), &quot;Items&quot;)]
+        public PagedResult&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt; GetChildren(Guid id,
+           int pageNumber = 0,
+           int pageSize = 0,
+           string orderBy = &quot;SortOrder&quot;,
+           Direction orderDirection = Direction.Ascending,
+           bool orderBySystemField = true,
+           string filter = &quot;&quot;)
+        {            
+            var entity = Services.EntityService.GetByKey(id);
+            if (entity != null)
+            {
+                return GetChildren(entity.Id, pageNumber, pageSize, orderBy, orderDirection, orderBySystemField, filter);
+            }
+            throw new HttpResponseException(HttpStatusCode.NotFound);
+        }
+
+        [Obsolete(&quot;Do not use this method, use either the overload with INT or GUID instead, this will be removed in future versions&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        [UmbracoTreeAuthorize(Constants.Trees.MediaTypes, Constants.Trees.Media)]
+        public PagedResult&lt;ContentItemBasic&lt;ContentPropertyBasic, IMedia&gt;&gt; GetChildren(string id,
+           int pageNumber = 0,
+           int pageSize = 0,
+           string orderBy = &quot;SortOrder&quot;,
+           Direction orderDirection = Direction.Ascending,
+           bool orderBySystemField = true,
+           string filter = &quot;&quot;)
+        {
+            foreach (var type in new[] { typeof(int), typeof(Guid) })
+            {
+                var parsed = id.TryConvertTo(type);
+                if (parsed)
+                {
+                    //oooh magic! will auto select the right overload
+                    return GetChildren((dynamic)parsed.Result);
+                }
+            }
+
+            throw new HttpResponseException(HttpStatusCode.NotFound);
+        }
+
+        /// &lt;summary&gt;
+        /// Moves an item to the recycle bin, if it is already there then it will permanently delete it
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [EnsureUserPermissionForMedia(&quot;id&quot;)]
+        [HttpPost]
+        public HttpResponseMessage DeleteById(int id)
+        {
+            var foundMedia = GetObjectFromRequest(() =&gt; Services.MediaService.GetById(id));
+
+            if (foundMedia == null)
+            {
+                return HandleContentNotFound(id, false);
+            }
+
+            //if the current item is in the recycle bin
+            if (foundMedia.IsInRecycleBin() == false)
+            {
+                var moveResult = Services.MediaService.WithResult().MoveToRecycleBin(foundMedia, (int)Security.CurrentUser.Id);
+                if (moveResult == false)
+                {
+                    //returning an object of INotificationModel will ensure that any pending
+                    // notification messages are added to the response.
+                    return Request.CreateValidationErrorResponse(new SimpleNotificationModel());
+                }
+            }
+            else
+            {
+                var deleteResult = Services.MediaService.WithResult().Delete(foundMedia, (int)Security.CurrentUser.Id);
+                if (deleteResult == false)
+                {
+                    //returning an object of INotificationModel will ensure that any pending
+                    // notification messages are added to the response.
+                    return Request.CreateValidationErrorResponse(new SimpleNotificationModel());
+                }
+            }
+
+            return Request.CreateResponse(HttpStatusCode.OK);
+        }
+
+        /// &lt;summary&gt;
+        /// Change the sort order for media
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;move&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [EnsureUserPermissionForMedia(&quot;move.Id&quot;)]
+        public HttpResponseMessage PostMove(MoveOrCopy move)
+        {
+            var toMove = ValidateMoveOrCopy(move);
+
+            Services.MediaService.Move(toMove, move.ParentId);
+
+            var response = Request.CreateResponse(HttpStatusCode.OK);
+            response.Content = new StringContent(toMove.Path, Encoding.UTF8, &quot;application/json&quot;);
+            return response;
+        }
+
+        /// &lt;summary&gt;
+        /// Saves content
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [FileUploadCleanupFilter]
+        [MediaPostValidate]
+        public MediaItemDisplay PostSave(
+            [ModelBinder(typeof(MediaItemBinder))]
+                MediaItemSave contentItem)
+        {
+            //If we&#39;ve reached here it means:
+            // * Our model has been bound
+            // * and validated
+            // * any file attachments have been saved to their temporary location for us to use
+            // * we have a reference to the DTO object and the persisted object
+            // * Permissions are valid
+
+            MapPropertyValues(contentItem);
+
+            //We need to manually check the validation results here because:
+            // * We still need to save the entity even if there are validation value errors
+            // * Depending on if the entity is new, and if there are non property validation errors (i.e. the name is null)
+            //      then we cannot continue saving, we can only display errors
+            // * If there are validation errors and they were attempting to publish, we can only save, NOT publish and display
+            //      a message indicating this
+            if (ModelState.IsValid == false)
+            {
+                if (ValidationHelper.ModelHasRequiredForPersistenceErrors(contentItem)
+                    &amp;&amp; (contentItem.Action == ContentSaveAction.SaveNew))
+                {
+                    //ok, so the absolute mandatory data is invalid and it&#39;s new, we cannot actually continue!
+                    // add the modelstate to the outgoing object and throw validation response
+                    var forDisplay = Mapper.Map&lt;IMedia, MediaItemDisplay&gt;(contentItem.PersistedContent);
+                    forDisplay.Errors = ModelState.ToErrorDictionary();
+                    throw new HttpResponseException(Request.CreateValidationErrorResponse(forDisplay));
+                }
+            }
+
+            //save the item
+            var saveStatus = Services.MediaService.WithResult().Save(contentItem.PersistedContent, (int)Security.CurrentUser.Id);
+
+            //return the updated model
+            var display = Mapper.Map&lt;IMedia, MediaItemDisplay&gt;(contentItem.PersistedContent);
+
+            //lasty, if it is not valid, add the modelstate to the outgoing object and throw a 403
+            HandleInvalidModelState(display);
+
+            //put the correct msgs in
+            switch (contentItem.Action)
+            {
+                case ContentSaveAction.Save:
+                case ContentSaveAction.SaveNew:
+                    if (saveStatus.Success)
+                    {
+                        display.AddSuccessNotification(
+                            Services.TextService.Localize(&quot;speechBubbles/editMediaSaved&quot;),
+                            Services.TextService.Localize(&quot;speechBubbles/editMediaSavedText&quot;));
+                    }
+                    else
+                    {
+                        AddCancelMessage(display);
+
+                        //If the item is new and the operation was cancelled, we need to return a different
+                        // status code so the UI can handle it since it won&#39;t be able to redirect since there
+                        // is no Id to redirect to!
+                        if (saveStatus.Result.StatusType == OperationStatusType.FailedCancelledByEvent &amp;&amp; IsCreatingAction(contentItem.Action))
+                        {
+                            throw new HttpResponseException(Request.CreateValidationErrorResponse(display));
+                        }
+                    }
+
+                    break;
+            }
+
+            return display;
+        }
+
+        /// &lt;summary&gt;
+        /// Maps the property values to the persisted entity
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentItem&quot;&gt;&lt;/param&gt;
+        protected override void MapPropertyValues&lt;TPersisted&gt;(ContentBaseItemSave&lt;TPersisted&gt; contentItem)
+        {
+            UpdateName(contentItem);
+
+            //use the base method to map the rest of the properties
+            base.MapPropertyValues(contentItem);
+        }
+
+        /// &lt;summary&gt;
+        /// Empties the recycle bin
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpDelete]
+        [HttpPost]
+        public HttpResponseMessage EmptyRecycleBin()
+        {
+            Services.MediaService.EmptyRecycleBin();
+
+            return Request.CreateNotificationSuccessResponse(Services.TextService.Localize(&quot;defaultdialogs/recycleBinIsEmpty&quot;));
+        }
+
+        /// &lt;summary&gt;
+        /// Change the sort order for media
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sorted&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [EnsureUserPermissionForMedia(&quot;sorted.ParentId&quot;)]
+        public HttpResponseMessage PostSort(ContentSortOrder sorted)
+        {
+            if (sorted == null)
+            {
+                return Request.CreateResponse(HttpStatusCode.NotFound);
+            }
+
+            //if there&#39;s nothing to sort just return ok
+            if (sorted.IdSortOrder.Length == 0)
+            {
+                return Request.CreateResponse(HttpStatusCode.OK);
+            }
+
+            var mediaService = base.ApplicationContext.Services.MediaService;
+            var sortedMedia = new List&lt;IMedia&gt;();
+            try
+            {
+                sortedMedia.AddRange(sorted.IdSortOrder.Select(mediaService.GetById));
+
+                // Save Media with new sort order and update content xml in db accordingly
+                if (mediaService.Sort(sortedMedia) == false)
+                {
+                    LogHelper.Warn&lt;MediaController&gt;(&quot;Media sorting failed, this was probably caused by an event being cancelled&quot;);
+                    return Request.CreateValidationErrorResponse(&quot;Media sorting failed, this was probably caused by an event being cancelled&quot;);
+                }
+                return Request.CreateResponse(HttpStatusCode.OK);
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Error&lt;MediaController&gt;(&quot;Could not update media sort order&quot;, ex);
+                throw;
+            }
+        }
+
+        [EnsureUserPermissionForMedia(&quot;folder.ParentId&quot;)]
+        public MediaItemDisplay PostAddFolder(EntityBasic folder)
+        {
+            var mediaService = ApplicationContext.Services.MediaService;
+            var f = mediaService.CreateMedia(folder.Name, folder.ParentId, Constants.Conventions.MediaTypes.Folder);
+            mediaService.Save(f, Security.CurrentUser.Id);
+
+            return Mapper.Map&lt;IMedia, MediaItemDisplay&gt;(f);
+        }
+
+        /// &lt;summary&gt;
+        /// Used to submit a media file
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// We cannot validate this request with attributes (nicely) due to the nature of the multi-part for data.
+        /// &lt;/remarks&gt;
+        [FileUploadCleanupFilter(false)]
+        public async Task&lt;HttpResponseMessage&gt; PostAddFile()
+        {
+            if (Request.Content.IsMimeMultipartContent() == false)
+            {
+                throw new HttpResponseException(HttpStatusCode.UnsupportedMediaType);
+            }
+
+            var root = IOHelper.MapPath(&quot;~/App_Data/TEMP/FileUploads&quot;);
+            //ensure it exists
+            Directory.CreateDirectory(root);
+            var provider = new MultipartFormDataStreamProvider(root);
+
+            var result = await Request.Content.ReadAsMultipartAsync(provider);
+
+            //must have a file
+            if (result.FileData.Count == 0)
+            {
+                return Request.CreateResponse(HttpStatusCode.NotFound);
+            }
+
+            //get the string json from the request
+            int parentId; bool entityFound;
+            string currentFolderId = result.FormData[&quot;currentFolder&quot;];
+            if (int.TryParse(currentFolderId, out parentId) == false)
+            {
+                // if a guid then try to look up the entity
+                Guid idGuid;
+                if (Guid.TryParse(currentFolderId, out idGuid))
+                {
+                    var entity = Services.EntityService.GetByKey(idGuid);
+                    if (entity != null)
+                    {
+                        entityFound = true;
+                        parentId = entity.Id;
+                    }
+                    else
+                    {
+                        throw new EntityNotFoundException(currentFolderId, &quot;The passed id doesn&#39;t exist&quot;);
+                    }
+                }
+                else
+                {
+                    return Request.CreateValidationErrorResponse(&quot;The request was not formatted correctly, the currentFolder is not an integer or Guid&quot;);
+                }
+
+                if (entityFound == false)
+                {
+                    return Request.CreateValidationErrorResponse(&quot;The request was not formatted correctly, the currentFolder is not an integer or Guid&quot;);
+                }
+            }
+
+
+            //ensure the user has access to this folder by parent id!
+            if (CheckPermissions(
+               new Dictionary&lt;string, object&gt;(),
+               Security.CurrentUser,
+               Services.MediaService, parentId) == false)
+            {
+                return Request.CreateResponse(
+                    HttpStatusCode.Forbidden,
+                    new SimpleNotificationModel(new Notification(
+                        Services.TextService.Localize(&quot;speechBubbles/operationFailedHeader&quot;),
+                        Services.TextService.Localize(&quot;speechBubbles/invalidUserPermissionsText&quot;),
+                        SpeechBubbleIcon.Warning)));
+            }
+
+            var tempFiles = new PostedFiles();
+            var mediaService = ApplicationContext.Services.MediaService;
+
+
+            //in case we pass a path with a folder in it, we will create it and upload media to it.
+            if (result.FormData.ContainsKey(&quot;path&quot;))
+            {
+
+                var folders = result.FormData[&quot;path&quot;].Split(&#39;/&#39;);
+
+                for (int i = 0; i &lt; folders.Length - 1; i++)
+                {
+                    var folderName = folders[i];
+                    IMedia folderMediaItem;
+
+                    //if uploading directly to media root and not a subfolder
+                    if (parentId == -1)
+                    {
+                        //look for matching folder
+                        folderMediaItem =
+                            mediaService.GetRootMedia().FirstOrDefault(x =&gt; x.Name == folderName &amp;&amp; x.ContentType.Alias == Constants.Conventions.MediaTypes.Folder);
+                        if (folderMediaItem == null)
+                        {
+                            //if null, create a folder
+                            folderMediaItem = mediaService.CreateMedia(folderName, -1, Constants.Conventions.MediaTypes.Folder);
+                            mediaService.Save(folderMediaItem);
+                        }
+                    }
+                    else
+                    {
+                        //get current parent
+                        var mediaRoot = mediaService.GetById(parentId);
+
+                        //if the media root is null, something went wrong, we&#39;ll abort
+                        if (mediaRoot == null)
+                            return Request.CreateErrorResponse(HttpStatusCode.InternalServerError,
+                                &quot;The folder: &quot; + folderName + &quot; could not be used for storing images, its ID: &quot; + parentId +
+                                &quot; returned null&quot;);
+
+                        //look for matching folder
+                        folderMediaItem = mediaRoot.Children().FirstOrDefault(x =&gt; x.Name == folderName &amp;&amp; x.ContentType.Alias == Constants.Conventions.MediaTypes.Folder);
+                        if (folderMediaItem == null)
+                        {
+                            //if null, create a folder
+                            folderMediaItem = mediaService.CreateMedia(folderName, mediaRoot, Constants.Conventions.MediaTypes.Folder);
+                            mediaService.Save(folderMediaItem);
+                        }
+                    }
+                    //set the media root to the folder id so uploaded files will end there.
+                    parentId = folderMediaItem.Id;
+                }
+            }
+
+            //get the files
+            foreach (var file in result.FileData)
+            {
+                var fileName = file.Headers.ContentDisposition.FileName.Trim(new[] { &#39;\&quot;&#39; }).TrimEnd();
+                var safeFileName = fileName.ToSafeFileName();
+                var ext = safeFileName.Substring(safeFileName.LastIndexOf(&#39;.&#39;) + 1).ToLower();
+
+                if (UmbracoConfig.For.UmbracoSettings().Content.DisallowedUploadFiles.Contains(ext) == false)
+                {
+                    var mediaType = Constants.Conventions.MediaTypes.File;
+
+                    if (result.FormData[&quot;contentTypeAlias&quot;] == Constants.Conventions.MediaTypes.AutoSelect)
+                    {
+                        if (UmbracoConfig.For.UmbracoSettings().Content.ImageFileTypes.Contains(ext))
+                        {
+                            mediaType = Constants.Conventions.MediaTypes.Image;
+                        }
+                    }
+                    else
+                    {
+                        mediaType = result.FormData[&quot;contentTypeAlias&quot;];
+                    }
+
+                    //TODO: make the media item name &quot;nice&quot; since file names could be pretty ugly, we have
+                    // string extensions to do much of this but we&#39;ll need:
+                    // * Pascalcase the name (use string extensions)
+                    // * strip the file extension
+                    // * underscores to spaces
+                    // * probably remove &#39;ugly&#39; characters - let&#39;s discuss
+                    // All of this logic should exist in a string extensions method and be unit tested
+                    // http://issues.umbraco.org/issue/U4-5572
+                    var mediaItemName = fileName;
+
+                    var f = mediaService.CreateMedia(mediaItemName, parentId, mediaType, Security.CurrentUser.Id);
+
+                    var fileInfo = new FileInfo(file.LocalFileName);
+                    var fs = fileInfo.OpenReadWithRetry();
+                    if (fs == null) throw new InvalidOperationException(&quot;Could not acquire file stream&quot;);
+                    using (fs)
+                    {
+                        f.SetValue(Constants.Conventions.Media.File, fileName, fs);
+                    }
+
+                    var saveResult = mediaService.WithResult().Save(f, Security.CurrentUser.Id);
+                    if (saveResult == false)
+                    {
+                        AddCancelMessage(tempFiles,
+                            message: Services.TextService.Localize(&quot;speechBubbles/operationCancelledText&quot;) + &quot; -- &quot; + mediaItemName,
+                            localizeMessage: false);
+                    }
+                    else
+                    {
+                        tempFiles.UploadedFiles.Add(new ContentItemFile
+                        {
+                            FileName = fileName,
+                            PropertyAlias = Constants.Conventions.Media.File,
+                            TempFilePath = file.LocalFileName
+                        });
+                    }
+                }
+                else
+                {
+                    tempFiles.Notifications.Add(new Notification(
+                        Services.TextService.Localize(&quot;speechBubbles/operationFailedHeader&quot;),
+                        Services.TextService.Localize(&quot;media/disallowedFileType&quot;),
+                        SpeechBubbleIcon.Warning));
+                }
+            }
+
+            //Different response if this is a &#39;blueimp&#39; request
+            if (Request.GetQueryNameValuePairs().Any(x =&gt; x.Key == &quot;origin&quot;))
+            {
+                var origin = Request.GetQueryNameValuePairs().First(x =&gt; x.Key == &quot;origin&quot;);
+                if (origin.Value == &quot;blueimp&quot;)
+                {
+                    return Request.CreateResponse(HttpStatusCode.OK,
+                        tempFiles,
+                        //Don&#39;t output the angular xsrf stuff, blue imp doesn&#39;t like that
+                        new JsonMediaTypeFormatter());
+                }
+            }
+
+            return Request.CreateResponse(HttpStatusCode.OK, tempFiles);
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures the item can be moved/copied to the new location
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IMedia ValidateMoveOrCopy(MoveOrCopy model)
+        {
+            if (model == null)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+
+            var mediaService = Services.MediaService;
+            var toMove = mediaService.GetById(model.Id);
+            if (toMove == null)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+            if (model.ParentId &lt; 0)
+            {
+                //cannot move if the content item is not allowed at the root
+                if (toMove.ContentType.AllowedAsRoot == false)
+                {
+                    var notificationModel = new SimpleNotificationModel();
+                    notificationModel.AddErrorNotification(Services.TextService.Localize(&quot;moveOrCopy/notAllowedAtRoot&quot;), &quot;&quot;);
+                    throw new HttpResponseException(Request.CreateValidationErrorResponse(notificationModel));
+                }
+            }
+            else
+            {
+                var parent = mediaService.GetById(model.ParentId);
+                if (parent == null)
+                {
+                    throw new HttpResponseException(HttpStatusCode.NotFound);
+                }
+
+                //check if the item is allowed under this one
+                if (parent.ContentType.AllowedContentTypes.Select(x =&gt; x.Id).ToArray()
+                    .Any(x =&gt; x.Value == toMove.ContentType.Id) == false)
+                {
+                    var notificationModel = new SimpleNotificationModel();
+                    notificationModel.AddErrorNotification(Services.TextService.Localize(&quot;moveOrCopy/notAllowedByContentType&quot;), &quot;&quot;);
+                    throw new HttpResponseException(Request.CreateValidationErrorResponse(notificationModel));
+                }
+
+                // Check on paths
+                if ((string.Format(&quot;,{0},&quot;, parent.Path)).IndexOf(string.Format(&quot;,{0},&quot;, toMove.Id), StringComparison.Ordinal) &gt; -1)
+                {
+                    var notificationModel = new SimpleNotificationModel();
+                    notificationModel.AddErrorNotification(Services.TextService.Localize(&quot;moveOrCopy/notAllowedByPath&quot;), &quot;&quot;);
+                    throw new HttpResponseException(Request.CreateValidationErrorResponse(notificationModel));
+                }
+            }
+
+            return toMove;
+        }
+
+        /// &lt;summary&gt;
+        /// Performs a permissions check for the user to check if it has access to the node based on
+        /// start node and/or permissions for the node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;storage&quot;&gt;The storage to add the content item to so it can be reused&lt;/param&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;mediaService&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;nodeId&quot;&gt;The content to lookup, if the contentItem is not specified&lt;/param&gt;
+        /// &lt;param name=&quot;media&quot;&gt;Specifies the already resolved content item to check against, setting this ignores the nodeId&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static bool CheckPermissions(IDictionary&lt;string, object&gt; storage, IUser user, IMediaService mediaService, int nodeId, IMedia media = null)
+        {
+            if (media == null &amp;&amp; nodeId != Constants.System.Root &amp;&amp; nodeId != Constants.System.RecycleBinMedia)
+            {
+                media = mediaService.GetById(nodeId);
+                //put the content item into storage so it can be retreived
+                // in the controller (saves a lookup)
+                storage[typeof(IMedia).ToString()] = media;
+            }
+
+            if (media == null &amp;&amp; nodeId != Constants.System.Root &amp;&amp; nodeId != Constants.System.RecycleBinMedia)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+
+            var hasPathAccess = (nodeId == Constants.System.Root)
+                                    ? UserExtensions.HasPathAccess(
+                                        Constants.System.Root.ToInvariantString(),
+                                        user.StartMediaId,
+                                        Constants.System.RecycleBinMedia)
+                                    : (nodeId == Constants.System.RecycleBinMedia)
+                                          ? UserExtensions.HasPathAccess(
+                                              Constants.System.RecycleBinMedia.ToInvariantString(),
+                                              user.StartMediaId,
+                                              Constants.System.RecycleBinMedia)
+                                          : user.HasPathAccess(media);
+
+            return hasPathAccess;
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[51,13,51,14,0],[52,17,53,147,0],[54,13,54,14,0],[61,15,61,43,0],[62,9,62,10,0],[63,9,63,10,0],[70,15,70,35,0],[71,9,71,10,0],[72,9,72,10,0],[82,9,82,10,0],[83,13,83,90,0],[84,13,84,37,0],[85,13,85,14,0],[86,17,86,74,0],[89,13,89,115,0],[90,13,90,77,0],[93,13,93,64,0],[93,64,93,129,0],[93,129,93,131,0],[93,13,93,131,0],[94,13,94,70,0],[95,13,95,27,0],[96,9,96,10,0],[103,9,103,10,0],[104,13,114,15,0],[116,13,116,117,0],[118,13,118,28,0],[119,9,119,10,0],[129,9,129,10,0],[130,13,130,59,0],[130,59,130,92,0],[130,92,130,94,0],[130,13,130,94,0],[132,13,132,38,0],[133,13,133,14,0],[134,17,134,43,0],[136,17,136,29,0],[138,13,138,71,0],[139,9,139,10,0],[148,9,148,10,0],[149,13,149,66,0],[150,13,150,76,0],[151,9,151,10,0],[161,9,161,10,0],[163,13,163,54,0],[164,13,164,33,0],[165,9,165,10,0],[175,9,175,10,0],[178,13,180,29,0],[180,29,180,55,0],[180,55,181,30,0],[181,30,181,34,0],[181,34,182,28,0],[178,13,182,28,0],[184,13,184,41,0],[185,13,185,14,0],[186,17,186,113,0],[190,13,190,172,0],[192,13,195,15,0],[196,9,196,10,0],[203,9,203,10,0],[206,13,207,104,0],[208,9,208,10,0],[221,9,221,10,0],[224,13,224,48,0],[225,13,225,14,0],[226,17,228,83,0],[229,13,229,14,0],[231,13,231,14,0],[232,17,232,76,0],[233,17,233,49,0],[234,13,234,14,0],[236,13,236,36,0],[237,13,237,14,0],[238,17,238,97,0],[241,13,241,132,0],[242,13,243,93,0],[245,13,245,32,0],[246,9,246,10,0],[267,9,267,10,0],[268,13,268,62,0],[269,13,269,32,0],[270,13,270,14,0],[271,17,271,122,0],[273,13,273,70,0],[274,9,274,10,0],[286,9,286,10,0],[287,13,287,20,0],[287,22,287,30,0],[287,31,287,33,0],[287,34,287,69,0],[288,13,288,14,0],[289,17,289,52,0],[290,17,290,28,0],[291,17,291,18,0],[293,21,293,64,0],[295,13,295,14,0],[297,13,297,70,0],[298,9,298,10,0],[308,9,308,10,0],[309,13,309,57,0],[309,57,309,90,0],[309,90,309,92,0],[309,13,309,92,0],[311,13,311,36,0],[312,13,312,14,0],[313,17,313,57,0],[317,13,317,54,0],[318,13,318,14,0],[319,17,319,128,0],[320,17,320,41,0],[321,17,321,18,0],[324,21,324,97,0],[326,13,326,14,0],[328,13,328,14,0],[329,17,329,120,0],[330,17,330,43,0],[331,17,331,18,0],[334,21,334,97,0],[336,13,336,14,0],[338,13,338,62,0],[339,9,339,10,0],[348,9,348,10,0],[349,13,349,51,0],[351,13,351,63,0],[353,13,353,70,0],[354,13,354,98,0],[355,13,355,29,0],[356,9,356,10,0],[367,9,367,10,0],[375,13,375,44,0],[383,13,383,45,0],[384,13,384,14,0],[385,17,386,74,0],[387,17,387,18,0],[390,21,390,105,0],[391,21,391,72,0],[392,21,392,104,0],[394,13,394,14,0],[397,13,397,130,0],[400,13,400,94,0],[403,13,403,46,0],[406,13,406,40,0],[410,21,410,44,0],[411,21,411,22,0],[412,25,414,96,0],[415,21,415,22,0],[417,21,417,22,0],[418,25,418,51,0],[423,25,423,144,0],[424,25,424,26,0],[425,29,425,109,0],[427,21,427,22,0],[429,21,429,27,0],[432,13,432,28,0],[433,9,433,10,0],[440,9,440,10,0],[441,13,441,37,0],[444,13,444,49,0],[445,9,445,10,0],[454,9,454,10,0],[455,13,455,53,0],[457,13,457,129,0],[458,9,458,10,0],[467,9,467,10,0],[468,13,468,32,0],[469,13,469,14,0],[470,17,470,72,0],[474,13,474,48,0],[475,13,475,14,0],[476,17,476,66,0],[479,13,479,78,0],[480,13,480,50,0],[482,13,482,14,0],[483,17,483,87,0],[486,17,486,61,0],[487,17,487,18,0],[488,21,488,131,0],[489,21,489,144,0],[491,17,491,66,0],[493,13,493,33,0],[494,13,494,14,0],[495,17,495,91,0],[496,17,496,23,0],[498,9,498,10,0],[502,9,502,10,0],[503,13,503,73,0],[504,13,504,117,0],[505,13,505,59,0],[507,13,507,60,0],[508,9,508,10,0],[519,9,519,10,0],[520,13,520,67,0],[521,13,521,14,0],[522,17,522,86,0],[525,13,525,72,0],[527,13,527,45,0],[528,13,528,70,0],[530,13,530,79,0],[533,13,533,44,0],[534,13,534,14,0],[535,17,535,72,0],[540,13,540,71,0],[541,13,541,70,0],[542,13,542,14,0],[545,17,545,64,0],[546,17,546,18,0],[547,21,547,74,0],[548,21,548,40,0],[549,21,549,22,0],[550,25,550,44,0],[551,25,551,46,0],[552,21,552,22,0],[554,21,554,22,0],[555,25,555,107,0],[557,17,557,18,0],[559,17,559,18,0],[560,21,560,154,0],[563,17,563,42,0],[564,17,564,18,0],[565,21,565,154,0],[567,13,567,14,0],[571,13,574,58,0],[575,13,575,14,0],[576,17,581,53,0],[584,13,584,47,0],[585,13,585,73,0],[589,13,589,53,0],[590,13,590,14,0],[592,17,592,66,0],[594,22,594,31,0],[594,33,594,55,0],[594,57,594,60,0],[595,17,595,18,0],[596,21,596,49,0],[600,21,600,40,0],[601,21,601,22,0],[603,25,604,77,0],[604,77,604,163,0],[604,163,604,165,0],[603,25,604,165,0],[605,25,605,53,0],[606,25,606,26,0],[608,29,608,129,0],[609,29,609,64,0],[610,25,610,26,0],[611,21,611,22,0],[613,21,613,22,0],[615,25,615,72,0],[618,25,618,47,0],[619,29,621,51,0],[624,25,624,84,0],[624,84,624,170,0],[624,170,624,172,0],[624,25,624,172,0],[625,25,625,53,0],[626,25,626,26,0],[628,29,628,136,0],[629,29,629,64,0],[630,25,630,26,0],[631,21,631,22,0],[633,21,633,51,0],[634,17,634,18,0],[635,13,635,14,0],[638,13,638,20,0],[638,22,638,30,0],[638,31,638,33,0],[638,34,638,49,0],[639,13,639,14,0],[640,17,640,104,0],[641,17,641,62,0],[642,17,642,95,0],[644,17,644,110,0],[645,17,645,18,0],[646,21,646,75,0],[648,21,648,108,0],[649,21,649,22,0],[650,25,650,102,0],[651,25,651,26,0],[652,29,652,80,0],[653,25,653,26,0],[654,21,654,22,0],[656,21,656,22,0],[657,25,657,73,0],[658,21,658,22,0],[668,21,668,50,0],[670,21,670,115,0],[672,21,672,69,0],[673,21,673,59,0],[674,21,674,36,0],[674,37,674,106,0],[675,21,675,31,0],[676,21,676,22,0],[677,25,677,84,0],[678,21,678,22,0],[680,21,680,97,0],[681,21,681,45,0],[682,21,682,22,0],[683,25,685,53,0],[686,21,686,22,0],[688,21,688,22,0],[689,25,694,28,0],[695,21,695,22,0],[696,17,696,18,0],[698,17,698,18,0],[699,21,702,52,0],[703,17,703,18,0],[704,13,704,14,0],[707,13,707,59,0],[707,59,707,76,0],[707,76,707,78,0],[707,13,707,78,0],[708,13,708,14,0],[709,17,709,74,0],[709,74,709,91,0],[709,91,709,93,0],[709,17,709,93,0],[710,17,710,47,0],[711,17,711,18,0],[712,21,715,55,0],[717,13,717,14,0],[719,13,719,73,0],[720,9,720,10,0],[728,9,728,10,0],[729,13,729,31,0],[730,13,730,14,0],[731,17,731,74,0],[734,13,734,54,0],[735,13,735,57,0],[736,13,736,32,0],[737,13,737,14,0],[738,17,738,74,0],[740,13,740,36,0],[741,13,741,14,0],[743,17,743,63,0],[744,17,744,18,0],[745,21,745,75,0],[746,21,746,126,0],[747,21,747,111,0],[749,13,749,14,0],[751,13,751,14,0],[752,17,752,67,0],[753,17,753,36,0],[754,17,754,18,0],[755,21,755,78,0],[759,17,759,72,0],[759,72,759,76,0],[759,76,760,31,0],[760,31,760,63,0],[760,63,760,74,0],[759,17,760,74,0],[761,17,761,18,0],[762,21,762,75,0],[763,21,763,133,0],[764,21,764,111,0],[768,17,768,133,0],[769,17,769,18,0],[770,21,770,75,0],[771,21,771,126,0],[772,21,772,111,0],[774,13,774,14,0],[776,13,776,27,0],[777,9,777,10,0],[790,9,790,10,1],[791,13,791,112,1],[792,13,792,14,1],[793,17,793,54,1],[796,17,796,60,1],[797,13,797,14,1],[799,13,799,112,1],[800,13,800,14,1],[801,17,801,74,1],[804,13,814,71,1],[816,13,816,34,1],[817,9,817,10,1]]);
+    </script>
+  </body>
+</html>

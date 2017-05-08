@@ -1,0 +1,2327 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Dynamics\ExpressionParser.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Dynamic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Dynamics;
+using Umbraco.Web.Models;
+
+namespace Umbraco.Web.Dynamics
+{
+    //SD: I wish all of this wasn&#39;t hacked and was just the original dynamic linq from MS... sigh. Just
+    // means we can&#39;t really use it for anything other than dynamic node (i think)
+    // I&#39;m fairly sure it&#39;s just hte convert to dynamic null stuff... still seems to work for normal linq operations would love to make it
+    // properly one day.
+
+	internal class ExpressionParser&lt;T&gt;
+	{
+		struct Token
+		{
+			public TokenId Id { get; set; }
+			public string Text { get; set; }
+			public int Pos { get; set; }
+		}
+
+		enum TokenId
+		{
+			Unknown,
+			End,
+			Identifier,
+			StringLiteral,
+			IntegerLiteral,
+			RealLiteral,
+			Exclamation,
+			Percent,
+			Amphersand,
+			OpenParen,
+			CloseParen,
+			Asterisk,
+			Plus,
+			Comma,
+			Minus,
+			Dot,
+			Slash,
+			Colon,
+			LessThan,
+			Equal,
+			GreaterThan,
+			Question,
+			OpenBracket,
+			CloseBracket,
+			Bar,
+			ExclamationEqual,
+			DoubleAmphersand,
+			LessThanEqual,
+			LessGreater,
+			DoubleEqual,
+			GreaterThanEqual,
+			DoubleBar
+		}
+
+		interface ILogicalSignatures
+		{
+			void F(bool x, bool y);
+			void F(bool? x, bool? y);
+		}
+
+		interface IArithmeticSignatures
+		{
+			void F(int x, int y);
+			void F(uint x, uint y);
+			void F(long x, long y);
+			void F(ulong x, ulong y);
+			void F(float x, float y);
+			void F(double x, double y);
+			void F(decimal x, decimal y);
+			void F(int? x, int? y);
+			void F(uint? x, uint? y);
+			void F(long? x, long? y);
+			void F(ulong? x, ulong? y);
+			void F(float? x, float? y);
+			void F(double? x, double? y);
+			void F(decimal? x, decimal? y);
+		}
+
+		interface IRelationalSignatures : IArithmeticSignatures
+		{
+			void F(string x, string y);
+			void F(char x, char y);
+			void F(DateTime x, DateTime y);
+			void F(TimeSpan x, TimeSpan y);
+			void F(char? x, char? y);
+			void F(DateTime? x, DateTime? y);
+			void F(TimeSpan? x, TimeSpan? y);
+		}
+
+		interface IEqualitySignatures : IRelationalSignatures
+		{
+			void F(bool x, bool y);
+			void F(bool? x, bool? y);
+		}
+
+		interface IAddSignatures : IArithmeticSignatures
+		{
+			void F(DateTime x, TimeSpan y);
+			void F(TimeSpan x, TimeSpan y);
+			void F(DateTime? x, TimeSpan? y);
+			void F(TimeSpan? x, TimeSpan? y);
+		}
+
+		interface ISubtractSignatures : IAddSignatures
+		{
+			void F(DateTime x, DateTime y);
+			void F(DateTime? x, DateTime? y);
+		}
+
+		interface INegationSignatures
+		{
+			void F(int x);
+			void F(long x);
+			void F(float x);
+			void F(double x);
+			void F(decimal x);
+			void F(int? x);
+			void F(long? x);
+			void F(float? x);
+			void F(double? x);
+			void F(decimal? x);
+		}
+
+		interface INotSignatures
+		{
+			void F(bool x);
+			void F(bool? x);
+		}
+
+		interface IEnumerableSignatures
+		{
+			void Where(bool predicate);
+			void Any();
+			void Any(bool predicate);
+			void All(bool predicate);
+			void Count();
+			void Count(bool predicate);
+			void Min(object selector);
+			void Max(object selector);
+			void Sum(int selector);
+			void Sum(int? selector);
+			void Sum(long selector);
+			void Sum(long? selector);
+			void Sum(float selector);
+			void Sum(float? selector);
+			void Sum(double selector);
+			void Sum(double? selector);
+			void Sum(decimal selector);
+			void Sum(decimal? selector);
+			void Average(int selector);
+			void Average(int? selector);
+			void Average(long selector);
+			void Average(long? selector);
+			void Average(float selector);
+			void Average(float? selector);
+			void Average(double selector);
+			void Average(double? selector);
+			void Average(decimal selector);
+			void Average(decimal? selector);
+		}
+
+		static readonly Type[] predefinedTypes = {
+		                                         	typeof(Object),
+		                                         	typeof(Boolean),
+		                                         	typeof(Char),
+		                                         	typeof(String),
+		                                         	typeof(SByte),
+		                                         	typeof(Byte),
+		                                         	typeof(Int16),
+		                                         	typeof(UInt16),
+		                                         	typeof(Int32),
+		                                         	typeof(UInt32),
+		                                         	typeof(Int64),
+		                                         	typeof(UInt64),
+		                                         	typeof(Single),
+		                                         	typeof(Double),
+		                                         	typeof(Decimal),
+		                                         	typeof(DateTime),
+		                                         	typeof(TimeSpan),
+		                                         	typeof(Guid),
+		                                         	typeof(Math),
+		                                         	typeof(Convert)
+		                                         };
+
+		static readonly Expression trueLiteral = Expression.Constant(true);
+		static readonly Expression falseLiteral = Expression.Constant(false);
+		static readonly Expression nullLiteral = Expression.Constant(null);
+
+		static readonly string keywordIt = &quot;it&quot;;
+		static readonly string keywordIif = &quot;iif&quot;;
+		static readonly string keywordNew = &quot;new&quot;;
+
+		static Dictionary&lt;string, object&gt; keywords;
+
+		Dictionary&lt;string, object&gt; symbols;
+		IDictionary&lt;string, object&gt; externals;
+		Dictionary&lt;Expression, string&gt; literals;
+		ParameterExpression it;
+		string text;
+		private readonly bool _flagConvertDynamicNullToBooleanFalse;
+		int textPos;
+		int textLen;
+		char ch;
+		Token token;
+
+		public ExpressionParser(ParameterExpression[] parameters, string expression, object[] values, bool flagConvertDynamicNullToBooleanFalse)
+		{
+			if (expression == null) throw new ArgumentNullException(&quot;expression&quot;);
+			if (keywords == null) keywords = CreateKeywords();
+			symbols = new Dictionary&lt;string, object&gt;(StringComparer.OrdinalIgnoreCase);
+			literals = new Dictionary&lt;Expression, string&gt;();
+			if (parameters != null) ProcessParameters(parameters);
+			if (values != null) ProcessValues(values);
+			text = expression;
+			_flagConvertDynamicNullToBooleanFalse = flagConvertDynamicNullToBooleanFalse;
+			textLen = text.Length;
+			SetTextPos(0);
+			NextToken();
+		}
+
+		void ProcessParameters(ParameterExpression[] parameters)
+		{
+			foreach (ParameterExpression pe in parameters)
+				if (!String.IsNullOrEmpty(pe.Name))
+					AddSymbol(pe.Name, pe);
+			if (parameters.Length == 1 &amp;&amp; String.IsNullOrEmpty(parameters[0].Name))
+				it = parameters[0];
+		}
+
+		void ProcessValues(object[] values)
+		{
+			for (int i = 0; i &lt; values.Length; i++)
+			{
+				object value = values[i];
+				if (i == values.Length - 1 &amp;&amp; value is IDictionary&lt;string, object&gt;)
+				{
+					externals = (IDictionary&lt;string, object&gt;)value;
+				}
+				else
+				{
+					AddSymbol(&quot;@&quot; + i.ToString(System.Globalization.CultureInfo.InvariantCulture), value);
+				}
+			}
+		}
+
+		void AddSymbol(string name, object value)
+		{
+			if (symbols.ContainsKey(name))
+				throw ParseError(Res.DuplicateIdentifier, name);
+			symbols.Add(name, value);
+		}
+
+		public Expression Parse(Type resultType)
+		{
+			int exprPos = token.Pos;
+			Expression expr = ParseExpression();
+			if (resultType != null)
+				if ((expr = PromoteExpression(expr, resultType, true)) == null)
+					throw ParseError(exprPos, Res.ExpressionTypeMismatch, GetTypeName(resultType));
+			ValidateToken(TokenId.End, Res.SyntaxError);
+			return expr;
+		}
+
+#pragma warning disable 0219
+		public IEnumerable&lt;DynamicOrdering&gt; ParseOrdering()
+		{
+			List&lt;DynamicOrdering&gt; orderings = new List&lt;DynamicOrdering&gt;();
+			while (true)
+			{
+				Expression expr = ParseExpression();
+				bool ascending = true;
+				if (TokenIdentifierIs(&quot;asc&quot;) || TokenIdentifierIs(&quot;ascending&quot;))
+				{
+					NextToken();
+				}
+				else if (TokenIdentifierIs(&quot;desc&quot;) || TokenIdentifierIs(&quot;descending&quot;))
+				{
+					NextToken();
+					ascending = false;
+				}
+				orderings.Add(new DynamicOrdering { Selector = expr, Ascending = ascending });
+				if (token.Id != TokenId.Comma) break;
+				NextToken();
+			}
+			ValidateToken(TokenId.End, Res.SyntaxError);
+			return orderings;
+		}
+#pragma warning restore 0219
+
+		// ?: operator
+		Expression ParseExpression()
+		{
+			int errorPos = token.Pos;
+			Expression expr = ParseLogicalOr();
+			if (token.Id == TokenId.Question)
+			{
+				NextToken();
+				Expression expr1 = ParseExpression();
+				ValidateToken(TokenId.Colon, Res.ColonExpected);
+				NextToken();
+				Expression expr2 = ParseExpression();
+				expr = GenerateConditional(expr, expr1, expr2, errorPos);
+			}
+			return expr;
+		}
+
+		// ||, or operator
+		Expression ParseLogicalOr()
+		{
+			Expression left = ParseLogicalAnd();
+			while (token.Id == TokenId.DoubleBar || TokenIdentifierIs(&quot;or&quot;))
+			{
+				Token op = token;
+				NextToken();
+				Expression right = ParseLogicalAnd();
+				CheckAndPromoteOperands(typeof(ILogicalSignatures), op.Text, ref left, ref right, op.Pos);
+				left = HandleDynamicNodeLambdas(ExpressionType.OrElse, left, right);
+			}
+			return left;
+		}
+
+		// &amp;&amp;, and operator
+		Expression ParseLogicalAnd()
+		{
+			Expression left = ParseComparison();
+			while (token.Id == TokenId.DoubleAmphersand || TokenIdentifierIs(&quot;and&quot;))
+			{
+				Token op = token;
+				NextToken();
+				Expression right = ParseComparison();
+				CheckAndPromoteOperands(typeof(ILogicalSignatures), op.Text, ref left, ref right, op.Pos);
+				left = HandleDynamicNodeLambdas(ExpressionType.AndAlso, left, right);
+			}
+			return left;
+		}
+
+		// =, ==, !=, &lt;&gt;, &gt;, &gt;=, &lt;, &lt;= operators
+		Expression ParseComparison()
+		{
+			Expression left = ParseAdditive();
+			while (token.Id == TokenId.Equal || token.Id == TokenId.DoubleEqual ||
+			       token.Id == TokenId.ExclamationEqual || token.Id == TokenId.LessGreater ||
+			       token.Id == TokenId.GreaterThan || token.Id == TokenId.GreaterThanEqual ||
+			       token.Id == TokenId.LessThan || token.Id == TokenId.LessThanEqual)
+			{
+				Token op = token;
+				NextToken();
+				Expression right = ParseAdditive();
+				bool isEquality = op.Id == TokenId.Equal || op.Id == TokenId.DoubleEqual ||
+				                  op.Id == TokenId.ExclamationEqual || op.Id == TokenId.LessGreater;
+				if (isEquality &amp;&amp; !left.Type.IsValueType &amp;&amp; !right.Type.IsValueType)
+				{
+					if (left.Type != right.Type)
+					{
+						if (left.Type.IsAssignableFrom(right.Type))
+						{
+							right = Expression.Convert(right, left.Type);
+						}
+						else if (right.Type.IsAssignableFrom(left.Type))
+						{
+							left = Expression.Convert(left, right.Type);
+						}
+						else if (left is LambdaExpression || right is LambdaExpression)
+						{
+							//do nothing here (but further down we&#39;ll handle the lambdaexpression)
+						}
+						else
+						{
+							throw IncompatibleOperandsError(op.Text, left, right, op.Pos);
+						}
+					}
+				}
+				else if (IsEnumType(left.Type) || IsEnumType(right.Type))
+				{
+					if (left.Type != right.Type)
+					{
+						Expression e;
+						if ((e = PromoteExpression(right, left.Type, true)) != null)
+						{
+							right = e;
+						}
+						else if ((e = PromoteExpression(left, right.Type, true)) != null)
+						{
+							left = e;
+						}
+						else
+						{
+							throw IncompatibleOperandsError(op.Text, left, right, op.Pos);
+						}
+					}
+				}
+				else
+				{
+					CheckAndPromoteOperands(isEquality ? typeof(IEqualitySignatures) : typeof(IRelationalSignatures),
+					                        op.Text, ref left, ref right, op.Pos);
+				}
+				switch (op.Id)
+				{
+					case TokenId.Equal:
+					case TokenId.DoubleEqual:
+						left = HandleDynamicNodeLambdas(ExpressionType.Equal, left, right);
+						break;
+					case TokenId.ExclamationEqual:
+					case TokenId.LessGreater:
+						left = HandleDynamicNodeLambdas(ExpressionType.NotEqual, left, right);
+						break;
+					case TokenId.GreaterThan:
+						left = HandleDynamicNodeLambdas(ExpressionType.GreaterThan, left, right);
+						break;
+					case TokenId.GreaterThanEqual:
+						left = HandleDynamicNodeLambdas(ExpressionType.GreaterThanOrEqual, left, right);
+						break;
+					case TokenId.LessThan:
+						left = HandleDynamicNodeLambdas(ExpressionType.LessThan, left, right);
+						break;
+					case TokenId.LessThanEqual:
+						left = HandleDynamicNodeLambdas(ExpressionType.LessThanOrEqual, left, right);
+						break;
+				}
+			}
+			return left;
+		}
+
+		// +, -, &amp; operators
+		Expression ParseAdditive()
+		{
+			Expression left = ParseMultiplicative();
+			while (token.Id == TokenId.Plus || token.Id == TokenId.Minus ||
+			       token.Id == TokenId.Amphersand)
+			{
+				Token op = token;
+				NextToken();
+				Expression right = ParseMultiplicative();
+				switch (op.Id)
+				{
+					case TokenId.Plus:
+						if (left.Type == typeof(string) || right.Type == typeof(string))
+							goto case TokenId.Amphersand;
+						CheckAndPromoteOperands(typeof(IAddSignatures), op.Text, ref left, ref right, op.Pos);
+						left = GenerateAdd(left, right);
+						break;
+					case TokenId.Minus:
+						CheckAndPromoteOperands(typeof(ISubtractSignatures), op.Text, ref left, ref right, op.Pos);
+						left = GenerateSubtract(left, right);
+						break;
+					case TokenId.Amphersand:
+						left = GenerateStringConcat(left, right);
+						break;
+				}
+			}
+			return left;
+		}
+
+		// *, /, %, mod operators
+		Expression ParseMultiplicative()
+		{
+			Expression left = ParseUnary();
+			while (token.Id == TokenId.Asterisk || token.Id == TokenId.Slash ||
+			       token.Id == TokenId.Percent || TokenIdentifierIs(&quot;mod&quot;))
+			{
+				Token op = token;
+				NextToken();
+				Expression right = ParseUnary();
+				CheckAndPromoteOperands(typeof(IArithmeticSignatures), op.Text, ref left, ref right, op.Pos);
+				switch (op.Id)
+				{
+					case TokenId.Asterisk:
+						left = Expression.Multiply(left, right);
+						break;
+					case TokenId.Slash:
+						left = Expression.Divide(left, right);
+						break;
+					case TokenId.Percent:
+					case TokenId.Identifier:
+						left = HandleDynamicNodeLambdas(ExpressionType.Modulo, left, right);
+						break;
+				}
+			}
+			return left;
+		}
+
+		// -, !, not unary operators
+		Expression ParseUnary()
+		{
+			if (token.Id == TokenId.Minus || token.Id == TokenId.Exclamation ||
+			    TokenIdentifierIs(&quot;not&quot;))
+			{
+				Token op = token;
+				NextToken();
+				if (op.Id == TokenId.Minus &amp;&amp; (token.Id == TokenId.IntegerLiteral ||
+				                               token.Id == TokenId.RealLiteral))
+				{
+					token.Text = &quot;-&quot; + token.Text;
+					token.Pos = op.Pos;
+					return ParsePrimary();
+				}
+				Expression expr = ParseUnary();
+				if (op.Id == TokenId.Minus)
+				{
+					CheckAndPromoteOperand(typeof(INegationSignatures), op.Text, ref expr, op.Pos);
+					expr = Expression.Negate(expr);
+				}
+				else
+				{
+					CheckAndPromoteOperand(typeof(INotSignatures), op.Text, ref expr, op.Pos);
+					if (expr is LambdaExpression)
+					{
+						ParameterExpression[] parameters = new ParameterExpression[(expr as LambdaExpression).Parameters.Count];
+						(expr as LambdaExpression).Parameters.CopyTo(parameters, 0);
+						var invokedExpr = Expression.Invoke(expr, parameters);
+						var not = Expression.Not(Expression.TypeAs(invokedExpr, typeof(Nullable&lt;bool&gt;)));
+						expr = Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(
+							Expression.Condition(
+								Expression.Property(not, &quot;HasValue&quot;),
+								Expression.Property(not, &quot;Value&quot;),
+								Expression.Constant(false, typeof(bool))
+								), parameters);
+					}
+					else
+					{
+						expr = Expression.Not(expr);
+					}
+				}
+				return expr;
+			}
+			return ParsePrimary();
+		}
+
+		Expression ParsePrimary()
+		{
+			Expression expr = ParsePrimaryStart();
+			while (true)
+			{
+				if (token.Id == TokenId.Dot)
+				{
+					NextToken();
+					expr = ParseMemberAccess(null, expr);
+				}
+				else if (token.Id == TokenId.OpenBracket)
+				{
+					expr = ParseElementAccess(expr);
+				}
+				else
+				{
+					break;
+				}
+			}
+			return expr;
+		}
+
+		Expression ParsePrimaryStart()
+		{
+			switch (token.Id)
+			{
+				case TokenId.Identifier:
+					return ParseIdentifier();
+				case TokenId.StringLiteral:
+					return ParseStringLiteral();
+				case TokenId.IntegerLiteral:
+					return ParseIntegerLiteral();
+				case TokenId.RealLiteral:
+					return ParseRealLiteral();
+				case TokenId.OpenParen:
+					return ParseParenExpression();
+				default:
+					throw ParseError(Res.ExpressionExpected);
+			}
+		}
+
+		Expression ParseStringLiteral()
+		{
+			ValidateToken(TokenId.StringLiteral);
+			char quote = token.Text[0];
+			string s = token.Text.Substring(1, token.Text.Length - 2);
+			int start = 0;
+			while (true)
+			{
+				int i = s.IndexOf(quote, start);
+				if (i &lt; 0) break;
+				s = s.Remove(i, 1);
+				start = i + 1;
+			}
+			if (quote == &#39;\&#39;&#39;)
+			{
+				if (s.Length != 1)
+					throw ParseError(Res.InvalidCharacterLiteral);
+				NextToken();
+				return CreateLiteral(s[0], s);
+			}
+			NextToken();
+			return CreateLiteral(s, s);
+		}
+
+		Expression ParseIntegerLiteral()
+		{
+			ValidateToken(TokenId.IntegerLiteral);
+			string text = token.Text;
+			if (text[0] != &#39;-&#39;)
+			{
+				ulong value;
+				if (!UInt64.TryParse(text, out value))
+					throw ParseError(Res.InvalidIntegerLiteral, text);
+				NextToken();
+				if (value &lt;= (ulong)Int32.MaxValue) return CreateLiteral((int)value, text);
+				if (value &lt;= (ulong)UInt32.MaxValue) return CreateLiteral((uint)value, text);
+				if (value &lt;= (ulong)Int64.MaxValue) return CreateLiteral((long)value, text);
+				return CreateLiteral(value, text);
+			}
+			else
+			{
+				long value;
+				if (!Int64.TryParse(text, out value))
+					throw ParseError(Res.InvalidIntegerLiteral, text);
+				NextToken();
+				if (value &gt;= Int32.MinValue &amp;&amp; value &lt;= Int32.MaxValue)
+					return CreateLiteral((int)value, text);
+				return CreateLiteral(value, text);
+			}
+		}
+
+		Expression ParseRealLiteral()
+		{
+			ValidateToken(TokenId.RealLiteral);
+			string text = token.Text;
+			object value = null;
+			char last = text[text.Length - 1];
+			if (last == &#39;F&#39; || last == &#39;f&#39;)
+			{
+				float f;
+				if (Single.TryParse(text.Substring(0, text.Length - 1), out f)) value = f;
+			}
+			else
+			{
+				double d;
+				if (Double.TryParse(text, out d)) value = d;
+			}
+			if (value == null) throw ParseError(Res.InvalidRealLiteral, text);
+			NextToken();
+			return CreateLiteral(value, text);
+		}
+
+		Expression CreateLiteral(object value, string text)
+		{
+			ConstantExpression expr = Expression.Constant(value);
+			literals.Add(expr, text);
+			return expr;
+		}
+
+		Expression ParseParenExpression()
+		{
+			ValidateToken(TokenId.OpenParen, Res.OpenParenExpected);
+			NextToken();
+			Expression e = ParseExpression();
+			ValidateToken(TokenId.CloseParen, Res.CloseParenOrOperatorExpected);
+			NextToken();
+			return e;
+		}
+
+		Expression ParseIdentifier()
+		{
+			ValidateToken(TokenId.Identifier);
+			object value;
+			if (keywords.TryGetValue(token.Text, out value))
+			{
+				if (value is Type) return ParseTypeAccess((Type)value);
+				if (value == (object)keywordIt) return ParseIt();
+				if (value == (object)keywordIif) return ParseIif();
+				if (value == (object)keywordNew) return ParseNew();
+				NextToken();
+				return (Expression)value;
+			}
+			if (symbols.TryGetValue(token.Text, out value) ||
+			    externals != null &amp;&amp; externals.TryGetValue(token.Text, out value))
+			{
+				Expression expr = value as Expression;
+				if (expr == null)
+				{
+					expr = Expression.Constant(value);
+				}
+				else
+				{
+					LambdaExpression lambda = expr as LambdaExpression;
+					if (lambda != null) return ParseLambdaInvocation(lambda);
+				}
+				NextToken();
+				return expr;
+			}
+			if (it != null) return ParseMemberAccess(null, it);
+			throw ParseError(Res.UnknownIdentifier, token.Text);
+		}
+
+		Expression ParseIt()
+		{
+			if (it == null)
+				throw ParseError(Res.NoItInScope);
+			NextToken();
+			return it;
+		}
+
+		Expression ParseIif()
+		{
+			int errorPos = token.Pos;
+			NextToken();
+			Expression[] args = ParseArgumentList();
+			if (args.Length != 3)
+				throw ParseError(errorPos, Res.IifRequiresThreeArgs);
+			return GenerateConditional(args[0], args[1], args[2], errorPos);
+		}
+
+		Expression GenerateConditional(Expression test, Expression expr1, Expression expr2, int errorPos)
+		{
+			if (test.Type != typeof(bool))
+				throw ParseError(errorPos, Res.FirstExprMustBeBool);
+			if (expr1.Type != expr2.Type)
+			{
+				Expression expr1as2 = expr2 != nullLiteral ? PromoteExpression(expr1, expr2.Type, true) : null;
+				Expression expr2as1 = expr1 != nullLiteral ? PromoteExpression(expr2, expr1.Type, true) : null;
+				if (expr1as2 != null &amp;&amp; expr2as1 == null)
+				{
+					expr1 = expr1as2;
+				}
+				else if (expr2as1 != null &amp;&amp; expr1as2 == null)
+				{
+					expr2 = expr2as1;
+				}
+				else
+				{
+					string type1 = expr1 != nullLiteral ? expr1.Type.Name : &quot;null&quot;;
+					string type2 = expr2 != nullLiteral ? expr2.Type.Name : &quot;null&quot;;
+					if (expr1as2 != null &amp;&amp; expr2as1 != null)
+						throw ParseError(errorPos, Res.BothTypesConvertToOther, type1, type2);
+					throw ParseError(errorPos, Res.NeitherTypeConvertsToOther, type1, type2);
+				}
+			}
+			return Expression.Condition(test, expr1, expr2);
+		}
+
+		Expression ParseNew()
+		{
+			NextToken();
+			ValidateToken(TokenId.OpenParen, Res.OpenParenExpected);
+			NextToken();
+			List&lt;DynamicProperty&gt; properties = new List&lt;DynamicProperty&gt;();
+			List&lt;Expression&gt; expressions = new List&lt;Expression&gt;();
+			while (true)
+			{
+				int exprPos = token.Pos;
+				Expression expr = ParseExpression();
+				string propName;
+				if (TokenIdentifierIs(&quot;as&quot;))
+				{
+					NextToken();
+					propName = GetIdentifier();
+					NextToken();
+				}
+				else
+				{
+					MemberExpression me = expr as MemberExpression;
+					if (me == null) throw ParseError(exprPos, Res.MissingAsClause);
+					propName = me.Member.Name;
+				}
+				expressions.Add(expr);
+				properties.Add(new DynamicProperty(propName, expr.Type));
+				if (token.Id != TokenId.Comma) break;
+				NextToken();
+			}
+			ValidateToken(TokenId.CloseParen, Res.CloseParenOrCommaExpected);
+			NextToken();
+			Type type = DynamicExpression.CreateClass(properties);
+			MemberBinding[] bindings = new MemberBinding[properties.Count];
+			for (int i = 0; i &lt; bindings.Length; i++)
+				bindings[i] = Expression.Bind(type.GetProperty(properties[i].Name), expressions[i]);
+			return Expression.MemberInit(Expression.New(type), bindings);
+		}
+
+		Expression ParseLambdaInvocation(LambdaExpression lambda)
+		{
+			int errorPos = token.Pos;
+			NextToken();
+			Expression[] args = ParseArgumentList();
+			MethodBase method;
+			if (FindMethod(lambda.Type, &quot;Invoke&quot;, false, args, out method) != 1)
+				throw ParseError(errorPos, Res.ArgsIncompatibleWithLambda);
+			return Expression.Invoke(lambda, args);
+		}
+
+		Expression ParseTypeAccess(Type type)
+		{
+			int errorPos = token.Pos;
+			NextToken();
+			if (token.Id == TokenId.Question)
+			{
+				if (!type.IsValueType || IsNullableType(type))
+					throw ParseError(errorPos, Res.TypeHasNoNullableForm, GetTypeName(type));
+				type = typeof(Nullable&lt;&gt;).MakeGenericType(type);
+				NextToken();
+			}
+			if (token.Id == TokenId.OpenParen)
+			{
+				Expression[] args = ParseArgumentList();
+				MethodBase method;
+				switch (FindBestMethod(type.GetConstructors(), args, out method))
+				{
+					case 0:
+						if (args.Length == 1)
+							return GenerateConversion(args[0], type, errorPos);
+						throw ParseError(errorPos, Res.NoMatchingConstructor, GetTypeName(type));
+					case 1:
+						return Expression.New((ConstructorInfo)method, args);
+					default:
+						throw ParseError(errorPos, Res.AmbiguousConstructorInvocation, GetTypeName(type));
+				}
+			}
+			ValidateToken(TokenId.Dot, Res.DotOrOpenParenExpected);
+			NextToken();
+			return ParseMemberAccess(type, null);
+		}
+
+		Expression GenerateConversion(Expression expr, Type type, int errorPos)
+		{
+			Type exprType = expr.Type;
+			if (exprType == type) return expr;
+			if (exprType.IsValueType &amp;&amp; type.IsValueType)
+			{
+				if ((IsNullableType(exprType) || IsNullableType(type)) &amp;&amp;
+				    GetNonNullableType(exprType) == GetNonNullableType(type))
+					return Expression.Convert(expr, type);
+				if ((IsNumericType(exprType) || IsEnumType(exprType)) &amp;&amp;
+				    (IsNumericType(type)) || IsEnumType(type))
+					return Expression.ConvertChecked(expr, type);
+			}
+			if (exprType.IsAssignableFrom(type) || type.IsAssignableFrom(exprType) ||
+			    exprType.IsInterface || type.IsInterface)
+				return Expression.Convert(expr, type);
+			throw ParseError(errorPos, Res.CannotConvertValue,
+			                 GetTypeName(exprType), GetTypeName(type));
+		}
+
+		Expression ParseMemberAccess(Type type, Expression instance)
+		{
+			//NOTE: SD: There is a lot of string checking going on here and I&#39;m 99% sure this can all be done better
+			// in a more generic sense to support any types with any extension methods, etc...
+			// Too bad whoever wrote this decided not to put any code comments in :(
+			// This is how to support method calls, etc... in dynamic statements.
+
+			if (instance != null) type = instance.Type;
+			int errorPos = token.Pos;
+			string id = GetIdentifier();
+			NextToken();
+			if (token.Id == TokenId.OpenParen)
+			{
+				if (instance != null &amp;&amp; type != typeof(string))
+				{
+					Type enumerableType = FindGenericType(typeof(IEnumerable&lt;&gt;), type);
+					if (enumerableType != null)
+					{
+						Type elementType = enumerableType.GetGenericArguments()[0];
+						return ParseAggregate(instance, elementType, id, errorPos);
+					}
+				}
+				Expression[] args = ParseArgumentList();
+				MethodBase mb;
+				LambdaExpression instanceAsString = null;
+				ParameterExpression instanceExpression = Expression.Parameter(typeof(T), &quot;instance&quot;);
+				if (type.IsGenericType &amp;&amp; type != typeof(string))
+				{
+					var typeArgs = type.GetGenericArguments();
+					if (typeArgs[0] == typeof(T))
+					{
+						if (instance != null &amp;&amp; instance is LambdaExpression)
+						{							
+							//not sure why this is object or why we need to do this but if we change it, things die...
+							//also not sure why it is changed to string, i think this might be to ensure string methods are supported
+							//but seems to me that we then won&#39;t support other types of methods?
+							if (typeArgs[1] == typeof(object))
+							{
+								instanceAsString = StringFormat(instance as LambdaExpression, instanceExpression);
+								type = typeof(string);
+							}
+							else if (typeArgs[1] == typeof(string))
+							{
+								instanceAsString = instance as LambdaExpression;
+								type = typeof(string);
+							}
+							//else
+							//{
+							//	instanceAsString = instance as LambdaExpression;
+							//	type = typeArgs[1];	
+							//}
+							
+						}
+					}
+				}
+				switch (FindMethod(type, id, instance == null, args, out mb))
+				{
+					case 0:
+						//not found
+
+						//SD: I have yet to see extension methods actually being called in the dynamic parsing... need to unit test these
+						// scenarios and figure out why all this type checking occurs.
+
+                        var runtimeCache = ApplicationContext.Current != null ? ApplicationContext.Current.ApplicationCache.RuntimeCache : new NullCacheProvider();
+
+						if (type == typeof(string) &amp;&amp; instanceAsString != null)
+						{
+							Expression[] newArgs = (new List&lt;Expression&gt;() { Expression.Invoke(instanceAsString, instanceExpression) }).Concat(args).ToArray();
+							mb = ExtensionMethodFinder.FindExtensionMethod(runtimeCache, typeof(string), newArgs, id, true);
+							if (mb != null)
+							{
+								return CallMethodOnDynamicNode(instance, newArgs, instanceAsString, instanceExpression, (MethodInfo)mb, true);
+							}
+						}
+						if (type == typeof(string) &amp;&amp; instanceAsString == null &amp;&amp; instance is MemberExpression)
+						{
+							Expression[] newArgs = (new List&lt;Expression&gt;() { instance }).Concat(args).ToArray();
+                            mb = ExtensionMethodFinder.FindExtensionMethod(runtimeCache, typeof(string), newArgs, id, true);
+							if (mb != null)
+							{
+								return Expression.Call(null, (MethodInfo)mb, newArgs);
+							}
+						}
+
+						throw ParseError(errorPos, Res.NoApplicableMethod,
+						                 id, GetTypeName(type));
+					case 1:
+						MethodInfo method = (MethodInfo)mb;
+						if (!IsPredefinedType(method.DeclaringType))
+							throw ParseError(errorPos, Res.MethodsAreInaccessible, GetTypeName(method.DeclaringType));
+						if (method.ReturnType == typeof(void))
+							throw ParseError(errorPos, Res.MethodIsVoid,
+							                 id, GetTypeName(method.DeclaringType));
+						if (instanceAsString != null)
+						{
+							return CallMethodOnDynamicNode(instance, args, instanceAsString, instanceExpression, method, false);
+						}
+						return Expression.Call(instance, (MethodInfo)method, args);
+					default:
+						throw ParseError(errorPos, Res.AmbiguousMethodInvocation,
+						                 id, GetTypeName(type));
+				}
+			}
+			else
+			{
+				//Looks for a member on the type, but above, we&#39;re rerouting that into TryGetMember
+				MemberInfo member = FindPropertyOrField(type, id, instance == null);
+				if (member == null)
+				{
+					if (typeof(DynamicObject).IsAssignableFrom(type))
+					{
+						//We are going to generate a dynamic method by hand coding the expression tree
+						//this will invoke TryGetMember (but wrapped in an expression tree)
+						//so that when it&#39;s evaluated, DynamicNode should be supported
+
+						ParameterExpression instanceExpression = Expression.Parameter(typeof(T), &quot;instance&quot;);
+						ParameterExpression convertDynamicNullToBooleanFalse = Expression.Parameter(typeof(bool), &quot;convertDynamicNullToBooleanFalse&quot;);
+						ParameterExpression result = Expression.Parameter(typeof(object), &quot;result&quot;);
+						ParameterExpression binder = Expression.Variable(typeof(DynamicQueryableGetMemberBinder), &quot;binder&quot;);
+						ParameterExpression ignoreCase = Expression.Variable(typeof(bool), &quot;ignoreCase&quot;);
+						ConstructorInfo getMemberBinderConstructor = typeof(DynamicQueryableGetMemberBinder).GetConstructor(new Type[] { typeof(string), typeof(bool) });
+						LabelTarget blockReturnLabel = Expression.Label(typeof(object));
+						MethodInfo method = typeof(T).GetMethod(&quot;TryGetMember&quot;);
+
+						BlockExpression block = Expression.Block(
+							typeof(object),
+							new[] { ignoreCase, binder, result, convertDynamicNullToBooleanFalse },
+							Expression.Assign(convertDynamicNullToBooleanFalse, Expression.Constant(_flagConvertDynamicNullToBooleanFalse, typeof(bool))),
+							Expression.Assign(ignoreCase, Expression.Constant(false, typeof(bool))),
+							Expression.Assign(binder, Expression.New(getMemberBinderConstructor, Expression.Constant(id, typeof(string)), ignoreCase)),
+							Expression.Assign(result, Expression.Constant(null)),
+							Expression.IfThen(Expression.NotEqual(Expression.Constant(null), instanceExpression),
+							                  Expression.Call(instanceExpression, method, binder, result)),
+							Expression.IfThen(
+								Expression.AndAlso(
+									Expression.TypeEqual(result, typeof(DynamicNull)),
+									Expression.Equal(convertDynamicNullToBooleanFalse, Expression.Constant(true, typeof(bool)))
+									),
+								Expression.Assign(result, Expression.Constant(false, typeof(object)))
+								),
+							Expression.Return(blockReturnLabel, result),
+							Expression.Label(blockReturnLabel, Expression.Constant(-2, typeof(object)))
+							);
+						LambdaExpression lax = Expression.Lambda&lt;Func&lt;T, object&gt;&gt;(block, instanceExpression);
+						return lax;
+					}
+					if (typeof(Func&lt;T, object&gt;).IsAssignableFrom(type))
+					{
+						//accessing a property off an already resolved DynamicNode TryGetMember call
+						//e.g. uBlogsyPostDate.Date
+						//SD: Removed the NonPublic accessor here because this will never work in medium trust, wondering why it is NonPublic vs Public ? Have changed to Public.
+						//MethodInfo ReflectPropertyValue = this.GetType().GetMethod(&quot;ReflectPropertyValue&quot;, BindingFlags.NonPublic | BindingFlags.Static);
+						MethodInfo reflectPropertyValue = this.GetType().GetMethod(&quot;ReflectPropertyValue&quot;, BindingFlags.Public | BindingFlags.Static);
+						ParameterExpression convertDynamicNullToBooleanFalse = Expression.Parameter(typeof(bool), &quot;convertDynamicNullToBooleanFalse&quot;);
+						ParameterExpression result = Expression.Parameter(typeof(object), &quot;result&quot;);
+						ParameterExpression idParam = Expression.Parameter(typeof(string), &quot;id&quot;);
+						ParameterExpression lambdaResult = Expression.Parameter(typeof(object), &quot;lambdaResult&quot;);
+						ParameterExpression lambdaInstanceExpression = Expression.Parameter(typeof(T), &quot;lambdaInstanceExpression&quot;);
+						ParameterExpression instanceExpression = Expression.Parameter(typeof(Func&lt;T, object&gt;), &quot;instance&quot;);
+						LabelTarget blockReturnLabel = Expression.Label(typeof(object));
+
+						BlockExpression block = Expression.Block(
+							typeof(object),
+							new[] { lambdaResult, result, idParam, convertDynamicNullToBooleanFalse },
+							Expression.Assign(convertDynamicNullToBooleanFalse, Expression.Constant(_flagConvertDynamicNullToBooleanFalse, typeof(bool))),
+							Expression.Assign(lambdaResult, Expression.Invoke(instance, lambdaInstanceExpression)),
+							Expression.Assign(result, Expression.Call(reflectPropertyValue, lambdaResult, Expression.Constant(id))),
+							Expression.IfThen(
+								Expression.AndAlso(
+									Expression.TypeEqual(result, typeof(DynamicNull)),
+									Expression.Equal(convertDynamicNullToBooleanFalse, Expression.Constant(true, typeof(bool)))
+									),
+								Expression.Assign(result, Expression.Constant(false, typeof(object)))
+								),
+							Expression.Return(blockReturnLabel, result),
+							Expression.Label(blockReturnLabel, Expression.Constant(-2, typeof(object)))
+							);
+						LambdaExpression lax = Expression.Lambda&lt;Func&lt;T, object&gt;&gt;(block, lambdaInstanceExpression);
+						return lax;
+					}
+				}
+				else
+				{
+					return member is PropertyInfo ?
+					                              	Expression.Property(instance, (PropertyInfo)member) :
+					                              	                                                    	Expression.Field(instance, (FieldInfo)member);
+				}
+				throw ParseError(errorPos, Res.UnknownPropertyOrField,
+				                 id, GetTypeName(type));
+
+			}
+		}
+		public static object ReflectPropertyValue(object o, string name)
+		{
+			PropertyInfo propertyInfo = o.GetType().GetProperty(name);
+			if (propertyInfo != null)
+			{
+				object result = propertyInfo.GetValue(o, null);
+				return result;
+			}
+			return null;
+		}
+		private static Expression CallMethodOnDynamicNode(Expression instance, Expression[] args, LambdaExpression instanceAsString, ParameterExpression instanceExpression, MethodInfo method, bool isStatic)
+		{			
+			Type methodReturnType = method.ReturnType;
+
+			var defaultReturnValue = Expression.Constant(methodReturnType.GetDefaultValue(), methodReturnType);			
+
+			ParameterExpression result = Expression.Parameter(method.ReturnType, &quot;result&quot;);
+			LabelTarget blockReturnLabel = Expression.Label(method.ReturnType);
+			BlockExpression block = Expression.Block(
+				method.ReturnType,
+				new[] { result },
+				Expression.Assign(result,
+				                  Expression.Call(
+				                  	isStatic ? null : Expression.Invoke(instanceAsString, instanceExpression),
+				                  	method,
+				                  	args)
+					),
+				Expression.Return(blockReturnLabel, result),
+				Expression.Label(blockReturnLabel, defaultReturnValue)
+				);
+
+			Type func = typeof(Func&lt;,&gt;);
+			Type generic = func.MakeGenericType(typeof(T), methodReturnType);
+			return Expression.Lambda(generic, block, instanceExpression);
+
+			//if (methodReturnType == typeof(string))
+			//	return Expression.Lambda&lt;Func&lt;T, string&gt;&gt;(block, instanceExpression);
+			//if (methodReturnType == typeof(int))
+			//	return Expression.Lambda&lt;Func&lt;T, int&gt;&gt;(block, instanceExpression);
+			//if (methodReturnType == typeof(bool))
+			//	return Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(block, instanceExpression);
+			//if (methodReturnType == typeof(string[]))	
+				//return Expression.Lambda&lt;Func&lt;T, string[]&gt;&gt;(block, instanceExpression);
+			
+			//return Expression.Call(instance, (MethodInfo)method, args);
+
+			//return Expression.Lambda&lt;Func&lt;T, object&gt;&gt;(
+			//	Expression.Convert(block, typeof(object)), instanceExpression);
+			
+		}
+
+		static Type FindGenericType(Type generic, Type type)
+		{
+			while (type != null &amp;&amp; type != typeof(object))
+			{
+				if (type.IsGenericType &amp;&amp; type.GetGenericTypeDefinition() == generic) return type;
+				if (generic.IsInterface)
+				{
+					foreach (Type intfType in type.GetInterfaces())
+					{
+						Type found = FindGenericType(generic, intfType);
+						if (found != null) return found;
+					}
+				}
+				type = type.BaseType;
+			}
+			return null;
+		}
+		LambdaExpression StringFormat(LambdaExpression lax, ParameterExpression instanceExpression)
+		{
+			ParameterExpression cresult = Expression.Parameter(typeof(string), &quot;cresult&quot;);
+			ParameterExpression temp = Expression.Parameter(typeof(object), &quot;temp&quot;);
+			ParameterExpression stemp = Expression.Parameter(typeof(string), &quot;string&quot;);
+			LabelTarget cblockReturnLabel = Expression.Label(typeof(string));
+
+			MethodInfo stringFormat = typeof(string).GetMethod(&quot;Format&quot;, new Type[] { typeof(string), typeof(object) });
+			BlockExpression cblock = Expression.Block(
+				typeof(string),
+				new[] { cresult, temp },
+				Expression.Assign(temp, Expression.Invoke(lax, instanceExpression)),
+				Expression.Assign(cresult, Expression.Call(stringFormat, Expression.Constant(&quot;{0}&quot;), temp)),
+				Expression.Return(cblockReturnLabel, cresult),
+				Expression.Label(cblockReturnLabel, Expression.Constant(null, typeof(string))));
+
+			LambdaExpression lax2 = Expression.Lambda&lt;Func&lt;T, string&gt;&gt;(cblock, instanceExpression);
+			var expression = Expression.Lambda&lt;Func&lt;T, string&gt;&gt;(cblock, instanceExpression);
+			return expression;
+
+		}
+		Expression ParseAggregate(Expression instance, Type elementType, string methodName, int errorPos)
+		{
+			ParameterExpression outerIt = it;
+			ParameterExpression innerIt = Expression.Parameter(elementType, &quot;&quot;);
+			it = innerIt;
+			Expression[] args = ParseArgumentList();
+			it = outerIt;
+			MethodBase signature;
+			if (FindMethod(typeof(IEnumerableSignatures), methodName, false, args, out signature) != 1)
+				throw ParseError(errorPos, Res.NoApplicableAggregate, methodName);
+			Type[] typeArgs;
+			if (signature.Name == &quot;Min&quot; || signature.Name == &quot;Max&quot;)
+			{
+				typeArgs = new Type[] { elementType, args[0].Type };
+			}
+			else
+			{
+				typeArgs = new Type[] { elementType };
+			}
+			if (args.Length == 0)
+			{
+				args = new Expression[] { instance };
+			}
+			else
+			{
+				args = new Expression[] { instance, Expression.Lambda(args[0], innerIt) };
+			}
+			return Expression.Call(typeof(Enumerable), signature.Name, typeArgs, args);
+		}
+
+		Expression[] ParseArgumentList()
+		{
+			ValidateToken(TokenId.OpenParen, Res.OpenParenExpected);
+			NextToken();
+			Expression[] args = token.Id != TokenId.CloseParen ? ParseArguments() : new Expression[0];
+			ValidateToken(TokenId.CloseParen, Res.CloseParenOrCommaExpected);
+			NextToken();
+			return args;
+		}
+
+		Expression[] ParseArguments()
+		{
+			List&lt;Expression&gt; argList = new List&lt;Expression&gt;();
+			while (true)
+			{
+				argList.Add(ParseExpression());
+				if (token.Id != TokenId.Comma) break;
+				NextToken();
+			}
+			return argList.ToArray();
+		}
+
+		Expression ParseElementAccess(Expression expr)
+		{
+			int errorPos = token.Pos;
+			ValidateToken(TokenId.OpenBracket, Res.OpenParenExpected);
+			NextToken();
+			Expression[] args = ParseArguments();
+			ValidateToken(TokenId.CloseBracket, Res.CloseBracketOrCommaExpected);
+			NextToken();
+			if (expr.Type.IsArray)
+			{
+				if (expr.Type.GetArrayRank() != 1 || args.Length != 1)
+					throw ParseError(errorPos, Res.CannotIndexMultiDimArray);
+				Expression index = PromoteExpression(args[0], typeof(int), true);
+				if (index == null)
+					throw ParseError(errorPos, Res.InvalidIndex);
+				return Expression.ArrayIndex(expr, index);
+			}
+			else
+			{
+				MethodBase mb;
+				switch (FindIndexer(expr.Type, args, out mb))
+				{
+					case 0:
+						throw ParseError(errorPos, Res.NoApplicableIndexer,
+						                 GetTypeName(expr.Type));
+					case 1:
+						return Expression.Call(expr, (MethodInfo)mb, args);
+					default:
+						throw ParseError(errorPos, Res.AmbiguousIndexerInvocation,
+						                 GetTypeName(expr.Type));
+				}
+			}
+		}
+
+		static bool IsPredefinedType(Type type)
+		{
+			foreach (Type t in predefinedTypes) if (t == type) return true;
+			return false;
+		}
+
+		static bool IsNullableType(Type type)
+		{
+			return type.IsGenericType &amp;&amp; type.GetGenericTypeDefinition() == typeof(Nullable&lt;&gt;);
+		}
+
+		static Type GetNonNullableType(Type type)
+		{
+			return IsNullableType(type) ? type.GetGenericArguments()[0] : type;
+		}
+
+		static string GetTypeName(Type type)
+		{
+			Type baseType = GetNonNullableType(type);
+			string s = baseType.Name;
+			if (type != baseType) s += &#39;?&#39;;
+			return s;
+		}
+
+		static bool IsNumericType(Type type)
+		{
+			return GetNumericTypeKind(type) != 0;
+		}
+
+		static bool IsSignedIntegralType(Type type)
+		{
+			return GetNumericTypeKind(type) == 2;
+		}
+
+		static bool IsUnsignedIntegralType(Type type)
+		{
+			return GetNumericTypeKind(type) == 3;
+		}
+
+		static int GetNumericTypeKind(Type type)
+		{
+			type = GetNonNullableType(type);
+			if (type.IsEnum) return 0;
+			switch (Type.GetTypeCode(type))
+			{
+				case TypeCode.Char:
+				case TypeCode.Single:
+				case TypeCode.Double:
+				case TypeCode.Decimal:
+					return 1;
+				case TypeCode.SByte:
+				case TypeCode.Int16:
+				case TypeCode.Int32:
+				case TypeCode.Int64:
+					return 2;
+				case TypeCode.Byte:
+				case TypeCode.UInt16:
+				case TypeCode.UInt32:
+				case TypeCode.UInt64:
+					return 3;
+				default:
+					return 0;
+			}
+		}
+
+		static bool IsEnumType(Type type)
+		{
+			return GetNonNullableType(type).IsEnum;
+		}
+
+		void CheckAndPromoteOperand(Type signatures, string opName, ref Expression expr, int errorPos)
+		{
+			Expression[] args = new Expression[] { expr };
+			MethodBase method;
+			if (FindMethod(signatures, &quot;F&quot;, false, args, out method) != 1)
+				throw ParseError(errorPos, Res.IncompatibleOperand,
+				                 opName, GetTypeName(args[0].Type));
+			expr = args[0];
+		}
+
+		void CheckAndPromoteOperands(Type signatures, string opName, ref Expression left, ref Expression right, int errorPos)
+		{
+			Expression[] args = new Expression[] { left, right };
+			MethodBase method;
+			if (FindMethod(signatures, &quot;F&quot;, false, args, out method) != 1)
+				throw IncompatibleOperandsError(opName, left, right, errorPos);
+			left = args[0];
+			right = args[1];
+		}
+
+		Exception IncompatibleOperandsError(string opName, Expression left, Expression right, int pos)
+		{
+			return ParseError(pos, Res.IncompatibleOperands,
+			                  opName, GetTypeName(left.Type), GetTypeName(right.Type));
+		}
+
+		MemberInfo FindPropertyOrField(Type type, string memberName, bool staticAccess)
+		{
+			BindingFlags flags = BindingFlags.Public | BindingFlags.DeclaredOnly |
+			                     (staticAccess ? BindingFlags.Static : BindingFlags.Instance);
+			foreach (Type t in SelfAndBaseTypes(type))
+			{
+				MemberInfo[] members = t.FindMembers(MemberTypes.Property | MemberTypes.Field,
+				                                     flags, Type.FilterNameIgnoreCase, memberName);
+				if (members.Length != 0) return members[0];
+			}
+			return null;
+		}
+
+		int FindMethod(Type type, string methodName, bool staticAccess, Expression[] args, out MethodBase method)
+		{
+			BindingFlags flags = BindingFlags.Public | BindingFlags.DeclaredOnly |
+			                     (staticAccess ? BindingFlags.Static : BindingFlags.Instance);
+			foreach (Type t in SelfAndBaseTypes(type))
+			{
+				MemberInfo[] members = t.FindMembers(MemberTypes.Method,
+				                                     flags, Type.FilterNameIgnoreCase, methodName);
+				int count = FindBestMethod(members.Cast&lt;MethodBase&gt;(), args, out method);
+				if (count != 0) return count;
+			}
+			method = null;
+			return 0;
+		}
+
+		int FindIndexer(Type type, Expression[] args, out MethodBase method)
+		{
+			foreach (Type t in SelfAndBaseTypes(type))
+			{
+				MemberInfo[] members = t.GetDefaultMembers();
+				if (members.Length != 0)
+				{
+					IEnumerable&lt;MethodBase&gt; methods = members.
+						OfType&lt;PropertyInfo&gt;().
+						Select(p =&gt; (MethodBase)p.GetGetMethod()).
+						Where(m =&gt; m != null);
+					int count = FindBestMethod(methods, args, out method);
+					if (count != 0) return count;
+				}
+			}
+			method = null;
+			return 0;
+		}
+
+		static IEnumerable&lt;Type&gt; SelfAndBaseTypes(Type type)
+		{
+			if (type.IsInterface)
+			{
+				List&lt;Type&gt; types = new List&lt;Type&gt;();
+				AddInterface(types, type);
+				return types;
+			}
+			return SelfAndBaseClasses(type);
+		}
+
+		static IEnumerable&lt;Type&gt; SelfAndBaseClasses(Type type)
+		{
+			while (type != null)
+			{
+				yield return type;
+				type = type.BaseType;
+			}
+		}
+
+		static void AddInterface(List&lt;Type&gt; types, Type type)
+		{
+			if (!types.Contains(type))
+			{
+				types.Add(type);
+				foreach (Type t in type.GetInterfaces()) AddInterface(types, t);
+			}
+		}
+
+		class MethodData
+		{
+			public MethodBase MethodBase;
+			public ParameterInfo[] Parameters;
+			public Expression[] Args;
+		}
+
+		int FindBestMethod(IEnumerable&lt;MethodBase&gt; methods, Expression[] args, out MethodBase method)
+		{
+			MethodData[] applicable = methods.
+				Select(m =&gt; new MethodData { MethodBase = m, Parameters = m.GetParameters() }).
+				Where(m =&gt; IsApplicable(m, args)).
+				ToArray();
+			if (applicable.Length &gt; 1)
+			{
+				applicable = applicable.
+					Where(m =&gt; applicable.All(n =&gt; m == n || IsBetterThan(args, m, n))).
+					ToArray();
+			}
+			if (applicable.Length == 1)
+			{
+				MethodData md = applicable[0];
+				for (int i = 0; i &lt; args.Length; i++) args[i] = md.Args[i];
+				method = md.MethodBase;
+			}
+			else
+			{
+				method = null;
+			}
+			return applicable.Length;
+		}
+
+		bool IsApplicable(MethodData method, Expression[] args)
+		{
+			if (method.Parameters.Length != args.Length) return false;
+			Expression[] promotedArgs = new Expression[args.Length];
+			for (int i = 0; i &lt; args.Length; i++)
+			{
+				ParameterInfo pi = method.Parameters[i];
+				if (pi.IsOut) return false;
+				Expression promoted;
+				
+				//TODO: Turns out this is real difficult to parse and don&#39;t really have time to figure this out at the moment
+				// to parse params parameter arrays.
+				
+				////here we need to check if it is a params array parameter
+				//if (pi.ParameterType.IsArray 
+				//	&amp;&amp; pi.ParameterType.GetElementType() != null
+				//	&amp;&amp; pi.GetCustomAttributes(typeof(ParamArrayAttribute), false).Any())
+				//{
+				//	//it is a params parameter so convert the value to an array
+				//	promoted = PromoteExpression(args[i], pi.ParameterType.GetElementType(), false);	
+				//}
+				//else
+				//{
+				promoted = PromoteExpression(args[i], pi.ParameterType, false);	
+				//}
+				if (promoted == null) return false;
+				promotedArgs[i] = promoted;
+			}
+			method.Args = promotedArgs;
+			return true;
+		}
+
+		Expression PromoteExpression(Expression expr, Type type, bool exact)
+		{
+			//if the type of the expression is the correct target type, just return it here
+			if (expr.Type == type) return expr;
+			//if the type of the expression is a func&lt;DynamicNode, object&gt; - invokable returning object, 
+			//we are going to return it here, because we can get the real value when we actually have the instance
+			//if (typeof(Func&lt;DynamicNode, object&gt;).IsAssignableFrom(expr.Type)) return expr;
+			if (expr is LambdaExpression &amp;&amp; ((LambdaExpression)expr).Parameters.Count &gt; 0 &amp;&amp; ((LambdaExpression)expr).Parameters[0].Type == typeof(T))
+			{
+				return expr;
+			}
+			if (expr is ConstantExpression)
+			{
+				ConstantExpression ce = (ConstantExpression)expr;
+				if (ce == nullLiteral)
+				{
+					if (!type.IsValueType || IsNullableType(type))
+						return Expression.Constant(null, type);
+				}
+				else
+				{
+					string text;
+					if (literals.TryGetValue(ce, out text))
+					{
+						Type target = GetNonNullableType(type);
+						Object value = null;
+						switch (Type.GetTypeCode(ce.Type))
+						{
+							case TypeCode.Int32:
+							case TypeCode.UInt32:
+							case TypeCode.Int64:
+							case TypeCode.UInt64:
+								value = ParseNumber(text, target);
+								break;
+							case TypeCode.Double:
+								if (target == typeof(decimal)) value = ParseNumber(text, target);
+								break;
+							case TypeCode.String:
+								value = ParseEnum(text, target);
+								break;
+						}
+						if (value != null)
+							return Expression.Constant(value, type);
+					}
+				}
+			}
+			if (IsCompatibleWith(expr.Type, type))
+			{
+				if (type.IsValueType || exact) return Expression.Convert(expr, type);
+				return expr;
+			}
+			return null;
+		}
+
+		static object ParseNumber(string text, Type type)
+		{
+			switch (Type.GetTypeCode(GetNonNullableType(type)))
+			{
+				case TypeCode.SByte:
+					sbyte sb;
+					if (sbyte.TryParse(text, out sb)) return sb;
+					break;
+				case TypeCode.Byte:
+					byte b;
+					if (byte.TryParse(text, out b)) return b;
+					break;
+				case TypeCode.Int16:
+					short s;
+					if (short.TryParse(text, out s)) return s;
+					break;
+				case TypeCode.UInt16:
+					ushort us;
+					if (ushort.TryParse(text, out us)) return us;
+					break;
+				case TypeCode.Int32:
+					int i;
+					if (int.TryParse(text, out i)) return i;
+					break;
+				case TypeCode.UInt32:
+					uint ui;
+					if (uint.TryParse(text, out ui)) return ui;
+					break;
+				case TypeCode.Int64:
+					long l;
+					if (long.TryParse(text, out l)) return l;
+					break;
+				case TypeCode.UInt64:
+					ulong ul;
+					if (ulong.TryParse(text, out ul)) return ul;
+					break;
+				case TypeCode.Single:
+					float f;
+					if (float.TryParse(text, out f)) return f;
+					break;
+				case TypeCode.Double:
+					double d;
+					if (double.TryParse(text, out d)) return d;
+					break;
+				case TypeCode.Decimal:
+					decimal e;
+					if (decimal.TryParse(text, out e)) return e;
+					break;
+			}
+			return null;
+		}
+
+		static object ParseEnum(string name, Type type)
+		{
+			if (type.IsEnum)
+			{
+				MemberInfo[] memberInfos = type.FindMembers(MemberTypes.Field,
+				                                            BindingFlags.Public | BindingFlags.DeclaredOnly | BindingFlags.Static,
+				                                            Type.FilterNameIgnoreCase, name);
+				if (memberInfos.Length != 0) return ((FieldInfo)memberInfos[0]).GetValue(null);
+			}
+			return null;
+		}
+
+		static bool IsCompatibleWith(Type source, Type target)
+		{
+			if (source == target) return true;
+			if (!target.IsValueType) return target.IsAssignableFrom(source);
+			Type st = GetNonNullableType(source);
+			Type tt = GetNonNullableType(target);
+			if (st != source &amp;&amp; tt == target) return false;
+			TypeCode sc = st.IsEnum ? TypeCode.Object : Type.GetTypeCode(st);
+			TypeCode tc = tt.IsEnum ? TypeCode.Object : Type.GetTypeCode(tt);
+			switch (sc)
+			{
+				case TypeCode.SByte:
+					switch (tc)
+					{
+						case TypeCode.SByte:
+						case TypeCode.Int16:
+						case TypeCode.Int32:
+						case TypeCode.Int64:
+						case TypeCode.Single:
+						case TypeCode.Double:
+						case TypeCode.Decimal:
+							return true;
+					}
+					break;
+				case TypeCode.Byte:
+					switch (tc)
+					{
+						case TypeCode.Byte:
+						case TypeCode.Int16:
+						case TypeCode.UInt16:
+						case TypeCode.Int32:
+						case TypeCode.UInt32:
+						case TypeCode.Int64:
+						case TypeCode.UInt64:
+						case TypeCode.Single:
+						case TypeCode.Double:
+						case TypeCode.Decimal:
+							return true;
+					}
+					break;
+				case TypeCode.Int16:
+					switch (tc)
+					{
+						case TypeCode.Int16:
+						case TypeCode.Int32:
+						case TypeCode.Int64:
+						case TypeCode.Single:
+						case TypeCode.Double:
+						case TypeCode.Decimal:
+							return true;
+					}
+					break;
+				case TypeCode.UInt16:
+					switch (tc)
+					{
+						case TypeCode.UInt16:
+						case TypeCode.Int32:
+						case TypeCode.UInt32:
+						case TypeCode.Int64:
+						case TypeCode.UInt64:
+						case TypeCode.Single:
+						case TypeCode.Double:
+						case TypeCode.Decimal:
+							return true;
+					}
+					break;
+				case TypeCode.Int32:
+					switch (tc)
+					{
+						case TypeCode.Int32:
+						case TypeCode.Int64:
+						case TypeCode.Single:
+						case TypeCode.Double:
+						case TypeCode.Decimal:
+							return true;
+					}
+					break;
+				case TypeCode.UInt32:
+					switch (tc)
+					{
+						case TypeCode.UInt32:
+						case TypeCode.Int64:
+						case TypeCode.UInt64:
+						case TypeCode.Single:
+						case TypeCode.Double:
+						case TypeCode.Decimal:
+							return true;
+					}
+					break;
+				case TypeCode.Int64:
+					switch (tc)
+					{
+						case TypeCode.Int64:
+						case TypeCode.Single:
+						case TypeCode.Double:
+						case TypeCode.Decimal:
+							return true;
+					}
+					break;
+				case TypeCode.UInt64:
+					switch (tc)
+					{
+						case TypeCode.UInt64:
+						case TypeCode.Single:
+						case TypeCode.Double:
+						case TypeCode.Decimal:
+							return true;
+					}
+					break;
+				case TypeCode.Single:
+					switch (tc)
+					{
+						case TypeCode.Single:
+						case TypeCode.Double:
+							return true;
+					}
+					break;
+				default:
+					if (st == tt) return true;
+					break;
+			}
+			return false;
+		}
+
+		static bool IsBetterThan(Expression[] args, MethodData m1, MethodData m2)
+		{
+			bool better = false;
+			for (int i = 0; i &lt; args.Length; i++)
+			{
+				int c = CompareConversions(args[i].Type,
+				                           m1.Parameters[i].ParameterType,
+				                           m2.Parameters[i].ParameterType);
+				if (c &lt; 0) return false;
+				if (c &gt; 0) better = true;
+			}
+			return better;
+		}
+
+		// Return 1 if s -&gt; t1 is a better conversion than s -&gt; t2
+		// Return -1 if s -&gt; t2 is a better conversion than s -&gt; t1
+		// Return 0 if neither conversion is better
+		static int CompareConversions(Type s, Type t1, Type t2)
+		{
+			if (t1 == t2) return 0;
+			if (s == t1) return 1;
+			if (s == t2) return -1;
+			bool t1t2 = IsCompatibleWith(t1, t2);
+			bool t2t1 = IsCompatibleWith(t2, t1);
+			if (t1t2 &amp;&amp; !t2t1) return 1;
+			if (t2t1 &amp;&amp; !t1t2) return -1;
+			if (IsSignedIntegralType(t1) &amp;&amp; IsUnsignedIntegralType(t2)) return 1;
+			if (IsSignedIntegralType(t2) &amp;&amp; IsUnsignedIntegralType(t1)) return -1;
+			return 0;
+		}
+
+		Expression GenerateEqual(Expression left, Expression right)
+		{
+			return HandleDynamicNodeLambdas(ExpressionType.Equal, left, right);
+		}
+
+		private static Expression HandleDynamicNodeLambdas(ExpressionType expressionType, Expression left, Expression right)
+		{
+			bool leftIsLambda = false, rightIsLambda = false;
+			Expression innerLeft = null;
+			Expression innerRight = null;
+			UnaryExpression unboxedLeft = null, unboxedRight = null;
+			ParameterExpression[] parameters = null;
+
+			if (left is LambdaExpression &amp;&amp; (left as LambdaExpression).Type.GetGenericArguments().First() == typeof(T))
+			{
+				leftIsLambda = true;
+			}
+
+			if (right is LambdaExpression &amp;&amp; (right as LambdaExpression).Type.GetGenericArguments().First() == typeof(T))
+			{
+				rightIsLambda = true;
+			}
+
+			if (leftIsLambda &amp;&amp; !rightIsLambda)
+			{
+				parameters = new ParameterExpression[(left as LambdaExpression).Parameters.Count];
+				(left as LambdaExpression).Parameters.CopyTo(parameters, 0);
+				if (right is ConstantExpression)
+				{
+					//left lambda, right constant
+					var invokedExpr = Expression.Invoke(left, (left as LambdaExpression).Parameters.Cast&lt;Expression&gt;());
+					innerLeft = Expression.Convert(invokedExpr, (right as ConstantExpression).Type);
+				}
+				if (leftIsLambda &amp;&amp; !rightIsLambda &amp;&amp; right is MemberExpression)
+				{
+					var invokedExpr = Expression.Invoke(left, (left as LambdaExpression).Parameters.Cast&lt;Expression&gt;());
+					innerLeft = Expression.Convert(invokedExpr, (right as MemberExpression).Type);
+				}
+			}
+			if (rightIsLambda &amp;&amp; !leftIsLambda)
+			{
+				parameters = new ParameterExpression[(right as LambdaExpression).Parameters.Count];
+				(right as LambdaExpression).Parameters.CopyTo(parameters, 0);
+				if (left is ConstantExpression)
+				{
+					//right lambda, left constant
+					var invokedExpr = Expression.Invoke(right, (right as LambdaExpression).Parameters.Cast&lt;Expression&gt;());
+					innerRight = Expression.Convert(invokedExpr, (left as ConstantExpression).Type);
+				}
+				if (right is MemberExpression)
+				{
+					var invokedExpr = Expression.Invoke(right, (right as LambdaExpression).Parameters.Cast&lt;Expression&gt;());
+					innerRight = Expression.Convert(invokedExpr, (left as MemberExpression).Type);
+				}
+			}
+			bool sequenceEqual = false;
+			if (leftIsLambda &amp;&amp; rightIsLambda)
+			{
+				{
+					Type leftType = ((LambdaExpression)left).Type;
+					Type rightType = ((LambdaExpression)right).Type;
+					Type[] leftTypeGenericArguments = leftType.GetGenericArguments();
+					Type[] rightTypeGenericArguments = rightType.GetGenericArguments();
+					if (leftTypeGenericArguments.SequenceEqual(rightTypeGenericArguments))
+					{
+						sequenceEqual = true;
+						if (leftTypeGenericArguments.Length == 2)
+						{
+							Type TOut = leftTypeGenericArguments[1];
+
+							if (expressionType == ExpressionType.AndAlso)
+							{
+								return ExpressionExtensions.And&lt;T&gt;(left as Expression&lt;Func&lt;T, bool&gt;&gt;, right as Expression&lt;Func&lt;T, bool&gt;&gt;);
+							}
+							if (expressionType == ExpressionType.OrElse)
+							{
+								return ExpressionExtensions.Or&lt;T&gt;(left as Expression&lt;Func&lt;T, bool&gt;&gt;, right as Expression&lt;Func&lt;T, bool&gt;&gt;);
+							}
+
+						}
+					}
+					else
+					{
+						if (leftTypeGenericArguments.Length == 2)
+						{
+							//sequence not equal - could be Func&lt;DynamicNode,object&gt; &amp;&amp; Func&lt;DynamicNode,bool&gt;
+							if (leftTypeGenericArguments.First() == rightTypeGenericArguments.First())
+							{
+								bool leftIsObject = leftTypeGenericArguments.ElementAt(1) == typeof(object);
+								bool rightIsObject = rightTypeGenericArguments.ElementAt(1) == typeof(object);
+								//if one is an object but not the other
+								if (leftIsObject ^ rightIsObject)
+								{
+									if (leftIsObject)
+									{
+										//left side is object
+										if (innerLeft == null)
+										{
+											parameters = new ParameterExpression[(left as LambdaExpression).Parameters.Count];
+											(left as LambdaExpression).Parameters.CopyTo(parameters, 0);
+											innerLeft = Expression.Invoke(left, parameters);
+										}
+										unboxedLeft = Expression.Unbox(innerLeft, rightTypeGenericArguments.ElementAt(1));
+
+										//left is invoked and unboxed to right&#39;s TOut, right was not boxed
+										if (expressionType == ExpressionType.AndAlso)
+										{
+											return ExpressionExtensions.And&lt;T&gt;(right as Expression&lt;Func&lt;T, bool&gt;&gt;, Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(unboxedLeft, parameters) as Expression&lt;Func&lt;T, bool&gt;&gt;);
+										}
+										if (expressionType == ExpressionType.OrElse)
+										{
+											return ExpressionExtensions.And&lt;T&gt;(right as Expression&lt;Func&lt;T, bool&gt;&gt;, Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(unboxedLeft, parameters) as Expression&lt;Func&lt;T, bool&gt;&gt;);
+										}
+									}
+									else
+									{
+										//right side is object
+										if (innerRight == null)
+										{
+											parameters = new ParameterExpression[(right as LambdaExpression).Parameters.Count];
+											(right as LambdaExpression).Parameters.CopyTo(parameters, 0);
+											innerRight = Expression.Invoke(right, parameters);
+										}
+										unboxedRight = Expression.Unbox(innerRight, leftTypeGenericArguments.ElementAt(1));
+
+										//right is invoked and unboxed to left&#39;s TOut, left was not boxed
+										if (expressionType == ExpressionType.AndAlso)
+										{
+											return ExpressionExtensions.And&lt;T&gt;(left as Expression&lt;Func&lt;T, bool&gt;&gt;, Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(unboxedRight, parameters) as Expression&lt;Func&lt;T, bool&gt;&gt;);
+										}
+										if (expressionType == ExpressionType.OrElse)
+										{
+											return ExpressionExtensions.And&lt;T&gt;(left as Expression&lt;Func&lt;T, bool&gt;&gt;, Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(unboxedRight, parameters) as Expression&lt;Func&lt;T, bool&gt;&gt;);
+										}
+									}
+
+								}
+							}
+						}
+					}
+				}
+			}
+
+			if (leftIsLambda &amp;&amp; innerLeft == null)
+			{
+				//left is a lambda, but the right was an unhandled expression type
+				//!ConstantExpression, !MemberExpression
+				//make sure the left gets invoked
+				if (parameters == null)
+				{
+					parameters = new ParameterExpression[(left as LambdaExpression).Parameters.Count];
+					(left as LambdaExpression).Parameters.CopyTo(parameters, 0);
+				}
+				innerLeft = Expression.Invoke(left, parameters);
+			}
+			if (rightIsLambda &amp;&amp; innerRight == null)
+			{
+				//right is a lambda, but the left was an unhandled expression type
+				//!ConstantExpression, !MemberExpression
+				//make sure the right gets invoked
+				if (parameters == null)
+				{
+					parameters = new ParameterExpression[(right as LambdaExpression).Parameters.Count];
+					(right as LambdaExpression).Parameters.CopyTo(parameters, 0);
+				}
+				innerRight = Expression.Invoke(right, parameters);
+			}
+			if (leftIsLambda &amp;&amp; !rightIsLambda &amp;&amp; innerLeft != null &amp;&amp; !(innerLeft is UnaryExpression) &amp;&amp; innerLeft.Type == typeof(object))
+			{
+				//innerLeft is an invoke
+				unboxedLeft = Expression.Unbox(innerLeft, right.Type);
+			}
+			if (rightIsLambda &amp;&amp; !leftIsLambda &amp;&amp; innerRight != null &amp;&amp; !(innerRight is UnaryExpression) &amp;&amp; innerRight.Type == typeof(object))
+			{
+				//innerRight is an invoke
+				unboxedRight = Expression.Unbox(innerRight, left.Type);
+			}
+
+			BinaryExpression binaryExpression = null;
+			var finalLeft = unboxedLeft ?? innerLeft ?? left;
+			var finalRight = unboxedRight ?? innerRight ?? right;
+			switch (expressionType)
+			{
+				case ExpressionType.Equal:
+					binaryExpression = Expression.Equal(finalLeft, finalRight);
+					break;
+				case ExpressionType.NotEqual:
+					binaryExpression = Expression.NotEqual(finalLeft, finalRight);
+					break;
+				case ExpressionType.GreaterThan:
+					binaryExpression = Expression.GreaterThan(finalLeft, finalRight);
+					break;
+				case ExpressionType.LessThan:
+					binaryExpression = Expression.LessThan(finalLeft, finalRight);
+					break;
+				case ExpressionType.GreaterThanOrEqual:
+					binaryExpression = Expression.GreaterThanOrEqual(finalLeft, finalRight);
+					break;
+				case ExpressionType.LessThanOrEqual:
+					binaryExpression = Expression.LessThanOrEqual(finalLeft, finalRight);
+					break;
+				case ExpressionType.Modulo:
+					binaryExpression = Expression.Modulo(finalLeft, finalRight);
+					return (Expression.Lambda&lt;Func&lt;T, int&gt;&gt;(binaryExpression, parameters));
+				case ExpressionType.AndAlso:
+					if ((leftIsLambda &amp;&amp; rightIsLambda &amp;&amp; sequenceEqual) || (!leftIsLambda &amp;&amp; !rightIsLambda))
+					{
+						return Expression.AndAlso(left, right);
+					}
+					else
+					{
+						return (Expression.Lambda&lt;Func&lt;T, Boolean&gt;&gt;(Expression.AndAlso(finalLeft, finalRight), parameters));
+					}
+				case ExpressionType.OrElse:
+					if (leftIsLambda &amp;&amp; rightIsLambda &amp;&amp; sequenceEqual || (!leftIsLambda &amp;&amp; !rightIsLambda))
+					{
+						return Expression.OrElse(left, right);
+					}
+					else
+					{
+						return (Expression.Lambda&lt;Func&lt;T, Boolean&gt;&gt;(Expression.OrElse(finalLeft, finalRight), parameters));
+					}
+				default:
+					return Expression.Equal(left, right);
+			}
+			if (leftIsLambda || rightIsLambda)
+			{
+				var body = Expression.Condition(Expression.TypeEqual(innerLeft, right.Type), binaryExpression, Expression.Constant(false));
+				return Expression.Lambda&lt;Func&lt;T, bool&gt;&gt;(body, parameters);
+			}
+			else
+			{
+				return binaryExpression;
+			}
+
+		}
+
+		Expression GenerateNotEqual(Expression left, Expression right)
+		{
+			return HandleDynamicNodeLambdas(ExpressionType.NotEqual, left, right);
+		}
+
+		Expression GenerateGreaterThan(Expression left, Expression right)
+		{
+			if (left.Type == typeof(string))
+			{
+				return Expression.GreaterThan(
+					GenerateStaticMethodCall(&quot;Compare&quot;, left, right),
+					Expression.Constant(0)
+					);
+			}
+			return HandleDynamicNodeLambdas(ExpressionType.GreaterThan, left, right);
+		}
+
+		Expression GenerateGreaterThanEqual(Expression left, Expression right)
+		{
+			if (left.Type == typeof(string))
+			{
+				return Expression.GreaterThanOrEqual(
+					GenerateStaticMethodCall(&quot;Compare&quot;, left, right),
+					Expression.Constant(0)
+					);
+			}
+			return HandleDynamicNodeLambdas(ExpressionType.GreaterThanOrEqual, left, right);
+		}
+
+		Expression GenerateLessThan(Expression left, Expression right)
+		{
+			if (left.Type == typeof(string))
+			{
+				return Expression.LessThan(
+					GenerateStaticMethodCall(&quot;Compare&quot;, left, right),
+					Expression.Constant(0)
+					);
+			}
+			return HandleDynamicNodeLambdas(ExpressionType.LessThan, left, right);
+		}
+
+		Expression GenerateLessThanEqual(Expression left, Expression right)
+		{
+			if (left.Type == typeof(string))
+			{
+				return Expression.LessThanOrEqual(
+					GenerateStaticMethodCall(&quot;Compare&quot;, left, right),
+					Expression.Constant(0)
+					);
+			}
+			return HandleDynamicNodeLambdas(ExpressionType.LessThanOrEqual, left, right);
+		}
+
+		Expression GenerateAdd(Expression left, Expression right)
+		{
+			if (left.Type == typeof(string) &amp;&amp; right.Type == typeof(string))
+			{
+				return GenerateStaticMethodCall(&quot;Concat&quot;, left, right);
+			}
+			return Expression.Add(left, right);
+		}
+
+		Expression GenerateSubtract(Expression left, Expression right)
+		{
+			return Expression.Subtract(left, right);
+		}
+
+		Expression GenerateStringConcat(Expression left, Expression right)
+		{
+			return Expression.Call(
+				null,
+				typeof(string).GetMethod(&quot;Concat&quot;, new[] { typeof(object), typeof(object) }),
+				new[] { left, right });
+		}
+
+		MethodInfo GetStaticMethod(string methodName, Expression left, Expression right)
+		{
+			return left.Type.GetMethod(methodName, new[] { left.Type, right.Type });
+		}
+
+		Expression GenerateStaticMethodCall(string methodName, Expression left, Expression right)
+		{
+			return Expression.Call(null, GetStaticMethod(methodName, left, right), new[] { left, right });
+		}
+
+		void SetTextPos(int pos)
+		{
+			textPos = pos;
+			ch = textPos &lt; textLen ? text[textPos] : &#39;\0&#39;;
+		}
+
+		void NextChar()
+		{
+			if (textPos &lt; textLen) textPos++;
+			ch = textPos &lt; textLen ? text[textPos] : &#39;\0&#39;;
+		}
+
+		void NextToken()
+		{
+			while (Char.IsWhiteSpace(ch)) NextChar();
+			TokenId t;
+			int tokenPos = textPos;
+			switch (ch)
+			{
+				case &#39;!&#39;:
+					NextChar();
+					if (ch == &#39;=&#39;)
+					{
+						NextChar();
+						t = TokenId.ExclamationEqual;
+					}
+					else
+					{
+						t = TokenId.Exclamation;
+					}
+					break;
+				case &#39;%&#39;:
+					NextChar();
+					t = TokenId.Percent;
+					break;
+				case &#39;&amp;&#39;:
+					NextChar();
+					if (ch == &#39;&amp;&#39;)
+					{
+						NextChar();
+						t = TokenId.DoubleAmphersand;
+					}
+					else
+					{
+						t = TokenId.Amphersand;
+					}
+					break;
+				case &#39;(&#39;:
+					NextChar();
+					t = TokenId.OpenParen;
+					break;
+				case &#39;)&#39;:
+					NextChar();
+					t = TokenId.CloseParen;
+					break;
+				case &#39;*&#39;:
+					NextChar();
+					t = TokenId.Asterisk;
+					break;
+				case &#39;+&#39;:
+					NextChar();
+					t = TokenId.Plus;
+					break;
+				case &#39;,&#39;:
+					NextChar();
+					t = TokenId.Comma;
+					break;
+				case &#39;-&#39;:
+					NextChar();
+					t = TokenId.Minus;
+					break;
+				case &#39;.&#39;:
+					NextChar();
+					t = TokenId.Dot;
+					break;
+				case &#39;/&#39;:
+					NextChar();
+					t = TokenId.Slash;
+					break;
+				case &#39;:&#39;:
+					NextChar();
+					t = TokenId.Colon;
+					break;
+				case &#39;&lt;&#39;:
+					NextChar();
+					if (ch == &#39;=&#39;)
+					{
+						NextChar();
+						t = TokenId.LessThanEqual;
+					}
+					else if (ch == &#39;&gt;&#39;)
+					{
+						NextChar();
+						t = TokenId.LessGreater;
+					}
+					else
+					{
+						t = TokenId.LessThan;
+					}
+					break;
+				case &#39;=&#39;:
+					NextChar();
+					if (ch == &#39;=&#39;)
+					{
+						NextChar();
+						t = TokenId.DoubleEqual;
+					}
+					else
+					{
+						t = TokenId.Equal;
+					}
+					break;
+				case &#39;&gt;&#39;:
+					NextChar();
+					if (ch == &#39;=&#39;)
+					{
+						NextChar();
+						t = TokenId.GreaterThanEqual;
+					}
+					else
+					{
+						t = TokenId.GreaterThan;
+					}
+					break;
+				case &#39;?&#39;:
+					NextChar();
+					t = TokenId.Question;
+					break;
+				case &#39;[&#39;:
+					NextChar();
+					t = TokenId.OpenBracket;
+					break;
+				case &#39;]&#39;:
+					NextChar();
+					t = TokenId.CloseBracket;
+					break;
+				case &#39;|&#39;:
+					NextChar();
+					if (ch == &#39;|&#39;)
+					{
+						NextChar();
+						t = TokenId.DoubleBar;
+					}
+					else
+					{
+						t = TokenId.Bar;
+					}
+					break;
+				case &#39;&quot;&#39;:
+				case &#39;\&#39;&#39;:
+					char quote = ch;
+					do
+					{
+						NextChar();
+						while (textPos &lt; textLen &amp;&amp; ch != quote) NextChar();
+						if (textPos == textLen)
+							throw ParseError(textPos, Res.UnterminatedStringLiteral);
+						NextChar();
+					} while (ch == quote);
+					t = TokenId.StringLiteral;
+					break;
+				default:
+					if (Char.IsLetter(ch) || ch == &#39;@&#39; || ch == &#39;_&#39;)
+					{
+						do
+						{
+							NextChar();
+						} while (Char.IsLetterOrDigit(ch) || ch == &#39;_&#39;);
+						t = TokenId.Identifier;
+						break;
+					}
+					if (Char.IsDigit(ch))
+					{
+						t = TokenId.IntegerLiteral;
+						do
+						{
+							NextChar();
+						} while (Char.IsDigit(ch));
+						if (ch == &#39;.&#39;)
+						{
+							t = TokenId.RealLiteral;
+							NextChar();
+							ValidateDigit();
+							do
+							{
+								NextChar();
+							} while (Char.IsDigit(ch));
+						}
+						if (ch == &#39;E&#39; || ch == &#39;e&#39;)
+						{
+							t = TokenId.RealLiteral;
+							NextChar();
+							if (ch == &#39;+&#39; || ch == &#39;-&#39;) NextChar();
+							ValidateDigit();
+							do
+							{
+								NextChar();
+							} while (Char.IsDigit(ch));
+						}
+						if (ch == &#39;F&#39; || ch == &#39;f&#39;) NextChar();
+						break;
+					}
+					if (textPos == textLen)
+					{
+						t = TokenId.End;
+						break;
+					}
+					throw ParseError(textPos, Res.InvalidCharacter, ch);
+			}
+			token.Id = t;
+			token.Text = text.Substring(tokenPos, textPos - tokenPos);
+			token.Pos = tokenPos;
+		}
+
+		bool TokenIdentifierIs(string id)
+		{
+			return token.Id == TokenId.Identifier &amp;&amp; String.Equals(id, token.Text, StringComparison.OrdinalIgnoreCase);
+		}
+
+		string GetIdentifier()
+		{
+			ValidateToken(TokenId.Identifier, Res.IdentifierExpected);
+			string id = token.Text;
+			if (id.Length &gt; 1 &amp;&amp; id[0] == &#39;@&#39;) id = id.Substring(1);
+			return id;
+		}
+
+		void ValidateDigit()
+		{
+			if (!Char.IsDigit(ch)) throw ParseError(textPos, Res.DigitExpected);
+		}
+
+		void ValidateToken(TokenId t, string errorMessage)
+		{
+			if (token.Id != t) throw ParseError(errorMessage);
+		}
+
+		void ValidateToken(TokenId t)
+		{
+			if (token.Id != t) throw ParseError(Res.SyntaxError);
+		}
+
+		Exception ParseError(string format, params object[] args)
+		{
+			return ParseError(token.Pos, format, args);
+		}
+
+		Exception ParseError(int pos, string format, params object[] args)
+		{
+			return new ParseException(string.Format(System.Globalization.CultureInfo.CurrentCulture, format, args), pos);
+		}
+
+		static Dictionary&lt;string, object&gt; CreateKeywords()
+		{
+			Dictionary&lt;string, object&gt; d = new Dictionary&lt;string, object&gt;(StringComparer.OrdinalIgnoreCase);
+			d.Add(&quot;true&quot;, trueLiteral);
+			d.Add(&quot;false&quot;, falseLiteral);
+			d.Add(&quot;null&quot;, nullLiteral);
+			d.Add(keywordIt, keywordIt);
+			d.Add(keywordIif, keywordIif);
+			d.Add(keywordNew, keywordNew);
+			foreach (Type type in predefinedTypes) d.Add(type.Name, type);
+			return d;
+		}
+	}
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[23,24,23,28,1],[23,29,23,33,1],[24,25,24,29,1],[24,30,24,34,1],[25,21,25,25,1],[25,26,25,30,1],[171,3,192,46,1],[194,3,194,70,1],[195,3,195,72,1],[196,3,196,70,1],[198,3,198,43,1],[199,3,199,45,1],[200,3,200,45,1],[215,3,215,139,1],[216,3,216,4,1],[217,4,217,27,1],[217,28,217,74,0],[218,4,218,25,1],[218,26,218,54,1],[219,4,219,79,1],[220,4,220,52,1],[221,4,221,27,1],[221,28,221,58,1],[222,4,222,23,1],[222,24,222,46,1],[223,4,223,22,1],[224,4,224,81,1],[225,4,225,26,1],[226,4,226,18,1],[227,4,227,16,1],[228,3,228,4,1],[231,3,231,4,1],[232,4,232,11,1],[232,13,232,35,1],[232,36,232,38,1],[232,39,232,49,1],[233,5,233,40,1],[234,6,234,29,0],[235,4,235,75,1],[236,5,236,24,1],[237,3,237,4,1],[240,3,240,4,1],[241,9,241,18,1],[241,20,241,37,1],[241,39,241,42,1],[242,4,242,5,1],[243,5,243,30,1],[244,5,244,72,1],[245,5,245,6,1],[246,6,246,53,1],[247,5,247,6,1],[249,5,249,6,0],[250,6,250,92,0],[251,5,251,6,0],[252,4,252,5,1],[253,3,253,4,1],[256,3,256,4,0],[257,4,257,34,0],[258,5,258,53,0],[259,4,259,29,0],[260,3,260,4,0],[263,3,263,4,1],[264,4,264,28,1],[265,4,265,40,1],[266,4,266,27,1],[267,5,267,68,1],[268,6,268,85,0],[269,4,269,48,1],[270,4,270,16,1],[271,3,271,4,1],[275,3,275,4,0],[276,4,276,66,0],[277,4,277,16,0],[278,4,278,5,0],[279,5,279,41,0],[280,5,280,27,0],[281,5,281,68,0],[282,5,282,6,0],[283,6,283,18,0],[284,5,284,6,0],[285,10,285,75,0],[286,5,286,6,0],[287,6,287,18,0],[288,6,288,24,0],[289,5,289,6,0],[290,5,290,83,0],[291,5,291,35,0],[291,36,291,42,0],[292,5,292,17,0],[293,4,293,5,0],[294,4,294,48,0],[295,4,295,21,0],[296,3,296,4,0],[301,3,301,4,1],[302,4,302,29,1],[303,4,303,39,1],[304,4,304,37,1],[305,4,305,5,0],[306,5,306,17,0],[307,5,307,42,0],[308,5,308,53,0],[309,5,309,17,0],[310,5,310,42,0],[311,5,311,62,0],[312,4,312,5,0],[313,4,313,16,1],[314,3,314,4,1],[318,3,318,4,1],[319,4,319,40,1],[320,4,320,68,1],[321,4,321,5,0],[322,5,322,22,0],[323,5,323,17,0],[324,5,324,42,0],[325,5,325,95,0],[326,5,326,73,0],[327,4,327,5,0],[328,4,328,16,1],[329,3,329,4,1],[333,3,333,4,1],[334,4,334,40,1],[335,4,335,76,1],[336,4,336,5,0],[337,5,337,22,0],[338,5,338,17,0],[339,5,339,42,0],[340,5,340,95,0],[341,5,341,74,0],[342,4,342,5,0],[343,4,343,16,1],[344,3,344,4,1],[348,3,348,4,1],[349,4,349,38,1],[350,4,353,77,1],[354,4,354,5,1],[355,5,355,22,1],[356,5,356,17,1],[357,5,357,40,1],[358,5,359,89,1],[360,5,360,73,1],[361,5,361,6,1],[362,6,362,34,1],[363,6,363,7,1],[364,7,364,50,1],[365,7,365,8,0],[366,8,366,53,0],[367,7,367,8,0],[368,12,368,55,1],[369,7,369,8,0],[370,8,370,52,0],[371,7,371,8,0],[372,12,372,70,1],[373,7,373,8,1],[375,7,375,8,1],[377,7,377,8,0],[378,8,378,70,0],[380,6,380,7,1],[381,5,381,6,1],[382,10,382,62,1],[383,5,383,6,0],[384,6,384,34,0],[385,6,385,7,0],[387,7,387,67,0],[388,7,388,8,0],[389,8,389,18,0],[390,7,390,8,0],[391,12,391,72,0],[392,7,392,8,0],[393,8,393,17,0],[394,7,394,8,0],[396,7,396,8,0],[397,8,397,70,0],[399,6,399,7,0],[400,5,400,6,0],[402,5,402,6,1],[403,6,404,68,1],[405,5,405,6,1],[406,5,406,19,1],[410,7,410,74,1],[411,7,411,13,1],[414,7,414,77,0],[415,7,415,13,0],[417,7,417,80,0],[418,7,418,13,0],[420,7,420,87,0],[421,7,421,13,0],[423,7,423,77,0],[424,7,424,13,0],[426,7,426,84,0],[427,7,427,13,0],[429,4,429,5,1],[430,4,430,16,1],[431,3,431,4,1],[435,3,435,4,1],[436,4,436,44,1],[437,4,438,42,1],[439,4,439,5,0],[440,5,440,22,0],[441,5,441,17,0],[442,5,442,46,0],[443,5,443,19,0],[446,7,446,71,0],[447,8,447,37,0],[448,7,448,93,0],[449,7,449,39,0],[450,7,450,13,0],[452,7,452,98,0],[453,7,453,44,0],[454,7,454,13,0],[456,7,456,48,0],[457,7,457,13,0],[459,4,459,5,0],[460,4,460,16,1],[461,3,461,4,1],[465,3,465,4,1],[466,4,466,35,1],[467,4,468,67,1],[469,4,469,5,0],[470,5,470,22,0],[471,5,471,17,0],[472,5,472,37,0],[473,5,473,98,0],[474,5,474,19,0],[477,7,477,47,0],[478,7,478,13,0],[480,7,480,45,0],[481,7,481,13,0],[484,7,484,75,0],[485,7,485,13,0],[487,4,487,5,0],[488,4,488,16,1],[489,3,489,4,1],[493,3,493,4,1],[494,4,495,33,1],[496,4,496,5,0],[497,5,497,22,0],[498,5,498,17,0],[499,5,500,69,0],[501,5,501,6,0],[502,6,502,36,0],[503,6,503,25,0],[504,6,504,28,0],[506,5,506,36,0],[507,5,507,32,0],[508,5,508,6,0],[509,6,509,85,0],[510,6,510,37,0],[511,5,511,6,0],[513,5,513,6,0],[514,6,514,80,0],[515,6,515,35,0],[516,6,516,7,0],[517,7,517,111,0],[518,7,518,67,0],[519,7,519,61,0],[520,7,520,88,0],[521,7,526,24,0],[527,6,527,7,0],[529,6,529,7,0],[530,7,530,35,0],[531,6,531,7,0],[532,5,532,6,0],[533,5,533,17,0],[535,4,535,26,1],[536,3,536,4,1],[539,3,539,4,1],[540,4,540,42,1],[541,4,541,16,1],[542,4,542,5,1],[543,5,543,33,1],[544,5,544,6,1],[545,6,545,18,1],[546,6,546,43,1],[547,5,547,6,1],[548,10,548,46,1],[549,5,549,6,0],[550,6,550,38,0],[551,5,551,6,0],[553,5,553,6,1],[554,6,554,12,1],[556,4,556,5,1],[557,4,557,16,1],[558,3,558,4,1],[561,3,561,4,1],[562,4,562,21,1],[565,6,565,31,1],[567,6,567,34,1],[569,6,569,35,1],[571,6,571,32,0],[573,6,573,36,0],[575,6,575,47,0],[577,3,577,4,1],[580,3,580,4,1],[581,4,581,41,1],[582,4,582,31,1],[583,4,583,62,1],[584,4,584,18,1],[585,4,585,16,1],[586,4,586,5,1],[587,5,587,37,1],[588,5,588,15,1],[588,16,588,22,1],[589,5,589,24,0],[590,5,590,19,0],[591,4,591,5,0],[592,4,592,22,1],[593,4,593,5,0],[594,5,594,23,0],[595,6,595,52,0],[596,5,596,17,0],[597,5,597,35,0],[599,4,599,16,1],[600,4,600,31,1],[601,3,601,4,1],[604,3,604,4,1],[605,4,605,42,1],[606,4,606,29,1],[607,4,607,23,1],[608,4,608,5,1],[610,5,610,43,1],[611,6,611,56,0],[612,5,612,17,1],[613,5,613,40,1],[613,41,613,80,1],[614,5,614,41,0],[614,42,614,82,0],[615,5,615,40,0],[615,41,615,81,0],[616,5,616,39,0],[619,4,619,5,0],[621,5,621,42,0],[622,6,622,56,0],[623,5,623,17,0],[624,5,624,60,0],[625,6,625,45,0],[626,5,626,39,0],[628,3,628,4,1],[631,3,631,4,0],[632,4,632,39,0],[633,4,633,29,0],[634,4,634,24,0],[635,4,635,38,0],[636,4,636,35,0],[637,4,637,5,0],[639,5,639,68,0],[639,69,639,79,0],[640,4,640,5,0],[642,4,642,5,0],[644,5,644,38,0],[644,39,644,49,0],[645,4,645,5,0],[646,4,646,22,0],[646,23,646,70,0],[647,4,647,16,0],[648,4,648,38,0],[649,3,649,4,0],[652,3,652,4,1],[653,4,653,57,1],[654,4,654,29,1],[655,4,655,16,1],[656,3,656,4,1],[659,3,659,4,0],[660,4,660,60,0],[661,4,661,16,0],[662,4,662,37,0],[663,4,663,72,0],[664,4,664,16,0],[665,4,665,13,0],[666,3,666,4,0],[669,3,669,4,1],[670,4,670,38,1],[672,4,672,52,1],[673,4,673,5,0],[674,5,674,23,0],[674,24,674,60,0],[675,5,675,36,0],[675,37,675,54,0],[676,5,676,37,0],[676,38,676,56,0],[677,5,677,37,0],[677,38,677,56,0],[678,5,678,17,0],[679,5,679,30,0],[681,4,682,74,1],[683,4,683,5,1],[684,5,684,43,1],[685,5,685,22,1],[686,5,686,6,1],[687,6,687,40,1],[688,5,688,6,1],[690,5,690,6,0],[691,6,691,57,0],[692,6,692,25,0],[692,26,692,63,0],[693,5,693,6,0],[694,5,694,17,1],[695,5,695,17,1],[697,4,697,19,1],[697,20,697,55,1],[698,4,698,56,0],[699,3,699,4,1],[702,3,702,4,0],[703,4,703,19,0],[704,5,704,39,0],[705,4,705,16,0],[706,4,706,14,0],[707,3,707,4,0],[710,3,710,4,0],[711,4,711,29,0],[712,4,712,16,0],[713,4,713,44,0],[714,4,714,25,0],[715,5,715,58,0],[716,4,716,68,0],[717,3,717,4,0],[720,3,720,4,0],[721,4,721,34,0],[722,5,722,57,0],[723,4,723,33,0],[724,4,724,5,0],[725,5,725,100,0],[726,5,726,100,0],[727,5,727,46,0],[728,5,728,6,0],[729,6,729,23,0],[730,5,730,6,0],[731,10,731,51,0],[732,5,732,6,0],[733,6,733,23,0],[734,5,734,6,0],[736,5,736,6,0],[737,6,737,69,0],[738,6,738,69,0],[739,6,739,47,0],[740,7,740,77,0],[741,6,741,79,0],[743,4,743,5,0],[744,4,744,52,0],[745,3,745,4,0],[748,3,748,4,0],[749,4,749,16,0],[750,4,750,60,0],[751,4,751,16,0],[752,4,752,67,0],[753,4,753,58,0],[754,4,754,16,0],[755,4,755,5,0],[756,5,756,29,0],[757,5,757,41,0],[759,5,759,33,0],[760,5,760,6,0],[761,6,761,18,0],[762,6,762,33,0],[763,6,763,18,0],[764,5,764,6,0],[766,5,766,6,0],[767,6,767,53,0],[768,6,768,21,0],[768,22,768,69,0],[769,6,769,32,0],[770,5,770,6,0],[771,5,771,27,0],[772,5,772,62,0],[773,5,773,35,0],[773,36,773,42,0],[774,5,774,17,0],[775,4,775,5,0],[776,4,776,69,0],[777,4,777,16,0],[778,4,778,58,0],[779,4,779,67,0],[780,9,780,18,0],[780,20,780,39,0],[780,41,780,44,0],[781,5,781,89,0],[782,4,782,65,0],[783,3,783,4,0],[786,3,786,4,0],[787,4,787,29,0],[788,4,788,16,0],[789,4,789,44,0],[791,4,791,72,0],[792,5,792,64,0],[793,4,793,43,0],[794,3,794,4,0],[797,3,797,4,0],[798,4,798,29,0],[799,4,799,16,0],[800,4,800,37,0],[801,4,801,5,0],[802,5,802,51,0],[803,6,803,79,0],[804,5,804,53,0],[805,5,805,17,0],[806,4,806,5,0],[807,4,807,38,0],[808,4,808,5,0],[809,5,809,45,0],[811,5,811,70,0],[814,7,814,28,0],[815,8,815,59,0],[816,7,816,80,0],[818,7,818,60,0],[820,7,820,89,0],[823,4,823,59,0],[824,4,824,16,0],[825,4,825,41,0],[826,3,826,4,0],[829,3,829,4,0],[830,4,830,30,0],[831,4,831,25,0],[831,26,831,38,0],[832,4,832,49,0],[833,4,833,5,0],[834,5,835,66,0],[836,6,836,44,0],[837,5,838,51,0],[839,6,839,51,0],[840,4,840,5,0],[841,4,842,49,0],[843,5,843,43,0],[844,4,845,63,0],[846,3,846,4,0],[849,3,849,4,1],[855,4,855,25,1],[855,26,855,47,1],[856,4,856,29,1],[857,4,857,32,1],[858,4,858,16,1],[859,4,859,38,1],[860,4,860,5,1],[861,5,861,52,1],[862,5,862,6,1],[863,6,863,73,1],[864,6,864,33,1],[865,6,865,7,0],[866,7,866,66,0],[867,7,867,66,0],[869,5,869,6,1],[870,5,870,45,1],[872,5,872,46,1],[873,5,873,90,1],[874,5,874,54,1],[875,5,875,6,1],[876,6,876,48,1],[877,6,877,35,1],[878,6,878,7,1],[879,7,879,60,1],[880,7,880,8,1],[884,8,884,42,1],[885,8,885,9,1],[886,9,886,91,1],[887,9,887,31,1],[888,8,888,9,1],[889,13,889,47,0],[890,8,890,9,0],[891,9,891,57,0],[892,9,892,31,0],[893,8,893,9,0],[900,7,900,8,1],[901,6,901,7,1],[902,5,902,6,1],[903,5,903,66,1],[911,25,911,164,1],[913,7,913,62,1],[914,7,914,8,1],[915,8,915,139,1],[916,8,916,104,1],[917,8,917,23,1],[918,8,918,9,1],[919,9,919,119,1],[921,7,921,8,0],[922,7,922,94,0],[923,7,923,8,0],[924,8,924,92,0],[925,29,925,125,0],[926,8,926,23,0],[927,8,927,9,0],[928,9,928,63,0],[930,7,930,8,0],[932,7,933,47,0],[935,7,935,42,1],[936,7,936,51,1],[937,8,937,98,0],[938,7,938,45,1],[939,8,940,64,0],[941,7,941,36,1],[942,7,942,8,1],[943,8,943,108,1],[945,7,945,66,0],[947,7,948,47,0],[952,4,952,5,1],[954,5,954,73,1],[955,5,955,24,1],[956,5,956,6,1],[957,6,957,55,1],[958,6,958,7,1],[963,7,963,92,1],[964,7,964,133,1],[965,7,965,83,1],[966,7,966,107,1],[967,7,967,88,1],[968,7,968,152,1],[969,7,969,71,1],[970,7,970,63,1],[972,7,990,10,1],[991,7,991,92,1],[992,7,992,18,1],[994,6,994,57,1],[995,6,995,7,1],[1000,7,1000,133,1],[1001,7,1001,133,1],[1002,7,1002,83,1],[1003,7,1003,80,1],[1004,7,1004,95,1],[1005,7,1005,114,1],[1006,7,1006,106,1],[1007,7,1007,71,1],[1009,7,1024,10,1],[1025,7,1025,98,1],[1026,7,1026,18,1],[1028,5,1028,6,0],[1030,5,1030,6,1],[1031,6,1033,136,1],[1035,5,1036,45,0],[1039,3,1039,4,1],[1041,3,1041,4,1],[1042,4,1042,62,1],[1043,4,1043,29,1],[1044,4,1044,5,1],[1045,5,1045,52,1],[1046,5,1046,19,1],[1048,4,1048,16,0],[1049,3,1049,4,1],[1051,3,1051,4,1],[1052,4,1052,46,1],[1054,4,1054,103,1],[1056,4,1056,83,1],[1057,4,1057,71,1],[1058,4,1069,7,1],[1071,4,1071,32,1],[1072,4,1072,69,1],[1073,4,1073,65,1],[1089,3,1089,4,1],[1092,3,1092,4,1],[1093,4,1093,50,1],[1094,4,1094,5,1],[1095,5,1095,74,1],[1095,75,1095,87,0],[1096,5,1096,29,1],[1097,5,1097,6,1],[1098,6,1098,13,1],[1098,15,1098,28,1],[1098,29,1098,31,1],[1098,32,1098,52,1],[1099,6,1099,7,1],[1100,7,1100,55,1],[1101,7,1101,25,1],[1101,26,1101,39,0],[1102,6,1102,7,1],[1103,5,1103,6,1],[1104,5,1104,26,1],[1105,4,1105,5,1],[1106,4,1106,16,1],[1107,3,1107,4,1],[1109,3,1109,4,1],[1110,4,1110,82,1],[1111,4,1111,76,1],[1112,4,1112,79,1],[1113,4,1113,69,1],[1115,4,1115,112,1],[1116,4,1122,85,1],[1124,4,1124,91,1],[1125,4,1125,84,1],[1126,4,1126,22,1],[1128,3,1128,4,1],[1130,3,1130,4,0],[1131,4,1131,37,0],[1132,4,1132,72,0],[1133,4,1133,17,0],[1134,4,1134,44,0],[1135,4,1135,17,0],[1137,4,1137,95,0],[1138,5,1138,71,0],[1140,4,1140,59,0],[1141,4,1141,5,0],[1142,5,1142,57,0],[1143,4,1143,5,0],[1145,4,1145,5,0],[1146,5,1146,43,0],[1147,4,1147,5,0],[1148,4,1148,25,0],[1149,4,1149,5,0],[1150,5,1150,42,0],[1151,4,1151,5,0],[1153,4,1153,5,0],[1154,5,1154,79,0],[1155,4,1155,5,0],[1156,4,1156,79,0],[1157,3,1157,4,0],[1160,3,1160,4,1],[1161,4,1161,60,1],[1162,4,1162,16,1],[1163,4,1163,94,1],[1164,4,1164,69,1],[1165,4,1165,16,1],[1166,4,1166,16,1],[1167,3,1167,4,1],[1170,3,1170,4,1],[1171,4,1171,54,1],[1172,4,1172,16,1],[1173,4,1173,5,1],[1174,5,1174,36,1],[1175,5,1175,35,1],[1175,36,1175,42,1],[1176,5,1176,17,1],[1177,4,1177,5,1],[1178,4,1178,29,1],[1179,3,1179,4,1],[1182,3,1182,4,0],[1183,4,1183,29,0],[1184,4,1184,62,0],[1185,4,1185,16,0],[1186,4,1186,41,0],[1187,4,1187,73,0],[1188,4,1188,16,0],[1189,4,1189,26,0],[1190,4,1190,5,0],[1191,5,1191,59,0],[1192,6,1192,63,0],[1193,5,1193,70,0],[1194,5,1194,23,0],[1195,6,1195,51,0],[1196,5,1196,47,0],[1199,4,1199,5,0],[1201,5,1201,50,0],[1204,7,1205,48,0],[1207,7,1207,58,0],[1209,7,1210,48,0],[1213,3,1213,4,0],[1216,3,1216,4,1],[1217,4,1217,11,1],[1217,13,1217,19,1],[1217,20,1217,22,1],[1217,23,1217,38,1],[1217,40,1217,54,1],[1217,55,1217,67,1],[1218,4,1218,17,0],[1219,3,1219,4,1],[1222,3,1222,4,1],[1223,4,1223,87,1],[1224,3,1224,4,1],[1227,3,1227,4,1],[1228,4,1228,71,1],[1229,3,1229,4,1],[1232,3,1232,4,0],[1233,4,1233,45,0],[1234,4,1234,29,0],[1235,4,1235,25,0],[1235,26,1235,35,0],[1236,4,1236,13,0],[1237,3,1237,4,0],[1240,3,1240,4,0],[1241,4,1241,41,0],[1242,3,1242,4,0],[1245,3,1245,4,1],[1246,4,1246,41,1],[1247,3,1247,4,1],[1250,3,1250,4,1],[1251,4,1251,41,1],[1252,3,1252,4,1],[1255,3,1255,4,1],[1256,4,1256,36,1],[1257,4,1257,20,1],[1257,21,1257,30,0],[1258,4,1258,35,1],[1264,6,1264,15,0],[1269,6,1269,15,1],[1274,6,1274,15,1],[1276,6,1276,15,0],[1278,3,1278,4,1],[1281,3,1281,4,1],[1282,4,1282,43,1],[1283,3,1283,4,1],[1286,3,1286,4,0],[1287,4,1287,50,0],[1289,4,1289,66,0],[1290,5,1291,57,0],[1292,4,1292,19,0],[1293,3,1293,4,0],[1296,3,1296,4,1],[1297,4,1297,57,1],[1299,4,1299,66,1],[1300,5,1300,68,0],[1301,4,1301,19,1],[1302,4,1302,20,1],[1303,3,1303,4,1],[1306,3,1306,4,0],[1307,4,1308,79,0],[1309,3,1309,4,0],[1312,3,1312,4,1],[1313,4,1314,86,1],[1315,4,1315,11,1],[1315,13,1315,19,1],[1315,20,1315,22,1],[1315,23,1315,45,1],[1316,4,1316,5,1],[1317,5,1318,88,1],[1319,5,1319,29,1],[1319,30,1319,48,1],[1320,4,1320,5,1],[1321,4,1321,16,1],[1322,3,1322,4,1],[1325,3,1325,4,1],[1326,4,1327,86,1],[1328,4,1328,11,1],[1328,13,1328,19,1],[1328,20,1328,22,1],[1328,23,1328,45,1],[1329,4,1329,5,1],[1330,5,1331,88,1],[1332,5,1332,78,1],[1333,5,1333,20,1],[1333,21,1333,34,1],[1334,4,1334,5,1],[1335,4,1335,18,1],[1336,4,1336,13,1],[1337,3,1337,4,1],[1340,3,1340,4,0],[1341,4,1341,11,0],[1341,13,1341,19,0],[1341,20,1341,22,0],[1341,23,1341,45,0],[1342,4,1342,5,0],[1343,5,1343,50,0],[1344,5,1344,29,0],[1345,5,1345,6,0],[1346,6,1348,19,0],[1348,19,1348,47,0],[1348,47,1349,18,0],[1349,18,1349,27,0],[1349,27,1349,29,0],[1346,6,1349,29,0],[1350,6,1350,60,0],[1351,6,1351,21,0],[1351,22,1351,35,0],[1352,5,1352,6,0],[1353,4,1353,5,0],[1354,4,1354,18,0],[1355,4,1355,13,0],[1356,3,1356,4,0],[1359,3,1359,4,1],[1360,4,1360,25,1],[1361,4,1361,5,1],[1362,5,1362,41,1],[1363,5,1363,31,1],[1364,5,1364,18,1],[1366,4,1366,36,1],[1367,3,1367,4,1],[1379,3,1379,4,1],[1380,4,1380,30,1],[1381,4,1381,5,1],[1382,5,1382,21,1],[1383,5,1383,12,1],[1383,14,1383,20,1],[1383,21,1383,23,1],[1383,24,1383,44,1],[1383,46,1383,69,1],[1384,4,1384,5,1],[1385,3,1385,4,1],[1395,3,1395,4,1],[1396,4,1397,17,1],[1397,17,1397,82,1],[1397,82,1398,16,1],[1398,16,1398,37,1],[1398,37,1399,15,1],[1396,4,1399,15,1],[1400,4,1400,30,1],[1401,4,1401,5,1],[1402,5,1403,17,1],[1403,17,1403,37,1],[1403,37,1403,71,1],[1403,71,1403,72,1],[1403,17,1403,72,1],[1403,72,1404,16,1],[1402,5,1404,16,1],[1405,4,1405,5,1],[1406,4,1406,31,1],[1407,4,1407,5,1],[1408,5,1408,35,1],[1409,10,1409,19,1],[1409,21,1409,36,1],[1409,38,1409,41,1],[1409,43,1409,64,1],[1410,5,1410,28,1],[1411,4,1411,5,1],[1413,4,1413,5,1],[1414,5,1414,19,1],[1415,4,1415,5,1],[1416,4,1416,29,1],[1417,3,1417,4,1],[1420,3,1420,4,1],[1421,4,1421,48,1],[1421,49,1421,62,1],[1422,4,1422,60,1],[1423,9,1423,18,1],[1423,20,1423,35,1],[1423,37,1423,40,1],[1424,4,1424,5,1],[1425,5,1425,45,1],[1426,5,1426,18,1],[1426,19,1426,32,0],[1442,5,1442,68,1],[1444,5,1444,26,1],[1444,27,1444,40,1],[1445,5,1445,32,1],[1446,4,1446,5,1],[1447,4,1447,31,1],[1448,4,1448,16,1],[1449,3,1449,4,1],[1452,3,1452,4,1],[1454,4,1454,26,1],[1454,27,1454,39,1],[1458,4,1458,142,1],[1459,4,1459,5,1],[1460,5,1460,17,1],[1462,4,1462,35,1],[1463,4,1463,5,1],[1464,5,1464,54,1],[1465,5,1465,27,1],[1466,5,1466,6,0],[1467,6,1467,52,0],[1468,7,1468,46,0],[1469,5,1469,6,0],[1471,5,1471,6,1],[1473,6,1473,45,1],[1474,6,1474,7,1],[1475,7,1475,46,1],[1476,7,1476,27,1],[1477,7,1477,41,1],[1483,9,1483,43,1],[1484,9,1484,15,1],[1486,9,1486,39,0],[1486,40,1486,74,0],[1487,9,1487,15,0],[1489,9,1489,41,0],[1490,9,1490,15,0],[1492,7,1492,25,1],[1493,8,1493,48,1],[1494,6,1494,7,1],[1495,5,1495,6,1],[1496,4,1496,5,1],[1497,4,1497,42,1],[1498,4,1498,5,1],[1499,5,1499,35,1],[1499,36,1499,74,1],[1500,5,1500,17,0],[1502,4,1502,16,1],[1503,3,1503,4,1],[1506,3,1506,4,1],[1507,4,1507,55,1],[1511,6,1511,39,0],[1511,40,1511,50,0],[1512,6,1512,12,0],[1515,6,1515,37,0],[1515,38,1515,47,0],[1516,6,1516,12,0],[1519,6,1519,38,0],[1519,39,1519,48,0],[1520,6,1520,12,0],[1523,6,1523,40,0],[1523,41,1523,51,0],[1524,6,1524,12,0],[1527,6,1527,36,1],[1527,37,1527,46,1],[1528,6,1528,12,0],[1531,6,1531,38,1],[1531,39,1531,49,1],[1532,6,1532,12,0],[1535,6,1535,37,1],[1535,38,1535,47,1],[1536,6,1536,12,0],[1539,6,1539,39,1],[1539,40,1539,50,1],[1540,6,1540,12,0],[1543,6,1543,38,1],[1543,39,1543,48,1],[1544,6,1544,12,0],[1547,6,1547,39,1],[1547,40,1547,49,1],[1548,6,1548,12,0],[1551,6,1551,40,1],[1551,41,1551,50,1],[1552,6,1552,12,0],[1554,4,1554,16,1],[1555,3,1555,4,1],[1558,3,1558,4,0],[1559,4,1559,20,0],[1560,4,1560,5,0],[1561,5,1563,82,0],[1564,5,1564,33,0],[1564,34,1564,84,0],[1565,4,1565,5,0],[1566,4,1566,16,0],[1567,3,1567,4,0],[1570,3,1570,4,1],[1571,4,1571,25,1],[1571,26,1571,38,0],[1572,4,1572,28,1],[1572,29,1572,68,1],[1573,4,1573,41,1],[1574,4,1574,41,1],[1575,4,1575,37,1],[1575,38,1575,51,1],[1576,4,1576,69,1],[1577,4,1577,69,1],[1578,4,1578,15,1],[1581,6,1581,17,0],[1590,8,1590,20,0],[1592,6,1592,12,0],[1594,6,1594,17,0],[1606,8,1606,20,0],[1608,6,1608,12,0],[1610,6,1610,17,0],[1618,8,1618,20,0],[1620,6,1620,12,0],[1622,6,1622,17,0],[1632,8,1632,20,0],[1634,6,1634,12,0],[1636,6,1636,17,1],[1643,8,1643,20,1],[1645,6,1645,12,1],[1647,6,1647,17,1],[1655,8,1655,20,0],[1657,6,1657,12,1],[1659,6,1659,17,1],[1665,8,1665,20,0],[1667,6,1667,12,1],[1669,6,1669,17,1],[1675,8,1675,20,0],[1677,6,1677,12,1],[1679,6,1679,17,1],[1683,8,1683,20,0],[1685,6,1685,12,1],[1687,6,1687,19,1],[1687,20,1687,32,1],[1688,6,1688,12,1],[1690,4,1690,17,1],[1691,3,1691,4,1],[1694,3,1694,4,1],[1695,4,1695,24,1],[1696,9,1696,18,1],[1696,20,1696,35,1],[1696,37,1696,40,1],[1697,4,1697,5,1],[1698,5,1700,64,1],[1701,5,1701,15,1],[1701,16,1701,29,1],[1702,5,1702,15,1],[1702,16,1702,30,1],[1703,4,1703,5,1],[1704,4,1704,18,1],[1705,3,1705,4,1],[1711,3,1711,4,1],[1712,4,1712,17,1],[1712,18,1712,27,0],[1713,4,1713,16,1],[1713,17,1713,26,1],[1714,4,1714,16,1],[1714,17,1714,27,1],[1715,4,1715,41,1],[1716,4,1716,41,1],[1717,4,1717,22,1],[1717,23,1717,32,1],[1718,4,1718,22,1],[1718,23,1718,33,1],[1719,4,1719,63,1],[1719,64,1719,73,1],[1720,4,1720,63,1],[1720,64,1720,74,1],[1721,4,1721,13,0],[1722,3,1722,4,1],[1725,3,1725,4,0],[1726,4,1726,71,0],[1727,3,1727,4,0],[1730,3,1730,4,1],[1731,4,1731,29,1],[1731,31,1731,52,1],[1732,4,1732,32,1],[1733,4,1733,33,1],[1734,4,1734,38,1],[1734,40,1734,59,1],[1735,4,1735,44,1],[1737,4,1737,111,1],[1738,4,1738,5,1],[1739,5,1739,25,1],[1740,4,1740,5,1],[1742,4,1742,113,1],[1743,4,1743,5,0],[1744,5,1744,26,0],[1745,4,1745,5,0],[1747,4,1747,39,1],[1748,4,1748,5,1],[1749,5,1749,87,1],[1750,5,1750,65,1],[1751,5,1751,37,1],[1752,5,1752,6,1],[1754,6,1754,106,1],[1755,6,1755,86,1],[1756,5,1756,6,1],[1757,5,1757,69,1],[1758,5,1758,6,0],[1759,6,1759,106,0],[1760,6,1760,84,0],[1761,5,1761,6,0],[1762,4,1762,5,1],[1763,4,1763,39,1],[1764,4,1764,5,0],[1765,5,1765,88,0],[1766,5,1766,66,0],[1767,5,1767,36,0],[1768,5,1768,6,0],[1770,6,1770,108,0],[1771,6,1771,86,0],[1772,5,1772,6,0],[1773,5,1773,35,0],[1774,5,1774,6,0],[1775,6,1775,108,0],[1776,6,1776,84,0],[1777,5,1777,6,0],[1778,4,1778,5,0],[1779,4,1779,31,1],[1780,4,1780,38,1],[1781,4,1781,5,0],[1782,5,1782,6,0],[1783,6,1783,52,0],[1784,6,1784,54,0],[1785,6,1785,71,0],[1786,6,1786,73,0],[1787,6,1787,76,0],[1788,6,1788,7,0],[1789,7,1789,28,0],[1790,7,1790,48,0],[1791,7,1791,8,0],[1792,8,1792,48,0],[1794,8,1794,53,0],[1795,8,1795,9,0],[1796,9,1796,115,0],[1798,8,1798,52,0],[1799,8,1799,9,0],[1800,9,1800,114,0],[1803,7,1803,8,0],[1804,6,1804,7,0],[1806,6,1806,7,0],[1807,7,1807,48,0],[1808,7,1808,8,0],[1810,8,1810,82,0],[1811,8,1811,9,0],[1812,9,1812,85,0],[1813,9,1813,87,0],[1815,9,1815,42,0],[1816,9,1816,10,0],[1817,10,1817,27,0],[1818,10,1818,11,0],[1820,11,1820,33,0],[1821,11,1821,12,0],[1822,12,1822,94,0],[1823,12,1823,72,0],[1824,12,1824,60,0],[1825,11,1825,12,0],[1826,11,1826,93,0],[1829,11,1829,56,0],[1830,11,1830,12,0],[1831,12,1831,171,0],[1833,11,1833,55,0],[1834,11,1834,12,0],[1835,12,1835,171,0],[1837,10,1837,11,0],[1839,10,1839,11,0],[1841,11,1841,34,0],[1842,11,1842,12,0],[1843,12,1843,95,0],[1844,12,1844,73,0],[1845,12,1845,62,0],[1846,11,1846,12,0],[1847,11,1847,94,0],[1850,11,1850,56,0],[1851,11,1851,12,0],[1852,12,1852,171,0],[1854,11,1854,55,0],[1855,11,1855,12,0],[1856,12,1856,171,0],[1858,10,1858,11,0],[1860,9,1860,10,0],[1861,8,1861,9,0],[1862,7,1862,8,0],[1863,6,1863,7,0],[1864,5,1864,6,0],[1865,4,1865,5,0],[1867,4,1867,42,1],[1868,4,1868,5,0],[1872,5,1872,28,0],[1873,5,1873,6,0],[1874,6,1874,88,0],[1875,6,1875,66,0],[1876,5,1876,6,0],[1877,5,1877,53,0],[1878,4,1878,5,0],[1879,4,1879,44,1],[1880,4,1880,5,0],[1884,5,1884,28,0],[1885,5,1885,6,0],[1886,6,1886,89,0],[1887,6,1887,67,0],[1888,5,1888,6,0],[1889,5,1889,55,0],[1890,4,1890,5,0],[1891,4,1891,131,1],[1892,4,1892,5,0],[1894,5,1894,59,0],[1895,4,1895,5,0],[1896,4,1896,134,1],[1897,4,1897,5,0],[1899,5,1899,60,0],[1900,4,1900,5,0],[1902,4,1902,45,1],[1903,4,1903,53,1],[1904,4,1904,57,1],[1905,4,1905,27,1],[1908,6,1908,65,1],[1909,6,1909,12,1],[1911,6,1911,68,0],[1912,6,1912,12,0],[1914,6,1914,71,0],[1915,6,1915,12,0],[1917,6,1917,68,0],[1918,6,1918,12,0],[1920,6,1920,78,0],[1921,6,1921,12,0],[1923,6,1923,75,0],[1924,6,1924,12,0],[1926,6,1926,66,0],[1927,6,1927,77,0],[1929,6,1929,96,0],[1930,6,1930,7,0],[1931,7,1931,46,0],[1934,6,1934,7,0],[1935,7,1935,107,0],[1938,6,1938,94,0],[1939,6,1939,7,0],[1940,7,1940,45,0],[1943,6,1943,7,0],[1944,7,1944,106,0],[1947,6,1947,43,0],[1949,4,1949,38,1],[1950,4,1950,5,1],[1951,5,1951,128,1],[1952,5,1952,63,1],[1955,4,1955,5,1],[1956,5,1956,29,1],[1959,3,1959,4,1],[1962,3,1962,4,0],[1963,4,1963,74,0],[1964,3,1964,4,0],[1967,3,1967,4,0],[1968,4,1968,36,0],[1969,4,1969,5,0],[1970,5,1973,8,0],[1975,4,1975,77,0],[1976,3,1976,4,0],[1979,3,1979,4,0],[1980,4,1980,36,0],[1981,4,1981,5,0],[1982,5,1985,8,0],[1987,4,1987,84,0],[1988,3,1988,4,0],[1991,3,1991,4,0],[1992,4,1992,36,0],[1993,4,1993,5,0],[1994,5,1997,8,0],[1999,4,1999,74,0],[2000,3,2000,4,0],[2003,3,2003,4,0],[2004,4,2004,36,0],[2005,4,2005,5,0],[2006,5,2009,8,0],[2011,4,2011,81,0],[2012,3,2012,4,0],[2015,3,2015,4,0],[2016,4,2016,68,0],[2017,4,2017,5,0],[2018,5,2018,60,0],[2020,4,2020,39,0],[2021,3,2021,4,0],[2024,3,2024,4,0],[2025,4,2025,44,0],[2026,3,2026,4,0],[2029,3,2029,4,0],[2030,4,2033,28,0],[2034,3,2034,4,0],[2037,3,2037,4,0],[2038,4,2038,76,0],[2039,3,2039,4,0],[2042,3,2042,4,0],[2043,4,2043,98,0],[2044,3,2044,4,0],[2047,3,2047,4,1],[2048,4,2048,18,1],[2049,4,2049,50,1],[2050,3,2050,4,1],[2053,3,2053,4,1],[2054,4,2054,26,1],[2054,27,2054,37,1],[2055,4,2055,50,1],[2056,3,2056,4,1],[2059,3,2059,4,1],[2060,4,2060,33,1],[2060,34,2060,45,1],[2062,4,2062,27,1],[2063,4,2063,15,1],[2066,6,2066,17,0],[2067,6,2067,20,0],[2068,6,2068,7,0],[2069,7,2069,18,0],[2070,7,2070,36,0],[2071,6,2071,7,0],[2073,6,2073,7,0],[2074,7,2074,31,0],[2075,6,2075,7,0],[2076,6,2076,12,0],[2078,6,2078,17,0],[2079,6,2079,26,0],[2080,6,2080,12,0],[2082,6,2082,17,0],[2083,6,2083,20,0],[2084,6,2084,7,0],[2085,7,2085,18,0],[2086,7,2086,36,0],[2087,6,2087,7,0],[2089,6,2089,7,0],[2090,7,2090,30,0],[2091,6,2091,7,0],[2092,6,2092,12,0],[2094,6,2094,17,1],[2095,6,2095,28,1],[2096,6,2096,12,1],[2098,6,2098,17,1],[2099,6,2099,29,1],[2100,6,2100,12,1],[2102,6,2102,17,0],[2103,6,2103,27,0],[2104,6,2104,12,0],[2106,6,2106,17,0],[2107,6,2107,23,0],[2108,6,2108,12,0],[2110,6,2110,17,1],[2111,6,2111,24,1],[2112,6,2112,12,1],[2114,6,2114,17,0],[2115,6,2115,24,0],[2116,6,2116,12,0],[2118,6,2118,17,1],[2119,6,2119,22,1],[2120,6,2120,12,1],[2122,6,2122,17,0],[2123,6,2123,24,0],[2124,6,2124,12,0],[2126,6,2126,17,0],[2127,6,2127,24,0],[2128,6,2128,12,0],[2130,6,2130,17,0],[2131,6,2131,20,0],[2132,6,2132,7,0],[2133,7,2133,18,0],[2134,7,2134,33,0],[2135,6,2135,7,0],[2136,11,2136,25,0],[2137,6,2137,7,0],[2138,7,2138,18,0],[2139,7,2139,31,0],[2140,6,2140,7,0],[2142,6,2142,7,0],[2143,7,2143,28,0],[2144,6,2144,7,0],[2145,6,2145,12,0],[2147,6,2147,17,1],[2148,6,2148,20,1],[2149,6,2149,7,1],[2150,7,2150,18,1],[2151,7,2151,31,1],[2152,6,2152,7,1],[2154,6,2154,7,1],[2155,7,2155,25,1],[2156,6,2156,7,1],[2157,6,2157,12,1],[2159,6,2159,17,0],[2160,6,2160,20,0],[2161,6,2161,7,0],[2162,7,2162,18,0],[2163,7,2163,36,0],[2164,6,2164,7,0],[2166,6,2166,7,0],[2167,7,2167,31,0],[2168,6,2168,7,0],[2169,6,2169,12,0],[2171,6,2171,17,0],[2172,6,2172,27,0],[2173,6,2173,12,0],[2175,6,2175,17,0],[2176,6,2176,30,0],[2177,6,2177,12,0],[2179,6,2179,17,0],[2180,6,2180,31,0],[2181,6,2181,12,0],[2183,6,2183,17,0],[2184,6,2184,20,0],[2185,6,2185,7,0],[2186,7,2186,18,0],[2187,7,2187,29,0],[2188,6,2188,7,0],[2190,6,2190,7,0],[2191,7,2191,23,0],[2192,6,2192,7,0],[2193,6,2193,12,0],[2196,6,2196,22,1],[2198,6,2198,7,1],[2199,7,2199,18,1],[2200,7,2200,47,1],[2200,48,2200,59,1],[2201,7,2201,30,1],[2202,8,2202,65,0],[2203,7,2203,18,1],[2204,6,2204,7,1],[2204,8,2204,28,1],[2205,6,2205,32,1],[2206,6,2206,12,1],[2208,6,2208,54,1],[2209,6,2209,7,1],[2211,7,2211,8,1],[2212,8,2212,19,1],[2213,7,2213,8,1],[2213,9,2213,55,1],[2214,7,2214,30,1],[2215,7,2215,13,1],[2217,6,2217,27,1],[2218,6,2218,7,1],[2219,7,2219,34,1],[2221,7,2221,8,1],[2222,8,2222,19,1],[2223,7,2223,8,1],[2223,9,2223,34,1],[2224,7,2224,21,1],[2225,7,2225,8,0],[2226,8,2226,32,0],[2227,8,2227,19,0],[2228,8,2228,24,0],[2230,8,2230,9,0],[2231,9,2231,20,0],[2232,8,2232,9,0],[2232,10,2232,35,0],[2233,7,2233,8,0],[2234,7,2234,34,1],[2235,7,2235,8,0],[2236,8,2236,32,0],[2237,8,2237,19,0],[2238,8,2238,35,0],[2238,36,2238,47,0],[2239,8,2239,24,0],[2241,8,2241,9,0],[2242,9,2242,20,0],[2243,8,2243,9,0],[2243,10,2243,35,0],[2244,7,2244,8,0],[2245,7,2245,34,1],[2245,35,2245,46,0],[2246,7,2246,13,1],[2248,6,2248,29,1],[2249,6,2249,7,1],[2250,7,2250,23,1],[2251,7,2251,13,1],[2253,6,2253,58,0],[2255,4,2255,17,1],[2256,4,2256,62,1],[2257,4,2257,25,1],[2258,3,2258,4,1],[2261,3,2261,4,1],[2262,4,2262,111,1],[2263,3,2263,4,1],[2266,3,2266,4,1],[2267,4,2267,62,1],[2268,4,2268,27,1],[2269,4,2269,38,1],[2269,39,2269,60,1],[2270,4,2270,14,1],[2271,3,2271,4,1],[2274,3,2274,4,0],[2275,4,2275,26,0],[2275,27,2275,72,0],[2276,3,2276,4,0],[2279,3,2279,4,1],[2280,4,2280,22,1],[2280,23,2280,54,0],[2281,3,2281,4,1],[2284,3,2284,4,1],[2285,4,2285,22,1],[2285,23,2285,57,0],[2286,3,2286,4,1],[2289,3,2289,4,0],[2290,4,2290,47,0],[2291,3,2291,4,0],[2294,3,2294,4,0],[2295,4,2295,113,0],[2296,3,2296,4,0],[2299,3,2299,4,1],[2300,4,2300,100,1],[2301,4,2301,31,1],[2302,4,2302,33,1],[2303,4,2303,31,1],[2304,4,2304,32,1],[2305,4,2305,34,1],[2306,4,2306,34,1],[2307,4,2307,11,1],[2307,13,2307,22,1],[2307,23,2307,25,1],[2307,26,2307,41,1],[2307,43,2307,66,1],[2308,4,2308,13,1],[2309,3,2309,4,1]]);
+    </script>
+  </body>
+</html>

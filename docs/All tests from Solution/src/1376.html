@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Trees\ApplicationTreeController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Globalization;
+using System.Linq;
+using System.Management.Instrumentation;
+using System.Net;
+using System.Net.Http.Formatting;
+using System.Threading.Tasks;
+using System.Web.Http;
+using System.Web.Mvc;
+using Umbraco.Core;
+using Umbraco.Core.Models;
+using Umbraco.Core.Services;
+using Umbraco.Web.Models.Trees;
+using Umbraco.Web.Mvc;
+using Umbraco.Web.WebApi;
+using Umbraco.Web.WebApi.Filters;
+using Constants = Umbraco.Core.Constants;
+
+using umbraco;
+
+namespace Umbraco.Web.Trees
+{
+    [AngularJsonOnlyConfiguration]
+    [PluginController(&quot;UmbracoTrees&quot;)]
+    public class ApplicationTreeController : UmbracoAuthorizedApiController
+    {
+        /// &lt;summary&gt;
+        /// Returns the tree nodes for an application
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;application&quot;&gt;The application to load tree for&lt;/param&gt;
+        /// &lt;param name=&quot;tree&quot;&gt;An optional single tree alias, if specified will only load the single tree for the request app&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpQueryStringFilter(&quot;queryStrings&quot;)]
+        public async Task&lt;SectionRootNode&gt; GetApplicationTrees(string application, string tree, FormDataCollection queryStrings)
+        {
+            if (string.IsNullOrEmpty(application)) throw new HttpResponseException(HttpStatusCode.NotFound);
+
+            var rootId = Constants.System.Root.ToString(CultureInfo.InvariantCulture);
+
+            //find all tree definitions that have the current application alias
+            var appTrees = ApplicationContext.Current.Services.ApplicationTreeService.GetApplicationTrees(application, true).ToArray();
+
+            if (appTrees.Count() == 1 || string.IsNullOrEmpty(tree) == false )
+            {
+                var apptree = string.IsNullOrEmpty(tree) == false 
+                    ? appTrees.SingleOrDefault(x =&gt; x.Alias == tree)
+                    : appTrees.SingleOrDefault();
+
+                if (apptree == null) throw new HttpResponseException(HttpStatusCode.NotFound);
+
+                var result = await GetRootForSingleAppTree(
+                    apptree,
+                    Constants.System.Root.ToString(CultureInfo.InvariantCulture),
+                    queryStrings, 
+                    application);
+
+                return result;
+            }
+
+
+            var collection = new TreeNodeCollection();
+            foreach (var apptree in appTrees)
+            {
+                //return the root nodes for each tree in the app
+                var rootNode = await GetRootForMultipleAppTree(apptree, queryStrings);
+                //This could be null if the tree decides not to return it&#39;s root (i.e. the member type tree does this when not in umbraco membership mode)
+                if (rootNode != null)
+                {
+                    collection.Add(rootNode);     
+                }
+            }
+
+            var multiTree = SectionRootNode.CreateMultiTreeSectionRoot(rootId, collection);
+            multiTree.Name = ui.Text(&quot;sections&quot;, application);
+            return multiTree;
+        }
+
+        /// &lt;summary&gt;
+        /// Get the root node for an application with multiple trees
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;configTree&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private async Task&lt;TreeNode&gt; GetRootForMultipleAppTree(ApplicationTree configTree, FormDataCollection queryStrings)
+        {
+            if (configTree == null) throw new ArgumentNullException(&quot;configTree&quot;);
+            var byControllerAttempt = await configTree.TryGetRootNodeFromControllerTree(queryStrings, ControllerContext);
+            if (byControllerAttempt.Success)
+            {
+                return byControllerAttempt.Result;
+            }
+
+            var legacyAttempt = configTree.TryGetRootNodeFromLegacyTree(queryStrings, Url, configTree.ApplicationAlias);
+            if (legacyAttempt.Success)
+            {
+                return legacyAttempt.Result;
+            }
+
+            throw new ApplicationException(&quot;Could not get root node for tree type &quot; + configTree.Alias);
+        }
+
+        /// &lt;summary&gt;
+        /// Get the root node for an application with one tree
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;configTree&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private async Task&lt;SectionRootNode&gt; GetRootForSingleAppTree(ApplicationTree configTree, string id, FormDataCollection queryStrings, string application)
+        {
+            var rootId = Constants.System.Root.ToString(CultureInfo.InvariantCulture);
+            if (configTree == null) throw new ArgumentNullException(&quot;configTree&quot;);
+            var byControllerAttempt = configTree.TryLoadFromControllerTree(id, queryStrings, ControllerContext);
+            if (byControllerAttempt.Success)
+            {
+                var rootNode = await configTree.TryGetRootNodeFromControllerTree(queryStrings, ControllerContext);
+                if (rootNode.Success == false)
+                {
+                    //This should really never happen if we&#39;ve successfully got the children above.
+                    throw new InvalidOperationException(&quot;Could not create root node for tree &quot; + configTree.Alias);
+                }
+
+                var sectionRoot = SectionRootNode.CreateSingleTreeSectionRoot(
+                    rootId, 
+                    rootNode.Result.ChildNodesUrl, 
+                    rootNode.Result.MenuUrl, 
+                    rootNode.Result.Name,
+                    byControllerAttempt.Result);
+
+                foreach (var d in rootNode.Result.AdditionalData)
+                {
+                    sectionRoot.AdditionalData[d.Key] = d.Value;
+                }
+                return sectionRoot;
+
+            }
+            var legacyAttempt = configTree.TryLoadFromLegacyTree(id, queryStrings, Url, configTree.ApplicationAlias);
+            if (legacyAttempt.Success)
+            {
+                var sectionRoot = SectionRootNode.CreateSingleTreeSectionRoot(
+                   rootId,
+                   &quot;&quot;, //TODO: I think we&#39;ll need this in this situation!
+                   Url.GetUmbracoApiService&lt;LegacyTreeController&gt;(&quot;GetMenu&quot;, rootId)
+                        + &quot;&amp;parentId=&quot; + rootId
+                        + &quot;&amp;treeType=&quot; + application
+                        + &quot;&amp;section=&quot; + application,
+                   &quot;&quot;, //TODO: I think we&#39;ll need this in this situation!
+                   legacyAttempt.Result);
+
+                
+                sectionRoot.AdditionalData.Add(&quot;treeAlias&quot;, configTree.Alias);
+                return sectionRoot;
+            }
+
+            throw new ApplicationException(&quot;Could not render a tree for type &quot; + configTree.Alias);
+        }
+        
+
+    }
+
+    
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[36,9,36,10,0],[37,13,37,51,0],[37,52,37,109,0],[39,13,39,87,0],[42,13,42,136,0],[44,13,44,79,0],[45,13,45,14,0],[46,17,47,53,0],[47,53,47,68,0],[47,68,48,50,0],[46,17,48,50,0],[50,17,50,37,0],[50,38,50,95,0],[52,17,56,34,0],[58,17,58,31,0],[62,13,62,55,0],[63,13,63,20,0],[63,22,63,33,0],[63,34,63,36,0],[63,37,63,45,0],[64,13,64,14,0],[66,17,66,87,0],[68,17,68,38,0],[69,17,69,18,0],[70,21,70,46,0],[71,17,71,18,0],[72,13,72,14,0],[74,13,74,92,0],[75,13,75,63,0],[76,13,76,30,0],[77,9,77,10,0],[86,9,86,10,0],[87,13,87,36,0],[87,37,87,83,0],[88,13,88,122,0],[89,13,89,45,0],[90,13,90,14,0],[91,17,91,51,0],[94,13,94,121,0],[95,13,95,39,0],[96,13,96,14,0],[97,17,97,45,0],[100,13,100,105,0],[101,9,101,10,0],[111,9,111,10,0],[112,13,112,87,0],[113,13,113,36,0],[113,37,113,83,0],[114,13,114,113,0],[115,13,115,45,0],[116,13,116,14,0],[117,17,117,115,0],[118,17,118,47,0],[119,17,119,18,0],[121,21,121,116,0],[124,17,129,49,0],[131,17,131,24,0],[131,26,131,31,0],[131,32,131,34,0],[131,35,131,65,0],[132,17,132,18,0],[133,21,133,65,0],[134,17,134,18,0],[135,17,135,36,0],[138,13,138,118,0],[139,13,139,39,0],[140,13,140,14,0],[141,17,149,42,0],[152,17,152,79,0],[153,17,153,36,0],[156,13,156,100,0],[157,9,157,10,0]]);
+    </script>
+  </body>
+</html>

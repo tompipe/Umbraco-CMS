@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\Publishing\PublishingStrategyTests.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using NUnit.Framework;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Events;
+using Umbraco.Core.IO;
+using Umbraco.Core.Models;
+using Umbraco.Core.ObjectResolution;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Publishing;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Tests.TestHelpers.Entities;
+using umbraco.editorControls.tinyMCE3;
+using umbraco.interfaces;
+using System.Linq;
+
+namespace Umbraco.Tests.Publishing
+{
+    [DatabaseTestBehavior(DatabaseBehavior.NewDbFileAndSchemaPerTest)]
+    [TestFixture]
+    public class PublishingStrategyTests : BaseDatabaseFactoryTest
+    {
+        [SetUp]
+        public override void Initialize()
+        {
+            base.Initialize();
+
+            //LegacyUmbracoSettings.SettingsFilePath = IOHelper.MapPath(SystemDirectories.Config + Path.DirectorySeparatorChar, false);              
+        }
+
+        [TearDown]
+        public override void TearDown()
+        {
+			base.TearDown();
+            
+            //ensure event handler is gone
+            PublishingStrategy.Publishing -= PublishingStrategyPublishing;            
+        }
+
+        private IContent _homePage;
+
+        /// &lt;summary&gt;
+        /// in these tests we have a heirarchy of 
+        /// - home
+        /// -- text page 1
+        /// -- text page 2
+        /// --- text page 3
+        /// 
+        /// For this test, none of them are published, then we bulk publish them all, however one of the nodes will fail publishing
+        /// because it is not valid, then it&#39;s children won&#39;t be published either because it&#39;s never been published.
+        /// &lt;/summary&gt;
+        [Test]
+        public void Publishes_Many_Ignores_Invalid_Items_And_Children()
+        {
+            var testData = CreateTestData();
+            //Create some other data which are descendants of Text Page 2
+            var mandatorContent = MockedContent.CreateSimpleContent(
+                ServiceContext.ContentTypeService.GetContentType(&quot;umbMandatory&quot;), &quot;Invalid Content&quot;, testData.Single(x =&gt; x.Name == &quot;Text Page 2&quot;).Id);
+            mandatorContent.SetValue(&quot;author&quot;, string.Empty);
+            ServiceContext.ContentService.Save(mandatorContent, 0);
+            var subContent = MockedContent.CreateSimpleContent(
+                ServiceContext.ContentTypeService.GetContentType(&quot;umbTextpage&quot;), &quot;Sub Sub Sub&quot;, mandatorContent.Id);
+            ServiceContext.ContentService.Save(subContent, 0);
+            
+            var strategy = new PublishingStrategy(new TransientMessagesFactory(), Logger);
+
+            //publish root and nodes at it&#39;s children level
+            var listToPublish = ServiceContext.ContentService.GetDescendants(_homePage.Id).Concat(new[] { _homePage });
+            var result = strategy.PublishWithChildrenInternal(listToPublish, 0, true);
+
+            Assert.AreEqual(listToPublish.Count() - 2, result.Count(x =&gt; x.Success));
+            Assert.IsTrue(result.Where(x =&gt; x.Success).Select(x =&gt; x.Result.ContentItem.Id)
+                                .ContainsAll(listToPublish.Where(x =&gt; x.Name != &quot;Invalid Content&quot; &amp;&amp; x.Name != &quot;Sub Sub Sub&quot;).Select(x =&gt; x.Id)));
+        }
+
+        /// &lt;summary&gt;
+        /// in these tests we have a heirarchy of 
+        /// - home
+        /// -- text page 1
+        /// -- text page 2
+        /// --- text page 3
+        /// 
+        /// For this test, none of them are published, then we bulk publish them all, however we cancel the publishing for
+        /// &quot;text page 2&quot;. This internally will ensure that text page 3 doesn&#39;t get published either because text page 2 has 
+        /// never been published.
+        /// &lt;/summary&gt;
+        [Test]
+        public void Publishes_Many_Ignores_Cancelled_Items_And_Children()
+        {
+            CreateTestData();
+
+            var strategy = new PublishingStrategy(new TransientMessagesFactory(), Logger);
+
+
+            PublishingStrategy.Publishing +=PublishingStrategyPublishing;
+
+            //publish root and nodes at it&#39;s children level
+            var listToPublish = ServiceContext.ContentService.GetDescendants(_homePage.Id).Concat(new[] {_homePage});
+            var result = strategy.PublishWithChildrenInternal(listToPublish, 0);
+            
+            Assert.AreEqual(listToPublish.Count() - 2, result.Count(x =&gt; x.Success));
+            Assert.IsTrue(result.Where(x =&gt; x.Success).Select(x =&gt; x.Result.ContentItem.Id)
+                                .ContainsAll(listToPublish.Where(x =&gt; x.Name != &quot;Text Page 2&quot; &amp;&amp; x.Name != &quot;Text Page 3&quot;).Select(x =&gt; x.Id)));
+        }
+
+        static void PublishingStrategyPublishing(IPublishingStrategy sender, PublishEventArgs&lt;IContent&gt; e)
+        {
+            foreach (var i in e.PublishedEntities.Where(i =&gt; i.Name == &quot;Text Page 2&quot;))
+            {
+                e.Cancel = true;
+            }
+        }
+
+        [Test]
+        public void Publishes_Many_Ignores_Unpublished_Items()
+        {
+            CreateTestData();
+
+            var strategy = new PublishingStrategy(new TransientMessagesFactory(), Logger);
+
+            //publish root and nodes at it&#39;s children level
+            var result1 = strategy.Publish(_homePage, 0);
+            Assert.IsTrue(result1);
+            Assert.IsTrue(_homePage.Published);
+            foreach (var c in ServiceContext.ContentService.GetChildren(_homePage.Id))
+            {
+                var r = strategy.Publish(c, 0);    
+                Assert.IsTrue(r);
+                Assert.IsTrue(c.Published);
+            }
+
+            //ok, all are published except the deepest descendant, we will pass in a flag to not include it to 
+            //be published
+            var result = strategy.PublishWithChildrenInternal(
+                ServiceContext.ContentService.GetDescendants(_homePage).Concat(new[] {_homePage}), 0, false);
+            //all of them will be SuccessAlreadyPublished unless the unpublished one gets included, in that case
+            //we&#39;ll have a &#39;Success&#39; result which we don&#39;t want.
+            Assert.AreEqual(0, result.Count(x =&gt; x.Result.StatusType == PublishStatusType.Success));
+        }
+
+        [Test]
+        public void Publishes_Many_Does_Not_Ignore_Unpublished_Items()
+        {
+            CreateTestData();
+
+            var strategy = new PublishingStrategy(new TransientMessagesFactory(), Logger);
+
+            //publish root and nodes at it&#39;s children level
+            var result1 = strategy.Publish(_homePage, 0);
+            Assert.IsTrue(result1);
+            Assert.IsTrue(_homePage.Published);
+            
+            //NOTE (MCH) This isn&#39;t persisted, so not really a good test as it will look like the result should be something else.
+            foreach (var c in ServiceContext.ContentService.GetChildren(_homePage.Id))
+            {
+                var r = strategy.Publish(c, 0);
+                Assert.IsTrue(r);
+                Assert.IsTrue(c.Published);
+            }
+
+            //NOTE (MCH) when doing the test like this the Publish status will not actually have been persisted
+            //since its only updating a property. The actual persistence and publishing is done through the ContentService.
+            //So when descendants are fetched from the ContentService the Publish status will be &quot;reset&quot;, which
+            //means the result will be 1 &#39;SuccessAlreadyPublished&#39; and 3 &#39;Success&#39; because the Homepage is
+            //inserted in the list and since that item has the status of already being Published it will be the one item
+            //with &#39;SuccessAlreadyPublished&#39;
+
+            var descendants = ServiceContext.ContentService.GetDescendants(_homePage).Concat(new[] {_homePage});
+            var result = strategy.PublishWithChildrenInternal(descendants, 0, true);
+            
+            Assert.AreEqual(3, result.Count(x =&gt; x.Result.StatusType == PublishStatusType.Success));
+            Assert.AreEqual(1, result.Count(x =&gt; x.Result.StatusType == PublishStatusType.SuccessAlreadyPublished));
+            Assert.IsTrue(result.First(x =&gt; x.Result.StatusType == PublishStatusType.Success).Success);
+            Assert.IsTrue(result.First(x =&gt; x.Result.StatusType == PublishStatusType.Success).Result.ContentItem.Published);
+        }
+
+        [NUnit.Framework.Ignore]
+        [Test]
+        public void Can_Publish_And_Update_Xml_Cache()
+        {
+            //TODO Create new test
+        }
+
+        public IEnumerable&lt;IContent&gt; CreateTestData()
+        {
+            //NOTE Maybe not the best way to create/save test data as we are using the services, which are being tested.
+
+            //Create and Save ContentType &quot;umbTextpage&quot; -&gt; 1045
+            ContentType contentType = MockedContentTypes.CreateSimpleContentType(&quot;umbTextpage&quot;, &quot;Textpage&quot;);
+            ServiceContext.ContentTypeService.Save(contentType);
+            var mandatoryType = MockedContentTypes.CreateSimpleContentType(&quot;umbMandatory&quot;, &quot;Mandatory Doc Type&quot;, true);
+            ServiceContext.ContentTypeService.Save(mandatoryType);
+
+            //Create and Save Content &quot;Homepage&quot; based on &quot;umbTextpage&quot; -&gt; 1046
+            _homePage = MockedContent.CreateSimpleContent(contentType);
+            ServiceContext.ContentService.Save(_homePage, 0);
+
+            //Create and Save Content &quot;Text Page 1&quot; based on &quot;umbTextpage&quot; -&gt; 1047
+            Content subpage = MockedContent.CreateSimpleContent(contentType, &quot;Text Page 1&quot;, _homePage.Id);
+            ServiceContext.ContentService.Save(subpage, 0);
+
+            //Create and Save Content &quot;Text Page 2&quot; based on &quot;umbTextpage&quot; -&gt; 1048
+            Content subpage2 = MockedContent.CreateSimpleContent(contentType, &quot;Text Page 2&quot;, _homePage.Id);
+            ServiceContext.ContentService.Save(subpage2, 0);
+
+            //Create and Save Content &quot;Text Page 3&quot; based on &quot;umbTextpage&quot; -&gt; 1048
+            Content subpage3 = MockedContent.CreateSimpleContent(contentType, &quot;Text Page 3&quot;, subpage2.Id);
+            ServiceContext.ContentService.Save(subpage3, 0);
+
+            return new[] {_homePage, subpage, subpage2, subpage3};
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[27,9,27,10,1],[28,13,28,31,1],[31,9,31,10,1],[35,9,35,10,1],[36,4,36,20,1],[39,13,39,75,1],[40,9,40,10,1],[56,9,56,10,1],[57,13,57,45,1],[59,13,60,123,1],[60,123,60,146,1],[60,146,60,152,1],[59,13,60,152,1],[61,13,61,62,1],[62,13,62,68,1],[63,13,64,117,1],[65,13,65,63,1],[67,13,67,91,1],[70,13,70,120,1],[71,13,71,87,1],[73,13,73,74,1],[73,74,73,83,1],[73,83,73,86,1],[73,13,73,86,1],[74,13,74,45,1],[74,45,74,54,1],[74,54,74,68,1],[74,68,74,91,1],[74,91,75,71,1],[75,71,75,125,1],[75,125,75,139,1],[75,139,75,143,1],[75,143,75,147,1],[74,13,75,147,1],[76,9,76,10,1],[91,9,91,10,1],[92,13,92,30,1],[94,13,94,91,1],[97,13,97,74,1],[100,13,100,118,1],[101,13,101,81,1],[103,13,103,74,1],[103,74,103,83,1],[103,83,103,86,1],[103,13,103,86,1],[104,13,104,45,1],[104,45,104,54,1],[104,54,104,68,1],[104,68,104,91,1],[104,91,105,71,1],[105,71,105,121,1],[105,121,105,135,1],[105,135,105,139,1],[105,139,105,143,1],[104,13,105,143,1],[106,9,106,10,1],[109,9,109,10,1],[110,13,110,20,1],[110,22,110,27,1],[110,28,110,30,1],[110,31,110,62,1],[110,62,110,85,1],[110,85,110,86,1],[110,31,110,86,1],[111,13,111,14,1],[112,17,112,33,1],[113,13,113,14,1],[114,9,114,10,1],[118,9,118,10,1],[119,13,119,30,1],[121,13,121,91,1],[124,13,124,58,1],[125,13,125,36,1],[126,13,126,48,1],[127,13,127,20,1],[127,22,127,27,1],[127,28,127,30,1],[127,31,127,86,1],[128,13,128,14,1],[129,17,129,48,1],[130,17,130,34,1],[131,17,131,44,1],[132,13,132,14,1],[136,13,137,110,1],[140,13,140,50,1],[140,50,140,98,1],[140,98,140,101,1],[140,13,140,101,1],[141,9,141,10,1],[145,9,145,10,1],[146,13,146,30,1],[148,13,148,91,1],[151,13,151,58,1],[152,13,152,36,1],[153,13,153,48,1],[156,13,156,20,1],[156,22,156,27,1],[156,28,156,30,1],[156,31,156,86,1],[157,13,157,14,1],[158,17,158,48,1],[159,17,159,34,1],[160,17,160,44,1],[161,13,161,14,1],[170,13,170,113,1],[171,13,171,85,1],[173,13,173,50,1],[173,50,173,98,1],[173,98,173,101,1],[173,13,173,101,1],[174,13,174,50,1],[174,50,174,114,1],[174,114,174,117,1],[174,13,174,117,1],[175,13,175,45,1],[175,45,175,93,1],[175,93,175,104,1],[175,13,175,104,1],[176,13,176,45,1],[176,45,176,93,1],[176,93,176,125,1],[176,13,176,125,1],[177,9,177,10,1],[182,9,182,10,0],[184,9,184,10,0],[187,9,187,10,1],[191,13,191,109,1],[192,13,192,65,1],[193,13,193,120,1],[194,13,194,67,1],[197,13,197,72,1],[198,13,198,62,1],[201,13,201,107,1],[202,13,202,60,1],[205,13,205,108,1],[206,13,206,61,1],[209,13,209,107,1],[210,13,210,61,1],[212,13,212,67,1],[213,9,213,10,1]]);
+    </script>
+  </body>
+</html>

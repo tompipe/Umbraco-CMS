@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\PropertyEditors\LabelPropertyEditor.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System.Collections.Generic;
+using System.Linq;
+using Newtonsoft.Json.Linq;
+using Umbraco.Core;
+using Umbraco.Core.Models;
+using Umbraco.Core.PropertyEditors;
+
+namespace Umbraco.Web.PropertyEditors
+{
+    [PropertyEditor(Constants.PropertyEditors.NoEditAlias, &quot;Label&quot;, &quot;readonlyvalue&quot;, Icon = &quot;icon-readonly&quot;)]
+    public class LabelPropertyEditor : PropertyEditor
+    {
+        protected override PropertyValueEditor CreateValueEditor()
+        {
+            return new LabelPropertyValueEditor(base.CreateValueEditor());
+        }
+
+        protected override PreValueEditor CreatePreValueEditor()
+        {
+            return new LabelPreValueEditor();
+        }
+
+        /// &lt;summary&gt;
+        /// Custom value editor to mark it as readonly
+        /// &lt;/summary&gt;
+        internal class LabelPropertyValueEditor : PropertyValueEditorWrapper
+        {
+            public LabelPropertyValueEditor(PropertyValueEditor wrapped)
+                : base(wrapped)
+            {
+            }
+
+            /// &lt;summary&gt;
+            /// This editor is for display purposes only, any values bound to it will not be saved back to the database
+            /// &lt;/summary&gt;
+            public override bool IsReadOnly
+            {
+                get { return true; }
+            }
+        }
+
+        internal class LabelPreValueEditor : PreValueEditor
+        {
+            private const string LegacyPropertyEditorValuesKey = &quot;values&quot;;
+
+            public LabelPreValueEditor()
+            {
+                Fields.Add(new PreValueField()
+                {
+                    HideLabel = true,
+                    View = &quot;readonlykeyvalues&quot;,
+                    Key = LegacyPropertyEditorValuesKey
+                });
+
+                ValueType = PropertyEditorValueTypes.String;
+            }
+
+            [PreValueField(Constants.PropertyEditors.PreValueKeys.DataValueType, &quot;Value type&quot;, &quot;valuetype&quot;)]
+            public string ValueType { get; set; }
+
+            /// &lt;summary&gt;
+            /// Other than for the pre-value fields defined on this property editor, chuck all the values into one field so devs can see what is stored there.
+            /// We want this in case we&#39;ve converted a legacy property editor over to a label as we should still show the pre-values stored for the data type.
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;defaultPreVals&quot;&gt;&lt;/param&gt;
+            /// &lt;param name=&quot;persistedPreVals&quot;&gt;&lt;/param&gt;
+            /// &lt;returns&gt;&lt;/returns&gt;
+            public override IDictionary&lt;string, object&gt; ConvertDbToEditor(IDictionary&lt;string, object&gt; defaultPreVals, PreValueCollection persistedPreVals)
+            {
+                var existing = base.ConvertDbToEditor(defaultPreVals, persistedPreVals);
+
+                // Check for a saved value type.  If not found set to default string type.
+                var valueType = PropertyEditorValueTypes.String;
+                if (existing.ContainsKey(Constants.PropertyEditors.PreValueKeys.DataValueType))
+                {
+                    valueType = (string)existing[Constants.PropertyEditors.PreValueKeys.DataValueType];
+                }
+
+                // Convert any other values from a legacy property editor to a list, easier to enumerate on the editor.
+                // Make sure to exclude values defined on the label property editor itself.
+                var asList = existing
+                    .Select(e =&gt; new KeyValuePair&lt;string, object&gt;(e.Key, e.Value))
+                    .Where(e =&gt; e.Key != Constants.PropertyEditors.PreValueKeys.DataValueType)
+                    .ToList();
+
+                var result = new Dictionary&lt;string, object&gt; { { Constants.PropertyEditors.PreValueKeys.DataValueType, valueType } };
+                if (asList.Any())
+                {
+                    result.Add(LegacyPropertyEditorValuesKey, asList);
+                }
+
+                return result;
+            }
+
+            /// &lt;summary&gt;
+            /// When saving we want to avoid saving an empty &quot;legacy property editor values&quot; field if there are none.
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;editorValue&quot;&gt;&lt;/param&gt;
+            /// &lt;param name=&quot;currentValue&quot;&gt;&lt;/param&gt;
+            /// &lt;returns&gt;&lt;/returns&gt;
+            public override IDictionary&lt;string, PreValue&gt; ConvertEditorToDb(IDictionary&lt;string, object&gt; editorValue, PreValueCollection currentValue)
+            {
+                // notes (from the PR):
+                //
+                // &quot;All stemmed from the fact that even though the label property editor could have pre-values (from a legacy type),
+                // they couldn&#39;t up to now be edited and saved through the UI. Now that a &quot;true&quot; pre-value has been added, it can,
+                // which led to some odd behaviour.
+                //
+                // Firstly there would be a pre-value record saved for legacy values even if there aren&#39;t any (the key would exist
+                // but with no value). In that case I remove that pre-value so it&#39;s not saved(likely does no harm, but it&#39;s not
+                // necessary - we only need this legacy values pre-value record if there are any).
+                //
+                // Secondly if there are legacy values, I found on each save the JSON structure containing them would get repeatedly
+                // nested (an outer JSON wrapper would be added each time). So what I&#39;m doing is if there are legacy pre-values,
+                // I&#39;m converting what comes in &quot;wrapped&quot; like (below) into the legacy property editor values.&quot;
+
+                if (editorValue.ContainsKey(LegacyPropertyEditorValuesKey))
+                {
+                    // If provided value contains an empty legacy property editor values, don&#39;t save it
+                    if (editorValue[LegacyPropertyEditorValuesKey] == null)
+                    {
+                        editorValue.Remove(LegacyPropertyEditorValuesKey);
+                    }
+                    else
+                    {
+                        // If provided value contains legacy property editor values, unwrap the value to save so it doesn&#39;t get repeatedly nested on saves.
+                        // This is a bit funky - but basically needing to parse out the original value from a JSON structure that is passed in
+                        // looking like:
+                        //   Value = {[
+                        //   {
+                        //      &quot;Key&quot;: &quot;values&quot;,
+                        //      &quot;Value&quot;: {
+                        //          &lt;legacy property editor values&gt;
+                        //      }}
+                        //   ]}
+                        var values = editorValue[LegacyPropertyEditorValuesKey] as JArray;
+                        if (values != null &amp;&amp; values.Count == 1 &amp;&amp; values.First.Values().Count() == 2)
+                        {
+                            editorValue[LegacyPropertyEditorValuesKey] = values.First.Values().Last();
+                        }
+                    }
+                }
+
+                return base.ConvertEditorToDb(editorValue, currentValue);
+            }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[14,9,14,10,1],[15,13,15,75,1],[16,9,16,10,1],[19,9,19,10,0],[20,13,20,46,0],[21,9,21,10,0],[29,19,29,32,1],[30,13,30,14,1],[31,13,31,14,1],[38,21,38,22,0],[38,23,38,35,0],[38,36,38,37,0],[46,13,46,41,0],[47,13,47,14,0],[48,17,53,20,0],[55,17,55,61,0],[56,13,56,14,0],[59,39,59,43,0],[59,44,59,48,0],[69,13,69,14,0],[70,17,70,89,0],[73,17,73,65,0],[74,17,74,96,0],[75,17,75,18,0],[76,21,76,104,0],[77,17,77,18,0],[81,17,82,34,0],[82,34,82,82,0],[82,82,83,33,0],[83,33,83,94,0],[83,94,84,31,0],[81,17,84,31,0],[86,17,86,133,0],[87,17,87,34,0],[88,17,88,18,0],[89,21,89,71,0],[90,17,90,18,0],[92,17,92,31,0],[93,13,93,14,0],[102,13,102,14,0],[117,17,117,76,0],[118,17,118,18,0],[120,21,120,76,0],[121,21,121,22,0],[122,25,122,75,0],[123,21,123,22,0],[125,21,125,22,0],[136,25,136,91,0],[137,25,137,103,0],[138,25,138,26,0],[139,29,139,103,0],[140,25,140,26,0],[141,21,141,22,0],[142,17,142,18,0],[144,17,144,74,0],[145,13,145,14,0]]);
+    </script>
+  </body>
+</html>

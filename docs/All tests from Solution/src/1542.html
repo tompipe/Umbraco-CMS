@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\ApplicationTreeService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Xml.Linq;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Events;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using File = System.IO.File;
+
+namespace Umbraco.Core.Services
+{
+    internal class ApplicationTreeService : IApplicationTreeService
+    {
+        private readonly ILogger _logger;
+        private readonly CacheHelper _cache;
+        private IEnumerable&lt;ApplicationTree&gt; _allAvailableTrees;
+        private volatile bool _isInitialized = false;
+        internal const string TreeConfigFileName = &quot;trees.config&quot;;
+        private static string _treeConfig;
+        private static readonly object Locker = new object();
+
+        public ApplicationTreeService(ILogger logger, CacheHelper cache)
+        {
+            _logger = logger;
+            _cache = cache;
+        }
+
+
+        /// &lt;summary&gt;
+        /// gets/sets the trees.config file path
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// The setter is generally only going to be used in unit tests, otherwise it will attempt to resolve it using the IOHelper.MapPath
+        /// &lt;/remarks&gt;
+        internal static string TreeConfigFilePath
+        {
+            get
+            {
+                if (string.IsNullOrWhiteSpace(_treeConfig))
+                {
+                    _treeConfig = IOHelper.MapPath(SystemDirectories.Config + &quot;/&quot; + TreeConfigFileName);
+                }
+                return _treeConfig;
+            }
+            set { _treeConfig = value; }
+        }
+
+        /// &lt;summary&gt;
+        /// The main entry point to get application trees
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This lazily on first access will scan for plugin trees and ensure the trees.config is up-to-date with the plugins. If plugins
+        /// haven&#39;t changed on disk then the file will not be saved. The trees are all then loaded from this config file into cache and returned.
+        /// &lt;/remarks&gt;
+        private List&lt;ApplicationTree&gt; GetAppTrees()
+        {
+            return _cache.RuntimeCache.GetCacheItem&lt;List&lt;ApplicationTree&gt;&gt;(
+                CacheKeys.ApplicationTreeCacheKey,
+                () =&gt;
+                {
+                    var list = ReadFromXmlAndSort();
+
+                    //On first access we need to do some initialization
+                    if (_isInitialized == false)
+                    {
+                        lock (Locker)
+                        {
+                            if (_isInitialized == false)
+                            {
+                                //now we can check the non-volatile flag
+                                if (_allAvailableTrees != null)
+                                {
+                                    var hasChanges = false;
+
+                                    LoadXml(doc =&gt;
+                                    {
+                                        //Now, load in the xml structure and update it with anything that is not declared there and save the file.
+
+                                        //NOTE: On the first iteration here, it will lazily scan all trees, etc... this is because this ienumerable is lazy
+                                        // based on the ApplicationTreeRegistrar - and as noted there this is not an ideal way to do things but were stuck like this
+                                        // currently because of the legacy assemblies and types not in the Core.
+
+                                        //Get all the trees not registered in the config (those not matching by alias casing will be detected as &quot;unregistered&quot;)
+                                        var unregistered = _allAvailableTrees
+                                            .Where(x =&gt; list.Any(l =&gt; l.Alias == x.Alias) == false)
+                                            .ToArray();
+
+                                        hasChanges = unregistered.Any();
+
+                                        if (hasChanges == false) return false;
+
+                                        //add or edit the unregistered ones and re-save the file if any changes were found
+                                        var count = 0;
+                                        foreach (var tree in unregistered)
+                                        {
+                                            var existingElement = doc.Root.Elements(&quot;add&quot;).SingleOrDefault(x =&gt;
+                                                string.Equals(x.Attribute(&quot;alias&quot;).Value, tree.Alias,
+                                                    StringComparison.InvariantCultureIgnoreCase) &amp;&amp;
+                                                string.Equals(x.Attribute(&quot;application&quot;).Value, tree.ApplicationAlias,
+                                                    StringComparison.InvariantCultureIgnoreCase));
+                                            if (existingElement != null)
+                                            {
+                                                existingElement.SetAttributeValue(&quot;alias&quot;, tree.Alias);
+                                            }
+                                            else
+                                            {
+                                                if (tree.Title.IsNullOrWhiteSpace())
+                                                {
+                                                    doc.Root.Add(new XElement(&quot;add&quot;,
+                                                        new XAttribute(&quot;initialize&quot;, tree.Initialize),
+                                                        new XAttribute(&quot;sortOrder&quot;, tree.SortOrder),
+                                                        new XAttribute(&quot;alias&quot;, tree.Alias),
+                                                        new XAttribute(&quot;application&quot;, tree.ApplicationAlias),                                                        
+                                                        new XAttribute(&quot;iconClosed&quot;, tree.IconClosed),
+                                                        new XAttribute(&quot;iconOpen&quot;, tree.IconOpened),
+                                                        new XAttribute(&quot;type&quot;, tree.Type)));
+                                                }
+                                                else
+                                                {
+                                                    doc.Root.Add(new XElement(&quot;add&quot;,
+                                                    new XAttribute(&quot;initialize&quot;, tree.Initialize),
+                                                    new XAttribute(&quot;sortOrder&quot;, tree.SortOrder),
+                                                    new XAttribute(&quot;alias&quot;, tree.Alias),
+                                                    new XAttribute(&quot;application&quot;, tree.ApplicationAlias),
+                                                    new XAttribute(&quot;title&quot;, tree.Title),
+                                                    new XAttribute(&quot;iconClosed&quot;, tree.IconClosed),
+                                                    new XAttribute(&quot;iconOpen&quot;, tree.IconOpened),
+                                                    new XAttribute(&quot;type&quot;, tree.Type)));
+                                                }
+                                                
+                                            }
+                                            count++;
+                                        }
+
+                                        //don&#39;t save if there&#39;s no changes
+                                        return count &gt; 0;
+                                    }, true);
+
+                                    if (hasChanges)
+                                    {
+                                        //If there were changes, we need to re-read the structures from the XML
+                                        list = ReadFromXmlAndSort();
+                                    }
+                                }
+
+                                _isInitialized = true;
+                            }
+                        }
+                    }
+                    return list;
+                }, new TimeSpan(0, 10, 0));
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes the service with any trees found in plugins
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;allAvailableTrees&quot;&gt;
+        /// A collection of all available tree found in assemblies in the application
+        /// &lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// This will update the trees.config with the found tree plugins that are not currently listed in the file when the first
+        /// access is made to resolve the tree collection
+        /// &lt;/remarks&gt;
+        public void Intitialize(IEnumerable&lt;ApplicationTree&gt; allAvailableTrees)
+        {
+            _allAvailableTrees = allAvailableTrees;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new application tree.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;initialize&quot;&gt;if set to &lt;c&gt;true&lt;/c&gt; [initialize].&lt;/param&gt;
+        /// &lt;param name=&quot;sortOrder&quot;&gt;The sort order.&lt;/param&gt;
+        /// &lt;param name=&quot;applicationAlias&quot;&gt;The application alias.&lt;/param&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;The alias.&lt;/param&gt;
+        /// &lt;param name=&quot;title&quot;&gt;The title.&lt;/param&gt;
+        /// &lt;param name=&quot;iconClosed&quot;&gt;The icon closed.&lt;/param&gt;
+        /// &lt;param name=&quot;iconOpened&quot;&gt;The icon opened.&lt;/param&gt;
+        /// &lt;param name=&quot;type&quot;&gt;The type.&lt;/param&gt;
+        public void MakeNew(bool initialize, byte sortOrder, string applicationAlias, string alias, string title, string iconClosed, string iconOpened, string type)
+        {
+            LoadXml(doc =&gt;
+            {
+                var el = doc.Root.Elements(&quot;add&quot;).SingleOrDefault(x =&gt; x.Attribute(&quot;alias&quot;).Value == alias &amp;&amp; x.Attribute(&quot;application&quot;).Value == applicationAlias);
+
+                if (el == null)
+                {
+                    doc.Root.Add(new XElement(&quot;add&quot;,
+                        new XAttribute(&quot;initialize&quot;, initialize),
+                        new XAttribute(&quot;sortOrder&quot;, sortOrder),
+                        new XAttribute(&quot;alias&quot;, alias),
+                        new XAttribute(&quot;application&quot;, applicationAlias),
+                        new XAttribute(&quot;title&quot;, title),
+                        new XAttribute(&quot;iconClosed&quot;, iconClosed),
+                        new XAttribute(&quot;iconOpen&quot;, iconOpened),
+                        new XAttribute(&quot;type&quot;, type)));
+                }
+
+                return true;
+
+            }, true);
+
+            OnNew(new ApplicationTree(initialize, sortOrder, applicationAlias, alias, title, iconClosed, iconOpened, type), new EventArgs());
+        }
+
+        /// &lt;summary&gt;
+        /// Saves this instance.
+        /// &lt;/summary&gt;
+        public void SaveTree(ApplicationTree tree)
+        {
+            LoadXml(doc =&gt;
+            {
+                var el = doc.Root.Elements(&quot;add&quot;).SingleOrDefault(x =&gt; x.Attribute(&quot;alias&quot;).Value == tree.Alias &amp;&amp; x.Attribute(&quot;application&quot;).Value == tree.ApplicationAlias);
+
+                if (el != null)
+                {
+                    el.RemoveAttributes();
+
+                    el.Add(new XAttribute(&quot;initialize&quot;, tree.Initialize));
+                    el.Add(new XAttribute(&quot;sortOrder&quot;, tree.SortOrder));
+                    el.Add(new XAttribute(&quot;alias&quot;, tree.Alias));
+                    el.Add(new XAttribute(&quot;application&quot;, tree.ApplicationAlias));
+                    el.Add(new XAttribute(&quot;title&quot;, tree.Title));
+                    el.Add(new XAttribute(&quot;iconClosed&quot;, tree.IconClosed));
+                    el.Add(new XAttribute(&quot;iconOpen&quot;, tree.IconOpened));
+                    el.Add(new XAttribute(&quot;type&quot;, tree.Type));
+                }
+
+                return true;
+
+            }, true);
+
+            OnUpdated(tree, new EventArgs());
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes this instance.
+        /// &lt;/summary&gt;
+        public void DeleteTree(ApplicationTree tree)
+        {
+            LoadXml(doc =&gt;
+            {
+                doc.Root.Elements(&quot;add&quot;)
+                    .Where(x =&gt; x.Attribute(&quot;application&quot;) != null
+                                &amp;&amp; x.Attribute(&quot;application&quot;).Value == tree.ApplicationAlias
+                                &amp;&amp; x.Attribute(&quot;alias&quot;) != null &amp;&amp; x.Attribute(&quot;alias&quot;).Value == tree.Alias).Remove();
+
+                return true;
+
+            }, true);
+
+            OnDeleted(tree, new EventArgs());
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an ApplicationTree by it&#39;s tree alias.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;treeAlias&quot;&gt;The tree alias.&lt;/param&gt;
+        /// &lt;returns&gt;An ApplicationTree instance&lt;/returns&gt;
+        public ApplicationTree GetByAlias(string treeAlias)
+        {
+            return GetAppTrees().Find(t =&gt; (t.Alias == treeAlias));
+
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all applicationTrees registered in umbraco from the umbracoAppTree table..
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;Returns a ApplicationTree Array&lt;/returns&gt;
+        public IEnumerable&lt;ApplicationTree&gt; GetAll()
+        {
+            return GetAppTrees().OrderBy(x =&gt; x.SortOrder);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the application tree for the applcation with the specified alias
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;applicationAlias&quot;&gt;The application alias.&lt;/param&gt;
+        /// &lt;returns&gt;Returns a ApplicationTree Array&lt;/returns&gt;
+        public IEnumerable&lt;ApplicationTree&gt; GetApplicationTrees(string applicationAlias)
+        {
+            return GetApplicationTrees(applicationAlias, false);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the application tree for the applcation with the specified alias
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;applicationAlias&quot;&gt;The application alias.&lt;/param&gt;
+        /// &lt;param name=&quot;onlyInitialized&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;Returns a ApplicationTree Array&lt;/returns&gt;
+        public IEnumerable&lt;ApplicationTree&gt; GetApplicationTrees(string applicationAlias, bool onlyInitialized)
+        {
+            var list = GetAppTrees().FindAll(
+                t =&gt;
+                {
+                    if (onlyInitialized)
+                        return (t.ApplicationAlias == applicationAlias &amp;&amp; t.Initialize);
+                    return (t.ApplicationAlias == applicationAlias);
+                }
+                );
+
+            return list.OrderBy(x =&gt; x.SortOrder).ToArray();
+        }
+
+        /// &lt;summary&gt;
+        /// Loads in the xml structure from disk if one is found, otherwise loads in an empty xml structure, calls the 
+        /// callback with the xml document and saves the structure back to disk if saveAfterCallback is true.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;callback&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;saveAfterCallbackIfChanges&quot;&gt;&lt;/param&gt;
+        internal void LoadXml(Func&lt;XDocument, bool&gt; callback, bool saveAfterCallbackIfChanges)
+        {
+            lock (Locker)
+            {
+                var doc = File.Exists(TreeConfigFilePath)
+                    ? XDocument.Load(TreeConfigFilePath)
+                    : XDocument.Parse(&quot;&lt;?xml version=\&quot;1.0\&quot;?&gt;&lt;trees /&gt;&quot;);
+
+                if (doc.Root != null)
+                {
+                    var hasChanges = callback.Invoke(doc);
+
+                    if (saveAfterCallbackIfChanges &amp;&amp; hasChanges
+                        //Don&#39;t save it if it is empty, in some very rare cases if the app domain get&#39;s killed in the middle of this process 
+                        // in some insane way the file saved will be empty. I&#39;m pretty sure it&#39;s not actually anything to do with the xml doc and
+                        // more about the IO trying to save the XML doc, but it doesn&#39;t hurt to check.
+                        &amp;&amp; doc.Root != null &amp;&amp; doc.Root.Elements().Any())
+                    {
+                        //ensures the folder exists
+                        Directory.CreateDirectory(Path.GetDirectoryName(TreeConfigFilePath));
+
+                        //saves it
+                        doc.Save(TreeConfigFilePath);
+
+                        //remove the cache now that it has changed  SD: I&#39;m leaving this here even though it
+                        // is taken care of by events as well, I think unit tests may rely on it being cleared here.
+                        _cache.RuntimeCache.ClearCacheItem(CacheKeys.ApplicationTreeCacheKey);
+                    }
+                }
+            }
+        }
+
+        private List&lt;ApplicationTree&gt; ReadFromXmlAndSort()
+        {
+            var list = new List&lt;ApplicationTree&gt;();
+
+            //read in the xml file containing trees and convert them all to ApplicationTree instances
+            LoadXml(doc =&gt;
+            {
+                foreach (var addElement in doc.Root.Elements(&quot;add&quot;).OrderBy(x =&gt;
+                {
+                    var sortOrderAttr = x.Attribute(&quot;sortOrder&quot;);
+                    return sortOrderAttr != null ? Convert.ToInt32(sortOrderAttr.Value) : 0;
+                }))
+                {
+                    var applicationAlias = (string)addElement.Attribute(&quot;application&quot;);
+                    var type = (string)addElement.Attribute(&quot;type&quot;);
+                    var assembly = (string)addElement.Attribute(&quot;assembly&quot;);
+
+                    var clrType = Type.GetType(type);
+                    if (clrType == null)
+                    {
+                        _logger.Warn&lt;ApplicationTreeService&gt;(&quot;The tree definition: &quot; + addElement.ToString() + &quot; could not be resolved to a .Net object type&quot;);
+                        continue;
+                    }
+
+                    //check if the tree definition (applicationAlias + type + assembly) is already in the list
+
+                    if (list.Any(tree =&gt; tree.ApplicationAlias.InvariantEquals(applicationAlias) &amp;&amp; tree.GetRuntimeType() == clrType) == false)
+                    {
+                        list.Add(new ApplicationTree(
+                                     addElement.Attribute(&quot;initialize&quot;) == null || Convert.ToBoolean(addElement.Attribute(&quot;initialize&quot;).Value),
+                                     addElement.Attribute(&quot;sortOrder&quot;) != null 
+                                        ? Convert.ToByte(addElement.Attribute(&quot;sortOrder&quot;).Value) 
+                                        : (byte)0,
+                                     (string)addElement.Attribute(&quot;application&quot;),
+                                     (string)addElement.Attribute(&quot;alias&quot;),
+                                     (string)addElement.Attribute(&quot;title&quot;),
+                                     (string)addElement.Attribute(&quot;iconClosed&quot;),
+                                     (string)addElement.Attribute(&quot;iconOpen&quot;),
+                                     (string)addElement.Attribute(&quot;type&quot;)));
+                    }
+                }
+
+                return false;
+
+            }, false);
+
+            return list;
+        }
+
+
+        internal static event TypedEventHandler&lt;ApplicationTree, EventArgs&gt; Deleted;
+        private static void OnDeleted(ApplicationTree app, EventArgs args)
+        {
+            if (Deleted != null)
+            {
+                Deleted(app, args);
+            }
+        }
+
+        internal static event TypedEventHandler&lt;ApplicationTree, EventArgs&gt; New;
+        private static void OnNew(ApplicationTree app, EventArgs args)
+        {
+            if (New != null)
+            {
+                New(app, args);
+            }
+        }
+
+        internal static event TypedEventHandler&lt;ApplicationTree, EventArgs&gt; Updated;
+        private static void OnUpdated(ApplicationTree app, EventArgs args)
+        {
+            if (Updated != null)
+            {
+                Updated(app, args);
+            }
+        }
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[20,9,20,54,1],[23,9,23,62,1],[25,9,25,73,1],[26,9,26,10,1],[27,13,27,30,1],[28,13,28,28,1],[29,9,29,10,1],[41,13,41,14,1],[42,17,42,60,1],[43,17,43,18,0],[44,21,44,105,0],[45,17,45,18,0],[46,17,46,36,1],[47,13,47,14,1],[48,17,48,18,1],[48,19,48,39,1],[48,40,48,41,1],[59,9,59,10,1],[60,13,63,17,1],[63,17,63,18,1],[63,18,64,21,1],[64,21,64,53,1],[64,53,67,21,1],[67,21,67,49,1],[67,49,68,21,1],[68,21,68,22,1],[68,22,69,25,1],[69,25,69,38,1],[69,38,70,25,1],[70,25,70,26,1],[70,26,71,29,1],[71,29,71,57,1],[71,57,72,29,1],[72,29,72,30,1],[72,30,74,33,1],[74,33,74,64,1],[74,64,75,33,1],[75,33,75,34,0],[75,34,76,37,1],[76,37,76,60,0],[76,60,78,37,1],[78,37,79,37,0],[79,37,79,38,0],[79,38,87,41,0],[87,41,88,57,0],[88,57,88,71,0],[88,71,88,89,0],[88,89,88,99,0],[88,57,88,99,0],[88,99,89,56,0],[87,41,89,56,0],[89,56,91,41,0],[91,41,91,73,0],[91,73,93,41,0],[93,41,93,65,0],[93,65,93,66,0],[93,66,93,79,0],[93,79,96,41,0],[96,41,96,55,0],[96,55,97,41,0],[97,41,97,48,0],[97,48,97,50,0],[97,50,97,58,0],[97,58,97,59,0],[97,59,97,61,0],[97,61,97,62,0],[97,62,97,74,0],[97,74,98,41,0],[98,41,98,42,0],[98,42,99,45,0],[99,45,100,49,0],[100,49,103,97,0],[103,97,103,99,0],[99,45,103,99,0],[103,99,104,45,0],[104,45,104,73,0],[104,73,105,45,0],[105,45,105,46,0],[105,46,106,49,0],[106,49,106,104,0],[106,104,107,45,0],[107,45,107,46,0],[107,46,109,45,0],[109,45,109,46,0],[109,46,110,49,0],[110,49,110,85,0],[110,85,111,49,0],[111,49,111,50,0],[111,50,112,53,0],[112,53,119,93,0],[119,93,120,49,0],[120,49,120,50,0],[120,50,122,49,0],[122,49,122,50,0],[122,50,123,53,0],[123,53,131,89,0],[131,89,132,49,0],[132,49,132,50,0],[132,50,134,45,0],[134,45,134,46,0],[134,46,135,45,0],[135,45,135,53,0],[135,53,136,41,0],[136,41,136,42,0],[136,42,139,41,0],[139,41,139,58,0],[139,58,140,37,0],[140,37,140,38,0],[140,38,140,46,0],[78,37,140,46,0],[140,46,142,37,1],[142,37,142,52,0],[142,52,143,37,1],[143,37,143,38,0],[143,38,145,41,1],[145,41,145,69,0],[145,69,146,37,1],[146,37,146,38,0],[146,38,147,33,1],[147,33,147,34,0],[147,34,149,33,1],[149,33,149,55,1],[149,55,150,29,1],[150,29,150,30,1],[150,30,151,25,1],[151,25,151,26,1],[151,26,152,21,1],[152,21,152,22,1],[152,22,153,21,1],[153,21,153,33,1],[153,33,154,17,1],[154,17,154,18,1],[154,18,154,44,1],[60,13,154,44,1],[155,9,155,10,1],[168,9,168,10,0],[169,13,169,52,0],[170,9,170,10,0],[184,9,184,10,1],[185,13,186,13,1],[186,13,186,14,1],[186,14,187,17,1],[187,17,187,72,1],[187,72,187,163,1],[187,163,187,165,1],[187,17,187,165,1],[187,165,189,17,1],[189,17,189,32,1],[189,32,190,17,1],[190,17,190,18,1],[190,18,191,21,1],[191,21,199,56,1],[199,56,200,17,1],[200,17,200,18,1],[200,18,202,17,1],[202,17,202,29,1],[202,29,204,13,1],[204,13,204,14,1],[204,14,204,22,1],[185,13,204,22,1],[206,13,206,142,1],[207,9,207,10,1],[213,9,213,10,0],[214,13,215,13,0],[215,13,215,14,0],[215,14,216,17,0],[216,17,216,72,0],[216,72,216,173,0],[216,173,216,175,0],[216,17,216,175,0],[216,175,218,17,0],[218,17,218,32,0],[218,32,219,17,0],[219,17,219,18,0],[219,18,220,21,0],[220,21,220,43,0],[220,43,222,21,0],[222,21,222,75,0],[222,75,223,21,0],[223,21,223,73,0],[223,73,224,21,0],[224,21,224,65,0],[224,65,225,21,0],[225,21,225,82,0],[225,82,226,21,0],[226,21,226,65,0],[226,65,227,21,0],[227,21,227,75,0],[227,75,228,21,0],[228,21,228,73,0],[228,73,229,21,0],[229,21,229,63,0],[229,63,230,17,0],[230,17,230,18,0],[230,18,232,17,0],[232,17,232,29,0],[232,29,234,13,0],[234,13,234,14,0],[234,14,234,22,0],[214,13,234,22,0],[236,13,236,46,0],[237,9,237,10,0],[243,9,243,10,1],[244,13,245,13,1],[245,13,245,14,1],[245,14,246,17,1],[246,17,247,33,1],[247,33,249,108,1],[249,108,249,119,1],[246,17,249,119,1],[249,119,251,17,1],[251,17,251,29,1],[251,29,253,13,1],[253,13,253,14,1],[253,14,253,22,1],[244,13,253,22,1],[255,13,255,46,1],[256,9,256,10,1],[264,9,264,10,1],[265,13,265,44,1],[265,44,265,66,1],[265,66,265,68,1],[265,13,265,68,1],[267,9,267,10,1],[274,9,274,10,0],[275,13,275,47,0],[275,47,275,58,0],[275,58,275,60,0],[275,13,275,60,0],[276,9,276,10,0],[284,9,284,10,1],[285,13,285,65,1],[286,9,286,10,1],[295,9,295,10,1],[296,13,298,17,1],[298,17,298,18,1],[298,18,299,21,1],[299,21,299,41,1],[299,41,300,25,1],[300,25,300,89,0],[300,89,301,21,1],[301,21,301,69,1],[301,69,302,17,1],[302,17,302,18,1],[302,18,303,19,1],[296,13,303,19,1],[305,13,305,38,1],[305,38,305,49,1],[305,49,305,61,1],[305,13,305,61,1],[306,9,306,10,1],[315,9,315,10,1],[316,13,316,26,1],[317,13,317,14,1],[318,17,320,75,1],[322,17,322,38,1],[323,17,323,18,1],[324,21,324,59,1],[326,21,330,74,1],[331,21,331,22,1],[333,25,333,94,1],[336,25,336,54,1],[340,25,340,95,1],[341,21,341,22,1],[342,17,342,18,1],[343,13,343,14,1],[344,9,344,10,1],[347,9,347,10,1],[348,13,348,52,1],[351,13,352,13,1],[352,13,352,14,1],[352,14,353,17,1],[353,17,353,24,1],[353,24,353,26,1],[353,26,353,40,1],[353,40,353,41,1],[353,41,353,43,1],[353,43,353,44,1],[353,44,354,17,1],[354,17,354,18,1],[354,18,355,21,1],[355,21,355,66,1],[355,66,356,21,1],[356,21,356,93,1],[356,93,357,17,1],[357,17,357,18,1],[357,18,357,19,1],[353,44,357,19,1],[357,19,358,17,1],[358,17,358,18,1],[358,18,359,21,1],[359,21,359,88,1],[359,88,360,21,1],[360,21,360,69,1],[360,69,361,21,1],[361,21,361,77,1],[361,77,363,21,1],[363,21,363,54,1],[363,54,364,21,1],[364,21,364,41,1],[364,41,365,21,1],[365,21,365,22,1],[365,22,366,25,1],[366,25,366,160,1],[366,160,367,25,1],[367,25,367,34,1],[367,34,372,21,1],[372,21,372,42,1],[372,42,372,133,1],[372,133,372,144,1],[372,21,372,144,1],[372,144,373,21,1],[373,21,373,22,1],[373,22,374,25,1],[374,25,384,77,1],[384,77,385,21,1],[385,21,385,22,1],[385,22,386,17,1],[386,17,386,18,1],[386,18,388,17,1],[388,17,388,30,1],[388,30,390,13,1],[390,13,390,14,1],[390,14,390,23,1],[351,13,390,23,1],[392,13,392,25,1],[393,9,393,10,1],[398,9,398,10,1],[399,13,399,33,1],[400,13,400,14,0],[401,17,401,36,0],[402,13,402,14,0],[403,9,403,10,1],[407,9,407,10,1],[408,13,408,29,1],[409,13,409,14,0],[410,17,410,32,0],[411,13,411,14,0],[412,9,412,10,1],[416,9,416,10,0],[417,13,417,33,0],[418,13,418,14,0],[419,17,419,36,0],[420,13,420,14,0],[421,9,421,10,0]]);
+    </script>
+  </body>
+</html>

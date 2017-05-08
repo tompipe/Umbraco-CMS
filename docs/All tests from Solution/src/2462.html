@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\datatype\DefaultData.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Linq;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+using umbraco.DataLayer;
+using umbraco.BusinessLogic;
+using umbraco.interfaces;
+using System.Xml;
+
+namespace umbraco.cms.businesslogic.datatype
+{
+    /// &lt;summary&gt;
+    /// Default implementation of the &lt;c&gt;IData&lt;/c&gt; interface that stores data inside the Umbraco database.
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;This class is no longer used and will be removed from the codebase in the future.&quot;)]
+    public class DefaultData : IData, IDataWithPreview, IDataValueSetter
+	{
+		private int _propertyId;
+		private object _value;
+		protected BaseDataType _dataType;
+        private bool _previewMode;
+        private bool _valueLoaded = false;
+		private Guid? _version = null;
+		private int? _nodeId = null;
+
+        /// &lt;summary&gt;
+        /// Unused, please do not use
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Obsolete, For querying the database use the new UmbracoDatabase object ApplicationContext.Current.DatabaseContext.Database&quot;, false)]
+        protected static ISqlHelper SqlHelper
+        {
+            get { return Application.SqlHelper; }
+        }
+
+        //TODO Refactor this class to use the Database object instead of the SqlHelper
+        //NOTE DatabaseContext.Current.Database should eventually be replaced with that from the Repository-Resolver refactor branch. 
+        internal static UmbracoDatabase Database
+        {
+            get { return ApplicationContext.Current.DatabaseContext.Database; }
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;DefaultData&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;DataType&quot;&gt;Type of the data.&lt;/param&gt;
+		public DefaultData(BaseDataType DataType)
+        {
+			_dataType = DataType;
+		}
+
+        /// &lt;summary&gt;
+        /// Initializes the object.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;InitValue&quot;&gt;The init value.&lt;/param&gt;
+        /// &lt;param name=&quot;InitPropertyId&quot;&gt;The init property id.&lt;/param&gt;
+        public virtual void Initialize(object InitValue, int InitPropertyId)
+        {
+            _propertyId = InitPropertyId;
+            _value = InitValue;
+        }
+
+        /// &lt;summary&gt;
+        /// This is here for performance reasons since in some cases we will have already resolved the value from the db
+        /// and want to just give this object the value so it doesn&#39;t go re-look it up from the database.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;val&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;strDbType&quot;&gt;&lt;/param&gt;
+        void IDataValueSetter.SetValue(object val, string strDbType)
+        {
+            //We need to ensure that val is not a null value, if it is then we&#39;ll convert this to an empty string.
+            //The reason for this is because by default the DefaultData.Value property returns an empty string when 
+            // there is no value, this is based on the PropertyDataDto.GetValue return value which defaults to an 
+            // empty string (which is called from this class&#39;s method LoadValueFromDatabase). 
+            //Some legacy implementations of DefaultData are expecting an empty string when there is 
+            // no value so we need to keep this consistent.
+            if (val == null)
+            {
+                val = string.Empty;
+            }
+
+            _value = val;
+            //now that we&#39;ve set our value, we can update our BaseDataType object with the correct values from the db
+            //instead of making it query for itself. This is a peformance optimization enhancement.
+            var dbType = BaseDataType.GetDBType(strDbType);
+            var fieldName = BaseDataType.GetDataFieldName(dbType);
+
+            //if misconfigured (datatype created in the tree, but save button never clicked), the datatype will be null
+            if(_dataType != null)
+                _dataType.SetDataTypeProperties(fieldName, dbType);
+
+            //ensures that it doesn&#39;t go back to the db
+            _valueLoaded = true;
+        }
+
+        /// &lt;summary&gt;
+        /// Loads the data value from the database.
+        /// &lt;/summary&gt;
+        protected internal virtual void LoadValueFromDatabase()
+        {
+            var sql = new Sql();
+            sql.Select(&quot;*&quot;)
+               .From&lt;PropertyDataDto&gt;()
+               .InnerJoin&lt;PropertyTypeDto&gt;()
+               .On&lt;PropertyTypeDto, PropertyDataDto&gt;(x =&gt; x.Id, y =&gt; y.PropertyTypeId)
+               .InnerJoin&lt;DataTypeDto&gt;()
+               .On&lt;DataTypeDto, PropertyTypeDto&gt;(x =&gt; x.DataTypeId, y =&gt; y.DataTypeId)
+               .Where&lt;PropertyDataDto&gt;(x =&gt; x.Id == _propertyId);
+            var dto = Database.Fetch&lt;PropertyDataDto, PropertyTypeDto, DataTypeDto&gt;(sql).FirstOrDefault();
+
+            if (dto != null &amp;&amp; _dataType != null)
+            {
+                //the type stored in the cmsDataType table
+                var strDbType = dto.PropertyTypeDto.DataTypeDto.DbType;
+                //get the enum of the data type
+                var dbType = BaseDataType.GetDBType(strDbType);
+                //get the column name in the cmsPropertyData table that stores the correct information for the data type
+                var fieldName = BaseDataType.GetDataFieldName(dbType);
+                //get the value for the data type, if null, set it to an empty string
+                _value = dto.GetValue;
+                //now that we&#39;ve set our value, we can update our BaseDataType object with the correct values from the db
+                //instead of making it query for itself. This is a peformance optimization enhancement.
+                _dataType.SetDataTypeProperties(fieldName, dbType);
+            }
+        }
+
+        internal string PropertyTypeAlias { get; set; }
+
+        public DBTypes DatabaseType
+        {
+            get
+            {
+                return _dataType.DBType;
+            }
+        }
+
+        public int DataTypeDefinitionId
+        {
+            get
+            {
+                return _dataType.DataTypeDefinitionId;
+            }
+        }
+
+		#region IData Members
+
+        /// &lt;summary&gt;
+        /// Converts the data to XML.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;data&quot;&gt;The data.&lt;/param&gt;
+        /// &lt;returns&gt;The data as XML.&lt;/returns&gt;
+		public virtual XmlNode ToXMl(XmlDocument data)
+		{
+            string sValue = Value!=null ? Value.ToString() : String.Empty;
+			if (_dataType.DBType == DBTypes.Ntext)
+                return data.CreateCDataSection(sValue);
+            return data.CreateTextNode(sValue);
+		}
+
+        /// &lt;summary&gt;
+        /// Gets or sets the value.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The value.&lt;/value&gt;
+        public virtual object Value 
+		{
+			get 
+			{
+                //Lazy load the value when it is required.
+                if (!_valueLoaded)
+                {
+                    LoadValueFromDatabase();
+                    _valueLoaded = true;
+                } 
+				return _value;
+			}
+			set 
+			{
+                _value = value;
+                _valueLoaded = true;
+			}
+		}
+
+        /// &lt;summary&gt;
+        /// Creates a new value.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;PropertyId&quot;&gt;The property id.&lt;/param&gt;
+		public virtual void MakeNew(int PropertyId)
+		{
+			// this default implementation of makenew does not do anything s�nce 
+			// it uses the default datastorage of umbraco, and the row is already populated by the &quot;property&quot; object
+			// If the datatype needs to have a default value, inherit this class and override this method.
+		}
+
+        /// &lt;summary&gt;
+        /// Deletes this instance.
+        /// &lt;/summary&gt;
+        public virtual void Delete()
+        {
+			// this default implementation of delete does not do anything s�nce 
+			// it uses the default datastorage of umbraco, and the row is already deleted by the &quot;property&quot; object
+		}
+
+        /// &lt;summary&gt;
+        /// Gets or sets the property id.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The property id.&lt;/value&gt;
+        public virtual int PropertyId
+		{
+			get
+            {
+				return _propertyId;
+			}
+			set
+			{
+				_propertyId = value;
+                //LoadValueFromDatabase();
+			}
+		}
+		
+		// TODO: clean up Legacy - these are needed by the wysiwyeditor, in order to feed the richtextholder with version and nodeid
+		// solution, create a new version of the richtextholder, which does not depend on these.
+        public virtual Guid Version
+        {
+			get
+			{
+				if (_version == null)
+				{
+					var dto = Database.FirstOrDefault&lt;PropertyDataDto&gt;(&quot;WHERE id = @Id&quot;, new { Id = PropertyId });
+					_version = dto.VersionId.HasValue ? dto.VersionId.Value : Guid.Empty;	
+				}
+				return _version.Value;
+			}
+		}
+
+        /// &lt;summary&gt;
+        /// Gets the node id.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The node id.&lt;/value&gt;
+        public virtual int NodeId
+        {
+			get
+			{
+				if (_nodeId == null)
+				{
+					_nodeId = Database.ExecuteScalar&lt;int&gt;(&quot;Select contentNodeid from cmsPropertyData where id = @Id&quot;, new { Id = PropertyId });	
+				}
+				return _nodeId.Value;
+			}
+            internal set { _nodeId = value; }
+		}
+
+		#endregion
+
+        #region IDataWithPreview Members
+
+        /// &lt;summary&gt;
+        /// Gets or sets a value indicating whether preview mode is switched on.
+        /// In preview mode, the &lt;see cref=&quot;Value&quot;/&gt; setter saves to a temporary location
+        /// instead of persistent storage, which the getter also reads from on subsequent access.
+        /// Switching off preview mode restores the persistent value.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;&lt;c&gt;true&lt;/c&gt; if preview mode is switched on; otherwise, &lt;c&gt;false&lt;/c&gt;.&lt;/value&gt;
+        public virtual bool PreviewMode
+        {
+            get
+            {
+                return _previewMode;
+            }
+            set
+            {
+                if (_previewMode != value)
+                {
+                    // if preview mode is switched off, reload the value from persistent storage
+                    if (!value)
+                        LoadValueFromDatabase();
+                    _previewMode = value;
+                }
+            }
+        }
+
+        #endregion
+
+        
+    }	
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,9,24,43,0],[25,3,25,33,0],[26,3,26,31,0],[34,17,34,18,0],[34,19,34,48,0],[34,49,34,50,0],[41,17,41,18,0],[41,19,41,78,0],[41,79,41,80,0],[48,3,48,44,0],[49,9,49,10,0],[50,4,50,25,0],[51,3,51,4,0],[59,9,59,10,0],[60,13,60,42,0],[61,13,61,32,0],[62,9,62,10,0],[71,9,71,10,0],[78,13,78,29,0],[79,13,79,14,0],[80,17,80,36,0],[81,13,81,14,0],[83,13,83,26,0],[86,13,86,60,0],[87,13,87,67,0],[90,13,90,34,0],[91,17,91,68,0],[94,13,94,33,0],[95,9,95,10,0],[101,9,101,10,0],[102,13,102,33,0],[103,13,109,66,0],[110,13,110,107,0],[112,13,112,50,0],[113,13,113,14,0],[115,17,115,72,0],[117,17,117,64,0],[119,17,119,71,0],[121,17,121,39,0],[124,17,124,68,0],[125,13,125,14,0],[126,9,126,10,0],[128,45,128,49,0],[128,50,128,54,0],[133,13,133,14,0],[134,17,134,41,0],[135,13,135,14,0],[141,13,141,14,0],[142,17,142,55,0],[143,13,143,14,0],[154,3,154,4,0],[155,13,155,75,0],[156,4,156,42,0],[157,17,157,56,0],[158,13,158,48,0],[159,3,159,4,0],[168,4,168,5,0],[170,17,170,35,0],[171,17,171,18,0],[172,21,172,45,0],[173,21,173,41,0],[174,17,174,18,0],[175,5,175,19,0],[176,4,176,5,0],[178,4,178,5,0],[179,17,179,32,0],[180,17,180,37,0],[181,4,181,5,0],[189,3,189,4,0],[193,3,193,4,0],[199,9,199,10,0],[202,3,202,4,0],[211,13,211,14,0],[212,5,212,24,0],[213,4,213,5,0],[215,4,215,5,0],[216,5,216,25,0],[218,4,218,5,0],[226,4,226,5,0],[227,5,227,26,0],[228,5,228,6,0],[229,6,229,100,0],[230,6,230,75,0],[231,5,231,6,0],[232,5,232,27,0],[233,4,233,5,0],[243,4,243,5,0],[244,5,244,25,0],[245,5,245,6,0],[246,6,246,129,0],[247,5,247,6,0],[248,5,248,26,0],[249,4,249,5,0],[250,26,250,27,0],[250,28,250,44,0],[250,45,250,46,0],[267,13,267,14,0],[268,17,268,37,0],[269,13,269,14,0],[271,13,271,14,0],[272,17,272,43,0],[273,17,273,18,0],[275,21,275,32,0],[276,25,276,49,0],[277,21,277,42,0],[278,17,278,18,0],[279,13,279,14,0]]);
+    </script>
+  </body>
+</html>

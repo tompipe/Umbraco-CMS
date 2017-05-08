@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Logging\Logger.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
+using System.Web;
+using log4net;
+using log4net.Config;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Diagnostics;
+
+namespace Umbraco.Core.Logging
+{
+    ///&lt;summary&gt;
+	/// Used for logging
+	///&lt;/summary&gt;
+    public class Logger : ILogger
+    {
+
+        public Logger(FileInfo log4NetConfigFile)
+            :this()
+        {
+            XmlConfigurator.Configure(log4NetConfigFile);
+        }
+
+        private Logger()
+        {
+            //Add custom global properties to the log4net context that we can use in our logging output
+
+            log4net.GlobalContext.Properties[&quot;processId&quot;] = Process.GetCurrentProcess().Id;
+            log4net.GlobalContext.Properties[&quot;appDomainId&quot;] = AppDomain.CurrentDomain.Id;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a logger with the default log4net configuration discovered (i.e. from the web.config)
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static Logger CreateWithDefaultLog4NetConfiguration()
+        {
+            return new Logger();
+        }
+
+		///&lt;summary&gt;
+		/// Returns a logger for the type specified
+		///&lt;/summary&gt;
+		///&lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+		///&lt;returns&gt;&lt;/returns&gt;
+		internal ILog LoggerFor&lt;T&gt;()
+		{
+			return LogManager.GetLogger(typeof(T));
+		}
+
+		/// &lt;summary&gt;
+		/// Returns a logger for the object&#39;s type
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;getTypeFromInstance&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		internal ILog LoggerFor(object getTypeFromInstance)
+		{
+			if (getTypeFromInstance == null) throw new ArgumentNullException(&quot;getTypeFromInstance&quot;);
+
+			return LogManager.GetLogger(getTypeFromInstance.GetType());
+		}
+
+		public void Error(Type callingType, string message, Exception exception)
+		{
+            var logger = LogManager.GetLogger(callingType);
+		    if (logger == null) return;
+
+		    var dump = false;
+
+		    if (IsTimeoutThreadAbortException(exception))
+		    {
+		        message += &quot;\r\nThe thread has been aborted, because the request has timed out.&quot;;
+
+                // dump if configured, or if stacktrace contains Monitor.ReliableEnter
+		        dump = UmbracoConfig.For.CoreDebug().DumpOnTimeoutThreadAbort || IsMonitorEnterThreadAbortException(exception);
+
+                // dump if it is ok to dump (might have a cap on number of dump...)
+		        dump &amp;= MiniDump.OkToDump();
+		    }
+
+            if (dump)
+		    {
+                try
+                {
+                    var dumped = MiniDump.Dump(withException: true);
+                    message += dumped
+                        ? &quot;\r\nA minidump was created in App_Data/MiniDump&quot;
+                        : &quot;\r\nFailed to create a minidump&quot;;
+                }
+                catch (Exception e)
+                {
+                    message += string.Format(&quot;\r\nFailed to create a minidump ({0}: {1})&quot;, e.GetType().FullName, e.Message);
+                }
+            }
+
+            logger.Error(message, exception);
+		}
+
+        private static bool IsMonitorEnterThreadAbortException(Exception exception)
+        {
+            var abort = exception as ThreadAbortException;
+            if (abort == null) return false;
+
+            var stacktrace = abort.StackTrace;
+            return stacktrace.Contains(&quot;System.Threading.Monitor.ReliableEnter&quot;);
+        }
+
+        private static bool IsTimeoutThreadAbortException(Exception exception)
+        {
+            var abort = exception as ThreadAbortException;
+            if (abort == null) return false;
+
+            if (abort.ExceptionState == null) return false;
+
+            var stateType = abort.ExceptionState.GetType();
+            if (stateType.FullName != &quot;System.Web.HttpApplication+CancelModuleException&quot;) return false;
+
+            var timeoutField = stateType.GetField(&quot;_timeout&quot;, BindingFlags.Instance | BindingFlags.NonPublic);
+            if (timeoutField == null) return false;
+
+            return (bool) timeoutField.GetValue(abort.ExceptionState);
+        }
+
+        public void Warn(Type callingType, string message, params Func&lt;object&gt;[] formatItems)
+		{
+			var logger = LogManager.GetLogger(callingType);
+			if (logger == null || logger.IsWarnEnabled == false) return;
+			logger.WarnFormat((message), formatItems.Select(x =&gt; x.Invoke()).ToArray());
+		}
+
+		public void Warn(Type callingType, string message, bool showHttpTrace, params Func&lt;object&gt;[] formatItems)
+		{
+			Mandate.ParameterNotNull(callingType, &quot;callingType&quot;);
+			Mandate.ParameterNotNullOrEmpty(message, &quot;message&quot;);
+
+			if (showHttpTrace &amp;&amp; HttpContext.Current != null)
+			{
+				HttpContext.Current.Trace.Warn(callingType.Name, string.Format(message, formatItems.Select(x =&gt; x.Invoke()).ToArray()));
+			}
+
+			var logger = LogManager.GetLogger(callingType);
+			if (logger == null || logger.IsWarnEnabled == false) return;
+			logger.WarnFormat((message), formatItems.Select(x =&gt; x.Invoke()).ToArray());
+
+		}
+
+		public void WarnWithException(Type callingType, string message, Exception e, params Func&lt;object&gt;[] formatItems)
+		{
+            Mandate.ParameterNotNull(e, &quot;e&quot;);
+            Mandate.ParameterNotNull(callingType, &quot;callingType&quot;);
+            Mandate.ParameterNotNullOrEmpty(message, &quot;message&quot;);
+
+            var logger = LogManager.GetLogger(callingType);
+            if (logger == null || logger.IsWarnEnabled == false) return;
+            var executedParams = formatItems.Select(x =&gt; x.Invoke()).ToArray();
+            logger.WarnFormat((message) + &quot;. Exception: &quot; + e, executedParams);
+		}
+
+		/// &lt;summary&gt;
+		/// Traces if tracing is enabled.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;callingType&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;generateMessage&quot;&gt;&lt;/param&gt;
+		public void Info(Type callingType, Func&lt;string&gt; generateMessage)
+		{
+			var logger = LogManager.GetLogger(callingType);
+			if (logger == null || logger.IsInfoEnabled == false) return;
+			logger.Info((generateMessage.Invoke()));
+		}
+
+		/// &lt;summary&gt;
+		/// Traces if tracing is enabled.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;type&quot;&gt;The type for the logging namespace.&lt;/param&gt;
+		/// &lt;param name=&quot;generateMessageFormat&quot;&gt;The message format.&lt;/param&gt;
+		/// &lt;param name=&quot;formatItems&quot;&gt;The format items.&lt;/param&gt;
+		public void Info(Type type, string generateMessageFormat, params Func&lt;object&gt;[] formatItems)
+		{
+			var logger = LogManager.GetLogger(type);
+			if (logger == null || logger.IsInfoEnabled == false) return;
+			var executedParams = formatItems.Select(x =&gt; x.Invoke()).ToArray();
+			logger.InfoFormat((generateMessageFormat), executedParams);
+		}
+
+
+		/// &lt;summary&gt;
+		/// Debugs if tracing is enabled.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;callingType&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;generateMessage&quot;&gt;&lt;/param&gt;
+		public void Debug(Type callingType, Func&lt;string&gt; generateMessage)
+		{
+			var logger = LogManager.GetLogger(callingType);
+			if (logger == null || logger.IsDebugEnabled == false) return;
+			logger.Debug((generateMessage.Invoke()));
+		}
+
+		/// &lt;summary&gt;
+		/// Debugs if tracing is enabled.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;type&quot;&gt;The type for the logging namespace.&lt;/param&gt;
+		/// &lt;param name=&quot;generateMessageFormat&quot;&gt;The message format.&lt;/param&gt;
+		/// &lt;param name=&quot;formatItems&quot;&gt;The format items.&lt;/param&gt;
+		public void Debug(Type type, string generateMessageFormat, params Func&lt;object&gt;[] formatItems)
+		{
+			var logger = LogManager.GetLogger(type);
+			if (logger == null || logger.IsDebugEnabled == false) return;
+			var executedParams = formatItems.Select(x =&gt; x.Invoke()).ToArray();
+			logger.DebugFormat((generateMessageFormat), executedParams);
+		}
+
+
+	}
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,14,22,20,1],[23,9,23,10,1],[24,13,24,58,1],[25,9,25,10,1],[27,9,27,25,1],[28,9,28,10,1],[31,13,31,92,1],[32,13,32,90,1],[33,9,33,10,1],[40,9,40,10,0],[41,13,41,33,0],[42,9,42,10,0],[50,3,50,4,0],[51,4,51,43,0],[52,3,52,4,0],[60,3,60,4,0],[61,4,61,36,0],[61,37,61,92,0],[63,4,63,63,0],[64,3,64,4,0],[67,3,67,4,1],[68,13,68,60,1],[69,7,69,26,1],[69,27,69,34,0],[71,7,71,24,1],[73,7,73,52,1],[74,7,74,8,0],[75,11,75,92,0],[78,11,78,122,0],[81,11,81,39,0],[82,7,82,8,0],[84,13,84,22,1],[85,7,85,8,0],[87,17,87,18,0],[88,21,88,69,0],[89,21,91,61,0],[92,17,92,18,0],[93,17,93,36,0],[94,17,94,18,0],[95,21,95,125,0],[96,17,96,18,0],[97,13,97,14,0],[99,13,99,46,1],[100,3,100,4,1],[103,9,103,10,0],[104,13,104,59,0],[105,13,105,31,0],[105,32,105,45,0],[107,13,107,47,0],[108,13,108,82,0],[109,9,109,10,0],[112,9,112,10,1],[113,13,113,59,1],[114,13,114,31,1],[114,32,114,45,1],[116,13,116,46,0],[116,47,116,60,0],[118,13,118,60,0],[119,13,119,90,0],[119,91,119,104,0],[121,13,121,111,0],[122,13,122,38,0],[122,39,122,52,0],[124,13,124,71,0],[125,9,125,10,1],[128,3,128,4,1],[129,4,129,51,1],[130,4,130,56,1],[130,57,130,64,0],[131,4,131,57,1],[131,57,131,67,1],[131,67,131,80,1],[131,4,131,80,1],[132,3,132,4,1],[135,3,135,4,0],[136,4,136,57,0],[137,4,137,56,0],[139,4,139,53,0],[140,4,140,5,0],[141,5,141,101,0],[141,101,141,111,0],[141,111,141,125,0],[141,5,141,125,0],[142,4,142,5,0],[144,4,144,51,0],[145,4,145,56,0],[145,57,145,64,0],[146,4,146,57,0],[146,57,146,67,0],[146,67,146,80,0],[146,4,146,80,0],[148,3,148,4,0],[151,3,151,4,0],[152,13,152,46,0],[153,13,153,66,0],[154,13,154,65,0],[156,13,156,60,0],[157,13,157,65,0],[157,66,157,73,0],[158,13,158,58,0],[158,58,158,68,0],[158,68,158,80,0],[158,13,158,80,0],[159,13,159,80,0],[160,3,160,4,0],[168,3,168,4,1],[169,4,169,51,1],[170,4,170,56,1],[170,57,170,64,1],[171,4,171,44,0],[172,3,172,4,1],[181,3,181,4,1],[182,4,182,44,1],[183,4,183,56,1],[183,57,183,64,1],[184,4,184,49,0],[184,49,184,59,0],[184,59,184,71,0],[184,4,184,71,0],[185,4,185,63,0],[186,3,186,4,1],[195,3,195,4,1],[196,4,196,51,1],[197,4,197,57,1],[197,58,197,65,1],[198,4,198,45,0],[199,3,199,4,1],[208,3,208,4,1],[209,4,209,44,1],[210,4,210,57,1],[210,58,210,65,1],[211,4,211,49,1],[211,49,211,59,0],[211,59,211,71,1],[211,4,211,71,1],[212,4,212,64,1],[213,3,213,4,1]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\RecycleBin.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Linq;
+using umbraco.BusinessLogic;
+using Umbraco.Core;
+using umbraco.DataLayer;
+using umbraco.cms.businesslogic.web;
+using umbraco.cms.businesslogic.media;
+
+namespace umbraco.cms.businesslogic
+{
+
+    public class RecycleBin : CMSNode
+    {
+        /// &lt;summary&gt;
+        /// The types of Recycle Bins.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Each enum item represents the integer value of the node Id of the recycle bin in the database.
+        /// &lt;/remarks&gt;
+        public enum RecycleBinType
+        {
+            Content = Constants.System.RecycleBinContent,
+            Media = Constants.System.RecycleBinMedia
+        }
+
+        private const string m_ChildCountSQL = @&quot;select count(id) from umbracoNode where nodeObjectType = @nodeObjectType and path like &#39;%,{0},%&#39;&quot;;
+        private const string m_ChildSQL = @&quot;SELECT id, createDate, trashed, parentId, nodeObjectType, nodeUser, level, path, sortOrder, uniqueID, text FROM umbracoNode where ParentID = @parentId And nodeObjectType = @type order by sortOrder&quot;;
+        private static object m_Locker = new object();
+
+        #region Private variables
+
+        private Guid _nodeObjectType;
+        private RecycleBinType m_BinType;
+
+        #endregion
+
+        #region Constructors
+        /// &lt;summary&gt;
+        /// Constructor to create a new recycle bin 
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;nodeObjectType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        [Obsolete(&quot;Use the simple constructor that has the RecycleBinType only parameter&quot;)]
+        public RecycleBin(Guid nodeObjectType, RecycleBinType type)
+            : base((int)type)
+        {
+            _nodeObjectType = nodeObjectType;
+            m_BinType = type;
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor to create a new recycle bin based on RecycleBinType
+        /// Will automatically update internal nodeObjectType based on the RecycleBinType enum
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        public RecycleBin(RecycleBinType type)
+            : base((int)type)
+        {
+            switch (type)
+            {
+                case RecycleBinType.Content:
+                    _nodeObjectType = Document._objectType;
+                    m_BinType = RecycleBinType.Content;
+                    break;
+                case RecycleBinType.Media:
+                    _nodeObjectType = Media._objectType;
+                    m_BinType = RecycleBinType.Media;
+                    break;
+
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Old constructor to create a content recycle bin
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;nodeObjectType&quot;&gt;&lt;/param&gt;
+        [Obsolete(&quot;Use the simple constructor that has the RecycleBinType only parameter&quot;)]
+        public RecycleBin(Guid nodeObjectType)
+            : this(nodeObjectType, RecycleBinType.Content) { }
+        #endregion
+
+        #region Static methods
+        /// &lt;summary&gt;
+        /// Get the number of items in the Recycle Bin
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;The number of all items in the Recycle Bin&lt;/returns&gt;
+        [Obsolete(&quot;Create a RecycleBin object to get the count per recycle bin type&quot;, true)]
+        public static int Count()
+        {
+            return Count(RecycleBinType.Content);
+        }
+
+        public static int Count(RecycleBinType type)
+        {
+            Guid objectType = Document._objectType;
+
+            switch (type)
+            {
+                case RecycleBinType.Content:
+                    objectType = Document._objectType;
+                    break;
+                case RecycleBinType.Media:
+                    objectType = Media._objectType;
+                    break;
+            }
+
+            string sql = String.Format(RecycleBin.m_ChildCountSQL,
+                        (int) type);
+
+            using (var sqlHelper = Application.SqlHelper)
+                return sqlHelper.ExecuteScalar&lt;int&gt;(sql, sqlHelper.CreateParameter(&quot;@nodeObjectType&quot;, objectType));
+        }
+        #endregion
+
+        #region Public methods
+
+        /// &lt;summary&gt;
+        /// If I smell, I&#39;m not empty 
+        /// &lt;/summary&gt;
+        public bool Smells()
+        {
+            return RecycleBin.Count(m_BinType) &gt; 0;
+        }
+
+        /// &lt;summary&gt;
+        /// Empties the trash can
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;itemDeletedCallback&quot;&gt;a function to call whenever an item is removed from the bin&lt;/param&gt;
+        public void CallTheGarbageMan(Action&lt;int&gt; itemDeletedCallback)
+        {
+            lock (m_Locker)
+            {
+                var itemsInTheBin = Count(m_BinType);
+                itemDeletedCallback(itemsInTheBin);
+
+                if (m_BinType == RecycleBinType.Media)
+                {
+                    ApplicationContext.Current.Services.MediaService.EmptyRecycleBin();
+                    var trashedMedia = ApplicationContext.Current.Services.MediaService.GetMediaInRecycleBin();
+                    itemsInTheBin = trashedMedia.Count();
+                }
+                else
+                {
+                    ApplicationContext.Current.Services.ContentService.EmptyRecycleBin();
+                    var trashedContent = ApplicationContext.Current.Services.ContentService.GetContentInRecycleBin();
+                    itemsInTheBin = trashedContent.Count();
+                }
+
+                itemDeletedCallback(itemsInTheBin);
+            }
+        }
+
+        #endregion
+
+        #region Public properties
+        public override umbraco.BusinessLogic.console.IconI[] Children
+        {
+            get
+            {
+                System.Collections.ArrayList tmp = new System.Collections.ArrayList();
+
+                using (var sqlHelper = Application.SqlHelper)
+                using (IRecordsReader dr = sqlHelper.ExecuteReader(m_ChildSQL,
+                            sqlHelper.CreateParameter(&quot;@parentId&quot;, this.Id),
+                            sqlHelper.CreateParameter(&quot;@type&quot;, _nodeObjectType)))
+                {
+                    while (dr.Read())
+                    {
+                        tmp.Add(new CMSNode(dr));
+                    }
+                }
+
+                CMSNode[] retval = new CMSNode[tmp.Count];
+
+                for (int i = 0; i &lt; tmp.Count; i++)
+                {
+                    retval[i] = (CMSNode)tmp[i];
+                }
+                return retval;
+            }
+        }
+        #endregion
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[28,9,28,55,0],[45,15,45,30,0],[46,9,46,10,0],[47,13,47,46,0],[48,13,48,30,0],[49,9,49,10,0],[57,15,57,30,0],[58,9,58,10,0],[59,13,59,26,0],[62,21,62,60,0],[63,21,63,56,0],[64,21,64,27,0],[66,21,66,57,0],[67,21,67,54,0],[68,21,68,27,0],[71,9,71,10,0],[79,15,79,59,0],[79,60,79,61,0],[79,62,79,63,0],[89,9,89,10,0],[90,13,90,50,0],[91,9,91,10,0],[94,9,94,10,0],[95,13,95,52,0],[97,13,97,26,0],[100,21,100,55,0],[101,21,101,27,0],[103,21,103,52,0],[104,21,104,27,0],[107,13,108,37,0],[110,20,110,57,0],[111,17,111,116,0],[112,9,112,10,0],[121,9,121,10,0],[122,13,122,52,0],[123,9,123,10,0],[130,9,130,10,0],[131,13,131,28,0],[132,13,132,14,0],[133,17,133,54,0],[134,17,134,52,0],[136,17,136,55,0],[137,17,137,18,0],[138,21,138,88,0],[139,21,139,112,0],[140,21,140,58,0],[141,17,141,18,0],[143,17,143,18,0],[144,21,144,90,0],[145,21,145,118,0],[146,21,146,60,0],[147,17,147,18,0],[149,17,149,52,0],[150,13,150,14,0],[151,9,151,10,0],[159,13,159,14,0],[160,17,160,87,0],[162,24,162,61,0],[163,24,165,81,0],[166,17,166,18,0],[167,21,167,38,0],[168,21,168,22,0],[169,25,169,50,0],[170,21,170,22,0],[171,17,171,18,0],[173,17,173,59,0],[175,22,175,31,0],[175,33,175,46,0],[175,48,175,51,0],[176,17,176,18,0],[177,21,177,49,0],[178,17,178,18,0],[179,17,179,31,0],[180,13,180,14,0]]);
+    </script>
+  </body>
+</html>

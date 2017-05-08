@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Models\Stylesheet.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Data;
+using System.Linq;
+using System.Runtime.Serialization;
+using Umbraco.Core.IO;
+using Umbraco.Core.Strings.Css;
+
+namespace Umbraco.Core.Models
+{
+    /// &lt;summary&gt;
+    /// Represents a Stylesheet file
+    /// &lt;/summary&gt;
+    [Serializable]
+    [DataContract(IsReference = true)]
+    public class Stylesheet : File
+    {
+        public Stylesheet(string path)
+            : this(path, null)
+        { }
+
+        internal Stylesheet(string path, Func&lt;File, string&gt; getFileContent)
+            : base(path.EnsureEndsWith(&quot;.css&quot;), getFileContent)
+        {
+            InitializeProperties();
+        }
+
+        private Lazy&lt;List&lt;StylesheetProperty&gt;&gt; _properties;
+
+        private void InitializeProperties()
+        {
+            //if the value is already created, we need to be created and update the collection according to 
+            //what is now in the content
+            if (_properties != null &amp;&amp; _properties.IsValueCreated)
+            {
+                //re-parse it so we can check what properties are different and adjust the event handlers
+                var parsed = StylesheetHelper.ParseRules(Content).ToArray();
+                var names = parsed.Select(x =&gt; x.Name).ToArray();
+                var existing = _properties.Value.Where(x =&gt; names.InvariantContains(x.Name)).ToArray();
+                //update existing
+                foreach (var stylesheetProperty in existing)
+                {
+                    var updateFrom = parsed.Single(x =&gt; x.Name.InvariantEquals(stylesheetProperty.Name));
+                    //remove current event handler while we update, we&#39;ll reset it after
+                    stylesheetProperty.PropertyChanged -= Property_PropertyChanged;
+                    stylesheetProperty.Alias = updateFrom.Selector;
+                    stylesheetProperty.Value = updateFrom.Styles;
+                    //re-add
+                    stylesheetProperty.PropertyChanged += Property_PropertyChanged;
+                }
+                //remove no longer existing
+                var nonExisting = _properties.Value.Where(x =&gt; names.InvariantContains(x.Name) == false).ToArray();
+                foreach (var stylesheetProperty in nonExisting)
+                {
+                    stylesheetProperty.PropertyChanged -= Property_PropertyChanged;
+                    _properties.Value.Remove(stylesheetProperty);
+                }
+                //add new ones
+                var newItems = parsed.Where(x =&gt; _properties.Value.Select(p =&gt; p.Name).InvariantContains(x.Name) == false);
+                foreach (var stylesheetRule in newItems)
+                {
+                    var prop = new StylesheetProperty(stylesheetRule.Name, stylesheetRule.Selector, stylesheetRule.Styles);
+                    prop.PropertyChanged += Property_PropertyChanged;
+                    _properties.Value.Add(prop);
+                }               
+            }
+
+            //we haven&#39;t read the properties yet so create the lazy delegate
+            _properties = new Lazy&lt;List&lt;StylesheetProperty&gt;&gt;(() =&gt;
+            {
+                var parsed = StylesheetHelper.ParseRules(Content);
+                return parsed.Select(statement =&gt;
+                {
+                    var property = new StylesheetProperty(statement.Name, statement.Selector, statement.Styles);
+                    property.PropertyChanged += Property_PropertyChanged;
+                    return property;
+
+                }).ToList();
+            });
+        }
+
+        /// &lt;summary&gt;
+        /// If the property has changed then we need to update the content
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        void Property_PropertyChanged(object sender, PropertyChangedEventArgs e)
+        {
+            var prop = (StylesheetProperty) sender;
+
+            //Ensure we are setting base.Content here so that the properties don&#39;t get reset and thus any event handlers would get reset too
+            base.Content = StylesheetHelper.ReplaceRule(Content, prop.Name, new StylesheetRule
+            {
+                Name = prop.Name,
+                Selector = prop.Alias,
+                Styles = prop.Value
+            });
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the Content of a File
+        /// &lt;/summary&gt;
+        public override string Content
+        {
+            get { return base.Content; }
+            set
+            {
+                base.Content = value;
+                //re-set the properties so they are re-read from the content
+                InitializeProperties();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a list of umbraco back office enabled stylesheet properties
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// An umbraco back office enabled stylesheet property has a special prefix, for example: 
+        /// 
+        /// /** umb_name: MyPropertyName */ p { font-size: 1em; }
+        /// &lt;/remarks&gt;
+        [IgnoreDataMember]
+        public IEnumerable&lt;StylesheetProperty&gt; Properties
+        {
+            get { return _properties.Value; }
+        }
+
+        /// &lt;summary&gt;
+        /// Adds an Umbraco stylesheet property for use in the back office
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;property&quot;&gt;&lt;/param&gt;
+        public void AddProperty(StylesheetProperty property)
+        {
+            if (Properties.Any(x =&gt; x.Name.InvariantEquals(property.Name)))
+            {
+                throw new DuplicateNameException(&quot;The property with the name &quot; + property.Name + &quot; already exists in the collection&quot;);
+            }
+
+            //now we need to serialize out the new property collection over-top of the string Content. 
+            Content = StylesheetHelper.AppendRule(Content, new StylesheetRule
+            {
+                Name = property.Name,
+                Selector = property.Alias,
+                Styles = property.Value
+            });
+
+            //re-set lazy collection
+            InitializeProperties();
+        }
+
+        /// &lt;summary&gt;
+        /// Removes an Umbraco stylesheet property
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;name&quot;&gt;&lt;/param&gt;
+        public void RemoveProperty(string name)
+        {
+            if (Properties.Any(x =&gt; x.Name.InvariantEquals(name)))
+            {
+                Content = StylesheetHelper.ReplaceRule(Content, name, null);
+            }
+        }
+  
+        /// &lt;summary&gt;
+        /// Indicates whether the current entity has an identity, which in this case is a path/name.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Overrides the default Entity identity check.
+        /// &lt;/remarks&gt;
+        public override bool HasIdentity
+        {
+            get { return string.IsNullOrEmpty(Path) == false; }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[20,15,20,31,1],[21,9,21,10,1],[21,11,21,12,1],[24,15,24,64,1],[25,9,25,10,1],[26,13,26,36,1],[27,9,27,10,1],[32,9,32,10,1],[35,13,35,67,1],[36,13,36,14,1],[38,17,38,77,1],[39,17,39,48,1],[39,48,39,54,1],[39,54,39,66,1],[39,17,39,66,1],[40,17,40,61,1],[40,61,40,92,1],[40,92,40,104,1],[40,17,40,104,1],[42,17,42,24,1],[42,26,42,48,0],[42,49,42,51,1],[42,52,42,60,1],[43,17,43,18,0],[44,21,44,57,0],[44,57,44,104,0],[44,104,44,106,0],[44,21,44,106,0],[46,21,46,84,0],[47,21,47,68,0],[48,21,48,66,0],[50,21,50,84,0],[51,17,51,18,0],[53,17,53,64,1],[53,64,53,104,1],[53,104,53,116,1],[53,17,53,116,1],[54,17,54,24,1],[54,26,54,48,1],[54,49,54,51,1],[54,52,54,63,1],[55,17,55,18,1],[56,21,56,84,1],[57,21,57,66,1],[58,17,58,18,1],[60,17,60,50,1],[60,50,60,80,1],[60,80,60,86,0],[60,86,60,122,1],[60,50,60,122,1],[60,122,60,124,1],[60,17,60,124,1],[61,17,61,24,1],[61,26,61,44,1],[61,45,61,47,1],[61,48,61,56,1],[62,17,62,18,1],[63,21,63,124,1],[64,21,64,70,1],[65,21,65,49,1],[66,17,66,18,1],[67,13,67,14,1],[70,13,71,13,1],[71,13,71,14,1],[71,14,72,17,1],[72,17,72,67,1],[72,67,73,17,1],[73,17,74,17,1],[74,17,74,18,1],[74,18,75,21,1],[75,21,75,113,1],[75,113,76,21,1],[76,21,76,74,1],[76,74,77,21,1],[77,21,77,37,1],[77,37,79,17,1],[79,17,79,18,1],[79,18,79,29,1],[73,17,79,29,1],[79,29,80,13,1],[80,13,80,14,1],[80,14,80,16,1],[70,13,80,16,1],[81,9,81,10,1],[89,9,89,10,1],[90,13,90,52,1],[93,13,98,16,1],[99,9,99,10,1],[106,17,106,18,1],[106,19,106,39,1],[106,40,106,41,1],[108,13,108,14,1],[109,17,109,38,1],[111,17,111,40,1],[112,13,112,14,1],[126,17,126,18,1],[126,19,126,44,1],[126,45,126,46,1],[134,9,134,10,1],[135,13,135,37,1],[135,37,135,74,1],[135,74,135,76,1],[135,13,135,76,1],[136,13,136,14,1],[137,17,137,135,1],[141,13,146,16,1],[149,13,149,36,1],[150,9,150,10,1],[157,9,157,10,1],[158,13,158,37,1],[158,37,158,65,1],[158,65,158,67,1],[158,13,158,67,1],[159,13,159,14,1],[160,17,160,77,1],[161,13,161,14,1],[162,9,162,10,1],[172,17,172,18,1],[172,19,172,62,1],[172,63,172,64,1]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\datatype\DataTypeDefinition.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.ComponentModel;
+using System.Globalization;
+using System.Data;
+using System.Linq;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.PropertyEditors;
+using umbraco.DataLayer;
+using System.Xml;
+using umbraco.cms.businesslogic.media;
+using umbraco.interfaces;
+using PropertyType = umbraco.cms.businesslogic.propertytype.PropertyType;
+using Umbraco.Core;
+using Umbraco.Core.Models;
+using Umbraco.Core.Services;
+
+namespace umbraco.cms.businesslogic.datatype
+{
+    /// &lt;summary&gt;
+    /// Datatypedefinitions is the basic buildingblocks of umbraco&#39;s documents/medias/members generic datastructure 
+    /// 
+    /// A datatypedefinition encapsulates an object which implements the interface IDataType, and are used when defining
+    /// the properties of a document in the documenttype. This extra layer between IDataType and a documenttypes propertytype
+    /// are used amongst other for enabling shared prevalues.
+    /// 
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;This class is no longer used and will be removed from the codebase in the future.&quot;)]
+    public class DataTypeDefinition : CMSNode
+    {
+        internal IDataTypeDefinition DataTypeItem;
+
+        #region Constructors
+
+        internal DataTypeDefinition(IDataTypeDefinition dataType)
+            : base(dataType)
+        {
+            DataTypeItem = dataType;
+        }
+
+        /// &lt;summary&gt;
+        /// Initialization of the datatypedefinition
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Datattypedefininition id&lt;/param&gt;
+        public DataTypeDefinition(int id) : base(id) { }
+
+        /// &lt;summary&gt;
+        /// Initialization of the datatypedefinition
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Datattypedefininition id&lt;/param&gt;
+        public DataTypeDefinition(Guid id) : base(id) { }
+
+        #endregion
+
+        #region Public Properties
+
+        public override string Text
+        {
+            get { return DataTypeItem.Name; }
+            set { DataTypeItem.Name = value; }
+        }
+
+        /// &lt;summary&gt;
+        /// The associated datatype, which delivers the methods for editing data, editing prevalues see: umbraco.interfaces.IDataType
+        /// &lt;/summary&gt;
+        public IDataType DataType
+        {
+            get
+            {
+                if (DataTypeItem.PropertyEditorAlias.IsNullOrWhiteSpace()) 
+                    return null;
+
+                //Attempt to resolve a legacy control id from the alias. If one is not found we&#39;ll generate one - 
+                // the reason one will not be found is if there&#39;s a new v7 property editor created that doesn&#39;t have a legacy
+                // property editor predecessor.
+                //So, we&#39;ll generate an id for it based on the alias which will remain consistent, but then we&#39;ll try to resolve a legacy
+                // IDataType which of course will not exist. In this case we&#39;ll have to create a new one on the fly for backwards compatibility but 
+                // this instance will have limited capabilities and will really only work for saving data so the legacy APIs continue to work.
+                var controlId = LegacyPropertyEditorIdToAliasConverter.GetLegacyIdFromAlias(DataTypeItem.PropertyEditorAlias, LegacyPropertyEditorIdToAliasConverter.NotFoundLegacyIdResponseBehavior.GenerateId);
+
+                var dt = DataTypesResolver.Current.GetById(controlId.Value);
+                
+                if (dt != null)
+                {
+                    dt.DataTypeDefinitionId = Id;
+                }
+                else
+                {
+                    //Ok so it was not found, we can only assume that this is because this is a new property editor that does not have a legacy predecessor.
+                    //we&#39;ll have to attempt to generate one at runtime.
+                    dt = BackwardsCompatibleDataType.Create(DataTypeItem.PropertyEditorAlias, controlId.Value, Id);
+                }
+                    
+
+                return dt;
+            }
+            set
+            {
+                if (value == null)
+                    throw new InvalidOperationException(&quot;The value passed in is null. The DataType property cannot be set to a null value&quot;);
+
+                var alias = LegacyPropertyEditorIdToAliasConverter.GetAliasFromLegacyId(value.Id, true);
+
+                DataTypeItem.PropertyEditorAlias = alias;
+            }
+        }
+
+        //internal string DbType { get; private set; }
+
+        #endregion
+
+        #region Public methods
+        public override void delete()
+        {
+            var e = new DeleteEventArgs();
+            FireBeforeDelete(e);
+            if (e.Cancel == false)
+            {
+                ApplicationContext.Current.Services.DataTypeService.Delete(DataTypeItem);
+               
+                FireAfterDelete(e);
+            }
+        }
+
+        [Obsolete(&quot;Use the standard delete() method instead&quot;)]
+        public void Delete()
+        {
+            delete();
+        }
+
+        /// &lt;summary&gt;
+        /// Used to persist object changes to the database. In Version3.0 it&#39;s just a stub for future compatibility
+        /// &lt;/summary&gt;
+        public override void Save()
+        {
+            ApplicationContext.Current.Services.DataTypeService.Save(DataTypeItem);
+
+            OnSaving(EventArgs.Empty);
+        }
+
+        public XmlElement ToXml(XmlDocument xd)
+        {
+            var serializer = new EntityXmlSerializer();
+            var xml = serializer.Serialize(ApplicationContext.Current.Services.DataTypeService, DataTypeItem);
+            return (XmlElement)xml.GetXmlNode(xd);
+        }
+        
+        #endregion
+
+        #region Static methods
+
+        [Obsolete(&quot;Do not use this method, it will not function correctly because legacy property editors are not supported in v7&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public static DataTypeDefinition Import(XmlNode xmlData)
+        {
+            var name = xmlData.Attributes[&quot;Name&quot;].Value;
+            var id = xmlData.Attributes[&quot;Id&quot;].Value;
+            var def = xmlData.Attributes[&quot;Definition&quot;].Value;
+
+
+            //Make sure that the dtd is not already present
+            if (IsNode(new Guid(def)) == false)
+            {
+                var u = BusinessLogic.User.GetCurrent() ?? BusinessLogic.User.GetUser(0);
+
+                var dtd = MakeNew(u, name, new Guid(def));
+                var dataType = DataTypesResolver.Current.GetById(new Guid(id));
+                if (dataType == null)
+                    throw new NullReferenceException(&quot;Could not resolve a data type with id &quot; + id);
+
+                dtd.DataType = dataType;
+                dtd.Save();
+
+                //add prevalues
+                foreach (XmlNode xmlPv in xmlData.SelectNodes(&quot;PreValues/PreValue&quot;))
+                {
+                    var val = xmlPv.Attributes[&quot;Value&quot;];
+
+                    if (val != null)
+                    {
+                        var p = new PreValue(0, 0, val.Value);
+                        p.DataTypeId = dtd.Id;
+                        p.Save();
+                    }
+                }
+
+                return dtd;
+            }
+
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieves a list of all datatypedefinitions
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;A list of all datatypedefinitions&lt;/returns&gt;
+        public static DataTypeDefinition[] GetAll()
+        {
+            var result = ApplicationContext.Current.Services.DataTypeService.GetAllDataTypeDefinitions();
+            return result.Select(x =&gt; new DataTypeDefinition(x)).ToArray();
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new datatypedefinition given its name and the user which creates it.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;u&quot;&gt;The user who creates the datatypedefinition&lt;/param&gt;
+        /// &lt;param name=&quot;Text&quot;&gt;The name of the DataTypeDefinition&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static DataTypeDefinition MakeNew(BusinessLogic.User u, string Text)
+        {
+            return MakeNew(u, Text, Guid.NewGuid());
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new datatypedefinition given its name and the user which creates it.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;u&quot;&gt;The user who creates the datatypedefinition&lt;/param&gt;
+        /// &lt;param name=&quot;Text&quot;&gt;The name of the DataTypeDefinition&lt;/param&gt;
+        /// &lt;param name=&quot;UniqueId&quot;&gt;Overrides the CMSnodes uniqueID&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static DataTypeDefinition MakeNew(BusinessLogic.User u, string Text, Guid UniqueId)
+        {
+            var found = ApplicationContext.Current.Services.DataTypeService.GetDataTypeDefinitionByName(Text);
+            if (found != null)
+            {
+                throw new DuplicateNameException(&quot;A data type with the name &quot; + Text + &quot; already exists&quot;);
+            }
+
+            var created = new Umbraco.Core.Models.DataTypeDefinition(&quot;&quot;)
+            {
+                Name = Text,
+                Key = UniqueId
+            };
+
+            ApplicationContext.Current.Services.DataTypeService.Save(created);
+
+            var dtd = new DataTypeDefinition(created);
+            dtd.OnNew(EventArgs.Empty);
+
+            return dtd;
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a list of datatypedefinitions which share the same IDataType datatype
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;DataTypeId&quot;&gt;The unique id of the IDataType&lt;/param&gt;
+        /// &lt;returns&gt;A list of datatypedefinitions which are based on the IDataType specified&lt;/returns&gt;
+        public static DataTypeDefinition GetByDataTypeId(Guid DataTypeId)
+        {
+            var dfId = 0;
+            // When creating a datatype and not saving it, it will be null, so we need this check
+            foreach (var df in GetAll().Where(x =&gt; x.DataType != null))
+            {
+                if (df.DataType.Id == DataTypeId)
+                {
+                    dfId = df.Id;
+                    break;
+                }
+            }
+
+            return dfId == 0 ? null : new DataTypeDefinition(dfId);
+        }
+
+        /// &lt;summary&gt;
+        /// Analyzes an object to see if its basetype is umbraco.editorControls.DefaultData
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Data&quot;&gt;The Data object to analyze&lt;/param&gt;
+        /// &lt;returns&gt;True if the basetype is the DefaultData class&lt;/returns&gt;
+        public static bool IsDefaultData(object Data)
+        {
+            Type typeOfData = Data.GetType();
+
+            while (typeOfData.BaseType != new Object().GetType())
+            {
+                typeOfData = typeOfData.BaseType;
+            }
+
+            return (typeOfData.FullName == &quot;umbraco.cms.businesslogic.datatype.DefaultData&quot;);
+        }
+
+        public static DataTypeDefinition GetDataTypeDefinition(int id)
+        {
+            var found = ApplicationContext.Current.Services.DataTypeService.GetDataTypeDefinitionById(id);
+            return found == null ? null : new DataTypeDefinition(found);
+        }
+
+        [Obsolete(&quot;Use GetDataTypeDefinition(int id) instead&quot;, false)]
+        public static DataTypeDefinition GetDataTypeDefinition(Guid id)
+        {
+            var found = ApplicationContext.Current.Services.DataTypeService.GetDataTypeDefinitionById(id);
+            return found == null ? null : new DataTypeDefinition(found);
+        }
+        #endregion
+
+        #region Protected methods
+
+        protected override void setupNode()
+        {
+            DataTypeItem = ApplicationContext.Current.Services.DataTypeService.GetDataTypeDefinitionById(Id);
+            if (DataTypeItem == null)
+            {
+                throw new ArgumentException(&quot;No dataType with id = &quot; + this.Id.ToString() + &quot; found&quot;);
+            }
+
+            //base.setupNode();
+
+            //using (var dr = SqlHelper.ExecuteReader(&quot;select dbType, propertyEditorAlias from cmsDataType where nodeId = &#39;&quot; + this.Id.ToString() + &quot;&#39;&quot;))
+            //{
+            //    if (dr.Read())
+            //    {
+            //        PropertyEditorAlias = dr.GetString(&quot;propertyEditorAlias&quot;);
+            //        DbType = dr.GetString(&quot;dbType&quot;);
+            //    }
+            //    else
+            //        throw new ArgumentException(&quot;No dataType with id = &quot; + this.Id.ToString() + &quot; found&quot;);
+            //}
+
+        }
+
+        //protected void SetupNode(IDataTypeDefinition dtd)
+        //{
+        //    base.setupNode();
+
+        //    using (var dr = SqlHelper.ExecuteReader(&quot;select dbType, propertyEditorAlias from cmsDataType where nodeId = &#39;&quot; + this.Id.ToString() + &quot;&#39;&quot;))
+        //    {
+        //        if (dr.Read())
+        //        {
+        //            PropertyEditorAlias = dr.GetString(&quot;propertyEditorAlias&quot;);
+        //            DbType = dr.GetString(&quot;dbType&quot;);
+        //        }
+        //        else
+        //            throw new ArgumentException(&quot;No dataType with id = &quot; + this.Id.ToString() + &quot; found&quot;);
+        //    }
+
+        //}
+
+        #endregion
+
+        #region Events
+        //EVENTS
+        public delegate void SaveEventHandler(DataTypeDefinition sender, EventArgs e);
+        public delegate void NewEventHandler(DataTypeDefinition sender, EventArgs e);
+        public delegate void DeleteEventHandler(DataTypeDefinition sender, EventArgs e);
+
+        /// &lt;summary&gt;
+        /// Occurs when a data type is saved.
+        /// &lt;/summary&gt;
+        public static event SaveEventHandler Saving;
+        protected virtual void OnSaving(EventArgs e)
+        {
+            if (Saving != null)
+                Saving(this, e);
+        }
+
+        public static event NewEventHandler New;
+        protected virtual void OnNew(EventArgs e)
+        {
+            if (New != null)
+                New(this, e);
+        }
+
+        [Obsolete(&quot;This event is not used! Use the BeforeDelete or AfterDelete events&quot;)]
+        public static event DeleteEventHandler Deleting;
+        protected virtual void OnDeleting(EventArgs e)
+        {
+            if (Deleting != null)
+                Deleting(this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs when [before delete].
+        /// &lt;/summary&gt;
+        public new static event DeleteEventHandler BeforeDelete;
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:BeforeDelete&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected override void FireBeforeDelete(DeleteEventArgs e)
+        {
+            if (BeforeDelete != null)
+                BeforeDelete(this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs when [after delete].
+        /// &lt;/summary&gt;
+        public new static event DeleteEventHandler AfterDelete;
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:AfterDelete&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected override void FireAfterDelete(DeleteEventArgs e)
+        {
+            if (AfterDelete != null)
+                AfterDelete(this, e);
+        }
+
+        #endregion
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[38,15,38,29,0],[39,9,39,10,0],[40,13,40,37,0],[41,9,41,10,0],[47,45,47,53,0],[47,54,47,55,0],[47,56,47,57,0],[53,46,53,54,0],[53,55,53,56,0],[53,57,53,58,0],[61,17,61,18,0],[61,19,61,44,0],[61,45,61,46,0],[62,17,62,18,0],[62,19,62,45,0],[62,46,62,47,0],[71,13,71,14,0],[72,17,72,75,0],[73,21,73,33,0],[81,17,81,211,0],[83,17,83,77,0],[85,17,85,32,0],[86,17,86,18,0],[87,21,87,50,0],[88,17,88,18,0],[90,17,90,18,0],[93,21,93,116,0],[94,17,94,18,0],[97,17,97,27,0],[98,13,98,14,0],[100,13,100,14,0],[101,17,101,35,0],[102,21,102,141,0],[104,17,104,105,0],[106,17,106,58,0],[107,13,107,14,0],[116,9,116,10,0],[117,13,117,43,0],[118,13,118,33,0],[119,13,119,35,0],[120,13,120,14,0],[121,17,121,90,0],[123,17,123,36,0],[124,13,124,14,0],[125,9,125,10,0],[129,9,129,10,0],[130,13,130,22,0],[131,9,131,10,0],[137,9,137,10,0],[138,13,138,84,0],[140,13,140,39,0],[141,9,141,10,0],[144,9,144,10,0],[145,13,145,56,0],[146,13,146,111,0],[147,13,147,51,0],[148,9,148,10,0],[157,9,157,10,0],[158,13,158,57,0],[159,13,159,53,0],[160,13,160,62,0],[164,13,164,48,0],[165,13,165,14,0],[166,17,166,90,0],[168,17,168,59,0],[169,17,169,80,0],[170,17,170,38,0],[171,21,171,101,0],[173,17,173,41,0],[174,17,174,28,0],[177,17,177,24,0],[177,26,177,39,0],[177,40,177,42,0],[177,43,177,84,0],[178,17,178,18,0],[179,21,179,57,0],[181,21,181,37,0],[182,21,182,22,0],[183,25,183,63,0],[184,25,184,47,0],[185,25,185,34,0],[186,21,186,22,0],[187,17,187,18,0],[189,17,189,28,0],[192,13,192,25,0],[193,9,193,10,0],[200,9,200,10,0],[201,13,201,106,0],[202,13,202,39,0],[202,39,202,64,0],[202,64,202,76,0],[202,13,202,76,0],[203,9,203,10,0],[212,9,212,10,0],[213,13,213,53,0],[214,9,214,10,0],[224,9,224,10,0],[225,13,225,111,0],[226,13,226,31,0],[227,13,227,14,0],[228,17,228,107,0],[231,13,235,15,0],[237,13,237,79,0],[239,13,239,55,0],[240,13,240,40,0],[242,13,242,24,0],[243,9,243,10,0],[251,9,251,10,0],[252,13,252,26,0],[254,13,254,20,0],[254,22,254,28,0],[254,29,254,31,0],[254,32,254,52,0],[254,52,254,70,0],[254,70,254,71,0],[254,32,254,71,0],[255,13,255,14,0],[256,17,256,50,0],[257,17,257,18,0],[258,21,258,34,0],[259,21,259,27,0],[261,13,261,14,0],[263,13,263,68,0],[264,9,264,10,0],[272,9,272,10,0],[273,13,273,46,0],[275,13,275,66,0],[276,13,276,14,0],[277,17,277,50,0],[278,13,278,14,0],[280,13,280,94,0],[281,9,281,10,0],[284,9,284,10,0],[285,13,285,107,0],[286,13,286,73,0],[287,9,287,10,0],[291,9,291,10,0],[292,13,292,107,0],[293,13,293,73,0],[294,9,294,10,0],[300,9,300,10,0],[301,13,301,110,0],[302,13,302,38,0],[303,13,303,14,0],[304,17,304,103,0],[320,9,320,10,0],[352,9,352,10,0],[353,13,353,32,0],[354,17,354,33,0],[355,9,355,10,0],[359,9,359,10,0],[360,13,360,29,0],[361,17,361,30,0],[362,9,362,10,0],[367,9,367,10,0],[368,13,368,34,0],[369,17,369,35,0],[370,9,370,10,0],[381,9,381,10,0],[382,13,382,38,0],[383,17,383,39,0],[384,9,384,10,0],[395,9,395,10,0],[396,13,396,37,0],[397,17,397,38,0],[398,9,398,10,0]]);
+    </script>
+  </body>
+</html>

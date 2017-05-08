@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\IO\PhysicalFileSystem.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Core.IO
+{
+    public class PhysicalFileSystem : IFileSystem
+    {
+        // the rooted, filesystem path, using directory separator chars, NOT ending with a separator
+        // eg &quot;c:&quot; or &quot;c:\path\to\site&quot; or &quot;\\server\path&quot;
+        private readonly string _rootPath;
+
+        // the ??? url, using url separator chars, NOT ending with a separator
+        // eg &quot;&quot; (?) or &quot;/Scripts&quot; or ???
+        private readonly string _rootUrl;
+
+        public PhysicalFileSystem(string virtualRoot)
+        {
+	        if (virtualRoot == null) throw new ArgumentNullException(&quot;virtualRoot&quot;);
+			if (virtualRoot.StartsWith(&quot;~/&quot;) == false)
+				throw new ArgumentException(&quot;The virtualRoot argument must be a virtual path and start with &#39;~/&#39;&quot;);
+
+            _rootPath = IOHelper.MapPath(virtualRoot);
+            _rootPath = EnsureDirectorySeparatorChar(_rootPath);
+            _rootPath = _rootPath.TrimEnd(Path.DirectorySeparatorChar);
+
+            _rootUrl = IOHelper.ResolveUrl(virtualRoot);
+            _rootUrl = EnsureUrlSeparatorChar(_rootUrl);
+            _rootUrl = _rootUrl.TrimEnd(&#39;/&#39;);
+        }
+
+        public PhysicalFileSystem(string rootPath, string rootUrl)
+        {
+            if (string.IsNullOrEmpty(rootPath))
+                throw new ArgumentException(&quot;The argument &#39;rootPath&#39; cannot be null or empty.&quot;);
+
+            if (string.IsNullOrEmpty(rootUrl))
+                throw new ArgumentException(&quot;The argument &#39;rootUrl&#39; cannot be null or empty.&quot;);
+
+			if (rootPath.StartsWith(&quot;~/&quot;))
+				throw new ArgumentException(&quot;The rootPath argument cannot be a virtual path and cannot start with &#39;~/&#39;&quot;);
+
+            // rootPath should be... rooted, as in, it&#39;s a root path!
+            // but the test suite App.config cannot really &quot;root&quot; anything so we&#39;ll have to do it here
+
+            //var localRoot = AppDomain.CurrentDomain.BaseDirectory;
+            var localRoot = IOHelper.GetRootDirectorySafe();
+            if (Path.IsPathRooted(rootPath) == false)
+            {
+                rootPath = Path.Combine(localRoot, rootPath);
+            }
+
+            rootPath = EnsureDirectorySeparatorChar(rootPath);
+            rootUrl = EnsureUrlSeparatorChar(rootUrl);
+
+            _rootPath = rootPath.TrimEnd(Path.DirectorySeparatorChar);
+            _rootUrl = rootUrl.TrimEnd(&#39;/&#39;);
+        }
+
+        public IEnumerable&lt;string&gt; GetDirectories(string path)
+        {
+            var fullPath = GetFullPath(path);
+
+            try
+            {
+                if (Directory.Exists(fullPath))
+                    return Directory.EnumerateDirectories(fullPath).Select(GetRelativePath);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                LogHelper.Error&lt;PhysicalFileSystem&gt;(&quot;Not authorized to get directories&quot;, ex);
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                LogHelper.Error&lt;PhysicalFileSystem&gt;(&quot;Directory not found&quot;, ex);
+            }
+
+            return Enumerable.Empty&lt;string&gt;();
+        }
+
+        public void DeleteDirectory(string path)
+        {
+            DeleteDirectory(path, false);
+        }
+
+        public void DeleteDirectory(string path, bool recursive)
+        {
+            var fullPath = GetFullPath(path);
+            if (Directory.Exists(fullPath) == false)
+                return;
+
+            try
+            {
+                Directory.Delete(fullPath, recursive);
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                LogHelper.Error&lt;PhysicalFileSystem&gt;(&quot;Directory not found&quot;, ex);
+            }
+        }
+
+        public bool DirectoryExists(string path)
+        {
+            var fullPath = GetFullPath(path);
+            return Directory.Exists(fullPath);
+        }
+
+        public void AddFile(string path, Stream stream)
+        {
+            AddFile(path, stream, true);
+        }
+
+        public void AddFile(string path, Stream stream, bool overrideIfExists)
+        {
+            var fullPath = GetFullPath(path);
+            var exists = File.Exists(fullPath);
+            if (exists &amp;&amp; overrideIfExists == false) 
+                throw new InvalidOperationException(string.Format(&quot;A file at path &#39;{0}&#39; already exists&quot;, path));
+
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)); // ensure it exists
+
+            if (stream.CanSeek)
+                stream.Seek(0, 0);
+
+            using (var destination = (Stream)File.Create(fullPath))
+                stream.CopyTo(destination);
+        }
+
+        public IEnumerable&lt;string&gt; GetFiles(string path)
+        {
+            return GetFiles(path, &quot;*.*&quot;);
+        }
+
+        public IEnumerable&lt;string&gt; GetFiles(string path, string filter)
+        {
+            var fullPath = GetFullPath(path);
+
+            try
+            {
+                if (Directory.Exists(fullPath))
+                    return Directory.EnumerateFiles(fullPath, filter).Select(GetRelativePath);
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                LogHelper.Error&lt;PhysicalFileSystem&gt;(&quot;Not authorized to get directories&quot;, ex);
+            }
+            catch (DirectoryNotFoundException ex)
+            {
+                LogHelper.Error&lt;PhysicalFileSystem&gt;(&quot;Directory not found&quot;, ex);
+            }
+
+            return Enumerable.Empty&lt;string&gt;();
+        }
+
+        public Stream OpenFile(string path)
+        {
+            var fullPath = GetFullPath(path);
+            return File.OpenRead(fullPath);
+        }
+
+        public void DeleteFile(string path)
+        {
+            var fullPath = GetFullPath(path);
+            if (File.Exists(fullPath) == false)
+                return;
+
+            try
+            {
+                File.Delete(fullPath);
+            }
+            catch (FileNotFoundException ex)
+            {
+                LogHelper.Info&lt;PhysicalFileSystem&gt;(string.Format(&quot;DeleteFile failed with FileNotFoundException: {0}&quot;, ex.InnerException));
+            }
+        }
+
+        public bool FileExists(string path)
+        {
+            var fullpath = GetFullPath(path);
+            return File.Exists(fullpath);
+        }
+
+        // beware, many things depend on how the GetRelative/AbsolutePath methods work!
+
+        /// &lt;summary&gt;
+        /// Gets the relative path.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;fullPathOrUrl&quot;&gt;The full path or url.&lt;/param&gt;
+        /// &lt;returns&gt;The path, relative to this filesystem&#39;s root.&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// &lt;para&gt;The relative path is relative to this filesystem&#39;s root, not starting with any
+        /// directory separator. If input was recognized as a url (path), then output uses url (path) separator
+        /// chars.&lt;/para&gt;
+        /// &lt;/remarks&gt;
+        public string GetRelativePath(string fullPathOrUrl)
+        {
+            // test url
+            var path = fullPathOrUrl.Replace(&#39;\\&#39;, &#39;/&#39;); // ensure url separator char
+
+            if (IOHelper.PathStartsWith(path, _rootUrl, &#39;/&#39;)) // if it starts with the root url...
+                return path.Substring(_rootUrl.Length) // strip it
+                            .TrimStart(&#39;/&#39;); // it&#39;s relative
+
+            // test path
+            path = EnsureDirectorySeparatorChar(fullPathOrUrl);
+
+            if (IOHelper.PathStartsWith(path, _rootPath, Path.DirectorySeparatorChar)) // if it starts with the root path
+                return path.Substring(_rootPath.Length) // strip it
+                            .TrimStart(Path.DirectorySeparatorChar); // it&#39;s relative
+
+            // unchanged - including separators
+            return fullPathOrUrl;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the full path.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;path&quot;&gt;The full or relative path.&lt;/param&gt;
+        /// &lt;returns&gt;The full path.&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// &lt;para&gt;On the physical filesystem, the full path is the rooted (ie non-relative), safe (ie within this
+        /// filesystem&#39;s root) path. All separators are converted to Path.DirectorySeparatorChar.&lt;/para&gt;
+        /// &lt;/remarks&gt;
+        public string GetFullPath(string path)
+        {
+            // normalize
+            var opath = path;
+            path = EnsureDirectorySeparatorChar(path);
+
+            // not sure what we are doing here - so if input starts with a (back) slash,
+            // we assume it&#39;s not a FS relative path and we try to convert it... but it
+            // really makes little sense?
+            if (path.StartsWith(Path.DirectorySeparatorChar.ToString()))
+                path = GetRelativePath(path);
+
+            // if already a full path, return
+            if (IOHelper.PathStartsWith(path, _rootPath, Path.DirectorySeparatorChar))
+                return path;
+
+            // else combine and sanitize, ie GetFullPath will take care of any relative
+            // segments in path, eg &#39;../../foo.tmp&#39; - it may throw a SecurityException
+            // if the combined path reaches illegal parts of the filesystem
+            var fpath = Path.Combine(_rootPath, path);
+            fpath = Path.GetFullPath(fpath);
+
+            // at that point, path is within legal parts of the filesystem, ie we have
+            // permissions to reach that path, but it may nevertheless be outside of
+            // our root path, due to relative segments, so better check
+            if (IOHelper.PathStartsWith(fpath, _rootPath, Path.DirectorySeparatorChar))
+                return fpath;
+
+            throw new FileSecurityException(&quot;File &#39;&quot; + opath + &quot;&#39; is outside this filesystem&#39;s root.&quot;);
+        }
+
+        public string GetUrl(string path)
+        {
+            path = EnsureUrlSeparatorChar(path).Trim(&#39;/&#39;);
+            return _rootUrl + &quot;/&quot; + path;
+        }
+
+        public DateTimeOffset GetLastModified(string path)
+        {
+            return DirectoryExists(path) 
+                ? new DirectoryInfo(GetFullPath(path)).LastWriteTimeUtc 
+                : new FileInfo(GetFullPath(path)).LastWriteTimeUtc;
+        }
+
+        public DateTimeOffset GetCreated(string path)
+        {
+            return DirectoryExists(path) 
+                ? Directory.GetCreationTimeUtc(GetFullPath(path)) 
+                : File.GetCreationTimeUtc(GetFullPath(path));
+        }
+
+        #region Helper Methods
+
+        protected virtual void EnsureDirectory(string path)
+        {
+            path = GetFullPath(path);
+            Directory.CreateDirectory(path);
+        }
+
+        protected string EnsureTrailingSeparator(string path)
+        {
+            return path.EnsureEndsWith(Path.DirectorySeparatorChar);
+        }
+
+        protected string EnsureDirectorySeparatorChar(string path)
+        {
+            path = path.Replace(&#39;/&#39;, Path.DirectorySeparatorChar);
+            path = path.Replace(&#39;\\&#39;, Path.DirectorySeparatorChar);
+            return path;
+        }
+
+        protected string EnsureUrlSeparatorChar(string path)
+        {
+            path = path.Replace(&#39;\\&#39;, &#39;/&#39;);
+            return path;
+        }
+
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[19,9,19,54,1],[20,9,20,10,1],[21,10,21,34,1],[21,35,21,82,0],[22,4,22,46,1],[23,5,23,104,0],[25,13,25,55,1],[26,13,26,65,1],[27,13,27,72,1],[29,13,29,57,1],[30,13,30,57,1],[31,13,31,46,1],[32,9,32,10,1],[34,9,34,67,1],[35,9,35,10,1],[36,13,36,48,1],[37,17,37,97,0],[39,13,39,47,1],[40,17,40,96,0],[42,4,42,34,1],[43,5,43,110,0],[49,13,49,61,1],[50,13,50,54,1],[51,13,51,14,1],[52,17,52,62,1],[53,13,53,14,1],[55,13,55,63,1],[56,13,56,55,1],[58,13,58,71,1],[59,13,59,45,1],[60,9,60,10,1],[63,9,63,10,1],[64,13,64,46,1],[67,13,67,14,1],[68,17,68,48,1],[69,21,69,93,1],[70,13,70,14,0],[71,13,71,51,0],[72,13,72,14,0],[73,17,73,94,0],[74,13,74,14,0],[75,13,75,50,0],[76,13,76,14,0],[77,17,77,80,0],[78,13,78,14,0],[80,13,80,47,0],[81,9,81,10,1],[84,9,84,10,1],[85,13,85,42,1],[86,9,86,10,1],[89,9,89,10,1],[90,13,90,46,1],[91,13,91,53,1],[92,17,92,24,0],[95,13,95,14,1],[96,17,96,55,1],[97,13,97,14,1],[98,13,98,50,0],[99,13,99,14,0],[100,17,100,80,0],[101,13,101,14,0],[102,9,102,10,1],[105,9,105,10,1],[106,13,106,46,1],[107,13,107,47,1],[108,9,108,10,1],[111,9,111,10,1],[112,13,112,41,1],[113,9,113,10,1],[116,9,116,10,1],[117,13,117,46,1],[118,13,118,48,1],[119,13,119,53,1],[120,17,120,113,1],[122,13,122,72,1],[124,13,124,32,1],[125,17,125,35,1],[127,20,127,67,1],[128,17,128,44,1],[129,9,129,10,1],[132,9,132,10,1],[133,13,133,42,1],[134,9,134,10,1],[137,9,137,10,1],[138,13,138,46,1],[141,13,141,14,1],[142,17,142,48,1],[143,21,143,95,1],[144,13,144,14,0],[145,13,145,51,0],[146,13,146,14,0],[147,17,147,94,0],[148,13,148,14,0],[149,13,149,50,0],[150,13,150,14,0],[151,17,151,80,0],[152,13,152,14,0],[154,13,154,47,0],[155,9,155,10,1],[158,9,158,10,1],[159,13,159,46,1],[160,13,160,44,1],[161,9,161,10,1],[164,9,164,10,1],[165,13,165,46,1],[166,13,166,48,1],[167,17,167,24,1],[170,13,170,14,1],[171,17,171,39,1],[172,13,172,14,1],[173,13,173,45,0],[174,13,174,14,0],[175,17,175,139,0],[176,13,176,14,0],[177,9,177,10,1],[180,9,180,10,1],[181,13,181,46,1],[182,13,182,42,1],[183,9,183,10,1],[198,9,198,10,1],[200,13,200,57,1],[202,13,202,62,1],[203,17,204,45,1],[207,13,207,64,1],[209,13,209,87,1],[210,17,211,69,1],[214,13,214,34,1],[215,9,215,10,1],[227,9,227,10,1],[229,13,229,30,1],[230,13,230,55,1],[235,13,235,73,1],[236,17,236,46,1],[239,13,239,87,1],[240,17,240,29,0],[245,13,245,55,1],[246,13,246,45,1],[251,13,251,88,1],[252,17,252,30,1],[254,13,254,104,1],[255,9,255,10,1],[258,9,258,10,1],[259,13,259,59,1],[260,13,260,42,1],[261,9,261,10,1],[264,9,264,10,1],[265,13,267,68,1],[268,9,268,10,1],[271,9,271,10,1],[272,13,274,62,1],[275,9,275,10,1],[280,9,280,10,0],[281,13,281,38,0],[282,13,282,45,0],[283,9,283,10,0],[286,9,286,10,0],[287,13,287,69,0],[288,9,288,10,0],[291,9,291,10,1],[292,13,292,67,1],[293,13,293,68,1],[294,13,294,25,1],[295,9,295,10,1],[298,9,298,10,1],[299,13,299,44,1],[300,13,300,25,1],[301,9,301,10,1]]);
+    </script>
+  </body>
+</html>

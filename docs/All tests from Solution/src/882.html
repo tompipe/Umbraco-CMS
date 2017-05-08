@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Trees\MemberTreeController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Globalization;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Formatting;
+using System.Web.Http;
+using System.Web.Security;
+using Umbraco.Core;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Security;
+using Umbraco.Web.Models.Trees;
+using Umbraco.Web.Mvc;
+using Umbraco.Web.WebApi.Filters;
+using umbraco;
+using umbraco.BusinessLogic.Actions;
+using Constants = Umbraco.Core.Constants;
+
+namespace Umbraco.Web.Trees
+{
+    //We will not allow the tree to render unless the user has access to any of the sections that the tree gets rendered
+    // this is not ideal but until we change permissions to be tree based (not section) there&#39;s not much else we can do here.
+    [UmbracoApplicationAuthorize(
+        Constants.Applications.Content,
+        Constants.Applications.Media,
+        Constants.Applications.Members)]
+    [LegacyBaseTree(typeof (loadMembers))]
+    [Tree(Constants.Applications.Members, Constants.Trees.Members, null, sortOrder: 0)]
+    [PluginController(&quot;UmbracoTrees&quot;)]
+    [CoreTree]
+    public class MemberTreeController : TreeController
+    {
+        public MemberTreeController()
+        {
+            _provider = Core.Security.MembershipProviderExtensions.GetMembersMembershipProvider();
+            _isUmbracoProvider = _provider.IsUmbracoMembershipProvider();
+        }
+
+        private readonly MembershipProvider _provider;
+        private readonly bool _isUmbracoProvider;
+
+        /// &lt;summary&gt;
+        /// Gets an individual tree node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpQueryStringFilter(&quot;queryStrings&quot;)]
+        public TreeNode GetTreeNode(string id, FormDataCollection queryStrings)
+        {   
+            var node = GetSingleTreeNode(id, queryStrings);
+
+            //add the tree alias to the node since it is standalone (has no root for which this normally belongs)
+            node.AdditionalData[&quot;treeAlias&quot;] = TreeAlias;
+            return node;
+        }
+
+        protected TreeNode GetSingleTreeNode(string id, FormDataCollection queryStrings)
+        {
+            if (_isUmbracoProvider)
+            {
+                Guid asGuid;
+                if (Guid.TryParse(id, out asGuid) == false)
+                {
+                    throw new HttpResponseException(Request.CreateResponse(HttpStatusCode.NotFound));
+                }
+
+                var member = Services.MemberService.GetByKey(asGuid);
+                if (member == null)
+                {
+                    throw new HttpResponseException(Request.CreateResponse(HttpStatusCode.NotFound));
+                }
+
+                var node = CreateTreeNode(
+                    member.Key.ToString(&quot;N&quot;),
+                    &quot;-1&quot;,
+                    queryStrings,
+                    member.Name,
+                    &quot;icon-user&quot;,
+                    false);
+
+                node.AdditionalData.Add(&quot;contentType&quot;, member.ContentTypeAlias);
+                node.AdditionalData.Add(&quot;isContainer&quot;, true);
+
+                return node;
+            }
+            else
+            {
+                object providerId = id;
+                Guid asGuid;
+                if (Guid.TryParse(id, out asGuid))
+                {
+                    providerId = asGuid;
+                }
+
+                var member = _provider.GetUser(providerId, false);
+                if (member == null)
+                {
+                    throw new HttpResponseException(Request.CreateResponse(HttpStatusCode.NotFound));
+                }
+
+                var node = CreateTreeNode(
+                    member.ProviderUserKey.TryConvertTo&lt;Guid&gt;().Result.ToString(&quot;N&quot;),
+                    &quot;-1&quot;,
+                    queryStrings,
+                    member.UserName,
+                    &quot;icon-user&quot;,
+                    false);
+
+                return node;    
+            }
+
+            
+        }
+
+        protected override TreeNodeCollection GetTreeNodes(string id, FormDataCollection queryStrings)
+        {
+            var nodes = new TreeNodeCollection();
+
+            if (id == Constants.System.Root.ToInvariantString())
+            {
+                nodes.Add(
+                        CreateTreeNode(Constants.Conventions.MemberTypes.AllMembersListId, id, queryStrings, ui.Text(&quot;member&quot;, &quot;allMembers&quot;), &quot;icon-users&quot;, false,
+                            queryStrings.GetValue&lt;string&gt;(&quot;application&quot;) + TreeAlias.EnsureStartsWith(&#39;/&#39;) + &quot;/list/&quot; + Constants.Conventions.MemberTypes.AllMembersListId));
+
+                if (_isUmbracoProvider)
+                {
+                    nodes.AddRange(Services.MemberTypeService.GetAll()
+                        .Select(memberType =&gt;
+                            CreateTreeNode(memberType.Alias, id, queryStrings, memberType.Name, &quot;icon-users&quot;, false,
+                                queryStrings.GetValue&lt;string&gt;(&quot;application&quot;) + TreeAlias.EnsureStartsWith(&#39;/&#39;) + &quot;/list/&quot; + memberType.Alias)));
+                }
+            }
+
+            //There is no menu for any of these nodes
+            nodes.ForEach(x =&gt; x.MenuUrl = null);
+            //All nodes are containers
+            nodes.ForEach(x =&gt; x.AdditionalData.Add(&quot;isContainer&quot;, true));
+
+            return nodes;
+        }
+
+        protected override MenuItemCollection GetMenuForNode(string id, FormDataCollection queryStrings)
+        {
+            var menu = new MenuItemCollection();
+
+            if (id == Constants.System.Root.ToInvariantString())
+            {
+                // root actions      
+                if (_provider.IsUmbracoMembershipProvider())
+                {
+                    //set default
+                    menu.DefaultMenuAlias = ActionNew.Instance.Alias;
+
+                    //Create the normal create action
+                    menu.Items.Add&lt;ActionNew&gt;(ui.Text(&quot;actions&quot;, ActionNew.Instance.Alias));
+                }
+                else
+                {
+                    //Create a custom create action - this does not launch a dialog, it just navigates to the create screen
+                    // we&#39;ll create it based on the ActionNew so it maintains the same icon properties, name, etc...
+                    var createMenuItem = new MenuItem(ActionNew.Instance);
+                    //we want to go to this route: /member/member/edit/-1?create=true
+                    createMenuItem.NavigateToRoute(&quot;/member/member/edit/-1?create=true&quot;);
+                    menu.Items.Add(createMenuItem);
+                }
+                
+                menu.Items.Add&lt;RefreshNode, ActionRefresh&gt;(ui.Text(&quot;actions&quot;, ActionRefresh.Instance.Alias), true);
+                return menu;
+            }
+
+            //add delete option for all members
+            menu.Items.Add&lt;ActionDelete&gt;(ui.Text(&quot;actions&quot;, ActionDelete.Instance.Alias));
+
+            return menu;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[35,9,35,38,0],[36,9,36,10,0],[37,13,37,99,0],[38,13,38,74,0],[39,9,39,10,0],[52,9,52,10,0],[53,13,53,60,0],[56,13,56,58,0],[57,13,57,25,0],[58,9,58,10,0],[61,9,61,10,0],[62,13,62,36,0],[63,13,63,14,0],[65,17,65,60,0],[66,17,66,18,0],[67,21,67,102,0],[70,17,70,70,0],[71,17,71,36,0],[72,17,72,18,0],[73,21,73,102,0],[76,17,82,28,0],[84,17,84,81,0],[85,17,85,62,0],[87,17,87,29,0],[90,13,90,14,0],[91,17,91,40,0],[93,17,93,51,0],[94,17,94,18,0],[95,21,95,41,0],[96,17,96,18,0],[98,17,98,67,0],[99,17,99,36,0],[100,17,100,18,0],[101,21,101,102,0],[104,17,110,28,0],[112,17,112,29,0],[116,9,116,10,0],[119,9,119,10,0],[120,13,120,50,0],[122,13,122,65,0],[123,13,123,14,0],[124,17,126,174,0],[128,17,128,40,0],[129,17,129,18,0],[130,21,132,29,0],[132,29,133,142,0],[133,142,133,145,0],[130,21,133,145,0],[134,17,134,18,0],[135,13,135,14,0],[138,13,138,32,0],[138,32,138,48,0],[138,48,138,50,0],[138,13,138,50,0],[140,13,140,32,0],[140,32,140,73,0],[140,73,140,75,0],[140,13,140,75,0],[142,13,142,26,0],[143,9,143,10,0],[146,9,146,10,0],[147,13,147,49,0],[149,13,149,65,0],[150,13,150,14,0],[152,17,152,61,0],[153,17,153,18,0],[155,21,155,70,0],[158,21,158,93,0],[159,17,159,18,0],[161,17,161,18,0],[164,21,164,75,0],[166,21,166,90,0],[167,21,167,52,0],[168,17,168,18,0],[170,17,170,116,0],[171,17,171,29,0],[175,13,175,91,0],[177,13,177,25,0],[178,9,178,10,0]]);
+    </script>
+  </body>
+</html>

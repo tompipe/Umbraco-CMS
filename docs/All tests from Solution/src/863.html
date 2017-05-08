@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\PublishedCache\XmlPublishedCache\XmlCacheFilePersister.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using umbraco;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Web.Scheduling;
+
+namespace Umbraco.Web.PublishedCache.XmlPublishedCache
+{
+    /// &lt;summary&gt;
+    /// This is the background task runner that persists the xml file to the file system
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// This is used so that all file saving is done on a web aware worker background thread and all logic is performed async so this
+    /// process will not interfere with any web requests threads. This is also done as to not require any global locks and to ensure that
+    /// if multiple threads are performing publishing tasks that the file will be persisted in accordance with the final resulting
+    /// xml structure since the file writes are queued.
+    /// &lt;/remarks&gt;
+    internal class XmlCacheFilePersister : LatchedBackgroundTaskBase
+    {
+        private readonly IBackgroundTaskRunner&lt;XmlCacheFilePersister&gt; _runner;
+        private readonly content _content;
+        private readonly ProfilingLogger _logger;
+        private readonly object _locko = new object();
+        private bool _released;
+        private Timer _timer;
+        private DateTime _initialTouch;
+        private readonly AsyncLock _runLock = new AsyncLock(); // ensure we run once at a time
+
+        // note:
+        // as long as the runner controls the runs, we know that we run once at a time, but
+        // when the AppDomain goes down and the runner has completed and yet the persister is
+        // asked to save, then we need to run immediately - but the runner may be running, so
+        // we need to make sure there&#39;s no collision - hence _runLock
+
+        private const int WaitMilliseconds = 4000; // save the cache 4s after the last change (ie every 4s min)
+        private const int MaxWaitMilliseconds = 30000; // save the cache after some time (ie no more than 30s of changes)
+
+        // save the cache when the app goes down
+        public override bool RunsOnShutdown { get { return _timer != null; } }
+
+        // initialize the first instance, which is inactive (not touched yet)
+        public XmlCacheFilePersister(IBackgroundTaskRunner&lt;XmlCacheFilePersister&gt; runner, content content, ProfilingLogger logger)
+            : this(runner, content, logger, false)
+        { }
+
+        private XmlCacheFilePersister(IBackgroundTaskRunner&lt;XmlCacheFilePersister&gt; runner, content content, ProfilingLogger logger, bool touched)
+        {
+            _runner = runner;
+            _content = content;
+            _logger = logger;
+
+            if (runner.TryAdd(this) == false)
+            {
+                _runner = null; // runner&#39;s down
+                _released = true; // don&#39;t mess with timer
+                return;
+            }
+
+            // runner could decide to run it anytime now
+
+            if (touched == false) return;
+
+            _logger.Logger.Debug&lt;XmlCacheFilePersister&gt;(&quot;Created, save in {0}ms.&quot;, () =&gt; WaitMilliseconds);
+            _initialTouch = DateTime.Now;
+            _timer = new Timer(_ =&gt; TimerRelease());
+            _timer.Change(WaitMilliseconds, 0);
+        }
+
+        public XmlCacheFilePersister Touch()
+        {
+            // if _released is false then we&#39;re going to setup a timer
+            //  then the runner wants to shutdown &amp; run immediately
+            //  this sets _released to true &amp; the timer will trigger eventualy &amp; who cares?
+            // if _released is true, either it&#39;s a normal release, or
+            //  a runner shutdown, in which case we won&#39;t be able to
+            //  add a new task, and so we&#39;ll run immediately
+
+            var ret = this;
+            var runNow = false;
+
+            lock (_locko)
+            {
+                if (_released) // our timer has triggered OR the runner is shutting down
+                {
+                    _logger.Logger.Debug&lt;XmlCacheFilePersister&gt;(&quot;Touched, was released...&quot;);
+
+                    // release: has run or is running, too late, return a new task (adds itself to runner)
+                    if (_runner == null)
+                    {
+                        _logger.Logger.Debug&lt;XmlCacheFilePersister&gt;(&quot;Runner is down, run now.&quot;);
+                        runNow = true;
+                    }
+                    else
+                    {
+                        _logger.Logger.Debug&lt;XmlCacheFilePersister&gt;(&quot;Create new...&quot;);
+                        ret = new XmlCacheFilePersister(_runner, _content, _logger, true);
+                        if (ret._runner == null)
+                        {
+                            // could not enlist with the runner, runner is completed, must run now
+                            _logger.Logger.Debug&lt;XmlCacheFilePersister&gt;(&quot;Runner is down, run now.&quot;);
+                            runNow = true;
+                        }
+                    }
+                }
+
+                else if (_timer == null) // we don&#39;t have a timer yet
+                {
+                    _logger.Logger.Debug&lt;XmlCacheFilePersister&gt;(&quot;Touched, was idle, start and save in {0}ms.&quot;, () =&gt; WaitMilliseconds);
+                    _initialTouch = DateTime.Now;
+                    _timer = new Timer(_ =&gt; TimerRelease());
+                    _timer.Change(WaitMilliseconds, 0);
+                }
+
+                else // we have a timer
+                {
+                    // change the timer to trigger in WaitMilliseconds unless we&#39;ve been touched first more
+                    // than MaxWaitMilliseconds ago and then leave the time unchanged
+
+                    if (DateTime.Now - _initialTouch &lt; TimeSpan.FromMilliseconds(MaxWaitMilliseconds))
+                    {
+                        _logger.Logger.Debug&lt;XmlCacheFilePersister&gt;(&quot;Touched, was waiting, can delay, save in {0}ms.&quot;, () =&gt; WaitMilliseconds);
+                        _timer.Change(WaitMilliseconds, 0);
+                    }
+                    else
+                    {
+                        _logger.Logger.Debug&lt;XmlCacheFilePersister&gt;(&quot;Touched, was waiting, cannot delay.&quot;);
+                    }
+                }
+            }
+
+            if (runNow)
+                //Run();
+                LogHelper.Warn&lt;XmlCacheFilePersister&gt;(&quot;Cannot write now because we are going down, changes may be lost.&quot;);
+
+            return ret; // this, by default, unless we created a new one
+        }
+
+        private void TimerRelease()
+        {
+            lock (_locko)
+            {
+                _logger.Logger.Debug&lt;XmlCacheFilePersister&gt;(&quot;Timer: release.&quot;);
+                _released = true;
+
+                Release();
+            }
+        }
+
+        public override Task RunAsync(CancellationToken token)
+        {
+            throw new NotImplementedException();
+        }
+
+        public override bool IsAsync
+        {
+            get { return false; }
+        }
+
+        public override void Run()
+        {
+            lock (_locko)
+            {
+                _logger.Logger.Debug&lt;XmlCacheFilePersister&gt;(&quot;Run now (sync).&quot;);
+                // not really needed but safer (it&#39;s only us invoking Run, but the method is public...)
+                _released = true;
+            }
+
+            using (_runLock.Lock())
+            {
+                _content.SaveXmlToFile();
+            }
+        }
+
+        protected override void DisposeResources()
+        {
+            base.DisposeResources();
+
+            // stop the timer
+            if (_timer == null) return;
+            _timer.Change(Timeout.Infinite, Timeout.Infinite);
+            _timer.Dispose();
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,9,25,55,0],[29,9,29,63,0],[41,51,41,52,0],[41,53,41,75,0],[41,76,41,77,0],[45,15,45,51,0],[46,9,46,10,0],[46,11,46,12,0],[48,9,48,146,0],[49,9,49,10,0],[50,13,50,30,0],[51,13,51,32,0],[52,13,52,30,0],[54,13,54,46,0],[55,13,55,14,0],[56,17,56,32,0],[57,17,57,34,0],[58,17,58,24,0],[63,13,63,34,0],[63,35,63,42,0],[65,13,65,90,0],[65,90,65,106,0],[65,106,65,108,0],[65,13,65,108,0],[66,13,66,42,0],[67,13,67,37,0],[67,37,67,51,0],[67,51,67,53,0],[67,13,67,53,0],[68,13,68,48,0],[69,9,69,10,0],[72,9,72,10,0],[80,13,80,28,0],[81,13,81,32,0],[83,13,83,26,0],[84,13,84,14,0],[85,17,85,31,0],[86,17,86,18,0],[87,21,87,93,0],[90,21,90,41,0],[91,21,91,22,0],[92,25,92,97,0],[93,25,93,39,0],[94,21,94,22,0],[96,21,96,22,0],[97,25,97,86,0],[98,25,98,91,0],[99,25,99,49,0],[100,25,100,26,0],[102,29,102,101,0],[103,29,103,43,0],[104,25,104,26,0],[105,21,105,22,0],[106,17,106,18,0],[108,22,108,41,0],[109,17,109,18,0],[110,21,110,118,0],[110,118,110,134,0],[110,134,110,136,0],[110,21,110,136,0],[111,21,111,50,0],[112,21,112,45,0],[112,45,112,59,0],[112,59,112,61,0],[112,21,112,61,0],[113,21,113,56,0],[114,17,114,18,0],[117,17,117,18,0],[121,21,121,103,0],[122,21,122,22,0],[123,25,123,126,0],[123,126,123,142,0],[123,142,123,144,0],[123,25,123,144,0],[124,25,124,60,0],[125,21,125,22,0],[127,21,127,22,0],[128,25,128,108,0],[129,21,129,22,0],[130,17,130,18,0],[131,13,131,14,0],[133,13,133,24,0],[135,17,135,123,0],[137,13,137,24,0],[138,9,138,10,0],[141,9,141,10,0],[142,13,142,26,0],[143,13,143,14,0],[144,17,144,80,0],[145,17,145,34,0],[147,17,147,27,0],[148,13,148,14,0],[149,9,149,10,0],[152,9,152,10,0],[153,13,153,49,0],[158,17,158,18,0],[158,19,158,32,0],[158,33,158,34,0],[162,9,162,10,0],[163,13,163,26,0],[164,13,164,14,0],[165,17,165,80,0],[167,17,167,34,0],[168,13,168,14,0],[170,13,170,36,0],[171,13,171,14,0],[172,17,172,42,0],[173,13,173,14,0],[174,9,174,10,0],[177,9,177,10,0],[178,13,178,37,0],[181,13,181,32,0],[181,33,181,40,0],[182,13,182,63,0],[183,13,183,30,0],[184,9,184,10,0]]);
+    </script>
+  </body>
+</html>

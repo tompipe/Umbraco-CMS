@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\controls\ContentControl.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Globalization;
+using System.Linq;
+using System.Web;
+using System.Web.UI;
+using System.Web.UI.WebControls;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Models;
+using umbraco.BasePages;
+using umbraco.cms.businesslogic;
+using umbraco.cms.businesslogic.datatype;
+using umbraco.cms.businesslogic.propertytype;
+using umbraco.cms.businesslogic.web;
+using umbraco.interfaces;
+using umbraco.uicontrols;
+using Content = umbraco.cms.businesslogic.Content;
+using ContentType = umbraco.cms.businesslogic.ContentType;
+using Media = umbraco.cms.businesslogic.media.Media;
+using Property = umbraco.cms.businesslogic.property.Property;
+using StylesheetProperty = umbraco.cms.businesslogic.web.StylesheetProperty;
+
+namespace umbraco.controls
+{
+    public class ContentControlLoadEventArgs : CancelEventArgs { }
+
+    /// &lt;summary&gt;
+    /// Summary description for ContentControl.
+    /// &lt;/summary&gt;
+    public class ContentControl : TabView
+    {
+
+        
+        internal Dictionary&lt;string, IDataType&gt; DataTypes = new Dictionary&lt;string, IDataType&gt;();
+        private readonly Content _content;
+        private UmbracoEnsuredPage _prntpage;
+        public event EventHandler SaveAndPublish;
+        public event EventHandler SaveToPublish;
+        public event EventHandler Save;
+        private readonly publishModes _canPublish = publishModes.NoPublish;
+        public TabPage tpProp;
+        public bool DoesPublish = false;
+        public TextBox NameTxt = new TextBox();
+        public PlaceHolder NameTxtHolder = new PlaceHolder();
+        public RequiredFieldValidator NameTxtValidator = new RequiredFieldValidator();
+        private readonly CustomValidator _nameTxtCustomValidator = new CustomValidator();
+        private static readonly string UmbracoPath = SystemDirectories.Umbraco;
+        public Pane PropertiesPane = new Pane();
+        // zb-00036 #29889 : load it only once
+        List&lt;ContentType.TabI&gt; _virtualTabs;
+        //default to true!
+        private bool _savePropertyDataWhenInvalid = true;
+        private ContentType _contentType;
+
+        
+        public Content ContentObject
+        {
+            get { return _content; }
+        }
+
+        /// &lt;summary&gt;
+        /// This property controls whether the content property values are persisted even if validation 
+        /// fails. If set to false, then the values will not be persisted.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This is required because when we are editing content we should be persisting invalid values to the database
+        /// as this makes it easier for editors to come back and fix up their changes before they publish. Of course we
+        /// don&#39;t publish if the page is invalid. In the case of media and members, we don&#39;t want to persist the values
+        /// to the database when the page is invalid because there is no published state.
+        /// Relates to: http://issues.umbraco.org/issue/U4-227
+        /// &lt;/remarks&gt;
+        public bool SavePropertyDataWhenInvalid
+        {
+            get { return _savePropertyDataWhenInvalid; }
+            set { _savePropertyDataWhenInvalid = value; }
+        }
+
+        [Obsolete(&quot;This is no longer used and will be removed from the codebase in future versions&quot;)]
+        private string _errorMessage = &quot;&quot;;
+
+        [Obsolete(&quot;This is no longer used and will be removed from the codebase in future versions&quot;)]
+        public string ErrorMessage
+        {
+            set { _errorMessage = value; }
+        }
+
+        [Obsolete(&quot;This is no longer used and will be removed from the codebase in future versions&quot;)]
+        protected void standardSaveAndPublishHandler(object sender, EventArgs e)
+        {
+        }
+
+        
+        /// &lt;summary&gt;
+        /// Constructor to set default properties.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;c&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;CanPublish&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;Id&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// This method used to create all of the child controls too which is BAD since
+        /// the page hasn&#39;t started initializing yet. Control IDs were not being named
+        /// correctly, etc... I&#39;ve moved the child control setup/creation to the CreateChildControls
+        /// method where they are suposed to be.
+        /// &lt;/remarks&gt;
+        public ContentControl(Content c, publishModes CanPublish, string Id)
+        {
+            ID = Id;
+            this._canPublish = CanPublish;
+            _content = c;
+
+            Width = 350;
+            Height = 350;
+
+            _prntpage = (UmbracoEnsuredPage)Page;
+
+            // zb-00036 #29889 : load it only once
+            if (_virtualTabs == null)
+                _virtualTabs = _content.ContentType.getVirtualTabs.ToList();
+
+            foreach (ContentType.TabI t in _virtualTabs)
+            {
+                TabPage tp = NewTabPage(t.Caption);
+                AddSaveAndPublishButtons(ref tp);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Create and setup all of the controls child controls.
+        /// &lt;/summary&gt;
+        protected override void CreateChildControls()
+        {
+            base.CreateChildControls();
+
+            
+            _prntpage = (UmbracoEnsuredPage)Page;
+            int i = 0;
+            Hashtable inTab = new Hashtable();
+
+            // zb-00036 #29889 : load it only once
+            if (_virtualTabs == null)
+                _virtualTabs = _content.ContentType.getVirtualTabs.ToList();
+
+            if(_contentType == null)
+                _contentType = ContentType.GetContentType(_content.ContentType.Id);
+
+            foreach (ContentType.TabI tab in _virtualTabs)
+            {
+                var tabPage = this.Panels[i] as TabPage;
+                if (tabPage == null)
+                {
+                    throw new ArgumentException(&quot;Unable to load tab \&quot;&quot; + tab.Caption + &quot;\&quot;&quot;);
+                }
+
+                tabPage.Style.Add(&quot;text-align&quot;, &quot;center&quot;);
+
+                //Legacy vs New API loading of PropertyTypes
+                if (_contentType.ContentTypeItem != null)
+                {
+                    LoadPropertyTypes(_contentType.ContentTypeItem, tabPage, inTab, tab.Id, tab.Caption);
+                }
+                else
+                {
+                    LoadPropertyTypes(tab, tabPage, inTab);
+                }
+
+                i++;
+            }
+
+            // Add property pane
+            tpProp = NewTabPage(ui.Text(&quot;general&quot;, &quot;properties&quot;));
+            AddSaveAndPublishButtons(ref tpProp);
+            tpProp.Controls.Add(
+                new LiteralControl(&quot;&lt;div id=\&quot;errorPane_&quot; + tpProp.ClientID +
+                                   &quot;\&quot; style=\&quot;display: none; text-align: left; color: red;width: 100%; border: 1px solid red; background-color: #FCDEDE\&quot;&gt;&lt;div&gt;&lt;b&gt;There were errors - data has not been saved!&lt;/b&gt;&lt;br/&gt;&lt;/div&gt;&lt;/div&gt;&quot;));
+
+            //if the property is not in a tab, add it to the general tab
+            var props = _content.GenericProperties;
+            foreach (Property p in props.OrderBy(x =&gt; x.PropertyType.SortOrder))
+            {
+                if (inTab[p.PropertyType.Id.ToString()] == null)
+                    AddControlNew(p, tpProp, ui.Text(&quot;general&quot;, &quot;properties&quot;));
+            }
+
+        }
+
+        /// &lt;summary&gt;
+        /// Loades PropertyTypes by Tab/PropertyGroup using the new API.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;tabPage&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;inTab&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;tabId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;tabCaption&quot;&gt;&lt;/param&gt;
+        private void LoadPropertyTypes(IContentTypeComposition contentType, TabPage tabPage, Hashtable inTab, int tabId, string tabCaption)
+        {
+            var groups = contentType.CompositionPropertyGroups.Where(x =&gt; x.Name == tabCaption);
+            var propertyTypes = groups
+                .SelectMany(x =&gt; x.PropertyTypes)
+                .OrderBy(x =&gt; x.SortOrder)
+                .Select(x =&gt; Tuple.Create(x.Id, x.Alias));
+
+            foreach (var items in propertyTypes)
+            {
+                var property = _content.getProperty(items.Item2);
+                if (property != null)
+                {
+                    AddControlNew(property, tabPage, tabCaption);
+
+                    if (!inTab.ContainsKey(items.Item1.ToString(CultureInfo.InvariantCulture)))
+                        inTab.Add(items.Item1.ToString(CultureInfo.InvariantCulture), true);
+                }
+                else
+                {
+                    throw new ArgumentNullException(
+                        string.Format(
+                            &quot;Property {0} ({1}) on Content Type {2} could not be retrieved for Document {3} on Tab Page {4}. To fix this problem, delete the property and recreate it.&quot;,
+                            items.Item2, items.Item1, _content.ContentType.Alias, _content.Id,
+                            tabCaption));
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Loades PropertyTypes by Tab using the Legacy API.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;tab&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;tabPage&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;inTab&quot;&gt;&lt;/param&gt;
+        private void LoadPropertyTypes(ContentType.TabI tab, TabPage tabPage, Hashtable inTab)
+        {
+            // Iterate through the property types and add them to the tab
+            // zb-00036 #29889 : fix property types getter to get the right set of properties
+            // ge : had a bit of a corrupt db and got weird NRE errors so rewrote this to catch the error and rethrow with detail
+            var propertyTypes = tab.GetPropertyTypes(_content.ContentType.Id);
+            foreach (var propertyType in propertyTypes.OrderBy(x =&gt; x.SortOrder))
+            {
+                var property = _content.getProperty(propertyType);
+                if (property != null &amp;&amp; tabPage != null)
+                {
+                    AddControlNew(property, tabPage, tab.Caption);
+
+                    // adding this check, as we occasionally get an already in dictionary error, though not sure why
+                    if (!inTab.ContainsKey(propertyType.Id.ToString(CultureInfo.InvariantCulture)))
+                        inTab.Add(propertyType.Id.ToString(CultureInfo.InvariantCulture), true);
+                }
+                else
+                {
+                    throw new ArgumentNullException(
+                        string.Format(
+                            &quot;Property {0} ({1}) on Content Type {2} could not be retrieved for Document {3} on Tab Page {4}. To fix this problem, delete the property and recreate it.&quot;,
+                            propertyType.Alias, propertyType.Id, _content.ContentType.Alias, _content.Id, tab.Caption));
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes the control and ensures child controls are setup
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        protected override void OnInit(EventArgs e)
+        {
+            base.OnInit(e);
+
+            EnsureChildControls();
+
+            // Add extras for the property tabpage. .
+            ContentControlLoadEventArgs contentcontrolEvent = new ContentControlLoadEventArgs();
+            FireBeforeContentControlLoad(contentcontrolEvent);
+
+            if (!contentcontrolEvent.Cancel)
+            {
+
+                NameTxt.ID = &quot;NameTxt&quot;;
+                if (!Page.IsPostBack)
+                {
+                    NameTxt.Text = _content.Text;
+                }
+
+                // Name validation
+                NameTxtValidator.ControlToValidate = NameTxt.ID;
+                _nameTxtCustomValidator.ControlToValidate = NameTxt.ID;
+                string[] errorVars = { ui.Text(&quot;name&quot;) };
+                NameTxtValidator.ErrorMessage = &quot; &quot; + ui.Text(&quot;errorHandling&quot;, &quot;errorMandatoryWithoutTab&quot;, errorVars) + &quot;&lt;br/&gt;&quot;;
+                NameTxtValidator.EnableClientScript = false;
+                NameTxtValidator.Display = ValidatorDisplay.Dynamic;                
+                _nameTxtCustomValidator.EnableClientScript = false;
+                _nameTxtCustomValidator.Display = ValidatorDisplay.Dynamic;
+                _nameTxtCustomValidator.ServerValidate += NameTxtCustomValidatorServerValidate;
+                _nameTxtCustomValidator.ValidateEmptyText = false;
+
+                NameTxtHolder.Controls.Add(NameTxt);
+                NameTxtHolder.Controls.Add(NameTxtValidator);
+                NameTxtHolder.Controls.Add(_nameTxtCustomValidator);
+                PropertiesPane.addProperty(ui.Text(&quot;general&quot;, &quot;name&quot;), NameTxtHolder);
+
+                Literal ltt = new Literal();
+                ltt.Text = _content.User.Name;
+                PropertiesPane.addProperty(ui.Text(&quot;content&quot;, &quot;createBy&quot;), ltt);
+
+                ltt = new Literal();
+                ltt.Text = _content.CreateDateTime.ToString();
+                PropertiesPane.addProperty(ui.Text(&quot;content&quot;, &quot;createDate&quot;), ltt);
+
+                ltt = new Literal();
+                ltt.Text = _content.Id.ToString();
+                PropertiesPane.addProperty(&quot;Id&quot;, ltt);
+
+                if (_content is Media)
+                {
+                    PropertiesPane.addProperty(ui.Text(&quot;content&quot;, &quot;mediatype&quot;), new LiteralControl(_content.ContentType.Alias));
+                }
+
+                tpProp.Controls.AddAt(0, PropertiesPane);
+                tpProp.Style.Add(&quot;text-align&quot;, &quot;center&quot;);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Custom validates the content name field
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;source&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;args&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// We need to ensure people are not entering XSS attacks on this field
+        /// http://issues.umbraco.org/issue/U4-485
+        /// 
+        /// This doesn&#39;t actually &#39;validate&#39; but changes the text field value and strips html
+        /// &lt;/remarks&gt;
+        void NameTxtCustomValidatorServerValidate(object source, ServerValidateEventArgs args)
+        {
+            NameTxt.Text = NameTxt.Text.StripHtml();
+            args.IsValid = true;
+        }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+
+            ContentControlLoadEventArgs contentcontrolEvent = new ContentControlLoadEventArgs();
+            FireAfterContentControlLoad(contentcontrolEvent);
+        }
+
+        /// &lt;summary&gt;
+        /// Sets the name (text) and values on the data types of the document
+        /// &lt;/summary&gt;
+        private void SetNameAndDataTypeValues()
+        {
+            //we only continue saving anything if: 
+            // SavePropertyDataWhenInvalid == true
+            // OR if the page is actually valid.
+            if (SavePropertyDataWhenInvalid || Page.IsValid)
+            {
+
+                foreach (var property in DataTypes)
+                {
+                    var defaultData = property.Value.Data as DefaultData;
+                    if (defaultData != null)
+                    {
+                        defaultData.PropertyTypeAlias = property.Key;
+                        defaultData.NodeId = _content.Id;
+                    }
+                    property.Value.DataEditor.Save();
+                }
+
+                //don&#39;t update if the name is empty
+                if (!NameTxt.Text.IsNullOrWhiteSpace())
+                {
+                    _content.Text = NameTxt.Text;
+                }
+            }
+        }
+
+        private void SaveClick(object sender, ImageClickEventArgs e)
+        {
+            SetNameAndDataTypeValues();
+
+            if (Save != null)
+            {
+                Save(this, new EventArgs());
+            }
+        }
+
+        private void DoSaveAndPublish(object sender, ImageClickEventArgs e)
+        {
+            DoesPublish = true;
+
+            SetNameAndDataTypeValues();
+
+            //NOTE: This is only here to keep backwards compatibility.
+            // see: http://issues.umbraco.org/issue/U4-1660
+            Save(this, new EventArgs());
+
+            if (SaveAndPublish != null)
+            {
+                SaveAndPublish(this, new EventArgs());    
+            }
+        }
+
+        private void DoSaveToPublish(object sender, ImageClickEventArgs e)
+        {
+            SaveClick(sender, e);
+            if (SaveToPublish != null)
+            {
+                SaveToPublish(this, new EventArgs());
+            }
+        }
+
+        private void AddSaveAndPublishButtons(ref TabPage tp)
+        {
+            MenuImageButton menuSave = tp.Menu.NewImageButton();
+            menuSave.ID = tp.ID + &quot;_save&quot;;
+            menuSave.ImageUrl = UmbracoPath + &quot;/images/editor/save.gif&quot;;
+            menuSave.Click += new ImageClickEventHandler(SaveClick);
+            menuSave.OnClickCommand = &quot;invokeSaveHandlers();&quot;;
+            menuSave.AltText = ui.Text(&quot;buttons&quot;, &quot;save&quot;);
+            if (_canPublish == publishModes.Publish)
+            {
+                MenuImageButton menuPublish = tp.Menu.NewImageButton();
+                menuPublish.ID = tp.ID + &quot;_publish&quot;;
+                menuPublish.ImageUrl = UmbracoPath + &quot;/images/editor/saveAndPublish.gif&quot;;
+                menuPublish.OnClickCommand = &quot;invokeSaveHandlers();&quot;;
+                menuPublish.Click += new ImageClickEventHandler(DoSaveAndPublish);
+                menuPublish.AltText = ui.Text(&quot;buttons&quot;, &quot;saveAndPublish&quot;);
+            }
+            else if (_canPublish == publishModes.SendToPublish)
+            {
+                MenuImageButton menuToPublish = tp.Menu.NewImageButton();
+                menuToPublish.ID = tp.ID + &quot;_topublish&quot;;
+                menuToPublish.ImageUrl = UmbracoPath + &quot;/images/editor/saveToPublish.gif&quot;;
+                menuToPublish.OnClickCommand = &quot;invokeSaveHandlers();&quot;;
+                menuToPublish.Click += new ImageClickEventHandler(DoSaveToPublish);
+                menuToPublish.AltText = ui.Text(&quot;buttons&quot;, &quot;saveToPublish&quot;);
+            }
+        }
+
+
+        private void AddControlNew(Property p, TabPage tp, string cap)
+        {
+            IDataType dt = p.PropertyType.DataTypeDefinition.DataType;
+
+            //check that property editor has been set for the data type used by this property
+            if (dt != null)
+            {
+                dt.DataEditor.Editor.ID = string.Format(&quot;prop_{0}&quot;, p.PropertyType.Alias);
+
+                dt.Data.PropertyId = p.Id;
+
+                //Add the DataType to an internal dictionary, which will be used to call the save method on the IDataEditor
+                //and to retrieve the value from IData in editContent.aspx.cs, so that it can be set on the legacy Document class.
+                DataTypes.Add(p.PropertyType.Alias, dt);
+
+                // check for buttons
+                IDataFieldWithButtons df1 = dt.DataEditor.Editor as IDataFieldWithButtons;
+                if (df1 != null)
+                {
+                    ((Control)df1).ID = p.PropertyType.Alias;
+
+
+                    if (df1.MenuIcons.Length &gt; 0)
+                        tp.Menu.InsertSplitter();
+
+
+                    // Add buttons
+                    int c = 0;
+                    bool atEditHtml = false;
+                    bool atSplitter = false;
+                    foreach (object o in df1.MenuIcons)
+                    {
+                        try
+                        {
+                            MenuIconI m = (MenuIconI)o;
+                            MenuIconI mi = tp.Menu.NewIcon();
+                            mi.ImageURL = m.ImageURL;
+                            mi.OnClickCommand = m.OnClickCommand;
+                            mi.AltText = m.AltText;
+                            mi.ID = tp.ID + &quot;_&quot; + m.ID;
+
+                            if (m.ID == &quot;html&quot;)
+                                atEditHtml = true;
+                            else
+                                atEditHtml = false;
+
+                            atSplitter = false;
+                        }
+                        catch
+                        {
+                            tp.Menu.InsertSplitter();
+                            atSplitter = true;
+                        }
+
+                        // Testing custom styles in editor
+                        if (atSplitter &amp;&amp; atEditHtml &amp;&amp; dt.DataEditor.TreatAsRichTextEditor)
+                        {
+                            DropDownList ddl = tp.Menu.NewDropDownList();
+
+                            ddl.Style.Add(&quot;margin-bottom&quot;, &quot;5px&quot;);
+                        ddl.Items.Add(ui.Text(&quot;buttons&quot;, &quot;styleChoose&quot;));
+                            ddl.ID = tp.ID + &quot;_editorStyle&quot;;
+                            if (StyleSheet.GetAll().Length &gt; 0)
+                            {
+                                foreach (StyleSheet s in StyleSheet.GetAll())
+                                {
+                                    foreach (StylesheetProperty sp in s.Properties)
+                                    {
+                                        ddl.Items.Add(new ListItem(sp.Text, sp.Alias));
+                                    }
+                                }
+                            }
+                            ddl.Attributes.Add(&quot;onChange&quot;, &quot;addStyle(this, &#39;&quot; + p.PropertyType.Alias + &quot;&#39;);&quot;);
+                            atEditHtml = false;
+                        }
+                        c++;
+                    }
+                }
+
+                // check for element additions
+                IMenuElement menuElement = dt.DataEditor.Editor as IMenuElement;
+                if (menuElement != null)
+                {
+                    // add separator
+                    tp.Menu.InsertSplitter();
+
+                    // add the element
+                    tp.Menu.NewElement(menuElement.ElementName, menuElement.ElementIdPreFix + p.Id.ToString(),
+                                       menuElement.ElementClass, menuElement.ExtraMenuWidth);
+                }
+
+                Pane pp = new Pane();
+                Control holder = new Control();
+                holder.Controls.Add(dt.DataEditor.Editor);
+                if (p.PropertyType.DataTypeDefinition.DataType.DataEditor.ShowLabel)
+                {
+                    string caption = p.PropertyType.Name;
+                    if (p.PropertyType.Description != null &amp;&amp; p.PropertyType.Description != String.Empty)
+                    switch (UmbracoConfig.For.UmbracoSettings().Content.PropertyContextHelpOption)
+                        {
+                            case &quot;icon&quot;:
+                                caption += &quot; &lt;img src=\&quot;&quot; + this.ResolveUrl(SystemDirectories.Umbraco) + &quot;/images/help.png\&quot; class=\&quot;umbPropertyContextHelp\&quot; alt=\&quot;&quot; + p.PropertyType.Description + &quot;\&quot; title=\&quot;&quot; + p.PropertyType.Description + &quot;\&quot; /&gt;&quot;;
+                                break;
+                            case &quot;text&quot;:
+                                caption += &quot;&lt;br /&gt;&lt;small&gt;&quot; + umbraco.library.ReplaceLineBreaks(p.PropertyType.Description) + &quot;&lt;/small&gt;&quot;;
+                                break;
+                        }
+                    pp.addProperty(caption, holder);
+                }
+                else
+                    pp.addProperty(holder);
+
+                // Validation
+                if (p.PropertyType.Mandatory)
+                {
+                    try
+                    {
+                        var rq = new RequiredFieldValidator
+                        {
+                            ControlToValidate = dt.DataEditor.Editor.ID,
+                            CssClass = &quot;error&quot;
+                        };
+                        rq.Style.Add(HtmlTextWriterStyle.Display, &quot;block&quot;);
+                        rq.Style.Add(HtmlTextWriterStyle.Padding, &quot;2px&quot;);
+                        var component = dt.DataEditor.Editor; // holder.FindControl(rq.ControlToValidate);
+                        var attribute = (ValidationPropertyAttribute)TypeDescriptor.GetAttributes(component)[typeof(ValidationPropertyAttribute)];
+                        PropertyDescriptor pd = null;
+                        if (attribute != null)
+                        {
+                            pd = TypeDescriptor.GetProperties(component, null)[attribute.Name];
+                        }
+                        if (pd != null)
+                        {
+                            rq.EnableClientScript = false;
+                            rq.Display = ValidatorDisplay.Dynamic;
+                            string[] errorVars = { p.PropertyType.Name, cap };
+                        rq.ErrorMessage = ui.Text(&quot;errorHandling&quot;, &quot;errorMandatory&quot;, errorVars) + &quot;&lt;br/&gt;&quot;;
+                            holder.Controls.AddAt(0, rq);
+                        }
+                    }
+                    catch (Exception valE)
+                    {
+                        HttpContext.Current.Trace.Warn(&quot;contentControl&quot;,
+                                                       &quot;EditorControl (&quot; + dt.DataTypeName + &quot;) does not support validation&quot;,
+                                                       valE);
+                    }
+                }
+
+                // RegExp Validation
+                if (p.PropertyType.ValidationRegExp != &quot;&quot;)
+                {
+                    try
+                    {
+                        var rv = new RegularExpressionValidator
+                        {
+                            ControlToValidate = dt.DataEditor.Editor.ID,
+                            CssClass = &quot;error&quot;
+                        };
+                        rv.Style.Add(HtmlTextWriterStyle.Display, &quot;block&quot;);
+                        rv.Style.Add(HtmlTextWriterStyle.Padding, &quot;2px&quot;);
+                        var component = dt.DataEditor.Editor; // holder.FindControl(rq.ControlToValidate);
+                        var attribute = (ValidationPropertyAttribute)TypeDescriptor.GetAttributes(component)[typeof(ValidationPropertyAttribute)];
+                        PropertyDescriptor pd = null;
+                        if (attribute != null)
+                        {
+                            pd = TypeDescriptor.GetProperties(component, null)[attribute.Name];
+                        }
+                        if (pd != null)
+                        {
+                            rv.ValidationExpression = p.PropertyType.ValidationRegExp;
+                            rv.EnableClientScript = false;
+                            rv.Display = ValidatorDisplay.Dynamic;
+                            string[] errorVars = { p.PropertyType.Name, cap };
+                        rv.ErrorMessage = ui.Text(&quot;errorHandling&quot;, &quot;errorRegExp&quot;, errorVars) + &quot;&lt;br/&gt;&quot;;
+                            holder.Controls.AddAt(0, rv);
+                        }
+                    }
+                    catch (Exception valE)
+                    {
+                        HttpContext.Current.Trace.Warn(&quot;contentControl&quot;,
+                                                       &quot;EditorControl (&quot; + dt.DataTypeName + &quot;) does not support validation&quot;,
+                                                       valE);
+                    }
+                }
+
+                // This is once again a nasty nasty hack to fix gui when rendering wysiwygeditor
+                if (dt.DataEditor.TreatAsRichTextEditor)
+                {
+                    tp.Controls.Add(dt.DataEditor.Editor);
+                }
+                else
+                {
+                    Panel ph = new Panel();
+                    ph.Attributes.Add(&quot;style&quot;, &quot;padding: 0; position: relative;&quot;); // NH 4.7.1, latest styles added to support CP item: 30363
+                    ph.Controls.Add(pp);
+
+                    tp.Controls.Add(ph);
+                }
+            }
+            else
+            {
+                
+                var ph = new Panel();
+
+                var pp = new Pane();
+
+                var missingPropertyEditorLabel = new Literal
+                {
+                    Text = ui.Text(&quot;errors&quot;, &quot;missingPropertyEditorErrorMessage&quot;)
+                };
+
+                pp.addProperty(p.PropertyType.Name, missingPropertyEditorLabel);
+                
+                ph.Attributes.Add(&quot;style&quot;, &quot;padding: 0; position: relative;&quot;);
+                
+                ph.Controls.Add(pp);
+
+                tp.Controls.Add(ph);
+            }
+
+            
+        }
+
+        public enum publishModes
+        {
+            Publish,
+            SendToPublish,
+            NoPublish
+        }
+
+        // EVENTS
+        public delegate void BeforeContentControlLoadEventHandler(ContentControl contentControl, ContentControlLoadEventArgs e);
+        public delegate void AfterContentControlLoadEventHandler(ContentControl contentControl, ContentControlLoadEventArgs e);
+
+
+        /// &lt;summary&gt;
+        /// Occurs when [before content control load].
+        /// &lt;/summary&gt;
+        public static event BeforeContentControlLoadEventHandler BeforeContentControlLoad;
+        /// &lt;summary&gt;
+        /// Fires the before content control load.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;umbraco.controls.ContentControlLoadEventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireBeforeContentControlLoad(ContentControlLoadEventArgs e)
+        {
+            if (BeforeContentControlLoad != null)
+                BeforeContentControlLoad(this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs when [before content control load].
+        /// &lt;/summary&gt;
+        public static event AfterContentControlLoadEventHandler AfterContentControlLoad;
+        /// &lt;summary&gt;
+        /// Fires the before content control load.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;umbraco.controls.ContentControlLoadEventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireAfterContentControlLoad(ContentControlLoadEventArgs e)
+        {
+            if (AfterContentControlLoad != null)
+                AfterContentControlLoad(this, e);
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[38,9,38,96,0],[44,9,44,76,0],[46,9,46,41,0],[47,9,47,48,0],[48,9,48,62,0],[49,9,49,87,0],[50,9,50,90,0],[51,9,51,80,0],[52,9,52,49,0],[56,9,56,58,0],[62,17,62,18,0],[62,19,62,35,0],[62,36,62,37,0],[78,17,78,18,0],[78,19,78,55,0],[78,56,78,57,0],[79,17,79,18,0],[79,19,79,56,0],[79,57,79,58,0],[83,9,83,43,0],[88,17,88,18,0],[88,19,88,41,0],[88,42,88,43,0],[93,9,93,10,0],[94,9,94,10,0],[109,9,109,77,0],[110,9,110,10,0],[111,13,111,21,0],[112,13,112,43,0],[113,13,113,26,0],[115,13,115,25,0],[116,13,116,26,0],[118,13,118,50,0],[121,13,121,38,0],[122,17,122,77,0],[124,13,124,20,0],[124,22,124,40,0],[124,41,124,43,0],[124,44,124,56,0],[125,13,125,14,0],[126,17,126,52,0],[127,17,127,50,0],[128,13,128,14,0],[129,9,129,10,0],[135,9,135,10,0],[136,13,136,40,0],[139,13,139,50,0],[140,13,140,23,0],[141,13,141,47,0],[144,13,144,38,0],[145,17,145,77,0],[147,13,147,37,0],[148,17,148,84,0],[150,13,150,20,0],[150,22,150,42,0],[150,43,150,45,0],[150,46,150,58,0],[151,13,151,14,0],[152,17,152,57,0],[153,17,153,37,0],[154,17,154,18,0],[155,21,155,95,0],[158,17,158,59,0],[161,17,161,58,0],[162,17,162,18,0],[163,21,163,106,0],[164,17,164,18,0],[166,17,166,18,0],[167,21,167,60,0],[168,17,168,18,0],[170,17,170,21,0],[171,13,171,14,0],[174,13,174,67,0],[175,13,175,50,0],[176,13,178,233,0],[181,13,181,52,0],[182,13,182,20,0],[182,22,182,32,0],[182,33,182,35,0],[182,36,182,55,0],[182,55,182,79,0],[182,79,182,80,0],[182,36,182,80,0],[183,13,183,14,0],[184,17,184,65,0],[185,21,185,80,0],[186,13,186,14,0],[188,9,188,10,0],[199,9,199,10,0],[200,13,200,75,0],[200,75,200,95,0],[200,95,200,97,0],[200,13,200,97,0],[201,13,202,34,0],[202,34,202,49,0],[202,49,203,31,0],[203,31,203,42,0],[203,42,204,30,0],[204,30,204,57,0],[204,57,204,59,0],[201,13,204,59,0],[206,13,206,20,0],[206,22,206,31,0],[206,32,206,34,0],[206,35,206,48,0],[207,13,207,14,0],[208,17,208,66,0],[209,17,209,38,0],[210,17,210,18,0],[211,21,211,66,0],[213,21,213,96,0],[214,25,214,93,0],[215,17,215,18,0],[217,17,217,18,0],[218,21,222,42,0],[224,13,224,14,0],[225,9,225,10,0],[234,9,234,10,0],[238,13,238,79,0],[239,13,239,20,0],[239,22,239,38,0],[239,39,239,41,0],[239,42,239,69,0],[239,69,239,80,0],[239,80,239,81,0],[239,42,239,81,0],[240,13,240,14,0],[241,17,241,67,0],[242,17,242,57,0],[243,17,243,18,0],[244,21,244,67,0],[247,21,247,100,0],[248,25,248,97,0],[249,17,249,18,0],[251,17,251,18,0],[252,21,255,121,0],[257,13,257,14,0],[258,9,258,10,0],[265,9,265,10,0],[266,13,266,28,0],[268,13,268,35,0],[271,13,271,97,0],[272,13,272,63,0],[274,13,274,45,0],[275,13,275,14,0],[277,17,277,40,0],[278,17,278,38,0],[279,17,279,18,0],[280,21,280,50,0],[281,17,281,18,0],[284,17,284,65,0],[285,17,285,72,0],[286,17,286,58,0],[287,17,287,129,0],[288,17,288,61,0],[289,17,289,69,0],[290,17,290,68,0],[291,17,291,76,0],[292,17,292,96,0],[293,17,293,67,0],[295,17,295,53,0],[296,17,296,62,0],[297,17,297,69,0],[298,17,298,87,0],[300,17,300,45,0],[301,17,301,47,0],[302,17,302,81,0],[304,17,304,37,0],[305,17,305,63,0],[306,17,306,83,0],[308,17,308,37,0],[309,17,309,51,0],[310,17,310,55,0],[312,17,312,39,0],[313,17,313,18,0],[314,21,314,129,0],[315,17,315,18,0],[317,17,317,58,0],[318,17,318,58,0],[319,13,319,14,0],[320,9,320,10,0],[334,9,334,10,0],[335,13,335,53,0],[336,13,336,33,0],[337,9,337,10,0],[340,9,340,10,0],[341,13,341,28,0],[343,13,343,97,0],[344,13,344,62,0],[345,9,345,10,0],[351,9,351,10,0],[355,13,355,61,0],[356,13,356,14,0],[358,17,358,24,0],[358,26,358,38,0],[358,39,358,41,0],[358,42,358,51,0],[359,17,359,18,0],[360,21,360,74,0],[361,21,361,45,0],[362,21,362,22,0],[363,25,363,70,0],[364,25,364,58,0],[365,21,365,22,0],[366,21,366,54,0],[367,17,367,18,0],[370,17,370,56,0],[371,17,371,18,0],[372,21,372,50,0],[373,17,373,18,0],[374,13,374,14,0],[375,9,375,10,0],[378,9,378,10,0],[379,13,379,40,0],[381,13,381,30,0],[382,13,382,14,0],[383,17,383,45,0],[384,13,384,14,0],[385,9,385,10,0],[388,9,388,10,0],[389,13,389,32,0],[391,13,391,40,0],[395,13,395,41,0],[397,13,397,40,0],[398,13,398,14,0],[399,17,399,55,0],[400,13,400,14,0],[401,9,401,10,0],[404,9,404,10,0],[405,13,405,34,0],[406,13,406,39,0],[407,13,407,14,0],[408,17,408,54,0],[409,13,409,14,0],[410,9,410,10,0],[413,9,413,10,0],[414,13,414,65,0],[415,13,415,43,0],[416,13,416,73,0],[417,13,417,69,0],[418,13,418,63,0],[419,13,419,59,0],[420,13,420,53,0],[421,13,421,14,0],[422,17,422,72,0],[423,17,423,53,0],[424,17,424,90,0],[425,17,425,70,0],[426,17,426,83,0],[427,17,427,76,0],[428,13,428,14,0],[429,18,429,64,0],[430,13,430,14,0],[431,17,431,74,0],[432,17,432,57,0],[433,17,433,91,0],[434,17,434,72,0],[435,17,435,84,0],[436,17,436,77,0],[437,13,437,14,0],[438,9,438,10,0],[442,9,442,10,0],[443,13,443,71,0],[446,13,446,28,0],[447,13,447,14,0],[448,17,448,91,0],[450,17,450,43,0],[454,17,454,57,0],[457,17,457,91,0],[458,17,458,33,0],[459,17,459,18,0],[460,21,460,62,0],[463,21,463,50,0],[464,25,464,50,0],[468,21,468,31,0],[469,21,469,45,0],[470,21,470,45,0],[471,21,471,28,0],[471,30,471,38,0],[471,39,471,41,0],[471,42,471,55,0],[472,21,472,22,0],[474,25,474,26,0],[475,29,475,56,0],[476,29,476,62,0],[477,29,477,54,0],[478,29,478,66,0],[479,29,479,52,0],[480,29,480,56,0],[482,29,482,48,0],[483,33,483,51,0],[485,33,485,52,0],[487,29,487,48,0],[488,25,488,26,0],[489,25,489,30,0],[490,25,490,26,0],[491,29,491,54,0],[492,29,492,47,0],[493,25,493,26,0],[496,25,496,93,0],[497,25,497,26,0],[498,29,498,74,0],[500,29,500,67,0],[501,25,501,74,0],[502,29,502,61,0],[503,29,503,64,0],[504,29,504,30,0],[505,33,505,40,0],[505,42,505,54,0],[505,55,505,57,0],[505,58,505,77,0],[506,33,506,34,0],[507,37,507,44,0],[507,46,507,67,0],[507,68,507,70,0],[507,71,507,83,0],[508,37,508,38,0],[509,41,509,88,0],[510,37,510,38,0],[511,33,511,34,0],[512,29,512,30,0],[513,29,513,111,0],[514,29,514,48,0],[515,25,515,26,0],[516,25,516,29,0],[517,21,517,22,0],[518,17,518,18,0],[521,17,521,81,0],[522,17,522,41,0],[523,17,523,18,0],[525,21,525,46,0],[528,21,529,94,0],[530,17,530,18,0],[532,17,532,38,0],[533,17,533,48,0],[534,17,534,59,0],[535,17,535,85,0],[536,17,536,18,0],[537,21,537,58,0],[538,21,538,106,0],[539,21,539,99,0],[542,33,542,251,0],[543,33,543,39,0],[545,33,545,137,0],[546,33,546,39,0],[548,21,548,53,0],[549,17,549,18,0],[551,21,551,44,0],[554,17,554,46,0],[555,17,555,18,0],[557,21,557,22,0],[558,25,562,27,0],[563,25,563,76,0],[564,25,564,74,0],[565,25,565,62,0],[566,25,566,147,0],[567,25,567,54,0],[568,25,568,47,0],[569,25,569,26,0],[570,29,570,96,0],[571,25,571,26,0],[572,25,572,40,0],[573,25,573,26,0],[574,29,574,59,0],[575,29,575,67,0],[576,29,576,79,0],[577,25,577,107,0],[578,29,578,58,0],[579,25,579,26,0],[580,21,580,22,0],[581,21,581,43,0],[582,21,582,22,0],[583,25,585,62,0],[586,21,586,22,0],[587,17,587,18,0],[590,17,590,59,0],[591,17,591,18,0],[593,21,593,22,0],[594,25,598,27,0],[599,25,599,76,0],[600,25,600,74,0],[601,25,601,62,0],[602,25,602,147,0],[603,25,603,54,0],[604,25,604,47,0],[605,25,605,26,0],[606,29,606,96,0],[607,25,607,26,0],[608,25,608,40,0],[609,25,609,26,0],[610,29,610,87,0],[611,29,611,59,0],[612,29,612,67,0],[613,29,613,79,0],[614,25,614,104,0],[615,29,615,58,0],[616,25,616,26,0],[617,21,617,22,0],[618,21,618,43,0],[619,21,619,22,0],[620,25,622,62,0],[623,21,623,22,0],[624,17,624,18,0],[627,17,627,57,0],[628,17,628,18,0],[629,21,629,59,0],[630,17,630,18,0],[632,17,632,18,0],[633,21,633,44,0],[634,21,634,83,0],[635,21,635,41,0],[637,21,637,41,0],[638,17,638,18,0],[639,13,639,14,0],[641,13,641,14,0],[643,17,643,38,0],[645,17,645,37,0],[647,17,650,19,0],[652,17,652,81,0],[654,17,654,79,0],[656,17,656,37,0],[658,17,658,37,0],[659,13,659,14,0],[662,9,662,10,0],[685,9,685,10,0],[686,13,686,50,0],[687,17,687,51,0],[688,9,688,10,0],[699,9,699,10,0],[700,13,700,49,0],[701,17,701,50,0],[702,9,702,10,0]]);
+    </script>
+  </body>
+</html>

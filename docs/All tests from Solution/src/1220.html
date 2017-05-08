@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Models\Mapping\ContentTypeModelMapper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Linq;
+using System.Threading;
+using AutoMapper;
+using Umbraco.Core;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Mapping;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Web.Models.ContentEditing;
+using System.Collections.Generic;
+using AutoMapper.Internal;
+using Umbraco.Core.Services;
+using Property = umbraco.NodeFactory.Property;
+
+namespace Umbraco.Web.Models.Mapping
+{
+    /// &lt;summary&gt;
+    /// Defines mappings for content/media/members type mappings
+    /// &lt;/summary&gt;
+    internal class ContentTypeModelMapper : MapperConfiguration
+    {
+        private readonly Lazy&lt;PropertyEditorResolver&gt; _propertyEditorResolver;
+
+        //default ctor
+        public ContentTypeModelMapper()
+        {
+            _propertyEditorResolver = new Lazy&lt;PropertyEditorResolver&gt;(() =&gt; PropertyEditorResolver.Current);
+        }
+
+        //ctor can be used for testing
+        public ContentTypeModelMapper(Lazy&lt;PropertyEditorResolver&gt; propertyEditorResolver)
+        {
+            _propertyEditorResolver = propertyEditorResolver;            
+        }
+
+        public override void ConfigureMappings(IConfiguration config, ApplicationContext applicationContext)
+        {
+            
+            config.CreateMap&lt;PropertyTypeBasic, PropertyType&gt;()
+                .ConstructUsing(basic =&gt; new PropertyType(applicationContext.Services.DataTypeService.GetDataTypeDefinitionById(basic.DataTypeId)))
+                .ForMember(type =&gt; type.ValidationRegExp, expression =&gt; expression.ResolveUsing(basic =&gt; basic.Validation.Pattern))
+                .ForMember(type =&gt; type.Mandatory, expression =&gt; expression.ResolveUsing(basic =&gt; basic.Validation.Mandatory))
+                .ForMember(type =&gt; type.Name, expression =&gt; expression.ResolveUsing(basic =&gt; basic.Label))
+                .ForMember(type =&gt; type.DataTypeDefinitionId, expression =&gt; expression.ResolveUsing(basic =&gt; basic.DataTypeId))
+                .ForMember(type =&gt; type.DataTypeId, expression =&gt; expression.Ignore())
+                .ForMember(type =&gt; type.PropertyEditorAlias, expression =&gt; expression.Ignore())
+                .ForMember(type =&gt; type.HelpText, expression =&gt; expression.Ignore())
+                .ForMember(type =&gt; type.Key, expression =&gt; expression.Ignore())
+                .ForMember(type =&gt; type.CreateDate, expression =&gt; expression.Ignore())
+                .ForMember(type =&gt; type.UpdateDate, expression =&gt; expression.Ignore())
+                .ForMember(type =&gt; type.HasIdentity, expression =&gt; expression.Ignore());
+
+            config.CreateMap&lt;DocumentTypeSave, IContentType&gt;()
+                //do the base mapping
+                .MapBaseContentTypeSaveToEntity&lt;DocumentTypeSave, PropertyTypeBasic, IContentType&gt;(applicationContext)
+                .ConstructUsing((source) =&gt; new ContentType(source.ParentId))
+                .ForMember(source =&gt; source.AllowedTemplates, expression =&gt; expression.Ignore())
+                .ForMember(dto =&gt; dto.DefaultTemplate, expression =&gt; expression.Ignore())
+                .AfterMap((source, dest) =&gt;
+                {
+                    dest.AllowedTemplates = source.AllowedTemplates
+                        .Where(x =&gt; x != null)
+                        .Select(s =&gt; applicationContext.Services.FileService.GetTemplate(s))
+                        .ToArray();
+
+                    if (source.DefaultTemplate != null)
+                        dest.SetDefaultTemplate(applicationContext.Services.FileService.GetTemplate(source.DefaultTemplate));
+
+                    ContentTypeModelMapperExtensions.AfterMapContentTypeSaveToEntity(source, dest, applicationContext);
+                });
+
+            config.CreateMap&lt;MediaTypeSave, IMediaType&gt;()
+                //do the base mapping
+                .MapBaseContentTypeSaveToEntity&lt;MediaTypeSave, PropertyTypeBasic, IMediaType&gt;(applicationContext)
+                .ConstructUsing((source) =&gt; new MediaType(source.ParentId))                
+                .AfterMap((source, dest) =&gt;
+                {
+                    ContentTypeModelMapperExtensions.AfterMapMediaTypeSaveToEntity(source, dest, applicationContext);
+                });
+
+            config.CreateMap&lt;MemberTypeSave, IMemberType&gt;()
+                //do the base mapping
+                .MapBaseContentTypeSaveToEntity&lt;MemberTypeSave, MemberPropertyTypeBasic, IMemberType&gt;(applicationContext)
+                .ConstructUsing((source) =&gt; new MemberType(source.ParentId))
+                .AfterMap((source, dest) =&gt;
+                {
+                    ContentTypeModelMapperExtensions.AfterMapContentTypeSaveToEntity(source, dest, applicationContext);
+
+                    //map the MemberCanEditProperty,MemberCanViewProperty
+                    foreach (var propertyType in source.Groups.SelectMany(x =&gt; x.Properties))
+                    {
+                        var localCopy = propertyType;
+                        var destProp = dest.PropertyTypes.SingleOrDefault(x =&gt; x.Alias.InvariantEquals(localCopy.Alias));
+                        if (destProp != null)
+                        {
+                            dest.SetMemberCanEditProperty(localCopy.Alias, localCopy.MemberCanEditProperty);
+                            dest.SetMemberCanViewProperty(localCopy.Alias, localCopy.MemberCanViewProperty);
+                        }
+                    }
+                });
+
+            config.CreateMap&lt;IContentTypeComposition, string&gt;().ConvertUsing(x =&gt; x.Alias);
+
+            config.CreateMap&lt;IMemberType, MemberTypeDisplay&gt;()
+                //map base logic
+                .MapBaseContentTypeEntityToDisplay&lt;IMemberType, MemberTypeDisplay, MemberPropertyTypeDisplay&gt;(applicationContext, _propertyEditorResolver)
+                .AfterMap((memberType, display) =&gt;
+                {
+                    //map the MemberCanEditProperty,MemberCanViewProperty
+                    foreach (var propertyType in memberType.PropertyTypes)
+                    {
+                        var localCopy = propertyType;
+                        var displayProp = display.Groups.SelectMany(x =&gt; x.Properties).SingleOrDefault(x =&gt; x.Alias.InvariantEquals(localCopy.Alias));
+                        if (displayProp != null)
+                        {
+                            displayProp.MemberCanEditProperty = memberType.MemberCanEditProperty(localCopy.Alias);
+                            displayProp.MemberCanViewProperty = memberType.MemberCanViewProperty(localCopy.Alias);
+                        }
+                    }
+                });
+
+            config.CreateMap&lt;IMediaType, MediaTypeDisplay&gt;()
+                //map base logic
+                .MapBaseContentTypeEntityToDisplay&lt;IMediaType, MediaTypeDisplay, PropertyTypeDisplay&gt;(applicationContext, _propertyEditorResolver)
+                .AfterMap((source, dest) =&gt;
+                 {
+                     //default listview
+                     dest.ListViewEditorName = Constants.Conventions.DataTypes.ListViewPrefix + &quot;Media&quot;;
+
+                     if (string.IsNullOrEmpty(source.Name) == false)
+                     {
+                         var name = Constants.Conventions.DataTypes.ListViewPrefix + source.Name;
+                         if (applicationContext.Services.DataTypeService.GetDataTypeDefinitionByName(name) != null)
+                             dest.ListViewEditorName = name;
+                     }
+                 });
+
+            config.CreateMap&lt;IContentType, DocumentTypeDisplay&gt;()
+                //map base logic
+                .MapBaseContentTypeEntityToDisplay&lt;IContentType, DocumentTypeDisplay, PropertyTypeDisplay&gt;(applicationContext, _propertyEditorResolver)
+                .ForMember(dto =&gt; dto.AllowedTemplates, expression =&gt; expression.Ignore())
+                .ForMember(dto =&gt; dto.DefaultTemplate, expression =&gt; expression.Ignore())
+                .ForMember(display =&gt; display.Notifications, expression =&gt; expression.Ignore())
+                .AfterMap((source, dest) =&gt;
+                {
+                    //sync templates
+                    dest.AllowedTemplates = source.AllowedTemplates.Select(Mapper.Map&lt;EntityBasic&gt;).ToArray();
+
+                    if (source.DefaultTemplate != null)
+                        dest.DefaultTemplate = Mapper.Map&lt;EntityBasic&gt;(source.DefaultTemplate);
+
+                    //default listview
+                    dest.ListViewEditorName = Constants.Conventions.DataTypes.ListViewPrefix + &quot;Content&quot;;
+
+                    if (string.IsNullOrEmpty(source.Alias) == false)
+                    {
+                        var name = Constants.Conventions.DataTypes.ListViewPrefix + source.Alias;
+                        if (applicationContext.Services.DataTypeService.GetDataTypeDefinitionByName(name) != null)
+                            dest.ListViewEditorName = name;
+                    }
+
+                });
+
+            config.CreateMap&lt;IMemberType, ContentTypeBasic&gt;();
+            config.CreateMap&lt;IMediaType, ContentTypeBasic&gt;();
+            config.CreateMap&lt;IContentType, ContentTypeBasic&gt;();
+
+            config.CreateMap&lt;PropertyTypeBasic, PropertyType&gt;()
+
+                .ConstructUsing(propertyTypeBasic =&gt;
+                {
+                    var dataType = applicationContext.Services.DataTypeService.GetDataTypeDefinitionById(propertyTypeBasic.DataTypeId);
+                    if (dataType == null) throw new NullReferenceException(&quot;No data type found with id &quot; + propertyTypeBasic.DataTypeId);
+                    return new PropertyType(dataType, propertyTypeBasic.Alias);
+                })
+
+                //only map if it is actually set
+                .ForMember(dest =&gt; dest.Id, expression =&gt; expression.Condition(source =&gt; source.Id &gt; 0))
+                .ForMember(dto =&gt; dto.CreateDate, expression =&gt; expression.Ignore())
+                .ForMember(dto =&gt; dto.UpdateDate, expression =&gt; expression.Ignore())
+                //only map if it is actually set, if it&#39;s  not set, it needs to be handled differently and will be taken care of in the 
+                // IContentType.AddPropertyType
+                .ForMember(dest =&gt; dest.PropertyGroupId, expression =&gt; expression.Condition(source =&gt; source.GroupId &gt; 0))
+                .ForMember(type =&gt; type.PropertyGroupId, expression =&gt; expression.MapFrom(display =&gt; new Lazy&lt;int&gt;(() =&gt; display.GroupId, false)))
+                .ForMember(type =&gt; type.Key, expression =&gt; expression.Ignore())
+                .ForMember(type =&gt; type.HelpText, expression =&gt; expression.Ignore())
+                .ForMember(type =&gt; type.HasIdentity, expression =&gt; expression.Ignore())
+                //ignore because this is set in the ctor NOT ON UPDATE, STUPID!
+                //.ForMember(type =&gt; type.Alias, expression =&gt; expression.Ignore())
+                //ignore because this is obsolete and shouldn&#39;t be used
+                .ForMember(type =&gt; type.DataTypeId, expression =&gt; expression.Ignore())
+                .ForMember(type =&gt; type.Mandatory, expression =&gt; expression.MapFrom(display =&gt; display.Validation.Mandatory))
+                .ForMember(type =&gt; type.ValidationRegExp, expression =&gt; expression.MapFrom(display =&gt; display.Validation.Pattern))
+                .ForMember(type =&gt; type.DataTypeDefinitionId, expression =&gt; expression.MapFrom(display =&gt; display.DataTypeId))
+                .ForMember(type =&gt; type.Name, expression =&gt; expression.MapFrom(display =&gt; display.Label));
+
+            #region *** Used for mapping on top of an existing display object from a save object ***
+
+            config.CreateMap&lt;MemberTypeSave, MemberTypeDisplay&gt;()
+                .MapBaseContentTypeSaveToDisplay&lt;MemberTypeSave, MemberPropertyTypeBasic, MemberTypeDisplay, MemberPropertyTypeDisplay&gt;();
+
+            config.CreateMap&lt;MediaTypeSave, MediaTypeDisplay&gt;()
+                .MapBaseContentTypeSaveToDisplay&lt;MediaTypeSave, PropertyTypeBasic, MediaTypeDisplay, PropertyTypeDisplay&gt;();
+            
+            config.CreateMap&lt;DocumentTypeSave, DocumentTypeDisplay&gt;()
+                .MapBaseContentTypeSaveToDisplay&lt;DocumentTypeSave, PropertyTypeBasic, DocumentTypeDisplay, PropertyTypeDisplay&gt;()
+                .ForMember(dto =&gt; dto.AllowedTemplates, expression =&gt; expression.Ignore())
+                .ForMember(dto =&gt; dto.DefaultTemplate, expression =&gt; expression.Ignore())
+                .AfterMap((source, dest) =&gt;
+                {
+                    //sync templates
+                    var destAllowedTemplateAliases = dest.AllowedTemplates.Select(x =&gt; x.Alias);
+                    //if the dest is set and it&#39;s the same as the source, then don&#39;t change
+                    if (destAllowedTemplateAliases.SequenceEqual(source.AllowedTemplates) == false)
+                    {
+                        var templates = applicationContext.Services.FileService.GetTemplates(source.AllowedTemplates.ToArray());
+                        dest.AllowedTemplates = source.AllowedTemplates
+                            .Select(x =&gt; Mapper.Map&lt;EntityBasic&gt;(templates.SingleOrDefault(t =&gt; t.Alias == x)))
+                            .WhereNotNull()
+                            .ToArray();
+                    }
+
+                    if (source.DefaultTemplate.IsNullOrWhiteSpace() == false)
+                    {
+                        //if the dest is set and it&#39;s the same as the source, then don&#39;t change
+                        if (dest.DefaultTemplate == null || source.DefaultTemplate != dest.DefaultTemplate.Alias)
+                        {
+                            var template = applicationContext.Services.FileService.GetTemplate(source.DefaultTemplate);
+                            dest.DefaultTemplate = template == null ? null : Mapper.Map&lt;EntityBasic&gt;(template);
+                        }
+                    }
+                    else
+                    {
+                        dest.DefaultTemplate = null;
+                    }
+                });
+
+            //for doc types, media types
+            config.CreateMap&lt;PropertyGroupBasic&lt;PropertyTypeBasic&gt;, PropertyGroup&gt;()
+                .MapPropertyGroupBasicToPropertyGroupPersistence&lt;PropertyGroupBasic&lt;PropertyTypeBasic&gt;, PropertyTypeBasic&gt;();
+
+            //for members
+            config.CreateMap&lt;PropertyGroupBasic&lt;MemberPropertyTypeBasic&gt;, PropertyGroup&gt;()
+                .MapPropertyGroupBasicToPropertyGroupPersistence&lt;PropertyGroupBasic&lt;MemberPropertyTypeBasic&gt;, MemberPropertyTypeBasic&gt;();
+
+            //for doc types, media types
+            config.CreateMap&lt;PropertyGroupBasic&lt;PropertyTypeBasic&gt;, PropertyGroupDisplay&lt;PropertyTypeDisplay&gt;&gt;()
+                .MapPropertyGroupBasicToPropertyGroupDisplay&lt;PropertyGroupBasic&lt;PropertyTypeBasic&gt;, PropertyTypeBasic, PropertyTypeDisplay&gt;();
+
+            //for members
+            config.CreateMap&lt;PropertyGroupBasic&lt;MemberPropertyTypeBasic&gt;, PropertyGroupDisplay&lt;MemberPropertyTypeDisplay&gt;&gt;()
+                .MapPropertyGroupBasicToPropertyGroupDisplay&lt;PropertyGroupBasic&lt;MemberPropertyTypeBasic&gt;, MemberPropertyTypeBasic, MemberPropertyTypeDisplay&gt;();
+
+            config.CreateMap&lt;PropertyTypeBasic, PropertyTypeDisplay&gt;()
+                .ForMember(g =&gt; g.Editor, expression =&gt; expression.Ignore())
+                .ForMember(g =&gt; g.View, expression =&gt; expression.Ignore())
+                .ForMember(g =&gt; g.Config, expression =&gt; expression.Ignore())
+                .ForMember(g =&gt; g.ContentTypeId, expression =&gt; expression.Ignore())
+                .ForMember(g =&gt; g.ContentTypeName, expression =&gt; expression.Ignore())
+                .ForMember(g =&gt; g.Locked, exp =&gt; exp.Ignore());
+
+            config.CreateMap&lt;MemberPropertyTypeBasic, MemberPropertyTypeDisplay&gt;()
+                .ForMember(g =&gt; g.Editor, expression =&gt; expression.Ignore())
+                .ForMember(g =&gt; g.View, expression =&gt; expression.Ignore())
+                .ForMember(g =&gt; g.Config, expression =&gt; expression.Ignore())
+                .ForMember(g =&gt; g.ContentTypeId, expression =&gt; expression.Ignore())
+                .ForMember(g =&gt; g.ContentTypeName, expression =&gt; expression.Ignore())
+                .ForMember(g =&gt; g.Locked, exp =&gt; exp.Ignore());
+
+            #endregion
+
+
+
+
+        }
+
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,9,25,40,1],[26,9,26,10,1],[27,13,27,78,1],[27,78,27,108,1],[27,108,27,110,1],[27,13,27,110,1],[28,9,28,10,1],[31,9,31,91,1],[32,9,32,10,1],[33,13,33,62,1],[34,9,34,10,1],[37,9,37,10,1],[39,13,40,42,1],[40,42,40,147,0],[40,147,41,73,1],[41,73,41,106,1],[41,106,41,130,0],[41,130,41,131,1],[41,73,41,131,1],[41,131,42,66,1],[42,66,42,99,1],[42,99,42,125,0],[42,125,42,126,1],[42,66,42,126,1],[42,126,43,61,1],[43,61,43,94,1],[43,94,43,105,0],[43,105,43,106,1],[43,61,43,106,1],[43,106,44,77,1],[44,77,44,110,1],[44,110,44,126,0],[44,126,44,127,1],[44,77,44,127,1],[44,127,45,67,1],[45,67,45,86,1],[45,86,46,76,1],[46,76,46,95,1],[46,95,47,65,1],[47,65,47,84,1],[47,84,48,60,1],[48,60,48,79,1],[48,79,49,67,1],[49,67,49,86,1],[49,86,50,67,1],[50,67,50,86,1],[50,86,51,68,1],[51,68,51,87,1],[51,87,51,89,1],[39,13,51,89,1],[53,13,56,45,1],[56,45,56,77,1],[56,77,57,77,1],[57,77,57,96,1],[57,96,58,70,1],[58,70,58,89,1],[58,89,60,17,1],[60,17,60,18,1],[60,18,61,21,1],[61,21,62,37,1],[62,37,62,46,1],[62,46,63,38,1],[63,38,63,92,1],[63,92,64,36,1],[61,21,64,36,1],[64,36,66,21,1],[66,21,66,56,1],[66,56,67,25,1],[67,25,67,126,1],[67,126,69,21,1],[69,21,69,120,1],[69,120,70,17,1],[70,17,70,18,1],[70,18,70,20,1],[53,13,70,20,1],[72,13,75,45,1],[75,45,75,75,1],[75,75,77,17,1],[77,17,77,18,1],[77,18,78,21,1],[78,21,78,118,1],[78,118,79,17,1],[79,17,79,18,1],[79,18,79,20,1],[72,13,79,20,1],[81,13,84,45,1],[84,45,84,76,1],[84,76,86,17,1],[86,17,86,18,1],[86,18,87,21,1],[87,21,87,120,1],[87,120,90,21,1],[90,21,90,28,1],[90,28,90,30,1],[90,30,90,46,1],[90,46,90,47,1],[90,47,90,49,1],[90,49,90,50,1],[90,50,90,80,1],[90,80,90,92,1],[90,92,90,93,1],[90,50,90,93,1],[90,93,91,21,1],[91,21,91,22,1],[91,22,92,25,1],[92,25,92,54,1],[92,54,93,25,1],[93,25,93,80,1],[93,80,93,120,1],[93,120,93,122,1],[93,25,93,122,1],[93,122,94,25,1],[94,25,94,46,1],[94,46,95,25,1],[95,25,95,26,1],[95,26,96,29,1],[96,29,96,109,1],[96,109,97,29,1],[97,29,97,109,1],[97,109,98,25,1],[98,25,98,26,1],[98,26,99,21,1],[99,21,99,22,1],[99,22,100,17,1],[100,17,100,18,1],[100,18,100,20,1],[81,13,100,20,1],[102,13,102,83,1],[102,83,102,90,1],[102,90,102,92,1],[102,13,102,92,1],[104,13,108,17,1],[108,17,108,18,1],[108,18,110,21,1],[110,21,110,28,1],[110,28,110,30,1],[110,30,110,46,1],[110,46,110,47,1],[110,47,110,49,1],[110,49,110,50,1],[110,50,110,74,1],[110,74,111,21,1],[111,21,111,22,1],[111,22,112,25,1],[112,25,112,54,1],[112,54,113,25,1],[113,25,113,74,1],[113,74,113,86,1],[113,86,113,109,1],[113,109,113,149,1],[113,149,113,151,1],[113,25,113,151,1],[113,151,114,25,1],[114,25,114,49,1],[114,49,115,25,1],[115,25,115,26,1],[115,26,116,29,1],[116,29,116,115,1],[116,115,117,29,1],[117,29,117,115,1],[117,115,118,25,1],[118,25,118,26,1],[118,26,119,21,1],[119,21,119,22,1],[119,22,120,17,1],[120,17,120,18,1],[120,18,120,20,1],[104,13,120,20,1],[122,13,126,18,1],[126,18,126,19,1],[126,19,128,22,1],[128,22,128,105,1],[128,105,130,22,1],[130,22,130,69,1],[130,69,131,22,1],[131,22,131,23,1],[131,23,132,26,1],[132,26,132,98,1],[132,98,133,26,1],[133,26,133,116,1],[133,116,134,30,1],[134,30,134,61,0],[134,61,135,22,1],[135,22,135,23,1],[135,23,136,18,1],[136,18,136,19,1],[136,19,136,21,1],[122,13,136,21,1],[138,13,141,71,1],[141,71,141,90,1],[141,90,142,70,1],[142,70,142,89,1],[142,89,143,76,1],[143,76,143,95,1],[143,95,145,17,1],[145,17,145,18,1],[145,18,147,21,1],[147,21,147,111,1],[147,111,149,21,1],[149,21,149,56,1],[149,56,150,25,1],[150,25,150,96,1],[150,96,153,21,1],[153,21,153,106,1],[153,106,155,21,1],[155,21,155,69,1],[155,69,156,21,1],[156,21,156,22,1],[156,22,157,25,1],[157,25,157,98,1],[157,98,158,25,1],[158,25,158,115,1],[158,115,159,29,1],[159,29,159,60,0],[159,60,160,21,1],[160,21,160,22,1],[160,22,162,17,1],[162,17,162,18,1],[162,18,162,20,1],[138,13,162,20,1],[164,13,164,63,1],[165,13,165,62,1],[166,13,166,64,1],[168,13,171,17,1],[171,17,171,18,1],[171,18,172,21,1],[172,21,172,136,1],[172,136,173,21,1],[173,21,173,42,1],[173,42,173,43,1],[173,43,173,138,0],[173,138,174,21,1],[174,21,174,80,1],[174,80,175,17,1],[175,17,175,18,1],[175,18,178,59,1],[178,59,178,90,1],[178,90,178,103,1],[178,103,178,104,1],[178,59,178,104,1],[178,104,179,65,1],[179,65,179,84,1],[179,84,180,65,1],[180,65,180,84,1],[180,84,183,72,1],[183,72,183,103,1],[183,103,183,121,1],[183,121,183,122,1],[183,72,183,122,1],[183,122,184,72,1],[184,72,184,146,1],[184,146,185,60,1],[185,60,185,79,1],[185,79,186,65,1],[186,65,186,84,1],[186,84,187,68,1],[187,68,187,87,1],[187,87,191,67,1],[191,67,191,86,1],[191,86,192,66,1],[192,66,192,125,1],[192,125,193,73,1],[193,73,193,130,1],[193,130,194,77,1],[194,77,194,126,1],[194,126,195,61,1],[195,61,195,105,1],[195,105,195,107,1],[168,13,195,107,1],[199,13,200,139,1],[202,13,203,125,1],[205,13,207,71,1],[207,71,207,90,1],[207,90,208,70,1],[208,70,208,89,1],[208,89,210,17,1],[210,17,210,18,0],[210,18,212,21,1],[212,21,212,88,0],[212,88,212,95,0],[212,95,212,97,0],[212,21,212,97,0],[212,97,214,21,1],[214,21,214,100,0],[214,100,215,21,1],[215,21,215,22,0],[215,22,216,25,1],[216,25,216,129,0],[216,129,217,25,1],[217,25,218,42,0],[218,42,218,97,0],[218,97,218,109,0],[218,109,218,111,0],[218,42,218,111,0],[218,111,220,40,0],[217,25,220,40,0],[220,40,221,21,1],[221,21,221,22,0],[221,22,223,21,1],[223,21,223,78,0],[223,78,224,21,1],[224,21,224,22,0],[224,22,226,25,1],[226,25,226,114,0],[226,114,227,25,1],[227,25,227,26,0],[227,26,228,29,1],[228,29,228,120,0],[228,120,229,29,1],[229,29,229,112,0],[229,112,230,25,1],[230,25,230,26,0],[230,26,231,21,1],[231,21,231,22,0],[231,22,233,21,1],[233,21,233,22,0],[233,22,234,25,1],[234,25,234,53,0],[234,53,235,21,1],[235,21,235,22,0],[235,22,236,17,1],[236,17,236,18,0],[236,18,236,20,1],[205,13,236,20,1],[239,13,240,126,1],[243,13,244,138,1],[247,13,248,143,1],[251,13,252,161,1],[254,13,255,57,1],[255,57,255,76,1],[255,76,256,55,1],[256,55,256,74,1],[256,74,257,57,1],[257,57,257,76,1],[257,76,258,64,1],[258,64,258,83,1],[258,83,259,66,1],[259,66,259,85,1],[259,85,260,50,1],[260,50,260,62,1],[260,62,260,64,1],[254,13,260,64,1],[262,13,263,57,1],[263,57,263,76,1],[263,76,264,55,1],[264,55,264,74,1],[264,74,265,57,1],[265,57,265,76,1],[265,76,266,64,1],[266,64,266,83,1],[266,83,267,66,1],[267,66,267,85,1],[267,85,268,50,1],[268,50,268,62,1],[268,62,268,64,1],[262,13,268,64,1],[275,9,275,10,1]]);
+    </script>
+  </body>
+</html>

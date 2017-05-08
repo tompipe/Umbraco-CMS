@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Migrations\Upgrades\TargetVersionSixTwoZero\AdditionalIndexesAndKeys.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Linq;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.Migrations.Initial;
+using Umbraco.Core.Persistence.SqlSyntax;
+
+namespace Umbraco.Core.Persistence.Migrations.Upgrades.TargetVersionSixTwoZero
+{
+    [Migration(&quot;7.1.0&quot;, 1, GlobalSettings.UmbracoMigrationName)]
+    [Migration(&quot;6.2.0&quot;, 1, GlobalSettings.UmbracoMigrationName)]
+    public class AdditionalIndexesAndKeys : MigrationBase
+    {
+        public AdditionalIndexesAndKeys(ISqlSyntaxProvider sqlSyntax, ILogger logger) : base(sqlSyntax, logger)
+        {
+        }
+
+        public override void Up()
+        {
+
+            var dbIndexes = SqlSyntax.GetDefinedIndexes(Context.Database)
+                .Select(x =&gt; new DbIndexDefinition()
+                {
+                    TableName = x.Item1,
+                    IndexName = x.Item2,
+                    ColumnName = x.Item3,
+                    IsUnique = x.Item4
+                }).ToArray();
+
+            //do not create any indexes if they already exist in the database
+
+            if (dbIndexes.Any(x =&gt; x.IndexName.InvariantEquals(&quot;IX_umbracoNodeTrashed&quot;)) == false)
+            {
+                Create.Index(&quot;IX_umbracoNodeTrashed&quot;).OnTable(&quot;umbracoNode&quot;).OnColumn(&quot;trashed&quot;).Ascending().WithOptions().NonClustered();    
+            }
+            if (dbIndexes.Any(x =&gt; x.IndexName.InvariantEquals(&quot;IX_cmsContentVersion_ContentId&quot;)) == false)
+            {
+                Create.Index(&quot;IX_cmsContentVersion_ContentId&quot;).OnTable(&quot;cmsContentVersion&quot;).OnColumn(&quot;ContentId&quot;).Ascending().WithOptions().NonClustered();
+            }
+            if (dbIndexes.Any(x =&gt; x.IndexName.InvariantEquals(&quot;IX_cmsDocument_published&quot;)) == false)
+            {
+                Create.Index(&quot;IX_cmsDocument_published&quot;).OnTable(&quot;cmsDocument&quot;).OnColumn(&quot;published&quot;).Ascending().WithOptions().NonClustered();
+            }
+            if (dbIndexes.Any(x =&gt; x.IndexName.InvariantEquals(&quot;IX_cmsDocument_newest&quot;)) == false)
+            {
+                Create.Index(&quot;IX_cmsDocument_newest&quot;).OnTable(&quot;cmsDocument&quot;).OnColumn(&quot;newest&quot;).Ascending().WithOptions().NonClustered();
+            }
+
+            //We need to do this for SQL Azure V2 since it does not let you drop any clustered indexes
+            // Issue: http://issues.umbraco.org/issue/U4-5673            
+            if (Context.CurrentDatabaseProvider == DatabaseProviders.SqlServer || Context.CurrentDatabaseProvider == DatabaseProviders.SqlAzure)
+            {
+                var version = Context.Database.ExecuteScalar&lt;string&gt;(&quot;SELECT @@@@VERSION&quot;);
+                if (version.Contains(&quot;Microsoft SQL Azure&quot;))
+                {
+                    var parts = version.Split(new[] { &#39;-&#39; }, StringSplitOptions.RemoveEmptyEntries).Select(x =&gt; x.Trim()).ToArray();
+                    if (parts.Length &gt; 1)
+                    {
+                        if (parts[1].StartsWith(&quot;11.&quot;))
+                        {
+
+                            //we want to drop the umbracoUserLogins_Index index since it is named incorrectly and then re-create it so 
+                            // it follows the standard naming convention
+                            if (dbIndexes.Any(x =&gt; x.IndexName.InvariantEquals(&quot;umbracoUserLogins_Index&quot;)))
+                            {
+                                //It&#39;s the old version that doesn&#39;t support dropping a clustered index on a table, so we need to do some manual work.
+                                ExecuteSqlAzureSqlForChangingIndex();
+                            }
+
+                            return;
+                        }
+                    }   
+                }                
+            }
+           
+
+            //we want to drop the umbracoUserLogins_Index index since it is named incorrectly and then re-create it so 
+            // it follows the standard naming convention
+            if (dbIndexes.Any(x =&gt; x.IndexName.InvariantEquals(&quot;umbracoUserLogins_Index&quot;)))
+            {
+                Delete.Index(&quot;umbracoUserLogins_Index&quot;).OnTable(&quot;umbracoUserLogins&quot;);                
+            }
+            if (dbIndexes.Any(x =&gt; x.IndexName.InvariantEquals(&quot;IX_umbracoUserLogins_Index&quot;)) == false)
+            {
+                Create.Index(&quot;IX_umbracoUserLogins_Index&quot;).OnTable(&quot;umbracoUserLogins&quot;).OnColumn(&quot;contextID&quot;).Ascending().WithOptions().Clustered();
+            }
+        }
+
+        public override void Down()
+        {
+            Delete.Index(&quot;IX_umbracoNodeTrashed&quot;).OnTable(&quot;umbracoNode&quot;);
+            Delete.Index(&quot;IX_cmsContentVersion_ContentId&quot;).OnTable(&quot;cmsContentVersion&quot;);
+            Delete.Index(&quot;IX_cmsDocument_published&quot;).OnTable(&quot;cmsDocument&quot;);
+            Delete.Index(&quot;IX_cmsDocument_newest&quot;).OnTable(&quot;cmsDocument&quot;);
+        }
+
+        private void ExecuteSqlAzureSqlForChangingIndex()
+        {
+            Context.Database.Execute(@&quot;CREATE TABLE &quot;&quot;umbracoUserLogins_temp&quot;&quot;
+(
+	contextID uniqueidentifier NOT NULL,
+	userID int NOT NULL,
+	[timeout] bigint NOT NULL
+);
+CREATE CLUSTERED INDEX &quot;&quot;IX_umbracoUserLogins_Index&quot;&quot; ON &quot;&quot;umbracoUserLogins_temp&quot;&quot; (&quot;&quot;contextID&quot;&quot;);
+INSERT INTO &quot;&quot;umbracoUserLogins_temp&quot;&quot; SELECT * FROM &quot;&quot;umbracoUserLogins&quot;&quot;
+DROP TABLE &quot;&quot;umbracoUserLogins&quot;&quot;
+CREATE TABLE &quot;&quot;umbracoUserLogins&quot;&quot;
+(
+	contextID uniqueidentifier NOT NULL,
+	userID int NOT NULL,
+	[timeout] bigint NOT NULL
+);
+CREATE CLUSTERED INDEX &quot;&quot;IX_umbracoUserLogins_Index&quot;&quot; ON &quot;&quot;umbracoUserLogins&quot;&quot; (&quot;&quot;contextID&quot;&quot;);
+INSERT INTO &quot;&quot;umbracoUserLogins&quot;&quot; SELECT * FROM &quot;&quot;umbracoUserLogins_temp&quot;&quot;
+DROP TABLE &quot;&quot;umbracoUserLogins_temp&quot;&quot;&quot;);
+
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[15,89,15,112,0],[16,9,16,10,0],[17,9,17,10,0],[20,9,20,10,0],[22,13,23,30,0],[23,30,29,18,0],[29,18,29,30,0],[22,13,29,30,0],[33,13,33,36,0],[33,36,33,88,0],[33,88,33,99,0],[33,13,33,99,0],[34,13,34,14,0],[35,17,35,139,0],[36,13,36,14,0],[37,13,37,36,0],[37,36,37,97,0],[37,97,37,108,0],[37,13,37,108,0],[38,13,38,14,0],[39,17,39,156,0],[40,13,40,14,0],[41,13,41,36,0],[41,36,41,91,0],[41,91,41,102,0],[41,13,41,102,0],[42,13,42,14,0],[43,17,43,144,0],[44,13,44,14,0],[45,13,45,36,0],[45,36,45,88,0],[45,88,45,99,0],[45,13,45,99,0],[46,13,46,14,0],[47,17,47,138,0],[48,13,48,14,0],[52,13,52,145,0],[53,13,53,14,0],[54,17,54,92,0],[55,17,55,61,0],[56,17,56,18,0],[57,21,57,113,0],[57,113,57,121,0],[57,121,57,133,0],[57,21,57,133,0],[58,21,58,42,0],[59,21,59,22,0],[60,25,60,56,0],[61,25,61,26,0],[65,29,65,52,0],[65,52,65,106,0],[65,106,65,108,0],[65,29,65,108,0],[66,29,66,30,0],[68,33,68,70,0],[69,29,69,30,0],[71,29,71,36,0],[73,21,73,22,0],[74,17,74,18,0],[75,13,75,14,0],[80,13,80,36,0],[80,36,80,90,0],[80,90,80,92,0],[80,13,80,92,0],[81,13,81,14,0],[82,17,82,86,0],[83,13,83,14,0],[84,13,84,36,0],[84,36,84,93,0],[84,93,84,104,0],[84,13,84,104,0],[85,13,85,14,0],[86,17,86,149,0],[87,13,87,14,0],[88,9,88,10,0],[91,9,91,10,0],[92,13,92,74,0],[93,13,93,89,0],[94,13,94,77,0],[95,13,95,74,0],[96,9,96,10,0],[99,9,99,10,0],[100,13,117,41,0],[119,9,119,10,0]]);
+    </script>
+  </body>
+</html>

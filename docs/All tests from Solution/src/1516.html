@@ -1,0 +1,2526 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\ContentService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Xml;
+using System.Xml.Linq;
+using Umbraco.Core.Auditing;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Events;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Publishing;
+
+namespace Umbraco.Core.Services
+{
+    /// &lt;summary&gt;
+    /// Represents the Content Service, which is an easy access to operations involving &lt;see cref=&quot;IContent&quot;/&gt;
+    /// &lt;/summary&gt;
+    public class ContentService : RepositoryService, IContentService, IContentServiceOperations
+    {
+        private readonly IPublishingStrategy _publishingStrategy;
+        private readonly EntityXmlSerializer _entitySerializer = new EntityXmlSerializer();
+        private readonly IDataTypeService _dataTypeService;
+        private readonly IUserService _userService;
+
+        //Support recursive locks because some of the methods that require locking call other methods that require locking. 
+        //for example, the Move method needs to be locked but this calls the Save method which also needs to be locked.
+        private static readonly ReaderWriterLockSlim Locker = new ReaderWriterLockSlim(LockRecursionPolicy.SupportsRecursion);
+
+        public ContentService(
+            IDatabaseUnitOfWorkProvider provider,
+            RepositoryFactory repositoryFactory,
+            ILogger logger,
+            IEventMessagesFactory eventMessagesFactory,
+            IPublishingStrategy publishingStrategy,
+            IDataTypeService dataTypeService,
+            IUserService userService)
+            : base(provider, repositoryFactory, logger, eventMessagesFactory)
+        {
+            if (publishingStrategy == null) throw new ArgumentNullException(&quot;publishingStrategy&quot;);
+            if (dataTypeService == null) throw new ArgumentNullException(&quot;dataTypeService&quot;);
+            if (userService == null) throw new ArgumentNullException(&quot;userService&quot;);
+            _publishingStrategy = publishingStrategy;
+            _dataTypeService = dataTypeService;
+            _userService = userService;
+        }
+
+        #region Static Queries
+
+        private IQuery&lt;IContent&gt; _notTrashedQuery;
+
+        #endregion
+
+        public int CountPublished(string contentTypeAlias = null)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                return repository.CountPublished();
+            }
+        }
+
+        public int Count(string contentTypeAlias = null)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                return repository.Count(contentTypeAlias);
+            }
+        }
+
+        public int CountChildren(int parentId, string contentTypeAlias = null)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                return repository.CountChildren(parentId, contentTypeAlias);
+            }
+        }
+
+        public int CountDescendants(int parentId, string contentTypeAlias = null)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                return repository.CountDescendants(parentId, contentTypeAlias);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Used to bulk update the permissions set for a content item. This will replace all permissions
+        /// assigned to an entity with a list of user id &amp; permission pairs.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;permissionSet&quot;&gt;&lt;/param&gt;
+        public void ReplaceContentPermissions(EntityPermissionSet permissionSet)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                repository.ReplaceContentPermissions(permissionSet);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Assigns a single permission to the current content item for the specified user ids
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;permission&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userIds&quot;&gt;&lt;/param&gt;
+        public void AssignContentPermission(IContent entity, char permission, IEnumerable&lt;int&gt; userIds)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                repository.AssignEntityPermission(entity, permission, userIds);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the list of permissions for the content item
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;EntityPermission&gt; GetPermissionsForEntity(IContent content)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                return repository.GetPermissionsForEntity(content.Id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Creates an &lt;see cref=&quot;IContent&quot;/&gt; object using the alias of the &lt;see cref=&quot;IContentType&quot;/&gt;
+        /// that this Content should based on.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Note that using this method will simply return a new IContent without any identity
+        /// as it has not yet been persisted. It is intended as a shortcut to creating new content objects
+        /// that does not invoke a save operation against the database.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Name of the Content object&lt;/param&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;Id of Parent for the new Content&lt;/param&gt;
+        /// &lt;param name=&quot;contentTypeAlias&quot;&gt;Alias of the &lt;see cref=&quot;IContentType&quot;/&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the user creating the content&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IContent&quot;/&gt;&lt;/returns&gt;
+        public IContent CreateContent(string name, int parentId, string contentTypeAlias, int userId = 0)
+        {
+            var contentType = FindContentTypeByAlias(contentTypeAlias);
+            var content = new Content(name, parentId, contentType);
+            var parent = GetById(content.ParentId);
+            content.Path = string.Concat(parent.IfNotNull(x =&gt; x.Path, content.ParentId.ToString()), &quot;,&quot;, content.Id);
+
+
+            if (Creating.IsRaisedEventCancelled(new NewEventArgs&lt;IContent&gt;(content, contentTypeAlias, parentId), this))
+            {
+                content.WasCancelled = true;
+                return content;
+            }
+
+            content.CreatorId = userId;
+            content.WriterId = userId;
+
+            Created.RaiseEvent(new NewEventArgs&lt;IContent&gt;(content, false, contentTypeAlias, parentId), this);
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var auditRepo = RepositoryFactory.CreateAuditRepository(uow))
+            {
+                auditRepo.AddOrUpdate(new AuditItem(content.Id, string.Format(&quot;Content &#39;{0}&#39; was created&quot;, name), AuditType.New, content.CreatorId));
+                uow.Commit();
+            }
+
+            return content;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates an &lt;see cref=&quot;IContent&quot;/&gt; object using the alias of the &lt;see cref=&quot;IContentType&quot;/&gt;
+        /// that this Content should based on.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Note that using this method will simply return a new IContent without any identity
+        /// as it has not yet been persisted. It is intended as a shortcut to creating new content objects
+        /// that does not invoke a save operation against the database.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Name of the Content object&lt;/param&gt;
+        /// &lt;param name=&quot;parent&quot;&gt;Parent &lt;see cref=&quot;IContent&quot;/&gt; object for the new Content&lt;/param&gt;
+        /// &lt;param name=&quot;contentTypeAlias&quot;&gt;Alias of the &lt;see cref=&quot;IContentType&quot;/&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the user creating the content&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IContent&quot;/&gt;&lt;/returns&gt;
+        public IContent CreateContent(string name, IContent parent, string contentTypeAlias, int userId = 0)
+        {
+            if (parent == null) throw new ArgumentNullException(&quot;parent&quot;);
+
+            var contentType = FindContentTypeByAlias(contentTypeAlias);
+            var content = new Content(name, parent, contentType);
+            content.Path = string.Concat(parent.Path, &quot;,&quot;, content.Id);
+
+            if (Creating.IsRaisedEventCancelled(new NewEventArgs&lt;IContent&gt;(content, contentTypeAlias, parent), this))
+            {
+                content.WasCancelled = true;
+                return content;
+            }
+
+            content.CreatorId = userId;
+            content.WriterId = userId;
+
+            Created.RaiseEvent(new NewEventArgs&lt;IContent&gt;(content, false, contentTypeAlias, parent), this);
+
+            Audit(AuditType.New, string.Format(&quot;Content &#39;{0}&#39; was created&quot;, name), content.CreatorId, content.Id);
+
+            return content;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and saves an &lt;see cref=&quot;IContent&quot;/&gt; object using the alias of the &lt;see cref=&quot;IContentType&quot;/&gt;
+        /// that this Content should based on.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This method returns an &lt;see cref=&quot;IContent&quot;/&gt; object that has been persisted to the database
+        /// and therefor has an identity.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Name of the Content object&lt;/param&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;Id of Parent for the new Content&lt;/param&gt;
+        /// &lt;param name=&quot;contentTypeAlias&quot;&gt;Alias of the &lt;see cref=&quot;IContentType&quot;/&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the user creating the content&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IContent&quot;/&gt;&lt;/returns&gt;
+        public IContent CreateContentWithIdentity(string name, int parentId, string contentTypeAlias, int userId = 0)
+        {
+            var contentType = FindContentTypeByAlias(contentTypeAlias);
+            var content = new Content(name, parentId, contentType);
+
+            //NOTE: I really hate the notion of these Creating/Created events - they are so inconsistent, I&#39;ve only just found
+            // out that in these &#39;WithIdentity&#39; methods, the Saving/Saved events were not fired, wtf. Anyways, they&#39;re added now.
+            if (Creating.IsRaisedEventCancelled(new NewEventArgs&lt;IContent&gt;(content, contentTypeAlias, parentId), this))
+            {
+                content.WasCancelled = true;
+                return content;
+            }
+
+            if (Saving.IsRaisedEventCancelled(new SaveEventArgs&lt;IContent&gt;(content), this))
+            {
+                content.WasCancelled = true;
+                return content;
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                content.CreatorId = userId;
+                content.WriterId = userId;
+                repository.AddOrUpdate(content);
+                //Generate a new preview
+                repository.AddOrUpdatePreviewXml(content, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+                uow.Commit();
+            }
+
+            Saved.RaiseEvent(new SaveEventArgs&lt;IContent&gt;(content, false), this);
+
+            Created.RaiseEvent(new NewEventArgs&lt;IContent&gt;(content, false, contentTypeAlias, parentId), this);
+
+            Audit(AuditType.New, string.Format(&quot;Content &#39;{0}&#39; was created with Id {1}&quot;, name, content.Id), content.CreatorId, content.Id);
+
+            return content;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and saves an &lt;see cref=&quot;IContent&quot;/&gt; object using the alias of the &lt;see cref=&quot;IContentType&quot;/&gt;
+        /// that this Content should based on.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This method returns an &lt;see cref=&quot;IContent&quot;/&gt; object that has been persisted to the database
+        /// and therefor has an identity.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Name of the Content object&lt;/param&gt;
+        /// &lt;param name=&quot;parent&quot;&gt;Parent &lt;see cref=&quot;IContent&quot;/&gt; object for the new Content&lt;/param&gt;
+        /// &lt;param name=&quot;contentTypeAlias&quot;&gt;Alias of the &lt;see cref=&quot;IContentType&quot;/&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the user creating the content&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IContent&quot;/&gt;&lt;/returns&gt;
+        public IContent CreateContentWithIdentity(string name, IContent parent, string contentTypeAlias, int userId = 0)
+        {
+            if (parent == null) throw new ArgumentNullException(&quot;parent&quot;);
+
+            var contentType = FindContentTypeByAlias(contentTypeAlias);
+            var content = new Content(name, parent, contentType);
+
+            //NOTE: I really hate the notion of these Creating/Created events - they are so inconsistent, I&#39;ve only just found
+            // out that in these &#39;WithIdentity&#39; methods, the Saving/Saved events were not fired, wtf. Anyways, they&#39;re added now.
+            if (Creating.IsRaisedEventCancelled(new NewEventArgs&lt;IContent&gt;(content, contentTypeAlias, parent), this))
+            {
+                content.WasCancelled = true;
+                return content;
+            }
+
+            if (Saving.IsRaisedEventCancelled(new SaveEventArgs&lt;IContent&gt;(content), this))
+            {
+                content.WasCancelled = true;
+                return content;
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                content.CreatorId = userId;
+                content.WriterId = userId;
+                repository.AddOrUpdate(content);
+                //Generate a new preview
+                repository.AddOrUpdatePreviewXml(content, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+                uow.Commit();
+            }
+
+            Saved.RaiseEvent(new SaveEventArgs&lt;IContent&gt;(content, false), this);
+
+            Created.RaiseEvent(new NewEventArgs&lt;IContent&gt;(content, false, contentTypeAlias, parent), this);
+
+            Audit(AuditType.New, string.Format(&quot;Content &#39;{0}&#39; was created with Id {1}&quot;, name, content.Id), content.CreatorId, content.Id);
+
+            return content;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an &lt;see cref=&quot;IContent&quot;/&gt; object by Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the Content to retrieve&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IContent&quot;/&gt;&lt;/returns&gt;
+        public IContent GetById(int id)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.Get(id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an &lt;see cref=&quot;IContent&quot;/&gt; object by Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ids&quot;&gt;Ids of the Content to retrieve&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IContent&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetByIds(IEnumerable&lt;int&gt; ids)
+        {
+            var idsArray = ids.ToArray();
+            if (idsArray.Length == 0) return Enumerable.Empty&lt;IContent&gt;();
+
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                //ensure that the result has the order based on the ids passed in
+                var result = repository.GetAll(idsArray);
+
+                var content = result.ToDictionary(x =&gt; x.Id, x =&gt; x);
+
+                var sortedResult = idsArray.Select(x =&gt;
+                {
+                    IContent c;
+                    return content.TryGetValue(x, out c) ? c : null;
+                }).WhereNotNull();
+
+                return sortedResult;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an &lt;see cref=&quot;IContent&quot;/&gt; object by its &#39;UniqueId&#39;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;key&quot;&gt;Guid key of the Content to retrieve&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IContent&quot;/&gt;&lt;/returns&gt;
+        public IContent GetById(Guid key)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Key == key);
+                var contents = repository.GetByQuery(query);
+                return contents.SingleOrDefault();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by the Id of the &lt;see cref=&quot;IContentType&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IContentType&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetContentOfContentType(int id)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.ContentTypeId == id);
+                var contents = repository.GetByQuery(query);
+
+                return contents;
+            }
+        }
+
+        internal IEnumerable&lt;IContent&gt; GetPublishedContentOfContentType(int id)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.ContentTypeId == id);
+                var contents = repository.GetByPublishedVersion(query);
+
+                return contents;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by Level
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;level&quot;&gt;The level to retrieve Content from&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetByLevel(int level)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Level == level &amp;&amp; !x.Path.StartsWith(Constants.System.RecycleBinContent.ToInvariantString()));
+                var contents = repository.GetByQuery(query);
+
+                return contents;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a specific version of an &lt;see cref=&quot;IContent&quot;/&gt; item.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;versionId&quot;&gt;Id of the version to retrieve&lt;/param&gt;
+        /// &lt;returns&gt;An &lt;see cref=&quot;IContent&quot;/&gt; item&lt;/returns&gt;
+        public IContent GetByVersion(Guid versionId)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetByVersion(versionId);
+            }
+        }
+
+
+        /// &lt;summary&gt;
+        /// Gets a collection of an &lt;see cref=&quot;IContent&quot;/&gt; objects versions by Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetVersions(int id)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var versions = repository.GetAllVersions(id);
+                return versions;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a list of all version Ids for the given content item ordered so latest is first
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;maxRows&quot;&gt;The maximum number of rows to return&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;Guid&gt; GetVersionIds(int id, int maxRows)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var versions = repository.GetVersionIds(id, maxRows);
+                return versions;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects, which are ancestors of the current content.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IContent&quot;/&gt; to retrieve ancestors for&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetAncestors(int id)
+        {
+            var content = GetById(id);
+            return GetAncestors(content);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects, which are ancestors of the current content.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;see cref=&quot;IContent&quot;/&gt; to retrieve ancestors for&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetAncestors(IContent content)
+        {
+            //null check otherwise we get exceptions
+            if (content.Path.IsNullOrWhiteSpace()) return Enumerable.Empty&lt;IContent&gt;();
+
+            var ids = content.Path.Split(&#39;,&#39;).Where(x =&gt; x != Constants.System.Root.ToInvariantString() &amp;&amp; x != content.Id.ToString(CultureInfo.InvariantCulture)).Select(int.Parse).ToArray();
+            if (ids.Any() == false)
+                return new List&lt;IContent&gt;();
+
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetAll(ids);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by Parent Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the Parent to retrieve Children from&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetChildren(int id)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.ParentId == id);
+                var contents = repository.GetByQuery(query).OrderBy(x =&gt; x.SortOrder);
+
+                return contents;
+            }
+        }
+
+        [Obsolete(&quot;Use the overload with &#39;long&#39; parameter types instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public IEnumerable&lt;IContent&gt; GetPagedChildren(int id, int pageIndex, int pageSize, out int totalChildren,
+            string orderBy, Direction orderDirection, string filter = &quot;&quot;)
+        {
+            long total;
+            var result = GetPagedChildren(id, Convert.ToInt64(pageIndex), pageSize, out total, orderBy, orderDirection, true, filter);
+            totalChildren = Convert.ToInt32(total);
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by Parent Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the Parent to retrieve Children from&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Page index (zero based)&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Page size&lt;/param&gt;
+        /// &lt;param name=&quot;totalChildren&quot;&gt;Total records query would return without paging&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;Field to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderDirection&quot;&gt;Direction to order by&lt;/param&gt;
+        /// &lt;param name=&quot;filter&quot;&gt;Search text filter&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetPagedChildren(int id, long pageIndex, int pageSize, out long totalChildren,
+            string orderBy, Direction orderDirection, string filter = &quot;&quot;)
+        {
+            return GetPagedChildren(id, pageIndex, pageSize, out totalChildren, orderBy, orderDirection, true, filter);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by Parent Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the Parent to retrieve Children from&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Page index (zero based)&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Page size&lt;/param&gt;
+        /// &lt;param name=&quot;totalChildren&quot;&gt;Total records query would return without paging&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;Field to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderDirection&quot;&gt;Direction to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderBySystemField&quot;&gt;Flag to indicate when ordering by system field&lt;/param&gt;
+        /// &lt;param name=&quot;filter&quot;&gt;Search text filter&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetPagedChildren(int id, long pageIndex, int pageSize, out long totalChildren,
+            string orderBy, Direction orderDirection, bool orderBySystemField, string filter)
+        {
+            Mandate.ParameterCondition(pageIndex &gt;= 0, &quot;pageIndex&quot;);
+            Mandate.ParameterCondition(pageSize &gt; 0, &quot;pageSize&quot;);
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+
+                var query = Query&lt;IContent&gt;.Builder;
+                //if the id is System Root, then just get all
+                if (id != Constants.System.Root)
+                {
+                    query.Where(x =&gt; x.ParentId == id);
+                }
+                IQuery&lt;IContent&gt; filterQuery = null;
+                if (filter.IsNullOrWhiteSpace() == false)
+                {
+                    filterQuery = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Name.Contains(filter));
+                }
+                var contents = repository.GetPagedResultsByQuery(query, pageIndex, pageSize, out totalChildren, orderBy, orderDirection, orderBySystemField, filterQuery);
+
+                return contents;
+            }
+        }
+
+        [Obsolete(&quot;Use the overload with &#39;long&#39; parameter types instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public IEnumerable&lt;IContent&gt; GetPagedDescendants(int id, int pageIndex, int pageSize, out int totalChildren, string orderBy = &quot;path&quot;, Direction orderDirection = Direction.Ascending, string filter = &quot;&quot;)
+        {
+            long total;
+            var result = GetPagedDescendants(id, Convert.ToInt64(pageIndex), pageSize, out total, orderBy, orderDirection, true, filter);
+            totalChildren = Convert.ToInt32(total);
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by Parent Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the Parent to retrieve Descendants from&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Page number&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Page size&lt;/param&gt;
+        /// &lt;param name=&quot;totalChildren&quot;&gt;Total records query would return without paging&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;Field to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderDirection&quot;&gt;Direction to order by&lt;/param&gt;
+        /// &lt;param name=&quot;filter&quot;&gt;Search text filter&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt; 
+        public IEnumerable&lt;IContent&gt; GetPagedDescendants(int id, long pageIndex, int pageSize, out long totalChildren, string orderBy = &quot;path&quot;, Direction orderDirection = Direction.Ascending, string filter = &quot;&quot;)
+        {
+            return GetPagedDescendants(id, pageIndex, pageSize, out totalChildren, orderBy, orderDirection, true, filter);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by Parent Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the Parent to retrieve Descendants from&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Page number&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Page size&lt;/param&gt;
+        /// &lt;param name=&quot;totalChildren&quot;&gt;Total records query would return without paging&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;Field to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderDirection&quot;&gt;Direction to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderBySystemField&quot;&gt;Flag to indicate when ordering by system field&lt;/param&gt;
+        /// &lt;param name=&quot;filter&quot;&gt;Search text filter&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;        
+        public IEnumerable&lt;IContent&gt; GetPagedDescendants(int id, long pageIndex, int pageSize, out long totalChildren, string orderBy, Direction orderDirection, bool orderBySystemField, string filter)
+        {
+            Mandate.ParameterCondition(pageIndex &gt;= 0, &quot;pageIndex&quot;);
+            Mandate.ParameterCondition(pageSize &gt; 0, &quot;pageSize&quot;);
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+
+                var query = Query&lt;IContent&gt;.Builder;
+                //if the id is System Root, then just get all
+                if (id != Constants.System.Root)
+                {
+                    query.Where(x =&gt; x.Path.SqlContains(string.Format(&quot;,{0},&quot;, id), TextColumnType.NVarchar));
+                }
+                IQuery&lt;IContent&gt; filterQuery = null;
+                if (filter.IsNullOrWhiteSpace() == false)
+                {
+                    filterQuery = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Name.Contains(filter));
+                }
+                var contents = repository.GetPagedResultsByQuery(query, pageIndex, pageSize, out totalChildren, orderBy, orderDirection, orderBySystemField, filterQuery);
+
+                return contents;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by Parent Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the Parent to retrieve Descendants from&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Page number&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Page size&lt;/param&gt;
+        /// &lt;param name=&quot;totalChildren&quot;&gt;Total records query would return without paging&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;Field to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderDirection&quot;&gt;Direction to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderBySystemField&quot;&gt;Flag to indicate when ordering by system field&lt;/param&gt;
+        /// &lt;param name=&quot;filter&quot;&gt;Search filter&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetPagedDescendants(int id, long pageIndex, int pageSize, out long totalChildren, string orderBy, Direction orderDirection, bool orderBySystemField, IQuery&lt;IContent&gt; filter)
+        {
+            Mandate.ParameterCondition(pageIndex &gt;= 0, &quot;pageIndex&quot;);
+            Mandate.ParameterCondition(pageSize &gt; 0, &quot;pageSize&quot;);
+
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder;
+
+                //if the id is System Root, then just get all
+                if (id != Constants.System.Root)
+                {
+                    query.Where(x =&gt; x.Path.SqlContains(string.Format(&quot;,{0},&quot;, id), TextColumnType.NVarchar));
+                }
+                var contents = repository.GetPagedResultsByQuery(query, pageIndex, pageSize, out totalChildren, orderBy, orderDirection, orderBySystemField, filter);
+
+                return contents;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by its name or partial name
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;Id of the Parent to retrieve Children from&lt;/param&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Full or partial name of the children&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetChildrenByName(int parentId, string name)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.ParentId == parentId &amp;&amp; x.Name.Contains(name));
+                var contents = repository.GetByQuery(query);
+
+                return contents;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by Parent Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the Parent to retrieve Descendants from&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetDescendants(int id)
+        {
+            var content = GetById(id);
+            if (content == null)
+            {
+                return Enumerable.Empty&lt;IContent&gt;();
+            }
+            return GetDescendants(content);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by Parent Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;see cref=&quot;IContent&quot;/&gt; item to retrieve Descendants from&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetDescendants(IContent content)
+        {
+            //This is a check to ensure that the path is correct for this entity to avoid problems like: http://issues.umbraco.org/issue/U4-9336 due to data corruption
+            if (content.ValidatePath() == false)
+                throw new InvalidDataException(string.Format(&quot;The content item {0} has an invalid path: {1} with parentID: {2}&quot;, content.Id, content.Path, content.ParentId));
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                var pathMatch = content.Path + &quot;,&quot;;
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Path.StartsWith(pathMatch) &amp;&amp; x.Id != content.Id);
+                var contents = repository.GetByQuery(query);
+
+                return contents;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the parent of the current content as an &lt;see cref=&quot;IContent&quot;/&gt; item.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IContent&quot;/&gt; to retrieve the parent from&lt;/param&gt;
+        /// &lt;returns&gt;Parent &lt;see cref=&quot;IContent&quot;/&gt; object&lt;/returns&gt;
+        public IContent GetParent(int id)
+        {
+            var content = GetById(id);
+            return GetParent(content);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the parent of the current content as an &lt;see cref=&quot;IContent&quot;/&gt; item.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;see cref=&quot;IContent&quot;/&gt; to retrieve the parent from&lt;/param&gt;
+        /// &lt;returns&gt;Parent &lt;see cref=&quot;IContent&quot;/&gt; object&lt;/returns&gt;
+        public IContent GetParent(IContent content)
+        {
+            if (content.ParentId == Constants.System.Root || content.ParentId == Constants.System.RecycleBinContent)
+                return null;
+
+            return GetById(content.ParentId);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the published version of an &lt;see cref=&quot;IContent&quot;/&gt; item
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IContent&quot;/&gt; to retrieve version from&lt;/param&gt;
+        /// &lt;returns&gt;An &lt;see cref=&quot;IContent&quot;/&gt; item&lt;/returns&gt;
+        public IContent GetPublishedVersion(int id)
+        {
+            var version = GetVersions(id);
+            return version.FirstOrDefault(x =&gt; x.Published == true);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the published version of a &lt;see cref=&quot;IContent&quot;/&gt; item.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The content item.&lt;/param&gt;
+        /// &lt;returns&gt;The published version, if any; otherwise, null.&lt;/returns&gt;
+        public IContent GetPublishedVersion(IContent content)
+        {
+            if (content.Published) return content;
+            return content.HasPublishedVersion
+                ? GetByVersion(content.PublishedVersionGuid)
+                : null;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects, which reside at the first level / root
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetRootContent()
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.ParentId == Constants.System.Root);
+                var contents = repository.GetByQuery(query);
+
+                return contents;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all published content items
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;IContent&gt; GetAllPublished()
+        {
+            //create it once if it is needed (no need for locking here)
+            if (_notTrashedQuery == null)
+            {
+                _notTrashedQuery = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Trashed == false);
+            }
+
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetByPublishedVersion(_notTrashedQuery);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects, which has an expiration date less than or equal to today.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetContentForExpiration()
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Published == true &amp;&amp; x.ExpireDate &lt;= DateTime.Now);
+                var contents = repository.GetByQuery(query);
+
+                return contents;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects, which has a release date less than or equal to today.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetContentForRelease()
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Published == false &amp;&amp; x.ReleaseDate &lt;= DateTime.Now);
+                var contents = repository.GetByQuery(query);
+
+                return contents;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a collection of an &lt;see cref=&quot;IContent&quot;/&gt; objects, which resides in the Recycle Bin
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetContentInRecycleBin()
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Path.Contains(Constants.System.RecycleBinContent.ToInvariantString()));
+                var contents = repository.GetByQuery(query);
+
+                return contents;
+            }
+        }
+
+
+
+        /// &lt;summary&gt;
+        /// Checks whether an &lt;see cref=&quot;IContent&quot;/&gt; item has any children
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IContent&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;True if the content has any children otherwise False&lt;/returns&gt;
+        public bool HasChildren(int id)
+        {
+            return CountChildren(id) &gt; 0;
+        }
+
+        internal int CountChildren(int id)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.ParentId == id);
+                var count = repository.Count(query);
+                return count;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Checks whether an &lt;see cref=&quot;IContent&quot;/&gt; item has any published versions
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IContent&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;True if the content has any published version otherwise False&lt;/returns&gt;
+        public bool HasPublishedVersion(int id)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Published == true &amp;&amp; x.Id == id &amp;&amp; x.Trashed == false);
+                int count = repository.Count(query);
+                return count &gt; 0;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the passed in &lt;see cref=&quot;IContent&quot;/&gt; can be published based on the anscestors publish state.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;see cref=&quot;IContent&quot;/&gt; to check if anscestors are published&lt;/param&gt;
+        /// &lt;returns&gt;True if the Content can be published, otherwise False&lt;/returns&gt;
+        public bool IsPublishable(IContent content)
+        {
+            //If the passed in content has yet to be saved we &quot;fallback&quot; to checking the Parent
+            //because if the Parent is publishable then the current content can be Saved and Published
+            if (content.HasIdentity == false)
+            {
+                IContent parent = GetById(content.ParentId);
+                return IsPublishable(parent, true);
+            }
+
+            return IsPublishable(content, false);
+        }
+
+        /// &lt;summary&gt;
+        /// This will rebuild the xml structures for content in the database. 
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;This is not used for anything&lt;/param&gt;
+        /// &lt;returns&gt;True if publishing succeeded, otherwise False&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This is used for when a document type alias or a document type property is changed, the xml will need to 
+        /// be regenerated.
+        /// &lt;/remarks&gt;
+        public bool RePublishAll(int userId = 0)
+        {
+            try
+            {
+                RebuildXmlStructures();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error&lt;ContentService&gt;(&quot;An error occurred executing RePublishAll&quot;, ex);
+                return false;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This will rebuild the xml structures for content in the database. 
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentTypeIds&quot;&gt;
+        /// If specified will only rebuild the xml for the content type&#39;s specified, otherwise will update the structure
+        /// for all published content.
+        /// &lt;/param&gt;
+        internal void RePublishAll(params int[] contentTypeIds)
+        {
+            try
+            {
+                RebuildXmlStructures(contentTypeIds);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error&lt;ContentService&gt;(&quot;An error occurred executing RePublishAll&quot;, ex);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to publish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;returns&gt;True if publishing succeeded, otherwise False&lt;/returns&gt;
+        public bool Publish(IContent content, int userId = 0)
+        {
+            var result = SaveAndPublishDo(content, userId);
+            Logger.Info&lt;ContentService&gt;(&quot;Call was made to ContentService.Publish, use PublishWithStatus instead since that method will provide more detailed information on the outcome&quot;);
+            return result.Success;
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a &lt;see cref=&quot;IContent&quot;/&gt; object and all its children
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to publish along with its children&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;param name=&quot;includeUnpublished&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;The list of statuses for all published items&lt;/returns&gt;
+        IEnumerable&lt;Attempt&lt;PublishStatus&gt;&gt; IContentServiceOperations.PublishWithChildren(IContent content, int userId, bool includeUnpublished)
+        {
+            return PublishWithChildrenDo(content, userId, includeUnpublished);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves and Publishes a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to save and publish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional boolean indicating whether or not to raise save events.&lt;/param&gt;
+        /// &lt;returns&gt;True if publishing succeeded, otherwise False&lt;/returns&gt;
+        Attempt&lt;PublishStatus&gt; IContentServiceOperations.SaveAndPublish(IContent content, int userId, bool raiseEvents)
+        {
+            return SaveAndPublishDo(content, userId, raiseEvents);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes an &lt;see cref=&quot;IContent&quot;/&gt; object by moving it to the Recycle Bin
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Move an item to the Recycle Bin will result in the item being unpublished&lt;/remarks&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to delete&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User deleting the Content&lt;/param&gt;
+        Attempt&lt;OperationStatus&gt; IContentServiceOperations.MoveToRecycleBin(IContent content, int userId)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+
+            using (new WriteLock(Locker))
+            {
+                //Hack: this ensures that the entity&#39;s path is valid and if not it fixes/persists it
+                //see: http://issues.umbraco.org/issue/U4-9336
+                content.EnsureValidPath(Logger, entity =&gt; GetById(entity.ParentId), QuickUpdate);
+
+                var originalPath = content.Path;
+
+                if (Trashing.IsRaisedEventCancelled(
+                  new MoveEventArgs&lt;IContent&gt;(evtMsgs, new MoveEventInfo&lt;IContent&gt;(content, originalPath, Constants.System.RecycleBinContent)),
+                  this))
+                {
+                    return OperationStatus.Cancelled(evtMsgs);
+                }
+
+                var moveInfo = new List&lt;MoveEventInfo&lt;IContent&gt;&gt;
+                {
+                    new MoveEventInfo&lt;IContent&gt;(content, originalPath, Constants.System.RecycleBinContent)
+                };
+
+                //Make sure that published content is unpublished before being moved to the Recycle Bin
+                if (HasPublishedVersion(content.Id))
+                {
+                    //TODO: this shouldn&#39;t be a &#39;sub operation&#39;, and if it needs to be it cannot raise events and cannot be cancelled!
+                    UnPublish(content, userId);
+                }
+
+                //Unpublish descendents of the content item that is being moved to trash
+                var descendants = GetDescendants(content).OrderBy(x =&gt; x.Level).ToList();
+                foreach (var descendant in descendants)
+                {
+                    //TODO: this shouldn&#39;t be a &#39;sub operation&#39;, and if it needs to be it cannot raise events and cannot be cancelled!
+                    UnPublish(descendant, userId);
+                }
+
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateContentRepository(uow))
+                {
+                    content.WriterId = userId;
+                    content.ChangeTrashedState(true);
+                    repository.AddOrUpdate(content);
+
+                    //Loop through descendants to update their trash state, but ensuring structure by keeping the ParentId
+                    foreach (var descendant in descendants)
+                    {
+                        moveInfo.Add(new MoveEventInfo&lt;IContent&gt;(descendant, descendant.Path, descendant.ParentId));
+
+                        descendant.WriterId = userId;
+                        descendant.ChangeTrashedState(true, descendant.ParentId);
+                        repository.AddOrUpdate(descendant);
+                    }
+
+                    uow.Commit();
+                }
+
+                Trashed.RaiseEvent(new MoveEventArgs&lt;IContent&gt;(false, evtMsgs, moveInfo.ToArray()), this);
+
+                Audit(AuditType.Move, &quot;Move Content to Recycle Bin performed by user&quot;, userId, content.Id);
+
+                return OperationStatus.Success(evtMsgs);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// UnPublishes a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to publish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;returns&gt;True if unpublishing succeeded, otherwise False&lt;/returns&gt;
+        Attempt&lt;UnPublishStatus&gt; IContentServiceOperations.UnPublish(IContent content, int userId)
+        {
+            return UnPublishDo(content, false, userId);
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to publish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;returns&gt;True if publishing succeeded, otherwise False&lt;/returns&gt;
+        public Attempt&lt;PublishStatus&gt; PublishWithStatus(IContent content, int userId = 0)
+        {
+            return ((IContentServiceOperations)this).Publish(content, userId);
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a &lt;see cref=&quot;IContent&quot;/&gt; object and all its children
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to publish along with its children&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;returns&gt;True if publishing succeeded, otherwise False&lt;/returns&gt;
+        [Obsolete(&quot;Use PublishWithChildrenWithStatus instead, that method will provide more detailed information on the outcome and also allows the includeUnpublished flag&quot;)]
+        public bool PublishWithChildren(IContent content, int userId = 0)
+        {
+            var result = PublishWithChildrenDo(content, userId, true);
+
+            //This used to just return false only when the parent content failed, otherwise would always return true so we&#39;ll
+            // do the same thing for the moment
+            if (result.All(x =&gt; x.Result.ContentItem.Id != content.Id))
+                return false;
+
+            return result.Single(x =&gt; x.Result.ContentItem.Id == content.Id).Success;
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a &lt;see cref=&quot;IContent&quot;/&gt; object and all its children
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to publish along with its children&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;param name=&quot;includeUnpublished&quot;&gt;set to true if you want to also publish children that are currently unpublished&lt;/param&gt;
+        /// &lt;returns&gt;True if publishing succeeded, otherwise False&lt;/returns&gt;
+        public IEnumerable&lt;Attempt&lt;PublishStatus&gt;&gt; PublishWithChildrenWithStatus(IContent content, int userId = 0, bool includeUnpublished = false)
+        {
+            return ((IContentServiceOperations)this).PublishWithChildren(content, userId, includeUnpublished);
+        }
+
+        /// &lt;summary&gt;
+        /// UnPublishes a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to publish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;returns&gt;True if unpublishing succeeded, otherwise False&lt;/returns&gt;
+        public bool UnPublish(IContent content, int userId = 0)
+        {
+            return ((IContentServiceOperations)this).UnPublish(content, userId).Success;
+        }
+
+        /// &lt;summary&gt;
+        /// Saves and Publishes a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to save and publish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional boolean indicating whether or not to raise save events.&lt;/param&gt;
+        /// &lt;returns&gt;True if publishing succeeded, otherwise False&lt;/returns&gt;
+        [Obsolete(&quot;Use SaveAndPublishWithStatus instead, that method will provide more detailed information on the outcome&quot;)]
+        public bool SaveAndPublish(IContent content, int userId = 0, bool raiseEvents = true)
+        {
+            var result = SaveAndPublishDo(content, userId, raiseEvents);
+            return result.Success;
+        }
+
+        /// &lt;summary&gt;
+        /// Saves and Publishes a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to save and publish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional boolean indicating whether or not to raise save events.&lt;/param&gt;
+        /// &lt;returns&gt;True if publishing succeeded, otherwise False&lt;/returns&gt;
+        public Attempt&lt;PublishStatus&gt; SaveAndPublishWithStatus(IContent content, int userId = 0, bool raiseEvents = true)
+        {
+            return ((IContentServiceOperations)this).SaveAndPublish(content, userId, raiseEvents);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User saving the Content&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional boolean indicating whether or not to raise events.&lt;/param&gt;
+        public void Save(IContent content, int userId = 0, bool raiseEvents = true)
+        {
+            ((IContentServiceOperations)this).Save(content, userId, raiseEvents);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects.
+        /// &lt;/summary&gt;        
+        /// &lt;param name=&quot;contents&quot;&gt;Collection of &lt;see cref=&quot;IContent&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User saving the Content&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional boolean indicating whether or not to raise events.&lt;/param&gt;        
+        Attempt&lt;OperationStatus&gt; IContentServiceOperations.Save(IEnumerable&lt;IContent&gt; contents, int userId, bool raiseEvents)
+        {
+            var asArray = contents.ToArray();
+
+            var evtMsgs = EventMessagesFactory.Get();
+
+            if (raiseEvents)
+            {
+                if (Saving.IsRaisedEventCancelled(
+                    new SaveEventArgs&lt;IContent&gt;(asArray, evtMsgs),
+                    this))
+                {
+                    return OperationStatus.Cancelled(evtMsgs);
+                }
+            }
+            using (new WriteLock(Locker))
+            {
+                var containsNew = asArray.Any(x =&gt; x.HasIdentity == false);
+
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateContentRepository(uow))
+                {
+                    if (containsNew)
+                    {
+                        foreach (var content in asArray)
+                        {
+                            content.WriterId = userId;
+
+                            //Only change the publish state if the &quot;previous&quot; version was actually published
+                            if (content.Published)
+                                content.ChangePublishedState(PublishedState.Saved);
+
+                            repository.AddOrUpdate(content);
+                            //add or update preview
+                            repository.AddOrUpdatePreviewXml(content, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+                        }
+                    }
+                    else
+                    {
+                        foreach (var content in asArray)
+                        {
+                            content.WriterId = userId;
+                            repository.AddOrUpdate(content);
+                            //add or update preview
+                            repository.AddOrUpdatePreviewXml(content, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+                        }
+                    }
+
+                    uow.Commit();
+                }
+
+                if (raiseEvents)
+                    Saved.RaiseEvent(new SaveEventArgs&lt;IContent&gt;(asArray, false, evtMsgs), this);
+
+                Audit(AuditType.Save, &quot;Bulk Save content performed by user&quot;, userId == -1 ? 0 : userId, Constants.System.Root);
+
+                return OperationStatus.Success(evtMsgs);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Permanently deletes an &lt;see cref=&quot;IContent&quot;/&gt; object.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This method will also delete associated media files, child content and possibly associated domains.
+        /// &lt;/remarks&gt;
+        /// &lt;remarks&gt;Please note that this method will completely remove the Content from the database&lt;/remarks&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to delete&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User deleting the Content&lt;/param&gt;
+        Attempt&lt;OperationStatus&gt; IContentServiceOperations.Delete(IContent content, int userId)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+
+            using (new WriteLock(Locker))
+            {
+                if (Deleting.IsRaisedEventCancelled(
+                  new DeleteEventArgs&lt;IContent&gt;(content, evtMsgs),
+                  this))
+                {
+                    return OperationStatus.Cancelled(evtMsgs);
+                }
+
+                //Make sure that published content is unpublished before being deleted
+                if (HasPublishedVersion(content.Id))
+                {
+                    UnPublish(content, userId);
+                }
+
+                //Delete children before deleting the &#39;possible parent&#39;
+                var children = GetChildren(content.Id);
+                foreach (var child in children)
+                {
+                    Delete(child, userId);
+                }
+
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateContentRepository(uow))
+                {
+                    repository.Delete(content);
+                    uow.Commit();
+
+                    var args = new DeleteEventArgs&lt;IContent&gt;(content, false, evtMsgs);
+                    Deleted.RaiseEvent(args, this);
+
+                    //remove any flagged media files
+                    repository.DeleteMediaFiles(args.MediaFilesToDelete);
+                }
+
+                Audit(AuditType.Delete, &quot;Delete Content performed by user&quot;, userId, content.Id);
+
+                return OperationStatus.Success(evtMsgs);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to publish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;returns&gt;The published status attempt&lt;/returns&gt;
+        Attempt&lt;PublishStatus&gt; IContentServiceOperations.Publish(IContent content, int userId)
+        {
+            return SaveAndPublishDo(content, userId);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User saving the Content&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional boolean indicating whether or not to raise events.&lt;/param&gt;
+        Attempt&lt;OperationStatus&gt; IContentServiceOperations.Save(IContent content, int userId, bool raiseEvents)
+        {
+            return Save(content, true, userId, raiseEvents);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// If the collection of content contains new objects that references eachother by Id or ParentId,
+        /// then use the overload Save method with a collection of Lazy &lt;see cref=&quot;IContent&quot;/&gt;.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;contents&quot;&gt;Collection of &lt;see cref=&quot;IContent&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User saving the Content&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional boolean indicating whether or not to raise events.&lt;/param&gt;
+        public void Save(IEnumerable&lt;IContent&gt; contents, int userId = 0, bool raiseEvents = true)
+        {
+            ((IContentServiceOperations)this).Save(contents, userId, raiseEvents);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes all content of specified type. All children of deleted content is moved to Recycle Bin.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;This needs extra care and attention as its potentially a dangerous and extensive operation&lt;/remarks&gt;
+        /// &lt;param name=&quot;contentTypeId&quot;&gt;Id of the &lt;see cref=&quot;IContentType&quot;/&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the user issueing the delete operation&lt;/param&gt;
+        public void DeleteContentOfType(int contentTypeId, int userId = 0)
+        {
+            //TODO: This currently this is called from the ContentTypeService but that needs to change, 
+            // if we are deleting a content type, we should just delete the data and do this operation slightly differently.
+            // This method will recursively go lookup every content item, check if any of it&#39;s descendants are
+            // of a different type, move them to the recycle bin, then permanently delete the content items. 
+            // The main problem with this is that for every content item being deleted, events are raised...
+            // which we need for many things like keeping caches in sync, but we can surely do this MUCH better.
+
+            using (new WriteLock(Locker))
+            {
+                using (var uow = UowProvider.GetUnitOfWork())
+                {
+                    var repository = RepositoryFactory.CreateContentRepository(uow);
+                    //NOTE What about content that has the contenttype as part of its composition?
+                    var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.ContentTypeId == contentTypeId);
+                    var contents = repository.GetByQuery(query).ToArray();
+
+                    if (Deleting.IsRaisedEventCancelled(new DeleteEventArgs&lt;IContent&gt;(contents), this))
+                        return;
+
+                    foreach (var content in contents.OrderByDescending(x =&gt; x.ParentId))
+                    {
+                        //Look for children of current content and move that to trash before the current content is deleted
+                        var c = content;
+                        var childQuery = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Path.StartsWith(c.Path));
+                        var children = repository.GetByQuery(childQuery);
+
+                        foreach (var child in children)
+                        {
+                            if (child.ContentType.Id != contentTypeId)
+                                MoveToRecycleBin(child, userId);
+                        }
+
+                        //Permantly delete the content
+                        Delete(content, userId);
+                    }
+                }
+
+                Audit(AuditType.Delete,
+                          string.Format(&quot;Delete Content of Type {0} performed by user&quot;, contentTypeId),
+                          userId, Constants.System.Root);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Permanently deletes an &lt;see cref=&quot;IContent&quot;/&gt; object as well as all of its Children.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This method will also delete associated media files, child content and possibly associated domains.
+        /// &lt;/remarks&gt;
+        /// &lt;remarks&gt;Please note that this method will completely remove the Content from the database&lt;/remarks&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to delete&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User deleting the Content&lt;/param&gt;
+        public void Delete(IContent content, int userId = 0)
+        {
+            ((IContentServiceOperations)this).Delete(content, userId);
+        }
+
+        /// &lt;summary&gt;
+        /// Permanently deletes versions from an &lt;see cref=&quot;IContent&quot;/&gt; object prior to a specific date.
+        /// This method will never delete the latest version of a content item.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IContent&quot;/&gt; object to delete versions from&lt;/param&gt;
+        /// &lt;param name=&quot;versionDate&quot;&gt;Latest version date&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User deleting versions of a Content object&lt;/param&gt;
+        public void DeleteVersions(int id, DateTime versionDate, int userId = 0)
+        {
+            if (DeletingVersions.IsRaisedEventCancelled(new DeleteRevisionsEventArgs(id, dateToRetain: versionDate), this))
+                return;
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                repository.DeleteVersions(id, versionDate);
+                uow.Commit();
+            }
+
+            DeletedVersions.RaiseEvent(new DeleteRevisionsEventArgs(id, false, dateToRetain: versionDate), this);
+
+            Audit(AuditType.Delete, &quot;Delete Content by version date performed by user&quot;, userId, Constants.System.Root);
+        }
+
+        /// &lt;summary&gt;
+        /// Permanently deletes specific version(s) from an &lt;see cref=&quot;IContent&quot;/&gt; object.
+        /// This method will never delete the latest version of a content item.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IContent&quot;/&gt; object to delete a version from&lt;/param&gt;
+        /// &lt;param name=&quot;versionId&quot;&gt;Id of the version to delete&lt;/param&gt;
+        /// &lt;param name=&quot;deletePriorVersions&quot;&gt;Boolean indicating whether to delete versions prior to the versionId&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User deleting versions of a Content object&lt;/param&gt;
+        public void DeleteVersion(int id, Guid versionId, bool deletePriorVersions, int userId = 0)
+        {
+            using (new WriteLock(Locker))
+            {
+                if (DeletingVersions.IsRaisedEventCancelled(new DeleteRevisionsEventArgs(id, specificVersion: versionId), this))
+                    return;
+
+                if (deletePriorVersions)
+                {
+                    var content = GetByVersion(versionId);
+                    DeleteVersions(id, content.UpdateDate, userId);
+                }
+
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateContentRepository(uow))
+                {
+                    repository.DeleteVersion(versionId);
+                    uow.Commit();
+                }
+
+                DeletedVersions.RaiseEvent(new DeleteRevisionsEventArgs(id, false, specificVersion: versionId), this);
+
+                Audit(AuditType.Delete, &quot;Delete Content by version performed by user&quot;, userId, Constants.System.Root);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes an &lt;see cref=&quot;IContent&quot;/&gt; object by moving it to the Recycle Bin
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Move an item to the Recycle Bin will result in the item being unpublished&lt;/remarks&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to delete&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User deleting the Content&lt;/param&gt;
+        public void MoveToRecycleBin(IContent content, int userId = 0)
+        {
+            ((IContentServiceOperations)this).MoveToRecycleBin(content, userId);
+        }
+
+        /// &lt;summary&gt;
+        /// Moves an &lt;see cref=&quot;IContent&quot;/&gt; object to a new location by changing its parent id.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// If the &lt;see cref=&quot;IContent&quot;/&gt; object is already published it will be
+        /// published after being moved to its new location. Otherwise it&#39;ll just
+        /// be saved with a new parent id.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to move&lt;/param&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;Id of the Content&#39;s new Parent&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User moving the Content&lt;/param&gt;
+        public void Move(IContent content, int parentId, int userId = 0)
+        {
+            using (new WriteLock(Locker))
+            {
+                //This ensures that the correct method is called if this method is used to Move to recycle bin.
+                if (parentId == Constants.System.RecycleBinContent)
+                {
+                    MoveToRecycleBin(content, userId);
+                    return;
+                }
+
+                if (Moving.IsRaisedEventCancelled(
+                    new MoveEventArgs&lt;IContent&gt;(
+                        new MoveEventInfo&lt;IContent&gt;(content, content.Path, parentId)), this))
+                {
+                    return;
+                }
+
+                //used to track all the moved entities to be given to the event
+                var moveInfo = new List&lt;MoveEventInfo&lt;IContent&gt;&gt;();
+
+                //call private method that does the recursive moving
+                PerformMove(content, parentId, userId, moveInfo);
+
+                Moved.RaiseEvent(new MoveEventArgs&lt;IContent&gt;(false, moveInfo.ToArray()), this);
+
+                Audit(AuditType.Move, &quot;Move Content performed by user&quot;, userId, content.Id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Empties the Recycle Bin by deleting all &lt;see cref=&quot;IContent&quot;/&gt; that resides in the bin
+        /// &lt;/summary&gt;
+        public void EmptyRecycleBin()
+        {
+            using (new WriteLock(Locker))
+            {
+                Dictionary&lt;int, IEnumerable&lt;Property&gt;&gt; entities;
+                List&lt;string&gt; files;
+                bool success;
+                var nodeObjectType = new Guid(Constants.ObjectTypes.Document);
+
+                using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+                {
+                    //Create a dictionary of ids -&gt; dictionary of property aliases + values
+                    entities = repository.GetEntitiesInRecycleBin()
+                        .ToDictionary(
+                            key =&gt; key.Id,
+                            val =&gt; (IEnumerable&lt;Property&gt;)val.Properties);
+
+                    files = ((ContentRepository)repository).GetFilesInRecycleBinForUploadField();
+
+                    if (EmptyingRecycleBin.IsRaisedEventCancelled(new RecycleBinEventArgs(nodeObjectType, entities, files), this))
+                        return;
+
+                    success = repository.EmptyRecycleBin();
+
+                    EmptiedRecycleBin.RaiseEvent(new RecycleBinEventArgs(nodeObjectType, entities, files, success), this);
+
+                    if (success)
+                        repository.DeleteMediaFiles(files);
+                }
+            }
+            Audit(AuditType.Delete, &quot;Empty Content Recycle Bin performed by user&quot;, 0, Constants.System.RecycleBinContent);
+        }
+
+        /// &lt;summary&gt;
+        /// Copies an &lt;see cref=&quot;IContent&quot;/&gt; object by creating a new Content object of the same type and copies all data from the current 
+        /// to the new copy which is returned. Recursively copies all children.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to copy&lt;/param&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;Id of the Content&#39;s new Parent&lt;/param&gt;
+        /// &lt;param name=&quot;relateToOriginal&quot;&gt;Boolean indicating whether the copy should be related to the original&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User copying the Content&lt;/param&gt;
+        /// &lt;returns&gt;The newly created &lt;see cref=&quot;IContent&quot;/&gt; object&lt;/returns&gt;
+        public IContent Copy(IContent content, int parentId, bool relateToOriginal, int userId = 0)
+        {
+            return Copy(content, parentId, relateToOriginal, true, userId);
+        }
+
+        /// &lt;summary&gt;
+        /// Copies an &lt;see cref=&quot;IContent&quot;/&gt; object by creating a new Content object of the same type and copies all data from the current 
+        /// to the new copy which is returned.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to copy&lt;/param&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;Id of the Content&#39;s new Parent&lt;/param&gt;
+        /// &lt;param name=&quot;relateToOriginal&quot;&gt;Boolean indicating whether the copy should be related to the original&lt;/param&gt;
+        /// &lt;param name=&quot;recursive&quot;&gt;A value indicating whether to recursively copy children.&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User copying the Content&lt;/param&gt;
+        /// &lt;returns&gt;The newly created &lt;see cref=&quot;IContent&quot;/&gt; object&lt;/returns&gt;
+        public IContent Copy(IContent content, int parentId, bool relateToOriginal, bool recursive, int userId = 0)
+        {
+            //TODO: This all needs to be managed correctly so that the logic is submitted in one
+            // transaction, the CRUD needs to be moved to the repo
+
+            using (new WriteLock(Locker))
+            {
+                var copy = content.DeepCloneWithResetIdentities();
+                copy.ParentId = parentId;
+
+                // A copy should never be set to published automatically even if the original was.
+                copy.ChangePublishedState(PublishedState.Unpublished);
+
+                if (Copying.IsRaisedEventCancelled(new CopyEventArgs&lt;IContent&gt;(content, copy, parentId), this))
+                    return null;
+
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateContentRepository(uow))
+                {
+                    // Update the create author and last edit author
+                    copy.CreatorId = userId;
+                    copy.WriterId = userId;
+
+                    repository.AddOrUpdate(copy);
+                    //add or update a preview
+                    repository.AddOrUpdatePreviewXml(copy, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+                    uow.Commit();
+
+
+                    //Special case for the associated tags
+                    //TODO: Move this to the repository layer in a single transaction!
+                    //don&#39;t copy tags data in tags table if the item is in the recycle bin
+                    if (parentId != Constants.System.RecycleBinContent)
+                    {
+
+                        var tags = uow.Database.Fetch&lt;TagRelationshipDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = content.Id });
+                        foreach (var tag in tags)
+                        {
+                            uow.Database.Insert(new TagRelationshipDto { NodeId = copy.Id, TagId = tag.TagId, PropertyTypeId = tag.PropertyTypeId });
+                        }
+                    }
+                }
+
+                if (recursive)
+                {
+                    //Look for children and copy those as well
+                    var children = GetChildren(content.Id);
+                    foreach (var child in children)
+                    {
+                        //TODO: This shouldn&#39;t recurse back to this method, it should be done in a private method
+                        // that doesn&#39;t have a nested lock and so we can perform the entire operation in one commit.
+                        Copy(child, copy.Id, relateToOriginal, true, userId);
+                    }
+                }
+
+                Copied.RaiseEvent(new CopyEventArgs&lt;IContent&gt;(content, copy, false, parentId, relateToOriginal), this);
+
+                Audit(AuditType.Copy, &quot;Copy Content performed by user&quot;, content.WriterId, content.Id);
+                return copy;
+            }
+        }
+
+
+        /// &lt;summary&gt;
+        /// Sends an &lt;see cref=&quot;IContent&quot;/&gt; to Publication, which executes handlers and events for the &#39;Send to Publication&#39; action.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to send to publication&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the send to publication&lt;/param&gt;
+        /// &lt;returns&gt;True if sending publication was succesfull otherwise false&lt;/returns&gt;
+        public bool SendToPublication(IContent content, int userId = 0)
+        {
+            if (SendingToPublish.IsRaisedEventCancelled(new SendToPublishEventArgs&lt;IContent&gt;(content), this))
+                return false;
+
+            //Save before raising event
+            Save(content, userId);
+
+            SentToPublish.RaiseEvent(new SendToPublishEventArgs&lt;IContent&gt;(content, false), this);
+
+            Audit(AuditType.SendToPublish, &quot;Send to Publish performed by user&quot;, content.WriterId, content.Id);
+
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Rollback an &lt;see cref=&quot;IContent&quot;/&gt; object to a previous version.
+        /// This will create a new version, which is a copy of all the old data.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// The way data is stored actually only allows us to rollback on properties
+        /// and not data like Name and Alias of the Content.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IContent&quot;/&gt;being rolled back&lt;/param&gt;
+        /// &lt;param name=&quot;versionId&quot;&gt;Id of the version to rollback to&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the rollback of the Content&lt;/param&gt;
+        /// &lt;returns&gt;The newly created &lt;see cref=&quot;IContent&quot;/&gt; object&lt;/returns&gt;
+        public IContent Rollback(int id, Guid versionId, int userId = 0)
+        {
+            var content = GetByVersion(versionId);
+
+            if (RollingBack.IsRaisedEventCancelled(new RollbackEventArgs&lt;IContent&gt;(content), this))
+                return content;
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                content.WriterId = userId;
+                content.CreatorId = userId;
+                content.ChangePublishedState(PublishedState.Unpublished);
+
+                repository.AddOrUpdate(content);
+                //add or update a preview
+                repository.AddOrUpdatePreviewXml(content, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+                uow.Commit();
+            }
+
+            RolledBack.RaiseEvent(new RollbackEventArgs&lt;IContent&gt;(content, false), this);
+
+            Audit(AuditType.RollBack, &quot;Content rollback performed by user&quot;, content.WriterId, content.Id);
+
+            return content;
+        }
+
+        /// &lt;summary&gt;
+        /// Sorts a collection of &lt;see cref=&quot;IContent&quot;/&gt; objects by updating the SortOrder according
+        /// to the ordering of items in the passed in &lt;see cref=&quot;IEnumerable{T}&quot;/&gt;.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Using this method will ensure that the Published-state is maintained upon sorting
+        /// so the cache is updated accordingly - as needed.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;items&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;True if sorting succeeded, otherwise False&lt;/returns&gt;
+        public bool Sort(IEnumerable&lt;IContent&gt; items, int userId = 0, bool raiseEvents = true)
+        {
+            var asArray = items.ToArray();
+            if (raiseEvents)
+            {
+                if (Saving.IsRaisedEventCancelled(new SaveEventArgs&lt;IContent&gt;(asArray), this))
+                    return false;
+            }
+
+            var shouldBePublished = new List&lt;IContent&gt;();
+            var shouldBeSaved = new List&lt;IContent&gt;();
+            
+            using (new WriteLock(Locker))
+            {
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateContentRepository(uow))
+                {
+                    int i = 0;
+                    foreach (var content in asArray)
+                    {
+                        //If the current sort order equals that of the content
+                        //we don&#39;t need to update it, so just increment the sort order
+                        //and continue.
+                        if (content.SortOrder == i)
+                        {
+                            i++;
+                            continue;
+                        }
+
+                        content.SortOrder = i;
+                        content.WriterId = userId;
+                        i++;
+
+                        if (content.Published)
+                        {
+                            //TODO: This should not be an inner operation, but if we do this, it cannot raise events and cannot be cancellable!
+                            var published = _publishingStrategy.Publish(content, userId);
+                            shouldBePublished.Add(content);
+                        }
+                        else
+                            shouldBeSaved.Add(content);
+
+                        repository.AddOrUpdate(content);
+                        //add or update a preview
+                        repository.AddOrUpdatePreviewXml(content, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+                    }
+
+                    foreach (var content in shouldBePublished)
+                    {
+                        //Create and Save ContentXml DTO
+                        repository.AddOrUpdateContentXml(content, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+                    }
+
+                    uow.Commit();
+                }
+            }
+
+            if (raiseEvents)
+                Saved.RaiseEvent(new SaveEventArgs&lt;IContent&gt;(asArray, false), this);
+
+            if (shouldBePublished.Any())
+            {
+                //TODO: This should not be an inner operation, but if we do this, it cannot raise events and cannot be cancellable!
+                _publishingStrategy.PublishingFinalized(shouldBePublished, false);
+            }
+
+
+            Audit(AuditType.Sort, &quot;Sorting content performed by user&quot;, userId, 0);
+
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets paged content descendants as XML by path
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;path&quot;&gt;Path starts with&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Page number&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Page size&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total records the query would return without paging&lt;/param&gt;
+        /// &lt;returns&gt;A paged enumerable of XML entries of content items&lt;/returns&gt;
+        public IEnumerable&lt;XElement&gt; GetPagedXmlEntries(string path, long pageIndex, int pageSize, out long totalRecords)
+        {
+            Mandate.ParameterCondition(pageIndex &gt;= 0, &quot;pageIndex&quot;);
+            Mandate.ParameterCondition(pageSize &gt; 0, &quot;pageSize&quot;);
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                var contents = repository.GetPagedXmlEntriesByPath(path, pageIndex, pageSize,
+                    //This order by is VERY important! This allows us to figure out what is implicitly not published, see ContentRepository.BuildXmlCache and
+                    // UmbracoContentIndexer.PerformIndexAll which uses the logic based on this sort order
+                    new[] {&quot;level&quot;, &quot;parentID&quot;, &quot;sortOrder&quot;},
+                    out totalRecords);
+                return contents;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This builds the Xml document used for the XML cache
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public XmlDocument BuildXmlCache()
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                var result = repository.BuildXmlCache();
+                return result;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Rebuilds all xml content in the cmsContentXml table for all documents
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentTypeIds&quot;&gt;
+        /// Only rebuild the xml structures for the content type ids passed in, if none then rebuilds the structures
+        /// for all content
+        /// &lt;/param&gt;
+        public void RebuildXmlStructures(params int[] contentTypeIds)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                repository.RebuildXmlStructures(
+                    content =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, content),
+                    contentTypeIds: contentTypeIds.Length == 0 ? null : contentTypeIds);
+
+                uow.Commit();
+            }
+
+            Audit(AuditType.Publish, &quot;ContentService.RebuildXmlStructures completed, the xml has been regenerated in the database&quot;, 0, Constants.System.Root);
+
+        }
+
+        #region Internal Methods
+
+        /// &lt;summary&gt;
+        /// Gets a collection of &lt;see cref=&quot;IContent&quot;/&gt; descendants by the first Parent.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;see cref=&quot;IContent&quot;/&gt; item to retrieve Descendants from&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        internal IEnumerable&lt;IContent&gt; GetPublishedDescendants(IContent content)
+        {
+            using (var repository = RepositoryFactory.CreateContentRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Id != content.Id &amp;&amp; x.Path.StartsWith(content.Path) &amp;&amp; x.Trashed == false);
+                var contents = repository.GetByPublishedVersion(query);
+
+                return contents;
+            }
+        }
+
+        #endregion
+
+        #region Private Methods
+
+        /// &lt;summary&gt;
+        /// Hack: This is used to fix some data if an entity&#39;s properties are invalid/corrupt
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        private void QuickUpdate(IContent content)
+        {
+            if (content == null) throw new ArgumentNullException(&quot;content&quot;);
+            if (content.HasIdentity == false) throw new InvalidOperationException(&quot;Cannot update an entity without an Identity&quot;);
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                repository.AddOrUpdate(content);                
+                uow.Commit();
+            }
+        }
+
+        private void Audit(AuditType type, string message, int userId, int objectId)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var auditRepo = RepositoryFactory.CreateAuditRepository(uow))
+            {
+                auditRepo.AddOrUpdate(new AuditItem(objectId, message, type, userId));
+                uow.Commit();
+            }
+        }
+
+        //TODO: All of this needs to be moved to the repository
+        private void PerformMove(IContent content, int parentId, int userId, ICollection&lt;MoveEventInfo&lt;IContent&gt;&gt; moveInfo)
+        {
+            //add a tracking item to use in the Moved event
+            moveInfo.Add(new MoveEventInfo&lt;IContent&gt;(content, content.Path, parentId));
+
+            content.WriterId = userId;
+            if (parentId == Constants.System.Root)
+            {
+                content.Path = string.Concat(Constants.System.Root, &quot;,&quot;, content.Id);
+                content.Level = 1;
+            }
+            else
+            {
+                var parent = GetById(parentId);
+                content.Path = string.Concat(parent.Path, &quot;,&quot;, content.Id);
+                content.Level = parent.Level + 1;
+            }
+
+            //If Content is being moved away from Recycle Bin, its state should be un-trashed
+            if (content.Trashed &amp;&amp; parentId != Constants.System.RecycleBinContent)
+            {
+                content.ChangeTrashedState(false, parentId);
+            }
+            else
+            {
+                content.ParentId = parentId;
+            }
+
+            //If Content is published, it should be (re)published from its new location
+            if (content.Published)
+            {
+                //If Content is Publishable its saved and published
+                //otherwise we save the content without changing the publish state, and generate new xml because the Path, Level and Parent has changed.
+                if (IsPublishable(content))
+                {
+                    //TODO: This is raising events, probably not desirable as this costs performance for event listeners like Examine
+                    SaveAndPublish(content, userId);
+                }
+                else
+                {
+                    //TODO: This is raising events, probably not desirable as this costs performance for event listeners like Examine
+                    Save(content, false, userId);
+
+                    //TODO: This shouldn&#39;t be here! This needs to be part of the repository logic but in order to fix this we need to 
+                    // change how this method calls &quot;Save&quot; as it needs to save using an internal method
+                    using (var uow = UowProvider.GetUnitOfWork())
+                    {
+                        var xml = _entitySerializer.Serialize(this, _dataTypeService, _userService, content);
+
+                        var poco = new ContentXmlDto { NodeId = content.Id, Xml = xml.ToDataString() };
+                        var exists =
+                            uow.Database.FirstOrDefault&lt;ContentXmlDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = content.Id }) !=
+                            null;
+                        int result = exists
+                                         ? uow.Database.Update(poco)
+                                         : Convert.ToInt32(uow.Database.Insert(poco));
+                    }
+                }
+            }
+            else
+            {
+                //TODO: This is raising events, probably not desirable as this costs performance for event listeners like Examine
+                Save(content, userId);
+            }
+
+            //Ensure that Path and Level is updated on children
+            var children = GetChildren(content.Id).ToArray();
+            if (children.Any())
+            {
+                foreach (var child in children)
+                {
+                    PerformMove(child, content.Id, userId, moveInfo);
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a &lt;see cref=&quot;IContent&quot;/&gt; object and all its children
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to publish along with its children&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;param name=&quot;includeUnpublished&quot;&gt;If set to true, this will also publish descendants that are completely unpublished, normally this will only publish children that have previously been published&lt;/param&gt;	    
+        /// &lt;returns&gt;
+        /// A list of publish statues. If the parent document is not valid or cannot be published because it&#39;s parent(s) is not published
+        /// then the list will only contain one status item, otherwise it will contain status items for it and all of it&#39;s descendants that
+        /// are to be published.
+        /// &lt;/returns&gt;
+        private IEnumerable&lt;Attempt&lt;PublishStatus&gt;&gt; PublishWithChildrenDo(
+            IContent content, int userId = 0, bool includeUnpublished = false)
+        {
+            if (content == null) throw new ArgumentNullException(&quot;content&quot;);
+
+            var evtMsgs = EventMessagesFactory.Get();
+
+            using (new WriteLock(Locker))
+            {
+                //Hack: this ensures that the entity&#39;s path is valid and if not it fixes/persists it
+                //see: http://issues.umbraco.org/issue/U4-9336
+                content.EnsureValidPath(Logger, entity =&gt; GetById(entity.ParentId), QuickUpdate);
+
+                var result = new List&lt;Attempt&lt;PublishStatus&gt;&gt;();
+
+                //Check if parent is published (although not if its a root node) - if parent isn&#39;t published this Content cannot be published
+                if (content.ParentId != Constants.System.Root &amp;&amp; content.ParentId != Constants.System.RecycleBinContent &amp;&amp; IsPublishable(content) == false)
+                {
+                    Logger.Info&lt;ContentService&gt;(
+                        string.Format(
+                            &quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; could not be published because its parent or one of its ancestors is not published.&quot;,
+                            content.Name, content.Id));
+                    result.Add(Attempt.Fail(new PublishStatus(content, PublishStatusType.FailedPathNotPublished, evtMsgs)));
+                    return result;
+                }
+
+                //Content contains invalid property values and can therefore not be published - fire event?
+                if (!content.IsValid())
+                {
+                    Logger.Info&lt;ContentService&gt;(
+                        string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; could not be published because of invalid properties.&quot;,
+                                      content.Name, content.Id));
+                    result.Add(
+                        Attempt.Fail(
+                            new PublishStatus(content, PublishStatusType.FailedContentInvalid, evtMsgs)
+                            {
+                                InvalidProperties = ((ContentBase)content).LastInvalidProperties
+                            }));
+                    return result;
+                }
+
+                //Consider creating a Path query instead of recursive method:
+                //var query = Query&lt;IContent&gt;.Builder.Where(x =&gt; x.Path.StartsWith(content.Path));
+
+                var updated = new List&lt;IContent&gt;();
+                var list = new List&lt;IContent&gt;();
+                list.Add(content); //include parent item
+                list.AddRange(GetDescendants(content));
+
+                var internalStrategy = (PublishingStrategy)_publishingStrategy;
+
+                //Publish and then update the database with new status
+                var publishedOutcome = internalStrategy.PublishWithChildrenInternal(list, userId, includeUnpublished).ToArray();
+                var published = publishedOutcome
+                    .Where(x =&gt; x.Success || x.Result.StatusType == PublishStatusType.SuccessAlreadyPublished)
+                    // ensure proper order (for events) - cannot publish a child before its parent!
+                    .OrderBy(x =&gt; x.Result.ContentItem.Level)
+                    .ThenBy(x =&gt; x.Result.ContentItem.SortOrder);
+
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateContentRepository(uow))
+                {
+                    //NOTE The Publish with subpages-dialog was used more as a republish-type-thing, so we&#39;ll have to include PublishStatusType.SuccessAlreadyPublished
+                    //in the updated-list, so the Published event is triggered with the expected set of pages and the xml is updated.
+                    foreach (var item in published)
+                    {
+                        item.Result.ContentItem.WriterId = userId;
+                        repository.AddOrUpdate(item.Result.ContentItem);
+                        //add or update a preview
+                        repository.AddOrUpdatePreviewXml(item.Result.ContentItem, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+                        //add or update the published xml
+                        repository.AddOrUpdateContentXml(item.Result.ContentItem, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+                        updated.Add(item.Result.ContentItem);
+                    }
+
+                    uow.Commit();
+
+                }
+                //Save xml to db and call following method to fire event:
+                _publishingStrategy.PublishingFinalized(updated, false);
+
+                Audit(AuditType.Publish, &quot;Publish with Children performed by user&quot;, userId, content.Id);
+
+
+                return publishedOutcome;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// UnPublishes a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to publish&lt;/param&gt;
+        /// &lt;param name=&quot;omitCacheRefresh&quot;&gt;Optional boolean to avoid having the cache refreshed when calling this Unpublish method. By default this method will update the cache.&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;returns&gt;True if unpublishing succeeded, otherwise False&lt;/returns&gt;
+        private Attempt&lt;UnPublishStatus&gt; UnPublishDo(IContent content, bool omitCacheRefresh = false, int userId = 0)
+        {
+            var newest = GetById(content.Id); // ensure we have the newest version
+            if (content.Version != newest.Version) // but use the original object if it&#39;s already the newest version
+                content = newest;
+
+            var evtMsgs = EventMessagesFactory.Get();
+
+            var published = content.Published ? content : GetPublishedVersion(content.Id); // get the published version
+            if (published == null)
+            {
+                return Attempt.Succeed(new UnPublishStatus(content, UnPublishedStatusType.SuccessAlreadyUnPublished, evtMsgs)); // already unpublished
+            }
+
+            var unpublished = _publishingStrategy.UnPublish(content, userId);
+            if (unpublished == false) return Attempt.Fail(new UnPublishStatus(content, UnPublishedStatusType.FailedCancelledByEvent, evtMsgs));
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateContentRepository(uow))
+            {
+                content.WriterId = userId;
+                repository.AddOrUpdate(content);
+                // is published is not newest, reset the published flag on published version
+                if (published.Version != content.Version)
+                    repository.ClearPublished(published);
+                repository.DeleteContentXml(content);
+
+                uow.Commit();
+            }
+            //Delete xml from db? and call following method to fire event through PublishingStrategy to update cache
+            if (omitCacheRefresh == false)
+                _publishingStrategy.UnPublishingFinalized(content);
+
+            Audit(AuditType.UnPublish, &quot;UnPublish performed by user&quot;, userId, content.Id);
+
+            return Attempt.Succeed(new UnPublishStatus(content, UnPublishedStatusType.Success, evtMsgs));
+        }
+
+        /// &lt;summary&gt;
+        /// Saves and Publishes a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to save and publish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User issueing the publishing&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional boolean indicating whether or not to raise save events.&lt;/param&gt;
+        /// &lt;returns&gt;True if publishing succeeded, otherwise False&lt;/returns&gt;
+        private Attempt&lt;PublishStatus&gt; SaveAndPublishDo(IContent content, int userId = 0, bool raiseEvents = true)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+
+            if (raiseEvents)
+            {
+                if (Saving.IsRaisedEventCancelled(
+                    new SaveEventArgs&lt;IContent&gt;(content, evtMsgs), this))
+                {
+                    return Attempt.Fail(new PublishStatus(content, PublishStatusType.FailedCancelledByEvent, evtMsgs));
+                }
+            }
+
+            using (new WriteLock(Locker))
+            {
+                //Has this content item previously been published? If so, we don&#39;t need to refresh the children
+                var previouslyPublished = content.HasIdentity &amp;&amp; HasPublishedVersion(content.Id); //content might not have an id
+                var publishStatus = new PublishStatus(content, PublishStatusType.Success, evtMsgs); //initially set to success
+
+                //Check if parent is published (although not if its a root node) - if parent isn&#39;t published this Content cannot be published
+                publishStatus.StatusType = CheckAndLogIsPublishable(content);
+                //if it is not successful, then check if the props are valid
+                if ((int)publishStatus.StatusType &lt; 10)
+                {
+                    //Content contains invalid property values and can therefore not be published - fire event?
+                    publishStatus.StatusType = CheckAndLogIsValid(content);
+                    //set the invalid properties (if there are any)
+                    publishStatus.InvalidProperties = ((ContentBase)content).LastInvalidProperties;
+                }
+                //if we&#39;re still successful, then publish using the strategy
+                if (publishStatus.StatusType == PublishStatusType.Success)
+                {
+                    var internalStrategy = (PublishingStrategy)_publishingStrategy;
+                    //Publish and then update the database with new status
+                    var publishResult = internalStrategy.PublishInternal(content, userId);
+                    //set the status type to the publish result
+                    publishStatus.StatusType = publishResult.Result.StatusType;
+                }
+
+                //we are successfully published if our publishStatus is still Successful
+                bool published = publishStatus.StatusType == PublishStatusType.Success;
+
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateContentRepository(uow))
+                {
+                    if (published == false)
+                    {
+                        content.ChangePublishedState(PublishedState.Saved);
+                    }
+                    //Since this is the Save and Publish method, the content should be saved even though the publish fails or isn&#39;t allowed
+                    if (content.HasIdentity == false)
+                    {
+                        content.CreatorId = userId;
+                    }
+                    content.WriterId = userId;
+
+                    repository.AddOrUpdate(content);
+
+                    //Generate a new preview
+                    repository.AddOrUpdatePreviewXml(content, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+
+                    if (published)
+                    {
+                        //Content Xml
+                        repository.AddOrUpdateContentXml(content, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+                    }
+
+                    uow.Commit();
+                }
+
+                if (raiseEvents)
+                    Saved.RaiseEvent(new SaveEventArgs&lt;IContent&gt;(content, false, evtMsgs), this);
+
+                //Save xml to db and call following method to fire event through PublishingStrategy to update cache
+                if (published)
+                {
+                    _publishingStrategy.PublishingFinalized(content);
+                }
+
+                //We need to check if children and their publish state to ensure that we &#39;republish&#39; content that was previously published
+                if (published &amp;&amp; previouslyPublished == false &amp;&amp; HasChildren(content.Id))
+                {
+                    //TODO: Horrible for performance if there are lots of descendents! We should page if anything but this is crazy
+                    var descendants = GetPublishedDescendants(content);
+
+                    _publishingStrategy.PublishingFinalized(descendants, false);
+                }
+
+                Audit(AuditType.Publish, &quot;Save and Publish performed by user&quot;, userId, content.Id);
+
+                return Attempt.If(publishStatus.StatusType == PublishStatusType.Success, publishStatus);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a single &lt;see cref=&quot;IContent&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The &lt;see cref=&quot;IContent&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;changeState&quot;&gt;Boolean indicating whether or not to change the Published state upon saving&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the User saving the Content&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional boolean indicating whether or not to raise events.&lt;/param&gt;
+        private Attempt&lt;OperationStatus&gt; Save(IContent content, bool changeState, int userId = 0, bool raiseEvents = true)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+
+            if (raiseEvents)
+            {
+                if (Saving.IsRaisedEventCancelled(
+                  new SaveEventArgs&lt;IContent&gt;(content, evtMsgs),
+                  this))
+                {
+                    return OperationStatus.Cancelled(evtMsgs);
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(content.Name))
+            {
+                throw new ArgumentException(&quot;Cannot save content with empty name.&quot;);
+            }
+
+            using (new WriteLock(Locker))
+            {
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateContentRepository(uow))
+                {
+                    if (content.HasIdentity == false)
+                    {
+                        content.CreatorId = userId;
+                    }
+                    content.WriterId = userId;
+
+                    //Only change the publish state if the &quot;previous&quot; version was actually published or marked as unpublished
+                    if (changeState &amp;&amp; (content.Published || ((Content)content).PublishedState == PublishedState.Unpublished))
+                        content.ChangePublishedState(PublishedState.Saved);
+
+                    repository.AddOrUpdate(content);
+
+                    //Generate a new preview
+                    repository.AddOrUpdatePreviewXml(content, c =&gt; _entitySerializer.Serialize(this, _dataTypeService, _userService, c));
+
+                    uow.Commit();
+                }
+
+                if (raiseEvents)
+                    Saved.RaiseEvent(new SaveEventArgs&lt;IContent&gt;(content, false, evtMsgs), this);
+
+                Audit(AuditType.Save, &quot;Save Content performed by user&quot;, userId, content.Id);
+
+                return OperationStatus.Success(evtMsgs);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the passed in &lt;see cref=&quot;IContent&quot;/&gt; can be published based on the anscestors publish state.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Check current is only used when falling back to checking the Parent of non-saved content, as
+        /// non-saved content doesn&#39;t have a valid path yet.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;see cref=&quot;IContent&quot;/&gt; to check if anscestors are published&lt;/param&gt;
+        /// &lt;param name=&quot;checkCurrent&quot;&gt;Boolean indicating whether the passed in content should also be checked for published versions&lt;/param&gt;
+        /// &lt;returns&gt;True if the Content can be published, otherwise False&lt;/returns&gt;
+        private bool IsPublishable(IContent content, bool checkCurrent)
+        {
+            var ids = content.Path.Split(&#39;,&#39;).Select(int.Parse).ToList();
+            foreach (var id in ids)
+            {
+                //If Id equals that of the recycle bin we return false because nothing in the bin can be published
+                if (id == Constants.System.RecycleBinContent)
+                    return false;
+
+                //We don&#39;t check the System Root, so just continue
+                if (id == Constants.System.Root) continue;
+
+                //If the current id equals that of the passed in content and if current shouldn&#39;t be checked we skip it.
+                if (checkCurrent == false &amp;&amp; id == content.Id) continue;
+
+                //Check if the content for the current id is published - escape the loop if we encounter content that isn&#39;t published
+                var hasPublishedVersion = HasPublishedVersion(id);
+                if (hasPublishedVersion == false)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private PublishStatusType CheckAndLogIsPublishable(IContent content)
+        {
+            //Check if parent is published (although not if its a root node) - if parent isn&#39;t published this Content cannot be published
+            if (content.ParentId != Constants.System.Root &amp;&amp; content.ParentId != Constants.System.RecycleBinContent &amp;&amp; IsPublishable(content) == false)
+            {
+                Logger.Info&lt;ContentService&gt;(
+                    string.Format(
+                        &quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; could not be published because its parent is not published.&quot;,
+                        content.Name, content.Id));
+                return PublishStatusType.FailedPathNotPublished;
+            }
+            else if (content.ExpireDate.HasValue &amp;&amp; content.ExpireDate.Value &gt; DateTime.MinValue &amp;&amp; DateTime.Now &gt; content.ExpireDate.Value)
+            {
+                Logger.Info&lt;ContentService&gt;(
+                    string.Format(
+                        &quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; has expired and could not be published.&quot;,
+                        content.Name, content.Id));
+                return PublishStatusType.FailedHasExpired;
+            }
+            else if (content.ReleaseDate.HasValue &amp;&amp; content.ReleaseDate.Value &gt; DateTime.MinValue &amp;&amp; content.ReleaseDate.Value &gt; DateTime.Now)
+            {
+                Logger.Info&lt;ContentService&gt;(
+                    string.Format(
+                        &quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; is awaiting release and could not be published.&quot;,
+                        content.Name, content.Id));
+                return PublishStatusType.FailedAwaitingRelease;
+            }
+
+            return PublishStatusType.Success;
+        }
+
+        private PublishStatusType CheckAndLogIsValid(IContent content)
+        {
+            //Content contains invalid property values and can therefore not be published - fire event?
+            if (content.IsValid() == false)
+            {
+                Logger.Info&lt;ContentService&gt;(
+                    string.Format(
+                        &quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; could not be published because of invalid properties.&quot;,
+                        content.Name, content.Id));
+                return PublishStatusType.FailedContentInvalid;
+            }
+
+            return PublishStatusType.Success;
+        }
+
+        private IContentType FindContentTypeByAlias(string contentTypeAlias)
+        {
+            using (var repository = RepositoryFactory.CreateContentTypeRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IContentType&gt;.Builder.Where(x =&gt; x.Alias == contentTypeAlias);
+                var types = repository.GetByQuery(query);
+
+                if (types.Any() == false)
+                    throw new Exception(
+                        string.Format(&quot;No ContentType matching the passed in Alias: &#39;{0}&#39; was found&quot;,
+                                      contentTypeAlias));
+
+                var contentType = types.First();
+
+                if (contentType == null)
+                    throw new Exception(string.Format(&quot;ContentType matching the passed in Alias: &#39;{0}&#39; was null&quot;,
+                                                      contentTypeAlias));
+
+                return contentType;
+            }
+        }
+
+        #endregion
+
+        #region Proxy Event Handlers
+        /// &lt;summary&gt;
+        /// Occurs before publish.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Proxy to the real event on the &lt;see cref=&quot;PublishingStrategy&quot;/&gt;&lt;/remarks&gt;
+        public static event TypedEventHandler&lt;IPublishingStrategy, PublishEventArgs&lt;IContent&gt;&gt; Publishing
+        {
+            add { PublishingStrategy.Publishing += value; }
+            remove { PublishingStrategy.Publishing -= value; }
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs after publish.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Proxy to the real event on the &lt;see cref=&quot;PublishingStrategy&quot;/&gt;&lt;/remarks&gt;
+        public static event TypedEventHandler&lt;IPublishingStrategy, PublishEventArgs&lt;IContent&gt;&gt; Published
+        {
+            add { PublishingStrategy.Published += value; }
+            remove { PublishingStrategy.Published -= value; }
+        }
+        /// &lt;summary&gt;
+        /// Occurs before unpublish.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Proxy to the real event on the &lt;see cref=&quot;PublishingStrategy&quot;/&gt;&lt;/remarks&gt;
+        public static event TypedEventHandler&lt;IPublishingStrategy, PublishEventArgs&lt;IContent&gt;&gt; UnPublishing
+        {
+            add { PublishingStrategy.UnPublishing += value; }
+            remove { PublishingStrategy.UnPublishing -= value; }
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs after unpublish.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Proxy to the real event on the &lt;see cref=&quot;PublishingStrategy&quot;/&gt;&lt;/remarks&gt;
+        public static event TypedEventHandler&lt;IPublishingStrategy, PublishEventArgs&lt;IContent&gt;&gt; UnPublished
+        {
+            add { PublishingStrategy.UnPublished += value; }
+            remove { PublishingStrategy.UnPublished -= value; }
+        }
+        #endregion
+
+        #region Event Handlers
+        /// &lt;summary&gt;
+        /// Occurs before Delete
+        /// &lt;/summary&gt;		
+        public static event TypedEventHandler&lt;IContentService, DeleteEventArgs&lt;IContent&gt;&gt; Deleting;
+
+        /// &lt;summary&gt;
+        /// Occurs after Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, DeleteEventArgs&lt;IContent&gt;&gt; Deleted;
+
+        /// &lt;summary&gt;
+        /// Occurs before Delete Versions
+        /// &lt;/summary&gt;		
+        public static event TypedEventHandler&lt;IContentService, DeleteRevisionsEventArgs&gt; DeletingVersions;
+
+        /// &lt;summary&gt;
+        /// Occurs after Delete Versions
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, DeleteRevisionsEventArgs&gt; DeletedVersions;
+
+        /// &lt;summary&gt;
+        /// Occurs before Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, SaveEventArgs&lt;IContent&gt;&gt; Saving;
+
+        /// &lt;summary&gt;
+        /// Occurs after Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, SaveEventArgs&lt;IContent&gt;&gt; Saved;
+
+        /// &lt;summary&gt;
+        /// Occurs before Create
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Use the Created event instead, the Creating and Created events both offer the same functionality, Creating event has been deprecated.&quot;)]
+        public static event TypedEventHandler&lt;IContentService, NewEventArgs&lt;IContent&gt;&gt; Creating;
+
+        /// &lt;summary&gt;
+        /// Occurs after Create
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Please note that the Content object has been created, but might not have been saved
+        /// so it does not have an identity yet (meaning no Id has been set).
+        /// &lt;/remarks&gt;
+        public static event TypedEventHandler&lt;IContentService, NewEventArgs&lt;IContent&gt;&gt; Created;
+
+        /// &lt;summary&gt;
+        /// Occurs before Copy
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, CopyEventArgs&lt;IContent&gt;&gt; Copying;
+
+        /// &lt;summary&gt;
+        /// Occurs after Copy
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, CopyEventArgs&lt;IContent&gt;&gt; Copied;
+
+        /// &lt;summary&gt;
+        /// Occurs before Content is moved to Recycle Bin
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, MoveEventArgs&lt;IContent&gt;&gt; Trashing;
+
+        /// &lt;summary&gt;
+        /// Occurs after Content is moved to Recycle Bin
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, MoveEventArgs&lt;IContent&gt;&gt; Trashed;
+
+        /// &lt;summary&gt;
+        /// Occurs before Move
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, MoveEventArgs&lt;IContent&gt;&gt; Moving;
+
+        /// &lt;summary&gt;
+        /// Occurs after Move
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, MoveEventArgs&lt;IContent&gt;&gt; Moved;
+
+        /// &lt;summary&gt;
+        /// Occurs before Rollback
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, RollbackEventArgs&lt;IContent&gt;&gt; RollingBack;
+
+        /// &lt;summary&gt;
+        /// Occurs after Rollback
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, RollbackEventArgs&lt;IContent&gt;&gt; RolledBack;
+
+        /// &lt;summary&gt;
+        /// Occurs before Send to Publish
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, SendToPublishEventArgs&lt;IContent&gt;&gt; SendingToPublish;
+
+        /// &lt;summary&gt;
+        /// Occurs after Send to Publish
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, SendToPublishEventArgs&lt;IContent&gt;&gt; SentToPublish;
+
+        /// &lt;summary&gt;
+        /// Occurs before the Recycle Bin is emptied
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, RecycleBinEventArgs&gt; EmptyingRecycleBin;
+
+        /// &lt;summary&gt;
+        /// Occurs after the Recycle Bin has been Emptied
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IContentService, RecycleBinEventArgs&gt; EmptiedRecycleBin;
+        #endregion
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[35,9,35,92,1],[41,9,41,127,1],[51,15,51,78,1],[52,9,52,10,1],[53,13,53,44,1],[53,45,53,99,0],[54,13,54,41,1],[54,42,54,93,0],[55,13,55,37,1],[55,38,55,85,0],[56,13,56,54,1],[57,13,57,48,1],[58,13,58,40,1],[59,9,59,10,1],[68,9,68,10,0],[69,13,69,51,0],[70,20,70,83,0],[71,13,71,14,0],[72,17,72,52,0],[74,9,74,10,0],[77,9,77,10,1],[78,13,78,51,1],[79,20,79,83,1],[80,13,80,14,1],[81,17,81,59,1],[83,9,83,10,1],[86,9,86,10,1],[87,13,87,51,1],[88,20,88,83,1],[89,13,89,14,1],[90,17,90,77,1],[92,9,92,10,1],[95,9,95,10,1],[96,13,96,51,1],[97,20,97,83,1],[98,13,98,14,1],[99,17,99,80,1],[101,9,101,10,1],[109,9,109,10,0],[110,13,110,51,0],[111,20,111,83,0],[112,13,112,14,0],[113,17,113,69,0],[114,13,114,14,0],[115,9,115,10,0],[124,9,124,10,1],[125,13,125,51,1],[126,20,126,83,1],[127,13,127,14,1],[128,17,128,80,1],[129,13,129,14,1],[130,9,130,10,1],[138,9,138,10,0],[139,13,139,51,0],[140,20,140,83,0],[141,13,141,14,0],[142,17,142,71,0],[144,9,144,10,0],[161,9,161,10,1],[162,13,162,72,1],[163,13,163,68,1],[164,13,164,52,1],[165,13,165,64,1],[165,64,165,70,1],[165,70,165,119,1],[165,13,165,119,1],[168,13,168,120,1],[169,13,169,14,0],[170,17,170,45,0],[171,17,171,32,0],[174,13,174,40,1],[175,13,175,39,1],[177,13,177,110,1],[179,13,179,51,1],[180,20,180,80,1],[181,13,181,14,1],[182,17,182,150,1],[183,17,183,30,1],[184,13,184,14,1],[186,13,186,28,1],[187,9,187,10,1],[204,9,204,10,0],[205,13,205,32,0],[205,33,205,75,0],[207,13,207,72,0],[208,13,208,66,0],[209,13,209,72,0],[211,13,211,118,0],[212,13,212,14,0],[213,17,213,45,0],[214,17,214,32,0],[217,13,217,40,0],[218,13,218,39,0],[220,13,220,108,0],[222,13,222,115,0],[224,13,224,28,0],[225,9,225,10,0],[241,9,241,10,1],[242,13,242,72,1],[243,13,243,68,1],[247,13,247,120,1],[248,13,248,14,0],[249,17,249,45,0],[250,17,250,32,0],[253,13,253,91,1],[254,13,254,14,0],[255,17,255,45,0],[256,17,256,32,0],[259,13,259,51,1],[260,20,260,83,1],[261,13,261,14,1],[262,17,262,44,1],[263,17,263,43,1],[264,17,264,49,1],[266,17,266,64,1],[266,64,266,132,1],[266,132,266,134,1],[266,17,266,134,1],[267,17,267,30,1],[268,13,268,14,1],[270,13,270,81,1],[272,13,272,110,1],[274,13,274,139,1],[276,13,276,28,1],[277,9,277,10,1],[293,9,293,10,1],[294,13,294,32,1],[294,33,294,75,0],[296,13,296,72,1],[297,13,297,66,1],[301,13,301,118,1],[302,13,302,14,0],[303,17,303,45,0],[304,17,304,32,0],[307,13,307,91,1],[308,13,308,14,0],[309,17,309,45,0],[310,17,310,32,0],[313,13,313,51,1],[314,20,314,83,1],[315,13,315,14,1],[316,17,316,44,1],[317,17,317,43,1],[318,17,318,49,1],[320,17,320,64,1],[320,64,320,132,1],[320,132,320,134,1],[320,17,320,134,1],[321,17,321,30,1],[322,13,322,14,1],[324,13,324,81,1],[326,13,326,108,1],[328,13,328,139,1],[330,13,330,28,1],[331,9,331,10,1],[339,9,339,10,1],[340,20,340,107,1],[341,13,341,14,1],[342,17,342,43,1],[344,9,344,10,1],[352,9,352,10,1],[353,13,353,42,1],[354,13,354,38,1],[354,39,354,75,0],[356,20,356,107,1],[357,13,357,14,1],[359,17,359,58,1],[361,17,361,56,1],[361,56,361,60,1],[361,60,361,67,1],[361,67,361,68,1],[361,68,361,70,1],[361,17,361,70,1],[363,17,364,17,1],[364,17,364,18,1],[364,18,366,21,1],[366,21,366,69,1],[366,69,367,17,1],[367,17,367,18,1],[367,18,367,35,1],[363,17,367,35,1],[369,17,369,37,1],[371,9,371,10,1],[379,9,379,10,1],[380,20,380,107,1],[381,13,381,14,1],[382,17,382,78,1],[383,17,383,61,1],[384,17,384,51,1],[386,9,386,10,1],[394,9,394,10,1],[395,20,395,107,1],[396,13,396,14,1],[397,17,397,87,1],[398,17,398,61,1],[400,17,400,33,1],[402,9,402,10,1],[405,9,405,10,0],[406,20,406,107,0],[407,13,407,14,0],[408,17,408,87,0],[409,17,409,72,0],[411,17,411,33,0],[413,9,413,10,0],[421,9,421,10,1],[422,20,422,107,1],[423,13,423,14,1],[424,17,424,160,1],[425,17,425,61,1],[427,17,427,33,1],[429,9,429,10,1],[437,9,437,10,1],[438,20,438,107,1],[439,13,439,14,1],[440,17,440,59,1],[442,9,442,10,1],[451,9,451,10,1],[452,20,452,107,1],[453,13,453,14,1],[454,17,454,62,1],[455,17,455,33,1],[457,9,457,10,1],[466,9,466,10,1],[467,20,467,107,1],[468,13,468,14,1],[469,17,469,70,1],[470,17,470,33,1],[472,9,472,10,1],[480,9,480,10,0],[481,13,481,39,0],[482,13,482,42,0],[483,9,483,10,0],[491,9,491,10,1],[493,13,493,51,1],[493,52,493,88,1],[495,13,495,58,0],[495,58,495,162,0],[495,162,495,192,0],[495,13,495,192,0],[496,13,496,36,0],[497,17,497,45,0],[499,20,499,107,0],[500,13,500,14,0],[501,17,501,47,0],[503,9,503,10,1],[511,9,511,10,1],[512,20,512,107,1],[513,13,513,14,1],[514,17,514,82,1],[515,17,515,74,1],[515,74,515,85,1],[515,85,515,87,1],[515,17,515,87,1],[517,17,517,33,1],[519,9,519,10,1],[525,9,525,10,0],[527,13,527,135,0],[528,13,528,52,0],[529,13,529,27,0],[530,9,530,10,0],[545,9,545,10,0],[546,13,546,120,0],[547,9,547,10,0],[563,9,563,10,0],[564,13,564,69,0],[565,13,565,66,0],[566,20,566,107,0],[567,13,567,14,0],[569,17,569,53,0],[571,17,571,49,0],[572,17,572,18,0],[573,21,573,56,0],[574,17,574,18,0],[575,17,575,53,0],[576,17,576,58,0],[577,17,577,18,0],[578,21,578,95,0],[579,17,579,18,0],[580,17,580,171,0],[582,17,582,33,0],[584,9,584,10,0],[589,9,589,10,0],[591,13,591,138,0],[592,13,592,52,0],[593,13,593,27,0],[594,9,594,10,0],[608,9,608,10,0],[609,13,609,123,0],[610,9,610,10,0],[625,9,625,10,0],[626,13,626,69,0],[627,13,627,66,0],[628,20,628,107,0],[629,13,629,14,0],[631,17,631,53,0],[633,17,633,49,0],[634,17,634,18,0],[635,21,635,111,0],[636,17,636,18,0],[637,17,637,53,0],[638,17,638,58,0],[639,17,639,18,0],[640,21,640,95,0],[641,17,641,18,0],[642,17,642,171,0],[644,17,644,33,0],[646,9,646,10,0],[661,9,661,10,0],[662,13,662,69,0],[663,13,663,66,0],[665,20,665,107,0],[666,13,666,14,0],[667,17,667,53,0],[670,17,670,49,0],[671,17,671,18,0],[672,21,672,111,0],[673,17,673,18,0],[674,17,674,166,0],[676,17,676,33,0],[678,9,678,10,0],[687,9,687,10,0],[688,20,688,107,0],[689,13,689,14,0],[690,17,690,113,0],[691,17,691,61,0],[693,17,693,33,0],[695,9,695,10,0],[703,9,703,10,1],[704,13,704,39,1],[705,13,705,33,1],[706,13,706,14,0],[707,17,707,53,0],[709,13,709,44,1],[710,9,710,10,1],[718,9,718,10,1],[720,13,720,49,1],[721,17,721,175,0],[723,13,723,51,1],[724,20,724,83,1],[725,13,725,14,1],[726,17,726,52,1],[727,17,727,116,1],[728,17,728,61,1],[730,17,730,33,1],[732,9,732,10,1],[740,9,740,10,0],[741,13,741,39,0],[742,13,742,39,0],[743,9,743,10,0],[751,9,751,10,0],[752,13,752,117,0],[753,17,753,29,0],[755,13,755,46,0],[756,9,756,10,0],[764,9,764,10,1],[765,13,765,43,1],[766,13,766,48,1],[766,48,766,67,1],[766,67,766,69,1],[766,13,766,69,1],[767,9,767,10,1],[775,9,775,10,1],[776,13,776,35,1],[776,36,776,51,0],[777,13,779,24,1],[780,9,780,10,1],[787,9,787,10,1],[788,20,788,107,1],[789,13,789,14,1],[790,17,790,101,1],[791,17,791,61,1],[793,17,793,33,1],[795,9,795,10,1],[802,9,802,10,0],[804,13,804,42,0],[805,13,805,14,0],[806,17,806,91,0],[807,13,807,14,0],[809,20,809,107,0],[810,13,810,14,0],[811,17,811,75,0],[813,9,813,10,0],[820,9,820,10,1],[821,20,821,107,1],[822,13,822,14,1],[823,17,823,117,1],[824,17,824,61,1],[826,17,826,33,1],[828,9,828,10,1],[835,9,835,10,1],[836,20,836,107,1],[837,13,837,14,1],[838,17,838,119,1],[839,17,839,61,1],[841,17,841,33,1],[843,9,843,10,1],[850,9,850,10,1],[851,20,851,107,1],[852,13,852,14,1],[853,17,853,137,1],[854,17,854,61,1],[856,17,856,33,1],[858,9,858,10,1],[868,9,868,10,1],[869,13,869,42,1],[870,9,870,10,1],[873,9,873,10,1],[874,20,874,107,1],[875,13,875,14,1],[876,17,876,82,1],[877,17,877,53,1],[878,17,878,30,1],[880,9,880,10,1],[888,9,888,10,1],[889,20,889,107,1],[890,13,890,14,1],[891,17,891,121,1],[892,17,892,53,1],[893,17,893,34,1],[895,9,895,10,1],[903,9,903,10,1],[906,13,906,46,1],[907,13,907,14,0],[908,17,908,61,0],[909,17,909,52,0],[912,13,912,50,1],[913,9,913,10,1],[925,9,925,10,1],[927,13,927,14,1],[928,17,928,40,1],[929,17,929,29,1],[931,13,931,33,0],[932,13,932,14,0],[933,17,933,94,0],[934,17,934,30,0],[936,9,936,10,1],[946,9,946,10,1],[948,13,948,14,1],[949,17,949,54,1],[950,13,950,14,1],[951,13,951,33,0],[952,13,952,14,0],[953,17,953,94,0],[954,13,954,14,0],[955,9,955,10,1],[964,9,964,10,1],[965,13,965,60,1],[966,13,966,187,1],[967,13,967,35,1],[968,9,968,10,1],[978,9,978,10,1],[979,13,979,79,1],[980,9,980,10,1],[990,9,990,10,1],[991,13,991,67,1],[992,9,992,10,1],[1001,9,1001,10,1],[1002,13,1002,54,1],[1004,13,1004,42,1],[1005,13,1005,14,1],[1008,17,1008,59,1],[1008,59,1008,83,0],[1008,83,1008,98,1],[1008,17,1008,98,1],[1010,17,1010,49,1],[1012,17,1014,25,1],[1015,17,1015,18,0],[1016,21,1016,63,0],[1019,17,1022,19,1],[1025,17,1025,53,1],[1026,17,1026,18,1],[1028,21,1028,48,1],[1029,17,1029,18,1],[1032,17,1032,72,1],[1032,72,1032,79,1],[1032,79,1032,90,1],[1032,17,1032,90,1],[1033,17,1033,24,1],[1033,26,1033,40,1],[1033,41,1033,43,1],[1033,44,1033,55,1],[1034,17,1034,18,1],[1036,21,1036,51,1],[1037,17,1037,18,1],[1039,17,1039,55,1],[1040,24,1040,87,1],[1041,17,1041,18,1],[1042,21,1042,47,1],[1043,21,1043,54,1],[1044,21,1044,53,1],[1047,21,1047,28,1],[1047,30,1047,44,1],[1047,45,1047,47,1],[1047,48,1047,59,1],[1048,21,1048,22,1],[1049,25,1049,117,1],[1051,25,1051,54,1],[1052,25,1052,82,1],[1053,25,1053,60,1],[1054,21,1054,22,1],[1056,21,1056,34,1],[1057,17,1057,18,1],[1059,17,1059,107,1],[1061,17,1061,108,1],[1063,17,1063,57,1],[1065,9,1065,10,1],[1074,9,1074,10,1],[1075,13,1075,56,1],[1076,9,1076,10,1],[1085,9,1085,10,1],[1086,13,1086,79,1],[1087,9,1087,10,1],[1097,9,1097,10,1],[1098,13,1098,71,1],[1102,13,1102,33,1],[1102,33,1102,70,1],[1102,70,1102,72,1],[1102,13,1102,72,1],[1103,17,1103,30,0],[1105,13,1105,39,1],[1105,39,1105,76,1],[1105,76,1105,86,1],[1105,13,1105,86,1],[1106,9,1106,10,1],[1116,9,1116,10,1],[1117,13,1117,111,1],[1118,9,1118,10,1],[1127,9,1127,10,1],[1128,13,1128,89,1],[1129,9,1129,10,1],[1140,9,1140,10,1],[1141,13,1141,73,1],[1142,13,1142,35,1],[1143,9,1143,10,1],[1153,9,1153,10,1],[1154,13,1154,99,1],[1155,9,1155,10,1],[1164,9,1164,10,1],[1165,13,1165,82,1],[1166,9,1166,10,1],[1175,9,1175,10,1],[1176,13,1176,46,1],[1178,13,1178,54,1],[1180,13,1180,29,1],[1181,13,1181,14,1],[1182,17,1184,27,1],[1185,17,1185,18,0],[1186,21,1186,63,0],[1188,13,1188,14,1],[1189,13,1189,42,1],[1190,13,1190,14,1],[1191,17,1191,52,1],[1191,52,1191,74,1],[1191,74,1191,76,1],[1191,17,1191,76,1],[1193,17,1193,55,1],[1194,24,1194,87,1],[1195,17,1195,18,1],[1196,21,1196,37,1],[1197,21,1197,22,1],[1198,25,1198,32,1],[1198,34,1198,45,1],[1198,46,1198,48,1],[1198,49,1198,56,1],[1199,25,1199,26,1],[1200,29,1200,55,1],[1203,29,1203,51,1],[1204,33,1204,84,0],[1206,29,1206,61,1],[1208,29,1208,76,1],[1208,76,1208,144,1],[1208,144,1208,146,1],[1208,29,1208,146,1],[1209,25,1209,26,1],[1210,21,1210,22,1],[1212,21,1212,22,0],[1213,25,1213,32,0],[1213,34,1213,45,0],[1213,46,1213,48,0],[1213,49,1213,56,0],[1214,25,1214,26,0],[1215,29,1215,55,0],[1216,29,1216,61,0],[1218,29,1218,76,0],[1218,76,1218,144,0],[1218,144,1218,146,0],[1218,29,1218,146,0],[1219,25,1219,26,0],[1220,21,1220,22,0],[1222,21,1222,34,1],[1223,17,1223,18,1],[1225,17,1225,33,1],[1226,21,1226,98,1],[1228,17,1228,128,1],[1230,17,1230,57,1],[1232,9,1232,10,1],[1244,9,1244,10,1],[1245,13,1245,54,1],[1247,13,1247,42,1],[1248,13,1248,14,1],[1249,17,1251,25,1],[1252,17,1252,18,0],[1253,21,1253,63,0],[1257,17,1257,53,1],[1258,17,1258,18,0],[1259,21,1259,48,0],[1260,17,1260,18,0],[1263,17,1263,56,1],[1264,17,1264,24,1],[1264,26,1264,35,0],[1264,36,1264,38,1],[1264,39,1264,47,1],[1265,17,1265,18,0],[1266,21,1266,43,0],[1267,17,1267,18,0],[1269,17,1269,55,1],[1270,24,1270,87,1],[1271,17,1271,18,1],[1272,21,1272,48,1],[1273,21,1273,34,1],[1275,21,1275,87,1],[1276,21,1276,52,1],[1279,21,1279,74,1],[1280,17,1280,18,1],[1282,17,1282,97,1],[1284,17,1284,57,1],[1286,9,1286,10,1],[1295,9,1295,10,1],[1296,13,1296,54,1],[1297,9,1297,10,1],[1306,9,1306,10,1],[1307,13,1307,61,1],[1308,9,1308,10,1],[1321,9,1321,10,1],[1322,13,1322,83,1],[1323,9,1323,10,1],[1332,9,1332,10,1],[1340,13,1340,42,1],[1341,13,1341,14,1],[1342,24,1342,61,1],[1343,17,1343,18,1],[1344,21,1344,85,1],[1346,21,1346,102,1],[1347,21,1347,75,1],[1349,21,1349,104,1],[1350,25,1350,32,0],[1352,21,1352,28,1],[1352,30,1352,41,1],[1352,42,1352,44,1],[1352,45,1352,77,1],[1352,77,1352,87,1],[1352,87,1352,88,1],[1352,45,1352,88,1],[1353,21,1353,22,1],[1355,25,1355,41,1],[1356,25,1356,104,1],[1357,25,1357,74,1],[1359,25,1359,32,1],[1359,34,1359,43,1],[1359,44,1359,46,1],[1359,47,1359,55,1],[1360,25,1360,26,1],[1361,29,1361,71,1],[1362,33,1362,65,0],[1363,25,1363,26,1],[1366,25,1366,49,1],[1367,21,1367,22,1],[1368,17,1368,18,1],[1370,17,1372,58,1],[1373,13,1373,14,1],[1374,9,1374,10,1],[1386,9,1386,10,1],[1387,13,1387,71,1],[1388,9,1388,10,1],[1398,9,1398,10,1],[1399,13,1399,124,1],[1400,17,1400,24,0],[1402,13,1402,51,1],[1403,20,1403,83,1],[1404,13,1404,14,1],[1405,17,1405,60,1],[1406,17,1406,30,1],[1407,13,1407,14,1],[1409,13,1409,114,1],[1411,13,1411,120,1],[1412,9,1412,10,1],[1423,9,1423,10,1],[1424,13,1424,42,1],[1425,13,1425,14,1],[1426,17,1426,129,1],[1427,21,1427,28,0],[1429,17,1429,41,1],[1430,17,1430,18,1],[1431,21,1431,59,1],[1432,21,1432,68,1],[1433,17,1433,18,1],[1435,17,1435,55,1],[1436,24,1436,87,1],[1437,17,1437,18,1],[1438,21,1438,57,1],[1439,21,1439,34,1],[1440,17,1440,18,1],[1442,17,1442,119,1],[1444,17,1444,119,1],[1445,13,1445,14,1],[1446,9,1446,10,1],[1455,9,1455,10,1],[1456,13,1456,81,1],[1457,9,1457,10,1],[1471,9,1471,10,1],[1472,13,1472,42,1],[1473,13,1473,14,1],[1475,17,1475,68,1],[1476,17,1476,18,0],[1477,21,1477,55,0],[1478,21,1478,28,0],[1481,17,1483,94,1],[1484,17,1484,18,0],[1485,21,1485,28,0],[1489,17,1489,68,1],[1492,17,1492,66,1],[1494,17,1494,96,1],[1496,17,1496,93,1],[1497,13,1497,14,1],[1498,9,1498,10,1],[1504,9,1504,10,1],[1505,13,1505,42,1],[1506,13,1506,14,1],[1510,17,1510,79,1],[1512,24,1512,111,1],[1513,17,1513,18,1],[1515,21,1517,36,1],[1517,36,1517,42,1],[1517,42,1518,36,1],[1518,36,1518,73,1],[1518,73,1518,75,1],[1515,21,1518,75,1],[1520,21,1520,98,1],[1522,21,1522,131,1],[1523,25,1523,32,0],[1525,21,1525,60,1],[1527,21,1527,123,1],[1529,21,1529,33,1],[1530,25,1530,60,1],[1531,17,1531,18,1],[1532,13,1532,14,1],[1533,13,1533,123,1],[1534,9,1534,10,1],[1546,9,1546,10,1],[1547,13,1547,76,1],[1548,9,1548,10,1],[1561,9,1561,10,1],[1565,13,1565,42,1],[1566,13,1566,14,1],[1567,17,1567,67,1],[1568,17,1568,42,1],[1571,17,1571,71,1],[1573,17,1573,112,1],[1574,21,1574,33,0],[1576,17,1576,55,1],[1577,24,1577,87,1],[1578,17,1578,18,1],[1580,21,1580,45,1],[1581,21,1581,44,1],[1583,21,1583,50,1],[1585,21,1585,65,1],[1585,65,1585,133,1],[1585,133,1585,135,1],[1585,21,1585,135,1],[1586,21,1586,34,1],[1592,21,1592,72,1],[1593,21,1593,22,1],[1595,25,1595,122,1],[1596,25,1596,32,1],[1596,34,1596,41,1],[1596,42,1596,44,1],[1596,45,1596,49,1],[1597,25,1597,26,1],[1598,29,1598,150,1],[1599,25,1599,26,1],[1600,21,1600,22,1],[1601,17,1601,18,1],[1603,17,1603,31,1],[1604,17,1604,18,1],[1606,21,1606,60,1],[1607,21,1607,28,1],[1607,30,1607,39,1],[1607,40,1607,42,1],[1607,43,1607,51,1],[1608,21,1608,22,1],[1611,25,1611,78,1],[1612,21,1612,22,1],[1613,17,1613,18,1],[1615,17,1615,120,1],[1617,17,1617,103,1],[1618,17,1618,29,1],[1620,9,1620,10,1],[1630,9,1630,10,0],[1631,13,1631,110,0],[1632,17,1632,30,0],[1635,13,1635,35,0],[1637,13,1637,98,0],[1639,13,1639,111,0],[1641,13,1641,25,0],[1642,9,1642,10,0],[1657,9,1657,10,1],[1658,13,1658,51,1],[1660,13,1660,100,1],[1661,17,1661,32,0],[1663,13,1663,51,1],[1664,20,1664,83,1],[1665,13,1665,14,1],[1666,17,1666,43,1],[1667,17,1667,44,1],[1668,17,1668,74,1],[1670,17,1670,49,1],[1672,17,1672,64,1],[1672,64,1672,132,1],[1672,132,1672,134,1],[1672,17,1672,134,1],[1673,17,1673,30,1],[1674,13,1674,14,1],[1676,13,1676,90,1],[1678,13,1678,107,1],[1680,13,1680,28,1],[1681,9,1681,10,1],[1696,9,1696,10,0],[1697,13,1697,43,0],[1698,13,1698,29,0],[1699,13,1699,14,0],[1700,17,1700,95,0],[1701,21,1701,34,0],[1702,13,1702,14,0],[1704,13,1704,58,0],[1705,13,1705,54,0],[1707,13,1707,42,0],[1708,13,1708,14,0],[1709,17,1709,55,0],[1710,24,1710,87,0],[1711,17,1711,18,0],[1712,21,1712,31,0],[1713,21,1713,28,0],[1713,30,1713,41,0],[1713,42,1713,44,0],[1713,45,1713,52,0],[1714,21,1714,22,0],[1718,25,1718,52,0],[1719,25,1719,26,0],[1720,29,1720,33,0],[1721,29,1721,38,0],[1724,25,1724,47,0],[1725,25,1725,51,0],[1726,25,1726,29,0],[1728,25,1728,47,0],[1729,25,1729,26,0],[1731,29,1731,90,0],[1732,29,1732,60,0],[1733,25,1733,26,0],[1735,29,1735,56,0],[1737,25,1737,57,0],[1739,25,1739,72,0],[1739,72,1739,140,0],[1739,140,1739,142,0],[1739,25,1739,142,0],[1740,21,1740,22,0],[1742,21,1742,28,0],[1742,30,1742,41,0],[1742,42,1742,44,0],[1742,45,1742,62,0],[1743,21,1743,22,0],[1745,25,1745,72,0],[1745,72,1745,140,0],[1745,140,1745,142,0],[1745,25,1745,142,0],[1746,21,1746,22,0],[1748,21,1748,34,0],[1749,17,1749,18,0],[1750,13,1750,14,0],[1752,13,1752,29,0],[1753,17,1753,85,0],[1755,13,1755,41,0],[1756,13,1756,14,0],[1758,17,1758,83,0],[1759,13,1759,14,0],[1762,13,1762,83,0],[1764,13,1764,25,0],[1765,9,1765,10,0],[1776,9,1776,10,0],[1777,13,1777,69,0],[1778,13,1778,66,0],[1780,13,1780,51,0],[1781,20,1781,83,0],[1782,13,1782,14,0],[1783,17,1787,39,0],[1788,17,1788,33,0],[1790,9,1790,10,0],[1797,9,1797,10,0],[1798,13,1798,51,0],[1799,20,1799,83,0],[1800,13,1800,14,0],[1801,17,1801,57,0],[1802,17,1802,31,0],[1804,9,1804,10,0],[1814,9,1814,10,1],[1815,13,1815,51,1],[1816,20,1816,83,1],[1817,13,1817,14,1],[1818,17,1819,32,1],[1819,32,1819,106,1],[1819,106,1820,89,1],[1818,17,1820,89,1],[1822,17,1822,30,1],[1823,13,1823,14,1],[1825,13,1825,159,1],[1827,9,1827,10,1],[1837,9,1837,10,1],[1838,20,1838,107,1],[1839,13,1839,14,1],[1840,17,1840,141,1],[1841,17,1841,72,1],[1843,17,1843,33,1],[1845,9,1845,10,1],[1856,9,1856,10,1],[1857,13,1857,33,1],[1857,34,1857,77,0],[1858,13,1858,46,1],[1858,47,1858,130,0],[1860,13,1860,51,1],[1861,20,1861,83,1],[1862,13,1862,14,1],[1863,17,1863,49,1],[1864,17,1864,30,1],[1865,13,1865,14,1],[1866,9,1866,10,1],[1869,9,1869,10,1],[1870,13,1870,51,1],[1871,20,1871,80,1],[1872,13,1872,14,1],[1873,17,1873,87,1],[1874,17,1874,30,1],[1875,13,1875,14,1],[1876,9,1876,10,1],[1880,9,1880,10,1],[1882,13,1882,88,1],[1884,13,1884,39,1],[1885,13,1885,51,1],[1886,13,1886,14,1],[1887,17,1887,86,1],[1888,17,1888,35,1],[1889,13,1889,14,1],[1891,13,1891,14,1],[1892,17,1892,48,1],[1893,17,1893,76,1],[1894,17,1894,50,1],[1895,13,1895,14,1],[1898,13,1898,83,1],[1899,13,1899,14,1],[1900,17,1900,61,1],[1901,13,1901,14,1],[1903,13,1903,14,0],[1904,17,1904,45,0],[1905,13,1905,14,0],[1908,13,1908,35,1],[1909,13,1909,14,0],[1912,17,1912,44,0],[1913,17,1913,18,0],[1915,21,1915,53,0],[1916,17,1916,18,0],[1918,17,1918,18,0],[1920,21,1920,50,0],[1924,28,1924,65,0],[1925,21,1925,22,0],[1926,25,1926,110,0],[1928,25,1928,104,0],[1929,25,1931,34,0],[1932,25,1934,87,0],[1935,21,1935,22,0],[1936,17,1936,18,0],[1937,13,1937,14,0],[1939,13,1939,14,1],[1941,17,1941,39,1],[1942,13,1942,14,1],[1945,13,1945,62,1],[1946,13,1946,32,1],[1947,13,1947,14,0],[1948,17,1948,24,0],[1948,26,1948,35,0],[1948,36,1948,38,0],[1948,39,1948,47,0],[1949,17,1949,18,0],[1950,21,1950,70,0],[1951,17,1951,18,0],[1952,13,1952,14,0],[1953,9,1953,10,1],[1968,9,1968,10,1],[1969,13,1969,33,1],[1969,34,1969,77,0],[1971,13,1971,54,1],[1973,13,1973,42,1],[1974,13,1974,14,1],[1977,17,1977,59,1],[1977,59,1977,83,0],[1977,83,1977,98,1],[1977,17,1977,98,1],[1979,17,1979,65,1],[1982,17,1982,156,1],[1983,17,1983,18,1],[1984,21,1987,56,1],[1988,21,1988,125,1],[1989,21,1989,35,1],[1993,17,1993,40,1],[1994,17,1994,18,0],[1995,21,1997,66,0],[1998,21,2003,33,0],[2004,21,2004,35,0],[2010,17,2010,52,1],[2011,17,2011,49,1],[2012,17,2012,35,1],[2013,17,2013,56,1],[2015,17,2015,80,1],[2018,17,2018,129,1],[2019,17,2020,33,1],[2020,33,2020,110,1],[2020,110,2022,35,1],[2022,35,2022,61,1],[2022,61,2023,34,1],[2023,34,2023,64,1],[2023,64,2023,66,1],[2019,17,2023,66,1],[2025,17,2025,55,1],[2026,24,2026,87,1],[2027,17,2027,18,1],[2030,21,2030,28,1],[2030,30,2030,38,1],[2030,39,2030,41,1],[2030,42,2030,51,1],[2031,21,2031,22,1],[2032,25,2032,67,1],[2033,25,2033,73,1],[2035,25,2035,88,1],[2035,88,2035,156,1],[2035,156,2035,158,1],[2035,25,2035,158,1],[2037,25,2037,88,1],[2037,88,2037,156,1],[2037,156,2037,158,1],[2037,25,2037,158,1],[2038,25,2038,62,1],[2039,21,2039,22,1],[2041,21,2041,34,1],[2043,17,2043,18,1],[2045,17,2045,73,1],[2047,17,2047,105,1],[2050,17,2050,41,1],[2052,9,2052,10,1],[2062,9,2062,10,1],[2063,13,2063,46,1],[2064,13,2064,51,1],[2065,17,2065,34,0],[2067,13,2067,54,1],[2069,13,2069,91,1],[2070,13,2070,35,1],[2071,13,2071,14,1],[2072,17,2072,128,1],[2075,13,2075,78,1],[2076,13,2076,38,1],[2076,39,2076,144,0],[2078,13,2078,51,1],[2079,20,2079,83,1],[2080,13,2080,14,1],[2081,17,2081,43,1],[2082,17,2082,49,1],[2084,17,2084,58,1],[2085,21,2085,58,0],[2086,17,2086,54,1],[2088,17,2088,30,1],[2089,13,2089,14,1],[2091,13,2091,43,1],[2092,17,2092,68,1],[2094,13,2094,91,1],[2096,13,2096,106,1],[2097,9,2097,10,1],[2107,9,2107,10,1],[2108,13,2108,54,1],[2110,13,2110,29,1],[2111,13,2111,14,1],[2112,17,2113,74,1],[2114,17,2114,18,0],[2115,21,2115,120,0],[2117,13,2117,14,1],[2119,13,2119,42,1],[2120,13,2120,14,1],[2122,17,2122,98,1],[2123,17,2123,100,1],[2126,17,2126,78,1],[2128,17,2128,56,1],[2129,17,2129,18,1],[2131,21,2131,76,1],[2133,21,2133,100,1],[2134,17,2134,18,1],[2136,17,2136,75,1],[2137,17,2137,18,1],[2138,21,2138,84,1],[2140,21,2140,91,1],[2142,21,2142,80,1],[2143,17,2143,18,1],[2146,17,2146,88,1],[2148,17,2148,55,1],[2149,24,2149,87,1],[2150,17,2150,18,1],[2151,21,2151,44,1],[2152,21,2152,22,1],[2153,25,2153,76,1],[2154,21,2154,22,1],[2156,21,2156,54,1],[2157,21,2157,22,1],[2158,25,2158,52,1],[2159,21,2159,22,1],[2160,21,2160,47,1],[2162,21,2162,53,1],[2165,21,2165,68,1],[2165,68,2165,136,1],[2165,136,2165,138,1],[2165,21,2165,138,1],[2167,21,2167,35,1],[2168,21,2168,22,1],[2170,25,2170,72,1],[2170,72,2170,140,1],[2170,140,2170,142,1],[2170,25,2170,142,1],[2171,21,2171,22,1],[2173,21,2173,34,1],[2174,17,2174,18,1],[2176,17,2176,33,1],[2177,21,2177,98,1],[2180,17,2180,31,1],[2181,17,2181,18,1],[2182,21,2182,70,1],[2183,17,2183,18,1],[2186,17,2186,90,1],[2187,17,2187,18,1],[2189,21,2189,72,1],[2191,21,2191,81,1],[2192,17,2192,18,1],[2194,17,2194,100,1],[2196,17,2196,105,1],[2198,9,2198,10,1],[2208,9,2208,10,1],[2209,13,2209,54,1],[2211,13,2211,29,1],[2212,13,2212,14,1],[2213,17,2215,25,1],[2216,17,2216,18,0],[2217,21,2217,63,0],[2219,13,2219,14,1],[2221,13,2221,57,1],[2222,13,2222,14,1],[2223,17,2223,85,1],[2226,13,2226,42,1],[2227,13,2227,14,1],[2228,17,2228,55,1],[2229,24,2229,87,1],[2230,17,2230,18,1],[2231,21,2231,54,1],[2232,21,2232,22,1],[2233,25,2233,52,1],[2234,21,2234,22,1],[2235,21,2235,47,1],[2238,21,2238,127,1],[2239,25,2239,76,1],[2241,21,2241,53,1],[2244,21,2244,68,1],[2244,68,2244,136,1],[2244,136,2244,138,1],[2244,21,2244,138,1],[2246,21,2246,34,1],[2247,17,2247,18,1],[2249,17,2249,33,1],[2250,21,2250,98,1],[2252,17,2252,93,1],[2254,17,2254,57,1],[2256,9,2256,10,1],[2269,9,2269,10,1],[2270,13,2270,74,1],[2271,13,2271,20,1],[2271,22,2271,28,1],[2271,29,2271,31,1],[2271,32,2271,35,1],[2272,13,2272,14,1],[2274,17,2274,62,1],[2275,21,2275,34,0],[2278,17,2278,49,1],[2278,50,2278,59,1],[2281,17,2281,63,1],[2281,64,2281,73,1],[2284,17,2284,67,1],[2285,17,2285,50,1],[2286,21,2286,34,1],[2287,13,2287,14,1],[2289,13,2289,25,1],[2290,9,2290,10,1],[2293,9,2293,10,1],[2295,13,2295,152,1],[2296,13,2296,14,0],[2297,17,2300,52,0],[2301,17,2301,65,0],[2303,18,2303,141,1],[2304,13,2304,14,1],[2305,17,2308,52,1],[2309,17,2309,59,1],[2311,18,2311,144,1],[2312,13,2312,14,1],[2313,17,2316,52,1],[2317,17,2317,64,1],[2320,13,2320,46,1],[2321,9,2321,10,1],[2324,9,2324,10,1],[2326,13,2326,44,1],[2327,13,2327,14,1],[2328,17,2331,52,1],[2332,17,2332,63,1],[2335,13,2335,46,1],[2336,9,2336,10,1],[2339,9,2339,10,1],[2340,20,2340,111,1],[2341,13,2341,14,1],[2342,17,2342,97,1],[2343,17,2343,58,1],[2345,17,2345,42,1],[2346,21,2348,58,1],[2350,17,2350,49,1],[2352,17,2352,41,1],[2353,21,2354,74,0],[2356,17,2356,36,1],[2358,9,2358,10,1],[2369,17,2369,18,1],[2369,19,2369,58,1],[2369,59,2369,60,1],[2370,20,2370,21,1],[2370,22,2370,61,1],[2370,62,2370,63,1],[2379,17,2379,18,0],[2379,19,2379,57,0],[2379,58,2379,59,0],[2380,20,2380,21,0],[2380,22,2380,60,0],[2380,61,2380,62,0],[2388,17,2388,18,0],[2388,19,2388,60,0],[2388,61,2388,62,0],[2389,20,2389,21,0],[2389,22,2389,63,0],[2389,64,2389,65,0],[2398,17,2398,18,0],[2398,19,2398,59,0],[2398,60,2398,61,0],[2399,20,2399,21,0],[2399,22,2399,62,0],[2399,63,2399,64,0]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\PocoDataDataReader.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using Umbraco.Core.Persistence.DatabaseAnnotations;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.SqlSyntax;
+
+namespace Umbraco.Core.Persistence
+{
+    /// &lt;summary&gt;
+    /// A data reader used for reading collections of PocoData entity types
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// We are using a custom data reader so that tons of memory is not consumed when rebuilding this table, previously
+    /// we&#39;d generate SQL insert statements, but we&#39;d have to put all of the XML structures into memory first. Alternatively
+    /// we can use .net&#39;s DataTable, but this also requires putting everything into memory. By using a DataReader we don&#39;t have to 
+    /// store every content item and it&#39;s XML structure in memory to get it into the DB, we can stream it into the db with this 
+    /// reader.
+    /// &lt;/remarks&gt;
+    internal class PocoDataDataReader&lt;T, TSyntax&gt; : BulkDataReader 
+        where TSyntax : ISqlSyntaxProvider
+    {        
+        private readonly MicrosoftSqlSyntaxProviderBase&lt;TSyntax&gt; _sqlSyntaxProvider;
+        private readonly TableDefinition _tableDefinition;
+        private readonly Database.PocoColumn[] _readerColumns;
+        private readonly IEnumerator&lt;T&gt; _enumerator;
+        private readonly ColumnDefinition[] _columnDefinitions;
+        private int _recordsAffected = -1;
+
+        public PocoDataDataReader(
+            IEnumerable&lt;T&gt; dataSource,             
+            Database.PocoData pd,
+            MicrosoftSqlSyntaxProviderBase&lt;TSyntax&gt; sqlSyntaxProvider)
+        {
+            if (dataSource == null) throw new ArgumentNullException(&quot;dataSource&quot;);            
+            if (sqlSyntaxProvider == null) throw new ArgumentNullException(&quot;sqlSyntaxProvider&quot;);
+
+            _tableDefinition = DefinitionFactory.GetTableDefinition(sqlSyntaxProvider, pd.type);
+            if (_tableDefinition == null) throw new InvalidOperationException(&quot;No table definition found for type &quot; + pd.type);
+            
+            _readerColumns = pd.Columns.Select(x =&gt; x.Value).ToArray();
+            _sqlSyntaxProvider = sqlSyntaxProvider;
+            _enumerator = dataSource.GetEnumerator();
+            _columnDefinitions = _tableDefinition.Columns.ToArray();
+            
+        }
+
+        protected override string SchemaName
+        {
+            get { return _tableDefinition.SchemaName; }
+        }
+
+        protected override string TableName
+        {
+            get { return _tableDefinition.Name; }
+        }
+
+        public override int RecordsAffected
+        {
+            get { return _recordsAffected &lt;= 0 ? -1 : _recordsAffected; }
+        }
+
+        /// &lt;summary&gt;
+        /// This will automatically add the schema rows based on the Poco table definition and the columns passed in
+        /// &lt;/summary&gt;
+        protected override void AddSchemaTableRows()
+        {
+            //var colNames = _readerColumns.Select(x =&gt; x.ColumnName).ToArray();
+            //foreach (var col in _columnDefinitions.Where(x =&gt; colNames.Contains(x.Name, StringComparer.OrdinalIgnoreCase)))
+            foreach (var col in _columnDefinitions)
+            {
+                var sqlDbType = SqlDbType.NVarChar;
+                if (col.HasSpecialDbType)
+                {
+                    //get the SqlDbType from the &#39;special type&#39;
+                    switch (col.DbType)
+                    {
+                        case SpecialDbTypes.NTEXT:
+                            sqlDbType = SqlDbType.NText;
+                            break;
+                        case SpecialDbTypes.NCHAR:
+                            sqlDbType = SqlDbType.NChar;
+                            break;
+                        default:
+                            throw new ArgumentOutOfRangeException();
+                    }
+                }
+                else if (col.Type.HasValue)
+                {
+                    //get the SqlDbType from the DbType
+                    sqlDbType = _sqlSyntaxProvider.GetSqlDbType(col.Type.Value);
+                }
+                else
+                {
+                    //get the SqlDbType from the clr type
+                    sqlDbType = _sqlSyntaxProvider.GetSqlDbType(col.PropertyType);
+                }
+                
+                AddSchemaTableRow(
+                    col.Name, 
+                    col.Size &gt; 0 ? (int?)col.Size : null,
+                    col.Precision &gt; 0  ? (short?)col.Precision : null, 
+                    null, col.IsUnique, col.IsIdentity, col.IsNullable, sqlDbType, 
+                    null, null, null, null, null);                
+            }
+
+        }
+
+        /// &lt;summary&gt;
+        /// Get the value from the column index for the current object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;i&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override object GetValue(int i)
+        {
+            if (_enumerator.Current != null)
+            {
+                return _readerColumns[i].GetValue(_enumerator.Current);
+                //return _columnDefinitions[i]. .GetValue(_enumerator.Current);
+            }
+
+            return null;
+            //TODO: Or throw ?
+        }
+
+        /// &lt;summary&gt;
+        /// Advance the cursor
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override bool Read()
+        {
+            var result = _enumerator.MoveNext();
+            if (result)
+            {
+                if (_recordsAffected == -1)
+                {
+                    _recordsAffected = 0;
+                }
+                _recordsAffected++;
+            }
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Ensure the enumerator is disposed
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;disposing&quot;&gt;&lt;/param&gt;
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+
+            if (disposing)
+            {
+                _enumerator.Dispose();
+            }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[29,9,29,43,0],[31,9,34,71,0],[35,9,35,10,0],[36,13,36,36,0],[36,37,36,83,0],[37,13,37,43,0],[37,44,37,97,0],[39,13,39,97,0],[40,13,40,42,0],[40,43,40,128,0],[42,13,42,53,0],[42,53,42,60,0],[42,60,42,72,0],[42,13,42,72,0],[43,13,43,52,0],[44,13,44,54,0],[45,13,45,69,0],[47,9,47,10,0],[51,17,51,18,0],[51,19,51,54,0],[51,55,51,56,0],[56,17,56,18,0],[56,19,56,48,0],[56,49,56,50,0],[61,17,61,18,0],[61,19,61,72,0],[61,73,61,74,0],[68,9,68,10,0],[71,13,71,20,0],[71,22,71,29,0],[71,30,71,32,0],[71,33,71,51,0],[72,13,72,14,0],[73,17,73,52,0],[74,17,74,42,0],[75,17,75,18,0],[77,21,77,40,0],[80,29,80,57,0],[81,29,81,35,0],[83,29,83,57,0],[84,29,84,35,0],[86,29,86,69,0],[88,17,88,18,0],[89,22,89,44,0],[90,17,90,18,0],[92,21,92,81,0],[93,17,93,18,0],[95,17,95,18,0],[97,21,97,83,0],[98,17,98,18,0],[100,17,105,51,0],[106,13,106,14,0],[108,9,108,10,0],[116,9,116,10,0],[117,13,117,45,0],[118,13,118,14,0],[119,17,119,72,0],[123,13,123,25,0],[125,9,125,10,0],[132,9,132,10,0],[133,13,133,49,0],[134,13,134,24,0],[135,13,135,14,0],[136,17,136,44,0],[137,17,137,18,0],[138,21,138,42,0],[139,17,139,18,0],[140,17,140,36,0],[141,13,141,14,0],[142,13,142,27,0],[143,9,143,10,0],[150,9,150,10,0],[151,13,151,37,0],[153,13,153,27,0],[154,13,154,14,0],[155,17,155,39,0],[156,13,156,14,0],[157,9,157,10,0]]);
+    </script>
+  </body>
+</html>

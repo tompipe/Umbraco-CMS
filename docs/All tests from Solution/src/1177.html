@@ -1,0 +1,1332 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Models\DynamicPublishedContent.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+// ENABLE THE FIX in 7.0.0
+// TODO if all goes well, remove the obsolete code eventually
+#define FIX_GET_PROPERTY_VALUE
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Dynamic;
+using System.Linq;
+using System.Web;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Dynamics;
+using Umbraco.Core.Models;
+using Umbraco.Core;
+using System.Reflection;
+using Umbraco.Core.Models.PublishedContent;
+
+namespace Umbraco.Web.Models
+{
+
+	/// &lt;summary&gt;
+	/// The base dynamic model for views
+	/// &lt;/summary&gt;
+    [DebuggerDisplay(&quot;Content Id: {Id}, Name: {Name}&quot;)]
+    public class DynamicPublishedContent : DynamicObject, IPublishedContent
+	{
+		protected internal IPublishedContent PublishedContent { get; private set; }
+	    private DynamicPublishedContentList _contentList;
+
+        // must implement that one if we implement IPublishedContent
+	    public IEnumerable&lt;IPublishedContent&gt; ContentSet
+	    {
+            // that is a definitively non-efficient way of doing it, though it should work
+	        get { return _contentList ?? (_contentList = new DynamicPublishedContentList(PublishedContent.ContentSet)); }
+	    }
+
+        public PublishedContentType ContentType { get { return PublishedContent.ContentType; } }
+
+		#region Constructors
+
+		public DynamicPublishedContent(IPublishedContent content)
+		{
+			if (content == null) throw new ArgumentNullException(&quot;content&quot;);
+			PublishedContent = content;
+		}
+
+        internal DynamicPublishedContent(IPublishedContent content, DynamicPublishedContentList contentList)
+        {
+            PublishedContent = content;
+            _contentList = contentList;
+        }
+		
+		#endregion
+
+        // these two here have leaked in v6 and so we cannot remove them anymore
+        // without breaking compatibility but... TODO: remove them in v7
+
+        [Obsolete(&quot;Will be removing in future versions&quot;)]
+        public DynamicPublishedContentList ChildrenAsList { get { return Children; } }
+        
+        [Obsolete(&quot;Will be removing in future versions&quot;)]
+        public int parentId { get { return PublishedContent.Parent.Id; } }
+
+        #region DynamicObject
+
+        private readonly ConcurrentDictionary&lt;string, object&gt; _cachedMemberOutput = new ConcurrentDictionary&lt;string, object&gt;();
+
+        /// &lt;summary&gt;
+		/// Attempts to call a method on the dynamic object
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;binder&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;args&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;result&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		public override bool TryInvokeMember(InvokeMemberBinder binder, object[] args, out object result)
+		{
+            var runtimeCache = ApplicationContext.Current != null ? ApplicationContext.Current.ApplicationCache.RuntimeCache : new NullCacheProvider();
+
+            var attempt = DynamicInstanceHelper.TryInvokeMember(runtimeCache, this, binder, args, new[]
+        		{
+					typeof(DynamicPublishedContent)
+        		});
+
+			if (attempt.Success)
+			{
+				result = attempt.Result.ObjectResult;
+
+				//need to check the return type and possibly cast if result is from an extension method found
+				if (attempt.Result.Reason == DynamicInstanceHelper.TryInvokeMemberSuccessReason.FoundExtensionMethod)
+				{					
+					//we don&#39;t need to cast if it is already DynamicPublishedContent
+					if (attempt.Result.ObjectResult != null &amp;&amp; (!(attempt.Result.ObjectResult is DynamicPublishedContent)))
+					{
+						if (attempt.Result.ObjectResult is IPublishedContent)
+						{
+							result = new DynamicPublishedContent((IPublishedContent)attempt.Result.ObjectResult);
+						}
+						else if (attempt.Result.ObjectResult is IEnumerable&lt;DynamicPublishedContent&gt;)
+						{
+							result = new DynamicPublishedContentList((IEnumerable&lt;DynamicPublishedContent&gt;)attempt.Result.ObjectResult);
+						}	
+						else if (attempt.Result.ObjectResult is IEnumerable&lt;IPublishedContent&gt;)
+						{
+							result = new DynamicPublishedContentList((IEnumerable&lt;IPublishedContent&gt;)attempt.Result.ObjectResult);
+						}
+					}	
+				}
+				return true;
+			}
+			
+			//this is the result of an extension method execution gone wrong so we return dynamic null
+			if (attempt.Result != null
+                &amp;&amp; attempt.Result.Reason == DynamicInstanceHelper.TryInvokeMemberSuccessReason.FoundExtensionMethod
+				&amp;&amp; attempt.Exception is TargetInvocationException) 				
+			{
+			    result = DynamicNull.Null;
+				return true;	
+			}
+		
+			result = null;
+			return false;
+		}
+
+		/// &lt;summary&gt;
+		/// Attempts to return a custom member (generally based on a string match)
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;binder&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		protected virtual Attempt&lt;object&gt; TryGetCustomMember(GetMemberBinder binder)
+		{
+            // as of 4.5 the CLR is case-sensitive which means that the default binder
+            // will handle those methods only when using the proper casing. So what
+            // this method does is ensure that any casing is supported.
+
+			if (binder.Name.InvariantEquals(&quot;ChildrenAsList&quot;) || binder.Name.InvariantEquals(&quot;Children&quot;))
+			{
+				return Attempt&lt;object&gt;.Succeed(Children);
+			}
+
+			if (binder.Name.InvariantEquals(&quot;parentId&quot;))
+			{
+				var parent = ((IPublishedContent) this).Parent;
+				if (parent == null)
+				{
+					throw new InvalidOperationException(string.Format(&quot;The node {0} does not have a parent&quot;, Id));
+				}
+				return Attempt&lt;object&gt;.Succeed(parent.Id);
+			}
+
+			return Attempt&lt;object&gt;.Fail();
+		}
+
+		/// &lt;summary&gt;
+		/// Attempts to return the children by the document type&#39;s alias (for example: CurrentPage.NewsItems where NewsItem is the
+		/// document type alias)
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;binder&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		/// &lt;remarks&gt;
+		/// This method will work by both the plural and non-plural alias (i.e. NewsItem and NewsItems)
+		/// &lt;/remarks&gt;
+		protected virtual Attempt&lt;object&gt; TryGetChildrenByAlias(GetMemberBinder binder)
+		{
+			
+			var filteredTypeChildren = PublishedContent.Children
+				.Where(x =&gt; x.DocumentTypeAlias.InvariantEquals(binder.Name) || x.DocumentTypeAlias.MakePluralName().InvariantEquals(binder.Name))
+				.ToArray();
+			if (filteredTypeChildren.Any())
+			{
+				return Attempt&lt;object&gt;.Succeed(
+				                           new DynamicPublishedContentList(filteredTypeChildren.Select(x =&gt; new DynamicPublishedContent(x))));
+			}
+			return Attempt&lt;object&gt;.Fail();
+		}
+
+		/// &lt;summary&gt;
+		/// Attempts to return a member based on the reflected document property
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;binder&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		protected virtual Attempt&lt;object&gt; TryGetDocumentProperty(GetMemberBinder binder)
+		{
+			var reflectedProperty = GetReflectedProperty(binder.Name);
+			var result = reflectedProperty != null
+				? reflectedProperty.Value
+				: null;
+
+		    return Attempt.If(result != null, result);
+		}
+
+		/// &lt;summary&gt;
+		/// Attempts to return a member based on a user defined umbraco property
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;binder&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		protected virtual Attempt&lt;object&gt; TryGetUserProperty(GetMemberBinder binder)
+		{
+			var name = binder.Name;
+			var recurse = false;
+			if (name.StartsWith(&quot;_&quot;))
+			{
+				name = name.Substring(1, name.Length - 1);
+				recurse = true;
+			}
+
+		    var value = PublishedContent.GetPropertyValue(name, recurse);
+			return Attempt&lt;object&gt;.SucceedIf(value != null, value);
+		}
+
+		/// &lt;summary&gt;
+		/// Returns the member match methods in the correct order and is used in the TryGetMember method.
+		/// &lt;/summary&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		protected virtual IEnumerable&lt;Func&lt;GetMemberBinder, Attempt&lt;object&gt;&gt;&gt; GetMemberMatchMethods()
+		{
+			var memberMatchMethods = new List&lt;Func&lt;GetMemberBinder, Attempt&lt;object&gt;&gt;&gt;
+				{
+					TryGetCustomMember,		//match custom members
+					TryGetUserProperty,		//then match custom user defined umbraco properties
+					TryGetChildrenByAlias,	//then try to match children based on doc type alias
+					TryGetDocumentProperty  //then try to match on a reflected document property
+				};
+			return memberMatchMethods;
+		} 
+
+		/// &lt;summary&gt;
+		/// Try to return an object based on the dynamic member accessor
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;binder&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;result&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		/// &lt;remarks&gt;
+		/// TODO: SD: This will alwasy return true so that no exceptions are generated, this is only because this is how the 
+		/// old DynamicNode worked, I&#39;m not sure if this is the correct/expected functionality but I&#39;ve left it like that.
+		/// IMO I think this is incorrect and it would be better to throw an exception for something that is not supported!
+		/// &lt;/remarks&gt;
+		public override bool TryGetMember(GetMemberBinder binder, out object result)
+		{
+			if (binder == null) throw new ArgumentNullException(&quot;binder&quot;);
+
+			var name = binder.Name;
+
+			//check the cache first!
+			if (_cachedMemberOutput.TryGetValue(name, out result))
+			{
+				return true;
+			}
+			
+			//loop through each member match method and execute it. 
+			//If it is successful, cache the result and return it.
+			foreach (var attempt in GetMemberMatchMethods()
+				.Select(m =&gt; m(binder))
+				.Where(attempt =&gt; attempt.Success))
+			{
+				result = attempt.Result;
+				//cache the result so we don&#39;t have to re-process the whole thing
+				_cachedMemberOutput.TryAdd(name, result);
+				return true;
+			}
+
+			//if property access, type lookup and member invoke all failed
+			//at this point, we&#39;re going to return null
+			//instead, we return a DynamicNull - see comments in that file
+			//this will let things like Model.ChildItem work and return nothing instead of crashing
+
+			//.Where explictly checks for this type
+			//and will make it false
+			//which means backwards equality (&amp;&amp; property != true) will pass
+			//forwwards equality (&amp;&amp; property or &amp;&amp; property == true) will fail
+            result = DynamicNull.Null;
+
+			//alwasy return true if we haven&#39;t thrown an exception though I&#39;m wondering if we return &#39;false&#39; if .Net throws an exception for us??
+			return true;
+		}		
+
+		/// &lt;summary&gt;
+		/// Returns a property defined on the document object as a member property using reflection
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;alias&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		private PropertyResult GetReflectedProperty(string alias)
+		{
+			return GetPropertyInternal(alias, PublishedContent, false);
+		}
+
+		/// &lt;summary&gt;
+		/// Return a user defined property
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;alias&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;recursive&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		internal PropertyResult GetUserProperty(string alias, bool recursive = false)
+		{
+			if (!recursive)
+			{
+				return GetPropertyInternal(alias, PublishedContent);
+			}
+			var context = this;
+			var prop = GetPropertyInternal(alias, PublishedContent);
+
+			while (prop == null || !prop.HasValue)
+			{
+				var parent = ((IPublishedContent) context).Parent;
+				if (parent == null) break;
+
+                // Update the context before attempting to retrieve the property again.
+                context = parent.AsDynamicOrNull();
+				prop = context.GetPropertyInternal(alias, context.PublishedContent);
+			}
+
+			return prop;
+		}
+
+		private PropertyResult GetPropertyInternal(string alias, IPublishedContent content, bool checkUserProperty = true)
+		{
+			if (alias.IsNullOrWhiteSpace()) throw new ArgumentNullException(&quot;alias&quot;);
+			if (content == null) throw new ArgumentNullException(&quot;content&quot;);
+
+			//if we&#39;re looking for a user defined property
+			if (checkUserProperty)
+			{
+				var prop = content.GetProperty(alias);
+
+                // get wrap the result in a PropertyResult - just so it&#39;s an IHtmlString - ?!
+                return prop == null
+			        ? null
+			        : new PropertyResult(prop, PropertyResultType.UserProperty);
+			}
+
+			//reflect
+
+            // as of 4.5 the CLR is case-sensitive which means that the default binder
+            // can handle properties only when using the proper casing. So what this
+            // does is ensure that any casing is supported.
+
+            var attempt = content.GetType().GetMemberIgnoreCase(content, alias);
+
+			return attempt.Success == false || attempt.Result == null
+				? null
+				: new PropertyResult(alias, attempt.Result, PropertyResultType.ReflectedProperty);
+		}
+
+        #endregion
+
+        #region Explicit IPublishedContent implementation
+
+        IPublishedContent IPublishedContent.Parent
+        {
+            get { return PublishedContent.Parent; }
+        }
+
+        int IPublishedContent.Id
+        {
+            get { return PublishedContent.Id; }
+        }
+
+        int IPublishedContent.TemplateId
+        {
+            get { return PublishedContent.TemplateId; }
+        }
+
+        int IPublishedContent.SortOrder
+        {
+            get { return PublishedContent.SortOrder; }
+        }
+
+        string IPublishedContent.Name
+        {
+            get { return PublishedContent.Name; }
+        }
+
+        string IPublishedContent.UrlName
+        {
+            get { return PublishedContent.UrlName; }
+        }
+
+        string IPublishedContent.DocumentTypeAlias
+        {
+            get { return PublishedContent.DocumentTypeAlias; }
+        }
+
+        int IPublishedContent.DocumentTypeId
+        {
+            get { return PublishedContent.DocumentTypeId; }
+        }
+
+        string IPublishedContent.WriterName
+        {
+            get { return PublishedContent.WriterName; }
+        }
+
+        string IPublishedContent.CreatorName
+        {
+            get { return PublishedContent.CreatorName; }
+        }
+
+        int IPublishedContent.WriterId
+        {
+            get { return PublishedContent.WriterId; }
+        }
+
+        int IPublishedContent.CreatorId
+        {
+            get { return PublishedContent.CreatorId; }
+        }
+
+        string IPublishedContent.Path
+        {
+            get { return PublishedContent.Path; }
+        }
+
+        DateTime IPublishedContent.CreateDate
+        {
+            get { return PublishedContent.CreateDate; }
+        }
+
+        DateTime IPublishedContent.UpdateDate
+        {
+            get { return PublishedContent.UpdateDate; }
+        }
+
+        Guid IPublishedContent.Version
+        {
+            get { return PublishedContent.Version; }
+        }
+
+        int IPublishedContent.Level
+        {
+            get { return PublishedContent.Level; }
+        }
+
+        bool IPublishedContent.IsDraft
+	    {
+            get { return PublishedContent.IsDraft; }
+	    }
+
+        int IPublishedContent.GetIndex()
+        {
+            return PublishedContent.GetIndex();
+        }
+
+        ICollection&lt;IPublishedProperty&gt; IPublishedContent.Properties
+        {
+            get { return PublishedContent.Properties; }
+        }
+
+        IEnumerable&lt;IPublishedContent&gt; IPublishedContent.Children
+        {
+            get { return PublishedContent.Children; }
+        }
+
+        IPublishedProperty IPublishedContent.GetProperty(string alias)
+        {
+            return PublishedContent.GetProperty(alias);
+        }
+
+        #endregion
+
+        #region IPublishedContent implementation
+
+		public int TemplateId
+		{
+			get { return PublishedContent.TemplateId; }
+		}
+
+		public int SortOrder
+		{
+			get { return PublishedContent.SortOrder; }
+		}
+
+		public string Name
+		{
+			get { return PublishedContent.Name; }
+		}
+
+		public string UrlName
+		{
+			get { return PublishedContent.UrlName; }
+		}
+
+		public string DocumentTypeAlias
+		{
+			get { return PublishedContent.DocumentTypeAlias; }
+		}
+
+		public string WriterName
+		{
+			get { return PublishedContent.WriterName; }
+		}
+
+		public string CreatorName
+		{
+			get { return PublishedContent.CreatorName; }
+		}
+
+		public int WriterId
+		{
+			get { return PublishedContent.WriterId; }
+		}
+
+		public int CreatorId
+		{
+			get { return PublishedContent.CreatorId; }
+		}
+
+		public string Path
+		{
+			get { return PublishedContent.Path; }
+		}
+
+		public DateTime CreateDate
+		{
+			get { return PublishedContent.CreateDate; }
+		}
+
+		public int Id
+		{
+			get { return PublishedContent.Id; }
+		}
+
+		public DateTime UpdateDate
+		{
+			get { return PublishedContent.UpdateDate; }
+		}
+
+		public Guid Version
+		{
+			get { return PublishedContent.Version; }
+		}
+
+		public int Level
+		{
+			get { return PublishedContent.Level; }
+		}
+
+		public string Url
+		{
+			get { return PublishedContent.Url; }
+		}
+
+		public PublishedItemType ItemType
+		{
+			get { return PublishedContent.ItemType; }
+		}
+
+        // see note in IPublishedContent
+        //public bool Published
+        //{
+        //    get { return PublishedContent.Published; }
+        //}
+
+		public IEnumerable&lt;IPublishedProperty&gt; Properties
+		{
+			get { return PublishedContent.Properties; }
+		}
+
+		public object this[string propertyAlias]
+		{
+			get { return PublishedContent[propertyAlias]; }
+		}
+
+        #endregion
+
+        #region GetProperty
+
+        // enhanced versions of the extension methods that exist for IPublishedContent,
+        // here we support the recursive (_) and reflected (@) syntax
+
+        public IPublishedProperty GetProperty(string alias)
+        {
+            return alias.StartsWith(&quot;_&quot;)
+                ? GetProperty(alias.Substring(1), true)
+                : GetProperty(alias, false);
+        }
+
+        public IPublishedProperty GetProperty(string alias, bool recurse)
+        {
+            if (alias.StartsWith(&quot;@&quot;)) return GetReflectedProperty(alias.Substring(1));
+
+            // get wrap the result in a PropertyResult - just so it&#39;s an IHtmlString - ?!
+            var property = PublishedContent.GetProperty(alias, recurse);
+            return property == null ? null : new PropertyResult(property, PropertyResultType.UserProperty);
+        }
+
+        #endregion
+
+        // IPublishedContent extension methods:
+        //
+        // all these methods are IPublishedContent extension methods so they should in
+        // theory apply to DynamicPublishedContent since it is an IPublishedContent and
+        // we look for extension methods. But that lookup has to be pretty slow.
+        // Duplicating the methods here makes things much faster.
+
+        #region IPublishedContent extension methods - Template
+
+        public string GetTemplateAlias()
+		{
+			return PublishedContentExtensions.GetTemplateAlias(this);
+		}
+        
+        #endregion
+
+        #region IPublishedContent extension methods - HasProperty
+
+        public bool HasProperty(string name)
+        {
+            return PublishedContent.HasProperty(name);
+        }
+        
+        #endregion
+
+        #region IPublishedContent extension methods - HasValue
+
+        public bool HasValue(string alias)
+		{
+			return PublishedContent.HasValue(alias);
+		}
+
+		public bool HasValue(string alias, bool recursive)
+		{
+			return PublishedContent.HasValue(alias, recursive);
+		}
+
+		public IHtmlString HasValue(string alias, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.HasValue(alias, valueIfTrue, valueIfFalse);
+		}
+
+		public IHtmlString HasValue(string alias, bool recursive, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.HasValue(alias, recursive, valueIfTrue, valueIfFalse);
+		}
+
+		public IHtmlString HasValue(string alias, string valueIfTrue)
+		{
+			return PublishedContent.HasValue(alias, valueIfTrue);
+		}
+
+		public IHtmlString HasValue(string alias, bool recursive, string valueIfTrue)
+		{
+			return PublishedContent.HasValue(alias, recursive, valueIfTrue);
+		} 
+
+		#endregion
+
+        #region IPublishedContent extension methods - GetPropertyValue
+
+        // for whatever reason, some methods returning strings were created in DynamicPublishedContent
+        // and are now considered a &quot;feature&quot; as of v6. So we can&#39;t have the proper GetPropertyValue
+        // methods returning objects, too. And we don&#39;t want to change it in v6 as that would be a 
+        // breaking change.
+
+#if FIX_GET_PROPERTY_VALUE
+
+        public object GetPropertyValue(string alias)
+        {
+            return PublishedContent.GetPropertyValue(alias);
+        }
+
+        public object GetPropertyValue(string alias, string defaultValue)
+        {
+            return PublishedContent.GetPropertyValue(alias, defaultValue);
+        }
+
+        public object GetPropertyValue(string alias, object defaultValue)
+        {
+            return PublishedContent.GetPropertyValue(alias, defaultValue);
+        }
+
+        public object GetPropertyValue(string alias, bool recurse)
+        {
+            return PublishedContent.GetPropertyValue(alias, recurse);
+        }
+
+        public object GetPropertyValue(string alias, bool recurse, object defaultValue)
+        {
+            return PublishedContent.GetPropertyValue(alias, recurse, defaultValue);
+        }
+
+#else
+
+        public string GetPropertyValue(string alias)
+        {
+            return GetPropertyValue(alias, false);
+        }
+
+        public string GetPropertyValue(string alias, string defaultValue)
+        {
+            var value = GetPropertyValue(alias);
+            return value.IsNullOrWhiteSpace() ? defaultValue : value;
+        }
+
+        public string GetPropertyValue(string alias, bool recurse, string defaultValue)
+        {
+            var value = GetPropertyValue(alias, recurse);
+            return value.IsNullOrWhiteSpace() ? defaultValue : value;
+        }
+
+        public string GetPropertyValue(string alias, bool recursive)
+        {
+            var property = GetProperty(alias, recursive);
+            if (property == null || property.Value == null) return null;
+            return property.Value.ToString();
+        }
+
+#endif
+
+        #endregion
+
+        #region IPublishedContent extension methods - GetPropertyValue&lt;T&gt;
+
+        public T GetPropertyValue&lt;T&gt;(string alias)
+        {
+            return PublishedContent.GetPropertyValue&lt;T&gt;(alias);
+        }
+
+        public T GetPropertyValue&lt;T&gt;(string alias, T defaultValue)
+        {
+            return PublishedContent.GetPropertyValue(alias, defaultValue);
+        }
+
+        public T GetPropertyValue&lt;T&gt;(string alias, bool recurse)
+        {
+            return PublishedContent.GetPropertyValue&lt;T&gt;(alias, recurse);
+        }
+
+        public T GetPropertyValue&lt;T&gt;(string alias, bool recurse, T defaultValue)
+        {
+            return PublishedContent.GetPropertyValue(alias, recurse, defaultValue);
+        }
+
+        #endregion
+
+        #region IPublishedContent extension methods - Search
+
+        public DynamicPublishedContentList Search(string term, bool useWildCards = true, string searchProvider = null)
+        {
+            return new DynamicPublishedContentList(PublishedContent.Search(term, useWildCards, searchProvider));
+        }
+
+        public DynamicPublishedContentList SearchDescendants(string term, bool useWildCards = true, string searchProvider = null)
+        {
+            return new DynamicPublishedContentList(PublishedContent.SearchDescendants(term, useWildCards, searchProvider));
+        }
+
+        public DynamicPublishedContentList SearchChildren(string term, bool useWildCards = true, string searchProvider = null)
+        {
+            return new DynamicPublishedContentList(PublishedContent.SearchChildren(term, useWildCards, searchProvider));
+        }
+
+        public DynamicPublishedContentList Search(Examine.SearchCriteria.ISearchCriteria criteria, Examine.Providers.BaseSearchProvider searchProvider = null)
+        {
+            return new DynamicPublishedContentList(PublishedContent.Search(criteria, searchProvider));
+        }
+
+        #endregion
+
+        #region IPublishedContent extension methods - AsDynamic
+
+        public dynamic AsDynamic()
+        {
+            return this;
+        }
+
+        public dynamic AsDynamicOrNull()
+        {
+            return this;
+        }
+        
+        #endregion
+
+        #region IPublishedContente extension methods - ContentSet
+
+        public int Position()
+        {
+            return Index();
+        }
+
+        public int Index()
+        {
+            return PublishedContent.GetIndex();
+        }
+
+        #endregion
+
+        #region IPublishedContent extension methods - IsSomething: misc
+
+        public bool Visible
+	    {
+	        get { return PublishedContent.IsVisible(); }
+	    }
+
+        public bool IsVisible()
+        {
+            return PublishedContent.IsVisible();
+        }
+
+		public bool IsDocumentType(string docTypeAlias)
+		{
+			return PublishedContent.IsDocumentType(docTypeAlias);
+		}
+
+		public bool IsNull(string alias, bool recursive)
+		{
+			return PublishedContent.IsNull(alias, recursive);
+		}
+
+		public bool IsNull(string alias)
+		{
+			return PublishedContent.IsNull(alias, false);
+		}
+
+        #endregion 
+
+        #region IPublishedContent extension methods - IsSomething: position in set
+
+        public bool IsFirst()
+		{
+			return PublishedContent.IsFirst();
+		}
+
+		public HtmlString IsFirst(string valueIfTrue)
+		{
+			return PublishedContent.IsFirst(valueIfTrue);
+		}
+
+		public HtmlString IsFirst(string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsFirst(valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsNotFirst()
+		{
+			return PublishedContent.IsNotFirst();
+		}
+
+		public HtmlString IsNotFirst(string valueIfTrue)
+		{
+			return PublishedContent.IsNotFirst(valueIfTrue);
+		}
+
+		public HtmlString IsNotFirst(string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsNotFirst(valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsPosition(int index)
+		{
+			return PublishedContent.IsPosition(index);
+		}
+
+		public HtmlString IsPosition(int index, string valueIfTrue)
+		{
+			return PublishedContent.IsPosition(index, valueIfTrue);
+		}
+
+		public HtmlString IsPosition(int index, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsPosition(index, valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsModZero(int modulus)
+		{
+			return PublishedContent.IsModZero(modulus);
+		}
+
+		public HtmlString IsModZero(int modulus, string valueIfTrue)
+		{
+			return PublishedContent.IsModZero(modulus, valueIfTrue);
+		}
+
+		public HtmlString IsModZero(int modulus, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsModZero(modulus, valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsNotModZero(int modulus)
+		{
+			return PublishedContent.IsNotModZero(modulus);
+		}
+
+		public HtmlString IsNotModZero(int modulus, string valueIfTrue)
+		{
+			return PublishedContent.IsNotModZero(modulus, valueIfTrue);
+		}
+
+		public HtmlString IsNotModZero(int modulus, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsNotModZero(modulus, valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsNotPosition(int index)
+		{
+			return PublishedContent.IsNotPosition(index);
+		}
+
+		public HtmlString IsNotPosition(int index, string valueIfTrue)
+		{
+			return PublishedContent.IsNotPosition(index, valueIfTrue);
+		}
+
+		public HtmlString IsNotPosition(int index, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsNotPosition(index, valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsLast()
+		{
+			return PublishedContent.IsLast();
+		}
+
+		public HtmlString IsLast(string valueIfTrue)
+		{
+			return PublishedContent.IsLast(valueIfTrue);
+		}
+
+		public HtmlString IsLast(string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsLast(valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsNotLast()
+		{
+			return PublishedContent.IsNotLast();
+		}
+
+		public HtmlString IsNotLast(string valueIfTrue)
+		{
+			return PublishedContent.IsNotLast(valueIfTrue);
+		}
+
+		public HtmlString IsNotLast(string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsNotLast(valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsEven()
+		{
+			return PublishedContent.IsEven();
+		}
+
+		public HtmlString IsEven(string valueIfTrue)
+		{
+			return PublishedContent.IsEven(valueIfTrue);
+		}
+
+		public HtmlString IsEven(string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsEven(valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsOdd()
+		{
+			return PublishedContent.IsOdd();
+		}
+
+		public HtmlString IsOdd(string valueIfTrue)
+		{
+			return PublishedContent.IsOdd(valueIfTrue);
+		}
+
+		public HtmlString IsOdd(string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsOdd(valueIfTrue, valueIfFalse);
+		}
+
+        #endregion
+
+        #region IPublishedContent extension methods - IsSomething: equality
+
+        public bool IsEqual(DynamicPublishedContent other)
+		{
+			return PublishedContent.IsEqual(other);
+		}
+
+		public HtmlString IsEqual(DynamicPublishedContent other, string valueIfTrue)
+		{
+			return PublishedContent.IsEqual(other, valueIfTrue);
+		}
+
+		public HtmlString IsEqual(DynamicPublishedContent other, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsEqual(other, valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsNotEqual(DynamicPublishedContent other)
+		{
+			return PublishedContent.IsNotEqual(other);
+		}
+
+		public HtmlString IsNotEqual(DynamicPublishedContent other, string valueIfTrue)
+		{
+			return PublishedContent.IsNotEqual(other, valueIfTrue);
+		}
+
+		public HtmlString IsNotEqual(DynamicPublishedContent other, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsNotEqual(other, valueIfTrue, valueIfFalse);
+		}
+
+        #endregion
+
+        #region IPublishedContent extension methods - IsSomething: ancestors and descendants
+
+        public bool IsDescendant(DynamicPublishedContent other)
+		{
+			return PublishedContent.IsDescendant(other);
+		}
+
+		public HtmlString IsDescendant(DynamicPublishedContent other, string valueIfTrue)
+		{
+			return PublishedContent.IsDescendant(other, valueIfTrue);
+		}
+
+		public HtmlString IsDescendant(DynamicPublishedContent other, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsDescendant(other, valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsDescendantOrSelf(DynamicPublishedContent other)
+		{
+			return PublishedContent.IsDescendantOrSelf(other);
+		}
+
+		public HtmlString IsDescendantOrSelf(DynamicPublishedContent other, string valueIfTrue)
+		{
+			return PublishedContent.IsDescendantOrSelf(other, valueIfTrue);
+		}
+
+		public HtmlString IsDescendantOrSelf(DynamicPublishedContent other, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsDescendantOrSelf(other, valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsAncestor(DynamicPublishedContent other)
+		{
+			return PublishedContent.IsAncestor(other);
+		}
+
+		public HtmlString IsAncestor(DynamicPublishedContent other, string valueIfTrue)
+		{
+			return PublishedContent.IsAncestor(other, valueIfTrue);
+		}
+
+		public HtmlString IsAncestor(DynamicPublishedContent other, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsAncestor(other, valueIfTrue, valueIfFalse);
+		}
+
+		public bool IsAncestorOrSelf(DynamicPublishedContent other)
+		{
+			return PublishedContent.IsAncestorOrSelf(other);
+		}
+
+		public HtmlString IsAncestorOrSelf(DynamicPublishedContent other, string valueIfTrue)
+		{
+			return PublishedContent.IsAncestorOrSelf(other, valueIfTrue);
+		}
+
+		public HtmlString IsAncestorOrSelf(DynamicPublishedContent other, string valueIfTrue, string valueIfFalse)
+		{
+			return PublishedContent.IsAncestorOrSelf(other, valueIfTrue, valueIfFalse);
+		}
+
+		#endregion
+
+        // all these methods wrap whatever PublishedContent returns in a new
+        // DynamicPublishedContentList, for dynamic usage.
+
+        #region Ancestors
+
+        public DynamicPublishedContentList Ancestors(int level)
+        {
+            return new DynamicPublishedContentList(PublishedContent.Ancestors(level));
+        }
+
+        public DynamicPublishedContentList Ancestors(string contentTypeAlias)
+        {
+            return new DynamicPublishedContentList(PublishedContent.Ancestors(contentTypeAlias));
+        }
+
+        public DynamicPublishedContentList Ancestors()
+        {
+            return new DynamicPublishedContentList(PublishedContent.Ancestors());
+        }
+
+        public DynamicPublishedContentList Ancestors(Func&lt;IPublishedContent, bool&gt; func)
+        {
+            return new DynamicPublishedContentList(PublishedContent.AncestorsOrSelf(false, func));
+        }
+
+        public DynamicPublishedContent AncestorOrSelf()
+        {
+            return PublishedContent.AncestorOrSelf().AsDynamicOrNull();
+        }
+
+        public DynamicPublishedContent AncestorOrSelf(int level)
+        {
+            return PublishedContent.AncestorOrSelf(level).AsDynamicOrNull();
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the &#39;site&#39; content for this content.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;The &#39;site&#39; content ie AncestorOrSelf(1).&lt;/returns&gt;
+	    public DynamicPublishedContent Site()
+	    {
+            return AncestorOrSelf(1);
+	    }
+
+        public DynamicPublishedContent AncestorOrSelf(string contentTypeAlias)
+        {
+            return PublishedContent.AncestorOrSelf(contentTypeAlias).AsDynamicOrNull();
+        }
+
+        public DynamicPublishedContent AncestorOrSelf(Func&lt;IPublishedContent, bool&gt; func)
+        {
+            return PublishedContent.AncestorsOrSelf(true, func).FirstOrDefault().AsDynamicOrNull();
+        }
+
+        public DynamicPublishedContentList AncestorsOrSelf(Func&lt;IPublishedContent, bool&gt; func)
+        {
+            return new DynamicPublishedContentList(PublishedContent.AncestorsOrSelf(true, func));
+        }
+
+        public DynamicPublishedContentList AncestorsOrSelf()
+        {
+            return new DynamicPublishedContentList(PublishedContent.AncestorsOrSelf());
+        }
+
+        public DynamicPublishedContentList AncestorsOrSelf(string contentTypeAlias)
+        {
+            return new DynamicPublishedContentList(PublishedContent.AncestorsOrSelf(contentTypeAlias));
+        }
+
+        public DynamicPublishedContentList AncestorsOrSelf(int level)
+        {
+            return new DynamicPublishedContentList(PublishedContent.AncestorsOrSelf(level));
+        }
+
+        #endregion
+
+        #region Descendants
+
+        public DynamicPublishedContentList Descendants(string contentTypeAlias)
+        {
+            return new DynamicPublishedContentList(PublishedContent.Descendants(contentTypeAlias));
+        }
+        public DynamicPublishedContentList Descendants(int level)
+        {
+            return new DynamicPublishedContentList(PublishedContent.Descendants(level));
+        }
+        public DynamicPublishedContentList Descendants()
+        {
+            return new DynamicPublishedContentList(PublishedContent.Descendants());
+        }
+        public DynamicPublishedContentList DescendantsOrSelf(int level)
+        {
+            return new DynamicPublishedContentList(PublishedContent.DescendantsOrSelf(level));
+        }
+        public DynamicPublishedContentList DescendantsOrSelf(string contentTypeAlias)
+        {
+            return new DynamicPublishedContentList(PublishedContent.DescendantsOrSelf(contentTypeAlias));
+        }
+        public DynamicPublishedContentList DescendantsOrSelf()
+        {
+            return new DynamicPublishedContentList(PublishedContent.DescendantsOrSelf());
+        }
+
+        #endregion
+        
+        #region Traversal
+
+		public DynamicPublishedContent Up()
+		{
+			return PublishedContent.Up().AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Up(int number)
+		{
+            return PublishedContent.Up(number).AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Up(string contentTypeAlias)
+		{
+            return PublishedContent.Up(contentTypeAlias).AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Down()
+		{
+            return PublishedContent.Down().AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Down(int number)
+		{
+            return PublishedContent.Down(number).AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Down(string contentTypeAlias)
+		{
+            return PublishedContent.Down(contentTypeAlias).AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Next()
+		{
+            return PublishedContent.Next().AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Next(int number)
+		{
+            return PublishedContent.Next(number).AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Next(string contentTypeAlias)
+		{
+            return PublishedContent.Next(contentTypeAlias).AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Previous()
+		{
+            return PublishedContent.Previous().AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Previous(int number)
+		{
+            return PublishedContent.Previous(number).AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Previous(string contentTypeAlias)
+		{
+            return PublishedContent.Previous(contentTypeAlias).AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Sibling(int number)
+		{
+            return PublishedContent.Previous(number).AsDynamicOrNull();
+		}
+
+		public DynamicPublishedContent Sibling(string contentTypeAlias)
+		{
+			return PublishedContent.Previous(contentTypeAlias).AsDynamicOrNull();
+		} 
+
+		#endregion
+
+		#region Parent
+
+		public DynamicPublishedContent Parent
+		{
+			get
+			{
+			    return PublishedContent.Parent != null ? PublishedContent.Parent.AsDynamicOrNull() : null;
+			}
+		} 
+		
+		#endregion
+
+        #region Children
+
+        // we want to cache the dynamic list of children here
+        // whether PublishedContent.Children itself is cached, is not our concern
+
+        private DynamicPublishedContentList _children;
+
+        public DynamicPublishedContentList Children
+        {
+            get { return _children ?? (_children = new DynamicPublishedContentList(PublishedContent.Children)); }
+        }
+
+	    public DynamicPublishedContent FirstChild()
+	    {
+	        return Children.FirstOrDefault&lt;DynamicPublishedContent&gt;();
+	    }
+
+	    public DynamicPublishedContent FirstChild(string alias)
+	    {
+	        return Children.FirstOrDefault&lt;IPublishedContent&gt;(x =&gt; x.DocumentTypeAlias == alias) as DynamicPublishedContent;
+	    }
+        
+        #endregion
+
+        // should probably cleanup what&#39;s below
+
+        #region Where
+
+        public HtmlString Where(string predicate, string valueIfTrue)
+		{
+			return Where(predicate, valueIfTrue, string.Empty);
+		}
+		public HtmlString Where(string predicate, string valueIfTrue, string valueIfFalse)
+		{
+			if (Where(predicate))
+			{
+				return new HtmlString(valueIfTrue);
+			}
+			return new HtmlString(valueIfFalse);
+		}
+		public bool Where(string predicate)
+		{
+			//Totally gonna cheat here
+			var dynamicDocumentList = new DynamicPublishedContentList();
+			dynamicDocumentList.Add(this);
+			var filtered = dynamicDocumentList.Where&lt;DynamicPublishedContent&gt;(predicate);
+			if (Queryable.Count(filtered) == 1)
+			{
+				//this node matches the predicate
+				return true;
+			}
+			return false;
+		}
+
+		#endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[28,59,28,63,1],[28,64,28,76,1],[35,14,35,15,0],[35,16,35,117,0],[35,118,35,119,0],[38,55,38,56,0],[38,57,38,93,0],[38,94,38,95,0],[42,3,42,60,1],[43,3,43,4,1],[44,4,44,24,1],[44,25,44,68,0],[45,4,45,31,1],[46,3,46,4,1],[48,9,48,109,1],[49,9,49,10,1],[50,13,50,40,1],[51,13,51,40,1],[52,9,52,10,1],[60,65,60,66,1],[60,67,60,83,1],[60,84,60,85,1],[63,35,63,36,1],[63,37,63,71,1],[63,72,63,73,1],[67,9,67,128,1],[67,9,67,128,1],[77,3,77,4,1],[78,13,78,152,1],[80,13,83,14,1],[85,4,85,24,1],[86,4,86,5,1],[87,5,87,42,1],[90,5,90,106,1],[91,5,91,6,1],[93,6,93,109,1],[94,6,94,7,1],[95,7,95,60,1],[96,7,96,8,0],[97,8,97,93,0],[98,7,98,8,0],[99,12,99,84,1],[100,7,100,8,1],[101,8,101,116,1],[102,7,102,8,1],[103,12,103,78,1],[104,7,104,8,0],[105,8,105,110,0],[106,7,106,8,0],[107,6,107,7,1],[108,5,108,6,1],[109,5,109,17,1],[113,4,115,55,0],[116,4,116,5,0],[117,8,117,34,0],[118,5,118,17,0],[121,4,121,18,0],[122,4,122,17,0],[123,3,123,4,1],[131,3,131,4,1],[136,4,136,97,1],[137,4,137,5,0],[138,5,138,46,0],[141,4,141,48,1],[142,4,142,5,1],[143,5,143,52,1],[144,5,144,24,1],[145,5,145,6,0],[146,6,146,100,0],[148,5,148,47,1],[151,4,151,34,1],[152,3,152,4,1],[164,3,164,4,1],[166,4,167,17,1],[167,17,167,134,1],[167,134,168,16,1],[166,4,168,16,1],[169,4,169,35,1],[170,4,170,5,1],[171,5,172,97,1],[172,97,172,127,1],[172,127,172,131,1],[171,5,172,131,1],[174,4,174,34,1],[175,3,175,4,1],[183,3,183,4,1],[184,4,184,62,1],[185,4,187,12,1],[189,7,189,49,1],[190,3,190,4,1],[198,3,198,4,1],[199,4,199,27,1],[200,4,200,24,1],[201,4,201,29,1],[202,4,202,5,1],[203,5,203,47,1],[204,5,204,20,1],[205,4,205,5,1],[207,7,207,68,1],[208,4,208,59,1],[209,3,209,4,1],[216,3,216,4,1],[217,4,223,7,1],[224,4,224,30,1],[225,3,225,4,1],[239,3,239,4,1],[240,4,240,23,1],[240,24,240,66,0],[242,4,242,27,1],[245,4,245,58,1],[246,4,246,5,1],[247,5,247,17,1],[252,4,252,11,1],[252,13,252,24,1],[252,25,252,27,1],[252,28,253,18,1],[253,18,253,27,1],[253,27,254,23,1],[254,23,254,38,1],[254,38,254,39,1],[252,28,254,39,1],[255,4,255,5,1],[256,5,256,29,1],[258,5,258,46,1],[259,5,259,17,1],[271,13,271,39,1],[274,4,274,16,1],[275,3,275,4,1],[283,3,283,4,1],[284,4,284,63,1],[285,3,285,4,1],[294,3,294,4,0],[295,4,295,19,0],[296,4,296,5,0],[297,5,297,57,0],[299,4,299,23,0],[300,4,300,60,0],[302,4,302,42,0],[303,4,303,5,0],[304,5,304,55,0],[305,5,305,24,0],[305,25,305,31,0],[308,17,308,52,0],[309,5,309,73,0],[310,4,310,5,0],[312,4,312,16,0],[313,3,313,4,0],[316,3,316,4,1],[317,4,317,35,1],[317,36,317,77,0],[318,4,318,24,1],[318,25,318,68,0],[321,4,321,26,1],[322,4,322,5,0],[323,5,323,43,0],[326,17,328,72,0],[337,13,337,81,1],[339,4,341,87,1],[342,3,342,4,1],[350,17,350,18,1],[350,19,350,50,1],[350,51,350,52,1],[355,17,355,18,1],[355,19,355,46,1],[355,47,355,48,1],[360,17,360,18,0],[360,19,360,54,0],[360,55,360,56,0],[365,17,365,18,0],[365,19,365,53,0],[365,54,365,55,0],[370,17,370,18,0],[370,19,370,48,0],[370,49,370,50,0],[375,17,375,18,0],[375,19,375,51,0],[375,52,375,53,0],[380,17,380,18,1],[380,19,380,61,1],[380,62,380,63,1],[385,17,385,18,0],[385,19,385,58,0],[385,59,385,60,0],[390,17,390,18,0],[390,19,390,54,0],[390,55,390,56,0],[395,17,395,18,0],[395,19,395,55,0],[395,56,395,57,0],[400,17,400,18,0],[400,19,400,52,0],[400,53,400,54,0],[405,17,405,18,0],[405,19,405,53,0],[405,54,405,55,0],[410,17,410,18,0],[410,19,410,48,0],[410,49,410,50,0],[415,17,415,18,0],[415,19,415,54,0],[415,55,415,56,0],[420,17,420,18,0],[420,19,420,54,0],[420,55,420,56,0],[425,17,425,18,0],[425,19,425,51,0],[425,52,425,53,0],[430,17,430,18,0],[430,19,430,49,0],[430,50,430,51,0],[435,17,435,18,0],[435,19,435,51,0],[435,52,435,53,0],[439,9,439,10,0],[440,13,440,48,0],[441,9,441,10,0],[445,17,445,18,0],[445,19,445,54,0],[445,55,445,56,0],[450,17,450,18,0],[450,19,450,52,0],[450,53,450,54,0],[454,9,454,10,0],[455,13,455,56,0],[456,9,456,10,0],[464,8,464,9,0],[464,10,464,45,0],[464,46,464,47,0],[469,8,469,9,0],[469,10,469,44,0],[469,45,469,46,0],[474,8,474,9,1],[474,10,474,39,1],[474,40,474,41,1],[479,8,479,9,0],[479,10,479,42,0],[479,43,479,44,0],[484,8,484,9,1],[484,10,484,52,1],[484,53,484,54,1],[489,8,489,9,0],[489,10,489,45,0],[489,46,489,47,0],[494,8,494,9,1],[494,10,494,46,1],[494,47,494,48,1],[499,8,499,9,0],[499,10,499,43,0],[499,44,499,45,0],[504,8,504,9,0],[504,10,504,44,0],[504,45,504,46,0],[509,8,509,9,0],[509,10,509,39,0],[509,40,509,41,0],[514,8,514,9,0],[514,10,514,45,0],[514,46,514,47,0],[519,8,519,9,1],[519,10,519,37,1],[519,38,519,39,1],[524,8,524,9,1],[524,10,524,45,1],[524,46,524,47,1],[529,8,529,9,0],[529,10,529,42,0],[529,43,529,44,0],[534,8,534,9,1],[534,10,534,40,1],[534,41,534,42,1],[539,8,539,9,0],[539,10,539,38,0],[539,39,539,40,0],[544,8,544,9,0],[544,10,544,43,0],[544,44,544,45,0],[555,8,555,9,0],[555,10,555,45,0],[555,46,555,47,0],[560,8,560,9,0],[560,10,560,49,0],[560,50,560,51,0],[571,9,571,10,1],[572,13,574,45,1],[575,9,575,10,1],[578,9,578,10,1],[579,13,579,39,1],[579,40,579,88,0],[582,13,582,73,1],[583,13,583,108,1],[584,9,584,10,1],[598,3,598,4,0],[599,4,599,61,0],[600,3,600,4,0],[607,9,607,10,1],[608,13,608,55,1],[609,9,609,10,1],[616,3,616,4,1],[617,4,617,44,1],[618,3,618,4,1],[621,3,621,4,0],[622,4,622,55,0],[623,3,623,4,0],[626,3,626,4,0],[627,4,627,71,0],[628,3,628,4,0],[631,3,631,4,0],[632,4,632,82,0],[633,3,633,4,0],[636,3,636,4,0],[637,4,637,57,0],[638,3,638,4,0],[641,3,641,4,0],[642,4,642,68,0],[643,3,643,4,0],[657,9,657,10,1],[658,13,658,61,1],[659,9,659,10,1],[662,9,662,10,0],[663,13,663,75,0],[664,9,664,10,0],[667,9,667,10,0],[668,13,668,75,0],[669,9,669,10,0],[672,9,672,10,0],[673,13,673,70,0],[674,9,674,10,0],[677,9,677,10,0],[678,13,678,84,0],[679,9,679,10,0],[714,9,714,10,0],[715,13,715,64,0],[716,9,716,10,0],[719,9,719,10,0],[720,13,720,75,0],[721,9,721,10,0],[724,9,724,10,0],[725,13,725,73,0],[726,9,726,10,0],[729,9,729,10,0],[730,13,730,84,0],[731,9,731,10,0],[738,9,738,10,0],[739,13,739,113,0],[740,9,740,10,0],[743,9,743,10,0],[744,13,744,124,0],[745,9,745,10,0],[748,9,748,10,0],[749,13,749,121,0],[750,9,750,10,0],[753,9,753,10,0],[754,13,754,103,0],[755,9,755,10,0],[762,9,762,10,1],[763,13,763,25,1],[764,9,764,10,1],[767,9,767,10,0],[768,13,768,25,0],[769,9,769,10,0],[776,9,776,10,0],[777,13,777,28,0],[778,9,778,10,0],[781,9,781,10,1],[782,13,782,48,1],[783,9,783,10,1],[791,14,791,15,1],[791,16,791,52,1],[791,53,791,54,1],[795,9,795,10,0],[796,13,796,49,0],[797,9,797,10,0],[800,3,800,4,0],[801,4,801,57,0],[802,3,802,4,0],[805,3,805,4,0],[806,4,806,53,0],[807,3,807,4,0],[810,3,810,4,0],[811,4,811,49,0],[812,3,812,4,0],[819,3,819,4,1],[820,4,820,38,1],[821,3,821,4,1],[824,3,824,4,0],[825,4,825,49,0],[826,3,826,4,0],[829,3,829,4,0],[830,4,830,63,0],[831,3,831,4,0],[834,3,834,4,1],[835,4,835,41,1],[836,3,836,4,1],[839,3,839,4,0],[840,4,840,52,0],[841,3,841,4,0],[844,3,844,4,0],[845,4,845,66,0],[846,3,846,4,0],[849,3,849,4,1],[850,4,850,46,1],[851,3,851,4,1],[854,3,854,4,0],[855,4,855,59,0],[856,3,856,4,0],[859,3,859,4,0],[860,4,860,73,0],[861,3,861,4,0],[864,3,864,4,0],[865,4,865,47,0],[866,3,866,4,0],[869,3,869,4,0],[870,4,870,60,0],[871,3,871,4,0],[874,3,874,4,0],[875,4,875,74,0],[876,3,876,4,0],[879,3,879,4,0],[880,4,880,50,0],[881,3,881,4,0],[884,3,884,4,0],[885,4,885,63,0],[886,3,886,4,0],[889,3,889,4,0],[890,4,890,77,0],[891,3,891,4,0],[894,3,894,4,0],[895,4,895,49,0],[896,3,896,4,0],[899,3,899,4,0],[900,4,900,62,0],[901,3,901,4,0],[904,3,904,4,0],[905,4,905,76,0],[906,3,906,4,0],[909,3,909,4,1],[910,4,910,37,1],[911,3,911,4,1],[914,3,914,4,0],[915,4,915,48,0],[916,3,916,4,0],[919,3,919,4,0],[920,4,920,62,0],[921,3,921,4,0],[924,3,924,4,0],[925,4,925,40,0],[926,3,926,4,0],[929,3,929,4,0],[930,4,930,51,0],[931,3,931,4,0],[934,3,934,4,0],[935,4,935,65,0],[936,3,936,4,0],[939,3,939,4,0],[940,4,940,37,0],[941,3,941,4,0],[944,3,944,4,0],[945,4,945,48,0],[946,3,946,4,0],[949,3,949,4,0],[950,4,950,62,0],[951,3,951,4,0],[954,3,954,4,0],[955,4,955,36,0],[956,3,956,4,0],[959,3,959,4,0],[960,4,960,47,0],[961,3,961,4,0],[964,3,964,4,0],[965,4,965,61,0],[966,3,966,4,0],[973,3,973,4,0],[974,4,974,43,0],[975,3,975,4,0],[978,3,978,4,0],[979,4,979,56,0],[980,3,980,4,0],[983,3,983,4,0],[984,4,984,70,0],[985,3,985,4,0],[988,3,988,4,0],[989,4,989,46,0],[990,3,990,4,0],[993,3,993,4,0],[994,4,994,59,0],[995,3,995,4,0],[998,3,998,4,0],[999,4,999,73,0],[1000,3,1000,4,0],[1007,3,1007,4,0],[1008,4,1008,48,0],[1009,3,1009,4,0],[1012,3,1012,4,0],[1013,4,1013,61,0],[1014,3,1014,4,0],[1017,3,1017,4,0],[1018,4,1018,75,0],[1019,3,1019,4,0],[1022,3,1022,4,0],[1023,4,1023,54,0],[1024,3,1024,4,0],[1027,3,1027,4,0],[1028,4,1028,67,0],[1029,3,1029,4,0],[1032,3,1032,4,0],[1033,4,1033,81,0],[1034,3,1034,4,0],[1037,3,1037,4,0],[1038,4,1038,46,0],[1039,3,1039,4,0],[1042,3,1042,4,0],[1043,4,1043,59,0],[1044,3,1044,4,0],[1047,3,1047,4,0],[1048,4,1048,73,0],[1049,3,1049,4,0],[1052,3,1052,4,0],[1053,4,1053,52,0],[1054,3,1054,4,0],[1057,3,1057,4,0],[1058,4,1058,65,0],[1059,3,1059,4,0],[1062,3,1062,4,0],[1063,4,1063,79,0],[1064,3,1064,4,0],[1074,9,1074,10,0],[1075,13,1075,87,0],[1076,9,1076,10,0],[1079,9,1079,10,0],[1080,13,1080,98,0],[1081,9,1081,10,0],[1084,9,1084,10,1],[1085,13,1085,82,1],[1086,9,1086,10,1],[1089,9,1089,10,0],[1090,13,1090,99,0],[1091,9,1091,10,0],[1094,9,1094,10,1],[1095,13,1095,72,1],[1096,9,1096,10,1],[1099,9,1099,10,1],[1100,13,1100,77,1],[1101,9,1101,10,1],[1108,6,1108,7,0],[1109,13,1109,38,0],[1110,6,1110,7,0],[1113,9,1113,10,0],[1114,13,1114,88,0],[1115,9,1115,10,0],[1118,9,1118,10,0],[1119,13,1119,100,0],[1120,9,1120,10,0],[1123,9,1123,10,0],[1124,13,1124,98,0],[1125,9,1125,10,0],[1128,9,1128,10,1],[1129,13,1129,88,1],[1130,9,1130,10,1],[1133,9,1133,10,0],[1134,13,1134,104,0],[1135,9,1135,10,0],[1138,9,1138,10,0],[1139,13,1139,93,0],[1140,9,1140,10,0],[1147,9,1147,10,0],[1148,13,1148,100,0],[1149,9,1149,10,0],[1151,9,1151,10,0],[1152,13,1152,89,0],[1153,9,1153,10,0],[1155,9,1155,10,1],[1156,13,1156,84,1],[1157,9,1157,10,1],[1159,9,1159,10,0],[1160,13,1160,95,0],[1161,9,1161,10,0],[1163,9,1163,10,0],[1164,13,1164,106,0],[1165,9,1165,10,0],[1167,9,1167,10,1],[1168,13,1168,90,1],[1169,9,1169,10,1],[1176,3,1176,4,1],[1177,4,1177,51,1],[1178,3,1178,4,1],[1181,3,1181,4,0],[1182,13,1182,66,0],[1183,3,1183,4,0],[1186,3,1186,4,0],[1187,13,1187,76,0],[1188,3,1188,4,0],[1191,3,1191,4,1],[1192,13,1192,62,1],[1193,3,1193,4,1],[1196,3,1196,4,0],[1197,13,1197,68,0],[1198,3,1198,4,0],[1201,3,1201,4,0],[1202,13,1202,78,0],[1203,3,1203,4,0],[1206,3,1206,4,1],[1207,13,1207,62,1],[1208,3,1208,4,1],[1211,3,1211,4,0],[1212,13,1212,68,0],[1213,3,1213,4,0],[1216,3,1216,4,0],[1217,13,1217,78,0],[1218,3,1218,4,0],[1221,3,1221,4,1],[1222,13,1222,66,1],[1223,3,1223,4,1],[1226,3,1226,4,0],[1227,13,1227,72,0],[1228,3,1228,4,0],[1231,3,1231,4,0],[1232,13,1232,82,0],[1233,3,1233,4,0],[1236,3,1236,4,0],[1237,13,1237,72,0],[1238,3,1238,4,0],[1241,3,1241,4,0],[1242,4,1242,73,0],[1243,3,1243,4,0],[1252,4,1252,5,0],[1253,8,1253,98,0],[1254,4,1254,5,0],[1268,17,1268,18,1],[1268,19,1268,112,1],[1268,113,1268,114,1],[1272,6,1272,7,1],[1273,10,1273,68,1],[1274,6,1274,7,1],[1277,6,1277,7,1],[1278,10,1278,65,1],[1278,65,1278,93,1],[1278,93,1278,122,1],[1278,10,1278,122,1],[1279,6,1279,7,1],[1288,3,1288,4,0],[1289,4,1289,55,0],[1290,3,1290,4,0],[1292,3,1292,4,0],[1293,4,1293,25,0],[1294,4,1294,5,0],[1295,5,1295,40,0],[1297,4,1297,40,0],[1298,3,1298,4,0],[1300,3,1300,4,0],[1302,4,1302,64,0],[1303,4,1303,34,0],[1304,4,1304,81,0],[1305,4,1305,39,0],[1306,4,1306,5,0],[1308,5,1308,17,0],[1310,4,1310,17,0],[1311,3,1311,4,0]]);
+    </script>
+  </body>
+</html>

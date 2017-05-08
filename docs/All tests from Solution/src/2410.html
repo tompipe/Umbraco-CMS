@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\Tags\Tag.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence.SqlSyntax;
+using umbraco.DataLayer;
+using umbraco.BusinessLogic;
+using umbraco.interfaces;
+using umbraco.cms.businesslogic.media;
+using umbraco.cms.businesslogic.web;
+
+namespace umbraco.cms.businesslogic.Tags
+{
+    [Obsolete(&quot;Use the TagService to query tags or the UmbracoHelper on the front-end and use the SetTags, RemoveTags extension methods on IContentBase to manipulate tags&quot;)]
+    public class Tag : ITag
+    {
+
+        private const string SqlGetTagPropertyIdsForNode = @&quot;SELECT cmsPropertyType.id FROM cmsPropertyType 
+                INNER JOIN cmsContent ON cmsContent.contentType = cmsPropertyType.contentTypeId
+                INNER JOIN cmsDataType ON cmsDataType.nodeId = cmsPropertyType.dataTypeId
+                WHERE cmsContent.nodeId = {0}
+                AND cmsDataType.propertyEditorAlias = &#39;&quot; + Constants.PropertyEditors.TagsAlias + &quot;&#39;&quot;;
+
+        #region Constructors
+        public Tag() { }
+        public Tag(int id, string tag, string group, int nodeCount)
+        {
+            Id = id;
+            TagCaption = tag;
+            Group = group;
+            NodeCount = nodeCount;
+        }
+        #endregion
+
+        #region Public Properties
+        public int NodeCount { get; private set; }
+
+        #region ITag Members
+
+        public int Id
+        {
+            get;
+            set;
+        }
+
+        public string TagCaption
+        {
+            get;
+            set;
+        }
+
+        public string Group
+        {
+            get;
+            set;
+        }
+
+        #endregion
+        #endregion
+
+
+        public static void AssociateTagToNode(int nodeId, int tagId)
+        {
+            //need to check if there&#39;s a tag property type to associate with the node, this is a new change with the db change
+            var tagProperties = ApplicationContext.Current.DatabaseContext.Database.Fetch&lt;int&gt;(
+                string.Format(SqlGetTagPropertyIdsForNode, nodeId)).ToArray();
+            if (tagProperties.Any() == false)
+            {
+                throw new InvalidOperationException(&quot;Cannot associate a tag to a node that doesn&#39;t have a Property Type assigned to a Tag Property Editor&quot;);
+            }
+            if (tagProperties.Length &gt; 1)
+            {
+                LogHelper.Warn&lt;Tag&gt;(&quot;Because the legacy Tag data layer is being used, the tags being associated with the node will only be associated with the first found Property Type containing a Tag Property Editor&quot;);
+            }
+
+            if (ApplicationContext.Current.DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                &quot;SELECT COUNT(*) FROM cmsTagRelationship WHERE nodeId=@nodeId AND tagId=@tagId AND propertyTypeId=@propertyTypeId&quot;,
+                new {tagId = tagId, nodeId = nodeId, propertyTypeId = tagProperties[0]}) == 0)
+            {
+                ApplicationContext.Current.DatabaseContext.Database.Insert(new TagRelationshipDto
+                {
+                    NodeId = nodeId,
+                    TagId = tagId,
+                    PropertyTypeId = tagProperties[0]
+                });
+            }
+                        
+        }
+
+        public static void AddTagsToNode(int nodeId, string tags, string group)
+        {
+            //need to check if there&#39;s a tag property type to associate with the node, this is a new change with the db change
+            var tagProperties = ApplicationContext.Current.DatabaseContext.Database.Fetch&lt;int&gt;(
+                string.Format(SqlGetTagPropertyIdsForNode, nodeId)).ToArray();
+            if (tagProperties.Any() == false)
+            {
+                throw new InvalidOperationException(&quot;Cannot associate a tag to a node that doesn&#39;t have a Property Type assigned to a Tag Property Editor&quot;);
+            }
+            if (tagProperties.Length &gt; 1)
+            {
+                LogHelper.Warn&lt;Tag&gt;(&quot;Because the legacy Tag data layer is being used, the tags being associated with the node will only be associated with the first found Property Type containing a Tag Property Editor&quot;);
+            }
+
+            string[] allTags = tags.Split(&quot;,&quot;.ToCharArray());
+            for (int i = 0; i &lt; allTags.Length; i++)
+            {
+                //if not found we&#39;ll get zero and handle that onsave instead...
+                int id = GetTagId(allTags[i], group);
+                if (id == 0)
+                    id = AddTag(allTags[i], group);
+
+                //Perform a subselect insert into cmsTagRelationship using a left outer join to perform the if not exists check
+                var sql = &quot;insert into cmsTagRelationship (nodeId,tagId,propertyTypeId) select &quot; + string.Format(&quot;{0}&quot;, nodeId) + &quot;, &quot; + string.Format(&quot;{0}&quot;, id) + &quot;, &quot; + string.Format(&quot;{0}&quot;, tagProperties[0]) + &quot; from cmsTags &quot;;
+                //sorry, gotta do this, @params not supported in join clause
+                sql += &quot;left outer join cmsTagRelationship on (cmsTags.id = cmsTagRelationship.TagId and cmsTagRelationship.nodeId = &quot; + string.Format(&quot;{0}&quot;, nodeId) + &quot;) &quot;;
+                sql += &quot;where cmsTagRelationship.tagId is null and cmsTags.id = &quot; + string.Format(&quot;{0}&quot;, id);
+
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(sql);
+            }
+        }
+
+        public static void MergeTagsToNode(int nodeId, string tags, string group)
+        {
+            //need to check if there&#39;s a tag property type to associate with the node, this is a new change with the db change
+            var tagProperties = ApplicationContext.Current.DatabaseContext.Database.Fetch&lt;int&gt;(
+                string.Format(SqlGetTagPropertyIdsForNode, nodeId)).ToArray();
+            if (tagProperties.Any() == false)
+            {
+                throw new InvalidOperationException(&quot;Cannot associate a tag to a node that doesn&#39;t have a Property Type assigned to a Tag Property Editor&quot;);
+            }
+            if (tagProperties.Length &gt; 1)
+            {
+                LogHelper.Warn&lt;Tag&gt;(&quot;Because the legacy Tag data layer is being used, the tags being associated with the node will only be associated with the first found Property Type containing a Tag Property Editor&quot;);
+            }
+
+
+            //GE 2011-11-01
+            //When you have a new CSV list of tags (e.g. from control) and want to push those to the DB, the only way to do this
+            //is delete all the existing tags and add the new ones. 
+            //On a lot of tags, or a very full cmsTagRelationship table, this will perform too slowly
+
+            string sql = null;
+            string TagSet = GetSqlSet(tags, group);
+
+            //deletes any tags not found in csv
+            sql = &quot;delete from cmsTagRelationship where nodeId = &quot; + string.Format(&quot;{0}&quot;, nodeId) + &quot; &quot;;
+            sql += &quot; and tagId in ( &quot;;
+            sql += &quot;     select cmsTagRelationship.tagId &quot;;
+            sql += &quot; from &quot;;
+            sql += &quot; cmsTagRelationship &quot;;
+            sql += &quot; left outer join &quot;;
+            sql += &quot; (&quot;;
+            sql += &quot; select NewTags.Id from &quot;;
+            sql += &quot; &quot; + TagSet + &quot; &quot;;
+            sql += &quot; inner join cmsTags as NewTags on (TagSet.Tag = NewTags.Tag and TagSet.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;Group&quot;) + &quot; = TagSet.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;Group&quot;) + &quot;) &quot;;
+            sql += &quot; ) as NewTagsSet &quot;;
+            sql += &quot; on (cmsTagRelationship.TagId = NewTagsSet.Id and cmsTagRelationship.NodeId = &quot; + string.Format(&quot;{0}&quot;, nodeId) + &quot;) &quot;;
+            sql += &quot; inner join  cmsTags as OldTags on (cmsTagRelationship.tagId = OldTags.Id) &quot;;
+            sql += &quot; where NewTagsSet.Id is null &quot;;
+            sql += &quot; )&quot;;
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(sql);
+
+            //adds any tags found in csv that aren&#39;t in cmsTag for that group
+            sql = &quot;insert into cmsTags (Tag,&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;Group&quot;) + @&quot;) &quot;;
+            sql += &quot; select TagSet.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;Tag&quot;) + @&quot;, TagSet.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;Group&quot;) + @&quot; from &quot;;
+            sql += &quot; &quot; + TagSet + &quot; &quot;;
+            sql += &quot; left outer join cmsTags on (TagSet.Tag = cmsTags.Tag and TagSet.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;Group&quot;) + &quot; = cmsTags.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;Group&quot;) + &quot;)&quot;;
+            sql += &quot; where cmsTags.Id is null &quot;;
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(sql);
+
+            //adds any tags found in csv that aren&#39;t in tagrelationships
+            sql = &quot;insert into cmsTagRelationship (TagId,NodeId,propertyTypeId) &quot;;
+            sql += &quot;select NewTagsSet.Id, &quot; + string.Format(&quot;{0}&quot;, nodeId) + &quot;, &quot; + string.Format(&quot;{0}&quot;, tagProperties[0]) + &quot; from  &quot;;
+            sql += &quot;( &quot;;
+            sql += &quot;select NewTags.Id from  &quot;;
+            sql += &quot; &quot; + TagSet + &quot; &quot;;
+            sql += &quot;inner join cmsTags as NewTags on (TagSet.Tag = NewTags.Tag and TagSet.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;Group&quot;) + &quot; = TagSet.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;Group&quot;) + &quot;) &quot;;
+            sql += &quot;) as NewTagsSet &quot;;
+            sql += &quot;left outer join cmsTagRelationship &quot;;
+            sql += &quot;on (cmsTagRelationship.TagId = NewTagsSet.Id and cmsTagRelationship.NodeId = &quot; + string.Format(&quot;{0}&quot;, nodeId) + &quot;) &quot;;
+            sql += &quot;where cmsTagRelationship.tagId is null &quot;;
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(sql);
+
+        }
+
+        /// &lt;summary&gt;
+        /// Removes a tag from the database, this will also remove all relations
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;tagId&quot;&gt;&lt;/param&gt;
+        public static void RemoveTag(int tagId)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(&quot;DELETE FROM cmsTagRelationship WHERE (tagid = @tagId)&quot;,
+                    sqlHelper.CreateParameter(&quot;@tagId&quot;, tagId));
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(&quot;DELETE FROM cmsTags WHERE (id = @tagId)&quot;, 
+                    sqlHelper.CreateParameter(&quot;@tagId&quot;, tagId));
+        }
+
+        /// &lt;summary&gt;
+        /// Delete all tag associations for the node specified
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;nodeId&quot;&gt;&lt;/param&gt;
+        public static void RemoveTagsFromNode(int nodeId)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(&quot;DELETE FROM cmsTagRelationship WHERE nodeId = @nodeId&quot;,
+                    sqlHelper.CreateParameter(&quot;@nodeId&quot;, nodeId));
+        }
+
+        /// &lt;summary&gt;
+        /// Delete all tag associations for the node &amp; group specified
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;nodeId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;group&quot;&gt;&lt;/param&gt;
+        public static void RemoveTagsFromNode(int nodeId, string group)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(&quot;DELETE FROM cmsTagRelationship WHERE (nodeId = @nodeId) AND EXISTS (SELECT id FROM cmsTags WHERE (cmsTagRelationship.tagId = id) AND (&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;) + &quot; = @group));&quot;,
+                    sqlHelper.CreateParameter(&quot;@nodeId&quot;, nodeId),
+                    sqlHelper.CreateParameter(&quot;@group&quot;, group));
+        }
+
+        /// &lt;summary&gt;
+        /// Remove a single tag association
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;nodeId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;tag&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;group&quot;&gt;&lt;/param&gt;
+        public static void RemoveTagFromNode(int nodeId, string tag, string group)
+        {
+            int tagId = GetTagId(tag, group);
+            if (tagId != 0)
+            {
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(&quot;DELETE FROM cmsTagRelationship WHERE (nodeId = @nodeId and tagId = @tagId)&quot;,
+                        sqlHelper.CreateParameter(&quot;@nodeId&quot;, nodeId),
+                        sqlHelper.CreateParameter(&quot;@tagId&quot;, tagId));
+            }
+        }
+
+        public static int AddTag(string tag, string group)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(&quot;INSERT INTO cmsTags(tag,&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;) + &quot;) VALUES (@tag,@group)&quot;,
+                    sqlHelper.CreateParameter(&quot;@tag&quot;, tag.Trim()),
+                    sqlHelper.CreateParameter(&quot;@group&quot;, group));
+            return GetTagId(tag, group);
+        }
+
+        public static int GetTagId(string tag, string group)
+        {
+            int retval = 0;
+            string sql = &quot;SELECT id FROM cmsTags where tag=@tag AND &quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;) + &quot;=@group;&quot;;
+            using (var sqlHelper = Application.SqlHelper)
+            {
+                object result = sqlHelper.ExecuteScalar&lt;object&gt;(sql,
+                    sqlHelper.CreateParameter(&quot;@tag&quot;, tag),
+                    sqlHelper.CreateParameter(&quot;@group&quot;, group));
+
+                if (result != null)
+                    retval = int.Parse(result.ToString());
+            }
+            return retval;
+        }
+
+        public static IEnumerable&lt;Tag&gt; GetTags(int nodeId, string group)
+        {
+            var sql = @&quot;SELECT cmsTags.id, cmsTags.tag, cmsTags.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;) + @&quot;, count(cmsTagRelationShip.tagid) AS nodeCount FROM cmsTags
+                  INNER JOIN cmsTagRelationship ON cmsTagRelationShip.tagId = cmsTags.id
+                  WHERE cmsTags.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;) + @&quot; = @group AND cmsTagRelationship.nodeid = @nodeid
+                  GROUP BY cmsTags.id, cmsTags.tag, cmsTags.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;);
+
+            using (var sqlHelper = Application.SqlHelper)
+                return ConvertSqlToTags(sql,
+                    sqlHelper.CreateParameter(&quot;@group&quot;, group),
+                    sqlHelper.CreateParameter(&quot;@nodeid&quot;, nodeId));
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the tags from node as ITag objects.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;nodeId&quot;&gt;The node id.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Tag&gt; GetTags(int nodeId)
+        {
+
+            string sql = @&quot;SELECT cmsTags.id, cmsTags.tag, cmsTags.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;) + @&quot;, count(cmsTagRelationShip.tagid) AS nodeCount FROM cmsTags
+                        INNER JOIN cmsTagRelationShip ON cmsTagRelationShip.tagid = cmsTags.id
+                        WHERE cmsTagRelationShip.nodeid = @nodeId
+                        GROUP BY cmsTags.id, cmsTags.tag, cmsTags.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;);
+
+            using (var sqlHelper = Application.SqlHelper)
+                return ConvertSqlToTags(sql, sqlHelper.CreateParameter(&quot;@nodeId&quot;, nodeId));
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the tags from group as ITag objects.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;group&quot;&gt;The group.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Tag&gt; GetTags(string group)
+        {
+
+            string sql = @&quot;SELECT cmsTags.id, cmsTags.tag, cmsTags.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;) + @&quot;, count(cmsTagRelationShip.tagid) AS nodeCount FROM cmsTags
+                            INNER JOIN cmsTagRelationShip ON cmsTagRelationShip.tagid = cmsTags.id
+                            WHERE cmsTags.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;) + @&quot; = @group
+                            GROUP BY cmsTags.id, cmsTags.tag, cmsTags.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;);
+
+            using (var sqlHelper = Application.SqlHelper)
+                return ConvertSqlToTags(sql, sqlHelper.CreateParameter(&quot;@group&quot;, group));
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all the tags as ITag objects
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;nodeId&quot;&gt;The node id.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IEnumerable&lt;Tag&gt; GetTags()
+        {
+
+            string sql = @&quot;SELECT cmsTags.id, cmsTags.tag, cmsTags.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;) + @&quot;, count(cmsTagRelationShip.tagid) AS nodeCount FROM cmsTags
+                            LEFT JOIN cmsTagRelationShip ON cmsTagRelationShip.tagid = cmsTags.id
+                            GROUP BY cmsTags.id, cmsTags.tag, cmsTags.&quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;group&quot;);
+
+            return ConvertSqlToTags(sql);
+
+        }
+
+        public static IEnumerable&lt;Document&gt; GetDocumentsWithTags(string tags)
+        {
+
+            var docs = new List&lt;Document&gt;();
+            string sql = @&quot;SELECT DISTINCT cmsTagRelationShip.nodeid from cmsTagRelationShip
+                            INNER JOIN cmsTags ON cmsTagRelationShip.tagid = cmsTags.id 
+                            INNER JOIN umbracoNode ON cmsTagRelationShip.nodeId = umbracoNode.id
+                            WHERE (cmsTags.tag IN ({0})) AND nodeObjectType=@nodeType&quot;;
+
+            using (var sqlHelper = Application.SqlHelper)
+            using (IRecordsReader rr = sqlHelper.ExecuteReader(string.Format(sql, GetSqlStringArray(tags)),
+                sqlHelper.CreateParameter(&quot;@nodeType&quot;, Document._objectType)))
+            {
+                while (rr.Read())
+                {
+                    Document cnode = new Document(rr.GetInt(&quot;nodeid&quot;));
+
+                    if (cnode.Published)
+                        docs.Add(cnode);
+                }
+            }
+
+            return docs;
+        }
+
+        public static IEnumerable&lt;CMSNode&gt; GetNodesWithTags(string tags)
+        {
+            var nodes = new List&lt;CMSNode&gt;();
+
+            string sql = @&quot;SELECT DISTINCT cmsTagRelationShip.nodeid from cmsTagRelationShip
+                            INNER JOIN cmsTags ON cmsTagRelationShip.tagid = cmsTags.id WHERE (cmsTags.tag IN (&quot; + GetSqlStringArray(tags) + &quot;))&quot;;
+
+            using (var sqlHelper = Application.SqlHelper)
+            using (IRecordsReader rr = sqlHelper.ExecuteReader(sql))
+            {
+                while (rr.Read())
+                {
+                    nodes.Add(new CMSNode(rr.GetInt(&quot;nodeid&quot;)));
+                }
+            }
+            return nodes;
+        }
+
+        private static string GetSqlSet(string commaSeparatedArray, string group)
+        {
+            // create array
+            var array = commaSeparatedArray.Trim().Split(&#39;,&#39;).ToList().ConvertAll(tag =&gt; string.Format(&quot;select &#39;{0}&#39; as Tag, &#39;{1}&#39; as &quot; + SqlSyntaxContext.SqlSyntaxProvider.GetQuotedColumnName(&quot;Group&quot;), tag.Replace(&quot;&#39;&quot;, &quot;&quot;), group)).ToArray();
+            return &quot;(&quot; + string.Join(&quot; union &quot;, array).Replace(&quot;  &quot;, &quot; &quot;) + &quot;) as TagSet&quot;;
+        }
+
+        private static string GetSqlStringArray(string commaSeparatedArray)
+        {
+            // create array
+            string[] array = commaSeparatedArray.Trim().Split(&#39;,&#39;);
+
+            // build SQL array
+            StringBuilder sqlArray = new StringBuilder();
+            foreach (string item in array)
+            {
+                string trimmedItem = item.Trim();
+                if (trimmedItem.Length &gt; 0)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                        sqlArray.Append(&quot;&#39;&quot;).Append(sqlHelper.EscapeString(trimmedItem)).Append(&quot;&#39;,&quot;);
+                }
+            }
+
+            // remove last comma
+            if (sqlArray.Length &gt; 0)
+                sqlArray.Remove(sqlArray.Length - 1, 1);
+            return sqlArray.ToString();
+        }
+
+        private static IEnumerable&lt;Tag&gt; ConvertSqlToTags(string sql, params IParameter[] param)
+        {
+            List&lt;Tag&gt; tags = new List&lt;Tag&gt;();
+            using (var sqlHelper = Application.SqlHelper)
+            using (IRecordsReader rr = sqlHelper.ExecuteReader(sql, param))
+            {
+                while (rr.Read())
+                {
+                    tags.Add(new Tag(
+                        rr.GetInt(&quot;id&quot;),
+                        rr.GetString(&quot;tag&quot;),
+                        rr.GetString(&quot;group&quot;),
+                        rr.GetInt(&quot;nodeCount&quot;)));
+                }
+            }
+
+
+            return tags;
+        }
+
+        /// &lt;summary&gt;
+        /// Unused, please do not use
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Obsolete, For querying the database use the new UmbracoDatabase object ApplicationContext.Current.DatabaseContext.Database&quot;, false)]
+        protected static ISqlHelper SqlHelper
+        {
+            get { return Application.SqlHelper; }
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[28,9,28,21,0],[28,22,28,23,0],[28,24,28,25,0],[29,9,29,68,0],[30,9,30,10,0],[31,13,31,21,0],[32,13,32,30,0],[33,13,33,27,0],[34,13,34,35,0],[35,9,35,10,0],[39,32,39,36,0],[39,37,39,49,0],[45,13,45,17,0],[46,13,46,17,0],[51,13,51,17,0],[52,13,52,17,0],[57,13,57,17,0],[58,13,58,17,0],[66,9,66,10,0],[68,13,69,79,0],[70,13,70,46,0],[71,13,71,14,0],[72,17,72,157,0],[74,13,74,42,0],[75,13,75,14,0],[76,17,76,221,0],[77,13,77,14,0],[79,13,81,95,0],[82,13,82,14,0],[83,17,88,20,0],[89,13,89,14,0],[91,9,91,10,0],[94,9,94,10,0],[96,13,97,79,0],[98,13,98,46,0],[99,13,99,14,0],[100,17,100,157,0],[102,13,102,42,0],[103,13,103,14,0],[104,17,104,221,0],[105,13,105,14,0],[107,13,107,62,0],[108,18,108,27,0],[108,29,108,47,0],[108,49,108,52,0],[109,13,109,14,0],[111,17,111,54,0],[112,17,112,29,0],[113,21,113,52,0],[116,17,116,230,0],[118,17,118,174,0],[119,17,119,110,0],[121,24,121,61,0],[122,21,122,52,0],[123,13,123,14,0],[124,9,124,10,0],[127,9,127,10,0],[129,13,130,79,0],[131,13,131,46,0],[132,13,132,14,0],[133,17,133,157,0],[135,13,135,42,0],[136,13,136,14,0],[137,17,137,221,0],[138,13,138,14,0],[146,13,146,31,0],[147,13,147,52,0],[150,13,150,105,0],[151,13,151,39,0],[152,13,152,60,0],[153,13,153,29,0],[154,13,154,43,0],[155,13,155,40,0],[156,13,156,25,0],[157,13,157,47,0],[158,13,158,39,0],[159,13,159,248,0],[160,13,160,40,0],[161,13,161,139,0],[162,13,162,98,0],[163,13,163,52,0],[164,13,164,25,0],[165,20,165,57,0],[166,17,166,48,0],[169,13,169,121,0],[170,13,170,195,0],[171,13,171,39,0],[172,13,172,242,0],[173,13,173,49,0],[174,20,174,57,0],[175,17,175,48,0],[178,13,178,83,0],[179,13,179,136,0],[180,13,180,25,0],[181,13,181,47,0],[182,13,182,39,0],[183,13,183,247,0],[184,13,184,39,0],[185,13,185,58,0],[186,13,186,138,0],[187,13,187,62,0],[188,20,188,57,0],[189,17,189,48,0],[191,9,191,10,0],[198,9,198,10,0],[199,20,199,57,0],[200,17,201,65,0],[202,20,202,57,0],[203,17,204,65,0],[205,9,205,10,0],[212,9,212,10,0],[213,20,213,57,0],[214,17,215,67,0],[216,9,216,10,0],[224,9,224,10,0],[225,20,225,57,0],[226,17,228,65,0],[229,9,229,10,0],[238,9,238,10,0],[239,13,239,46,0],[240,13,240,28,0],[241,13,241,14,0],[242,24,242,61,0],[243,21,245,69,0],[246,13,246,14,0],[247,9,247,10,0],[250,9,250,10,0],[251,20,251,57,0],[252,17,254,65,0],[255,13,255,41,0],[256,9,256,10,0],[259,9,259,10,0],[260,13,260,28,0],[261,13,261,150,0],[262,20,262,57,0],[263,13,263,14,0],[264,17,266,65,0],[268,17,268,36,0],[269,21,269,59,0],[270,13,270,14,0],[271,13,271,27,0],[272,9,272,10,0],[275,9,275,10,0],[276,13,279,129,0],[281,20,281,57,0],[282,17,284,67,0],[285,9,285,10,0],[293,9,293,10,0],[295,13,298,135,0],[300,20,300,57,0],[301,17,301,92,0],[302,9,302,10,0],[310,9,310,10,0],[312,13,315,139,0],[317,20,317,57,0],[318,17,318,90,0],[319,9,319,10,0],[327,9,327,10,0],[329,13,331,139,0],[333,13,333,42,0],[335,9,335,10,0],[338,9,338,10,0],[340,13,340,45,0],[341,13,344,88,0],[346,20,346,57,0],[347,20,348,78,0],[349,13,349,14,0],[350,17,350,34,0],[351,17,351,18,0],[352,21,352,72,0],[354,21,354,41,0],[355,25,355,41,0],[356,17,356,18,0],[357,13,357,14,0],[359,13,359,25,0],[360,9,360,10,0],[363,9,363,10,0],[364,13,364,45,0],[366,13,367,147,0],[369,20,369,57,0],[370,20,370,68,0],[371,13,371,14,0],[372,17,372,34,0],[373,17,373,18,0],[374,21,374,65,0],[375,17,375,18,0],[376,13,376,14,0],[377,13,377,26,0],[378,9,378,10,0],[381,9,381,10,0],[383,13,383,90,0],[383,90,383,232,0],[383,232,383,244,0],[383,13,383,244,0],[384,13,384,91,0],[385,9,385,10,0],[388,9,388,10,0],[390,13,390,68,0],[393,13,393,58,0],[394,13,394,20,0],[394,22,394,33,0],[394,34,394,36,0],[394,37,394,42,0],[395,13,395,14,0],[396,17,396,50,0],[397,17,397,44,0],[398,17,398,18,0],[399,28,399,65,0],[400,25,400,103,0],[401,17,401,18,0],[402,13,402,14,0],[405,13,405,37,0],[406,17,406,57,0],[407,13,407,40,0],[408,9,408,10,0],[411,9,411,10,0],[412,13,412,46,0],[413,20,413,57,0],[414,20,414,75,0],[415,13,415,14,0],[416,17,416,34,0],[417,17,417,18,0],[418,21,422,50,0],[423,17,423,18,0],[424,13,424,14,0],[427,13,427,25,0],[428,9,428,10,0],[436,17,436,18,0],[436,19,436,48,0],[436,49,436,50,0]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\UserService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Data.Common;
+using System.Data.SqlClient;
+using System.Linq;
+using Umbraco.Core.Events;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Security;
+
+namespace Umbraco.Core.Services
+{
+    /// &lt;summary&gt;
+    /// Represents the UserService, which is an easy access to operations involving &lt;see cref=&quot;IProfile&quot;/&gt;, &lt;see cref=&quot;IMembershipUser&quot;/&gt; and eventually Backoffice Users.
+    /// &lt;/summary&gt;
+    public class UserService : RepositoryService, IUserService
+    {
+
+        //TODO: We need to change the isUpgrading flag to use an app state enum as described here: http://issues.umbraco.org/issue/U4-6816
+        // in the meantime, we will use a boolean which we are currently using during upgrades to ensure that a user object is not persisted during this phase, otherwise
+        // exceptions can occur if the db is not in it&#39;s correct state.
+        internal bool IsUpgrading { get; set; }
+
+        public UserService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory, ILogger logger, IEventMessagesFactory eventMessagesFactory)
+            : base(provider, repositoryFactory, logger, eventMessagesFactory)
+        {
+            IsUpgrading = false;
+        }
+
+        #region Implementation of IMembershipUserService
+
+        /// &lt;summary&gt;
+        /// Gets the default MemberType alias
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;By default we&#39;ll return the &#39;writer&#39;, but we need to check it exists. If it doesn&#39;t we&#39;ll 
+        /// return the first type that is not an admin, otherwise if there&#39;s only one we will return that one.&lt;/remarks&gt;
+        /// &lt;returns&gt;Alias of the default MemberType&lt;/returns&gt;
+        public string GetDefaultMemberType()
+        {
+            using (var repository = RepositoryFactory.CreateUserTypeRepository(UowProvider.GetUnitOfWork()))
+            {
+                var types = repository.GetAll().Select(x =&gt; x.Alias).ToArray();
+
+                if (types.Any() == false)
+                {
+                    throw new EntityNotFoundException(&quot;No member types could be resolved&quot;);
+                }
+
+                if (types.InvariantContains(&quot;writer&quot;))
+                {
+                    return types.First(x =&gt; x.InvariantEquals(&quot;writer&quot;));
+                }
+                
+                if (types.Length == 1)
+                {
+                    return types.First();
+                }
+
+                //first that is not admin
+                return types.First(x =&gt; x.InvariantEquals(&quot;admin&quot;) == false);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if a User with the username exists
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username to check&lt;/param&gt;
+        /// &lt;returns&gt;&lt;c&gt;True&lt;/c&gt; if the User exists otherwise &lt;c&gt;False&lt;/c&gt;&lt;/returns&gt;
+        public bool Exists(string username)
+        {
+            using (var repository = RepositoryFactory.CreateUserRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.Exists(username);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new User
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;The user will be saved in the database and returned with an Id&lt;/remarks&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username of the user to create&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email of the user to create&lt;/param&gt;
+        /// &lt;param name=&quot;userType&quot;&gt;&lt;see cref=&quot;IUserType&quot;/&gt; which the User should be based on&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IUser&quot;/&gt;&lt;/returns&gt;
+        public IUser CreateUserWithIdentity(string username, string email, IUserType userType)
+        {
+            return CreateUserWithIdentity(username, email, &quot;&quot;, userType);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and persists a new &lt;see cref=&quot;IUser&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username of the &lt;see cref=&quot;IUser&quot;/&gt; to create&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email of the &lt;see cref=&quot;IUser&quot;/&gt; to create&lt;/param&gt;
+        /// &lt;param name=&quot;passwordValue&quot;&gt;This value should be the encoded/encrypted/hashed value for the password that will be stored in the database&lt;/param&gt;
+        /// &lt;param name=&quot;memberTypeAlias&quot;&gt;Alias of the Type&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IUser&quot;/&gt;&lt;/returns&gt;
+        IUser IMembershipMemberService&lt;IUser&gt;.CreateWithIdentity(string username, string email, string passwordValue, string memberTypeAlias)
+        {
+            var userType = GetUserTypeByAlias(memberTypeAlias);
+            if (userType == null)
+            {
+                throw new EntityNotFoundException(&quot;The user type &quot; + memberTypeAlias + &quot; could not be resolved&quot;);
+            }
+
+            return CreateUserWithIdentity(username, email, passwordValue, userType);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and persists a Member
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Using this method will persist the Member object before its returned 
+        /// meaning that it will have an Id available (unlike the CreateMember method)&lt;/remarks&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email of the Member to create&lt;/param&gt;
+        /// &lt;param name=&quot;passwordValue&quot;&gt;This value should be the encoded/encrypted/hashed value for the password that will be stored in the database&lt;/param&gt;
+        /// &lt;param name=&quot;userType&quot;&gt;MemberType the Member should be based on&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IUser&quot;/&gt;&lt;/returns&gt;
+        private IUser CreateUserWithIdentity(string username, string email, string passwordValue, IUserType userType)
+        {
+            if (userType == null) throw new ArgumentNullException(&quot;userType&quot;);
+
+            if (string.IsNullOrWhiteSpace(username))
+            {
+                throw new ArgumentException(&quot;Cannot create user with empty username.&quot;);
+            }
+
+            //TODO: PUT lock here!!
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserRepository(uow))
+            {
+                var loginExists = uow.Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(id) FROM umbracoUser WHERE userLogin = @Login&quot;, new { Login = username }) != 0;
+                if (loginExists)
+                    throw new ArgumentException(&quot;Login already exists&quot;);
+
+                var user = new User(userType)
+                {
+                    DefaultToLiveEditing = false,
+                    Email = email,
+                    Language = Configuration.GlobalSettings.DefaultUILanguage,
+                    Name = username,
+                    RawPasswordValue = passwordValue,                    
+                    Username = username,
+                    StartContentId = -1,
+                    StartMediaId = -1,
+                    IsLockedOut = false,
+                    IsApproved = true
+                };
+                //adding default sections content and media
+                user.AddAllowedSection(&quot;content&quot;);
+                user.AddAllowedSection(&quot;media&quot;);
+
+                if (SavingUser.IsRaisedEventCancelled(new SaveEventArgs&lt;IUser&gt;(user), this))
+                    return user;
+
+                repository.AddOrUpdate(user);
+                uow.Commit();
+
+                SavedUser.RaiseEvent(new SaveEventArgs&lt;IUser&gt;(user, false), this);
+
+                return user;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a User by its integer id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;see cref=&quot;System.int&quot;/&gt; Id&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IUser&quot;/&gt;&lt;/returns&gt;
+        public IUser GetById(int id)
+        {
+            using (var repository = RepositoryFactory.CreateUserRepository(UowProvider.GetUnitOfWork()))
+            {
+                var user = repository.Get((int)id);
+
+                return user;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an &lt;see cref=&quot;IUser&quot;/&gt; by its provider key
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id to use for retrieval&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IUser&quot;/&gt;&lt;/returns&gt;
+        public IUser GetByProviderKey(object id)
+        {
+            var asInt = id.TryConvertTo&lt;int&gt;();
+            if (asInt.Success)
+            {
+                return GetById((int)id);
+            }
+
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// Get an &lt;see cref=&quot;IUser&quot;/&gt; by email
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;email&quot;&gt;Email to use for retrieval&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IUser&quot;/&gt;&lt;/returns&gt;
+        public IUser GetByEmail(string email)
+        {
+            using (var repository = RepositoryFactory.CreateUserRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IUser&gt;.Builder.Where(x =&gt; x.Email.Equals(email));
+                var user = repository.GetByQuery(query).FirstOrDefault();
+
+                return user;
+            }
+        }
+        
+        /// &lt;summary&gt;
+        /// Get an &lt;see cref=&quot;IUser&quot;/&gt; by username
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username to use for retrieval&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IUser&quot;/&gt;&lt;/returns&gt;
+        public IUser GetByUsername(string username)
+        {
+            using (var repository = RepositoryFactory.CreateUserRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IUser&gt;.Builder.Where(x =&gt; x.Username.Equals(username));
+                var user = repository.GetByQuery(query).FirstOrDefault();
+                return user;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes an &lt;see cref=&quot;IUser&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;membershipUser&quot;&gt;&lt;see cref=&quot;IUser&quot;/&gt; to Delete&lt;/param&gt;
+        public void Delete(IUser membershipUser)
+        {            
+            //disable
+            membershipUser.IsApproved = false;            
+            //can&#39;t rename if it&#39;s going to take up too many chars
+            if (membershipUser.Username.Length + 9 &lt;= 125)
+            {
+                membershipUser.Username = DateTime.Now.ToString(&quot;yyyyMMdd&quot;) + &quot;_&quot; + membershipUser.Username;
+            }
+            Save(membershipUser);
+        }
+
+        /// &lt;summary&gt;
+        /// This is simply a helper method which essentially just wraps the MembershipProvider&#39;s ChangePassword method
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This method exists so that Umbraco developers can use one entry point to create/update users if they choose to.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;user&quot;&gt;The user to save the password for&lt;/param&gt;
+        /// &lt;param name=&quot;password&quot;&gt;The password to save&lt;/param&gt;
+        public void SavePassword(IUser user, string password)
+        {
+            if (user == null) throw new ArgumentNullException(&quot;user&quot;);
+
+            var provider = MembershipProviderExtensions.GetUsersMembershipProvider();
+
+            if (provider.IsUmbracoMembershipProvider() == false)
+                throw new NotSupportedException(&quot;When using a non-Umbraco membership provider you must change the user password by using the MembershipProvider.ChangePassword method&quot;);
+
+            provider.ChangePassword(user.Username, &quot;&quot;, password);
+
+            //go re-fetch the member and update the properties that may have changed
+            var result = GetByUsername(user.Username);
+            if (result != null)
+            {
+                //should never be null but it could have been deleted by another thread.
+                user.RawPasswordValue = result.RawPasswordValue;
+                user.LastPasswordChangeDate = result.LastPasswordChangeDate;
+                user.UpdateDate = result.UpdateDate;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes or disables a User
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;user&quot;&gt;&lt;see cref=&quot;IUser&quot;/&gt; to delete&lt;/param&gt;
+        /// &lt;param name=&quot;deletePermanently&quot;&gt;&lt;c&gt;True&lt;/c&gt; to permanently delete the user, &lt;c&gt;False&lt;/c&gt; to disable the user&lt;/param&gt;
+        public void Delete(IUser user, bool deletePermanently)
+        {
+            if (deletePermanently == false)
+            {
+                Delete(user);
+            }
+            else
+            {
+                if (DeletingUser.IsRaisedEventCancelled(new DeleteEventArgs&lt;IUser&gt;(user), this))
+                    return;
+
+                var uow = UowProvider.GetUnitOfWork();
+                using (var repository = RepositoryFactory.CreateUserRepository(uow))
+                {
+                    repository.Delete(user);
+                    uow.Commit();
+                }
+
+                DeletedUser.RaiseEvent(new DeleteEventArgs&lt;IUser&gt;(user, false), this);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Saves an &lt;see cref=&quot;IUser&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;see cref=&quot;IUser&quot;/&gt; to Save&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter to raise events. 
+        /// Default is &lt;c&gt;True&lt;/c&gt; otherwise set to &lt;c&gt;False&lt;/c&gt; to not raise events&lt;/param&gt;
+        public void Save(IUser entity, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (SavingUser.IsRaisedEventCancelled(new SaveEventArgs&lt;IUser&gt;(entity), this))
+                    return;
+            }
+
+            if (string.IsNullOrWhiteSpace(entity.Username))
+            {
+                throw new ArgumentException(&quot;Cannot save user with empty username.&quot;);
+            }
+            if (string.IsNullOrWhiteSpace(entity.Name))
+            {
+                throw new ArgumentException(&quot;Cannot save user with empty name.&quot;);
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserRepository(uow))
+            {
+                repository.AddOrUpdate(entity);
+                try
+                {
+                    uow.Commit();
+                }
+                catch (DbException ex)
+                {
+                    //Special case, if we are upgrading and an exception occurs, just continue
+                    if (IsUpgrading == false) throw;
+
+                    Logger.WarnWithException&lt;UserService&gt;(&quot;An error occurred attempting to save a user instance during upgrade, normally this warning can be ignored&quot;, ex);
+                    return;
+                }
+            }
+
+            if (raiseEvents)
+                SavedUser.RaiseEvent(new SaveEventArgs&lt;IUser&gt;(entity, false), this);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a list of &lt;see cref=&quot;IUser&quot;/&gt; objects
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entities&quot;&gt;&lt;see cref=&quot;IEnumerable{IUser}&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter to raise events. 
+        /// Default is &lt;c&gt;True&lt;/c&gt; otherwise set to &lt;c&gt;False&lt;/c&gt; to not raise events&lt;/param&gt;
+        public void Save(IEnumerable&lt;IUser&gt; entities, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (SavingUser.IsRaisedEventCancelled(new SaveEventArgs&lt;IUser&gt;(entities), this))
+                    return;
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserRepository(uow))
+            {
+                foreach (var member in entities)
+                {
+                    if (string.IsNullOrWhiteSpace(member.Username))
+                    {
+                        throw new ArgumentException(&quot;Cannot save user with empty username.&quot;);
+                    }
+                    if (string.IsNullOrWhiteSpace(member.Name))
+                    {
+                        throw new ArgumentException(&quot;Cannot save user with empty name.&quot;);
+                    }
+                    repository.AddOrUpdate(member);
+                }
+                //commit the whole lot in one go
+                uow.Commit();
+            }
+
+            if (raiseEvents)
+                SavedUser.RaiseEvent(new SaveEventArgs&lt;IUser&gt;(entities, false), this);
+        }
+
+        /// &lt;summary&gt;
+        /// Finds a list of &lt;see cref=&quot;IUser&quot;/&gt; objects by a partial email string
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;emailStringToMatch&quot;&gt;Partial email string to match&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Current page index&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Size of the page&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total number of records found (out)&lt;/param&gt;
+        /// &lt;param name=&quot;matchType&quot;&gt;The type of match to make as &lt;see cref=&quot;StringPropertyMatchType&quot;/&gt;. Default is &lt;see cref=&quot;StringPropertyMatchType.StartsWith&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IUser}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IUser&gt; FindByEmail(string emailStringToMatch, int pageIndex, int pageSize, out int totalRecords, StringPropertyMatchType matchType = StringPropertyMatchType.StartsWith)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserRepository(uow))
+            {
+                var query = new Query&lt;IUser&gt;();
+
+                switch (matchType)
+                {
+                    case StringPropertyMatchType.Exact:
+                        query.Where(member =&gt; member.Email.Equals(emailStringToMatch));
+                        break;
+                    case StringPropertyMatchType.Contains:
+                        query.Where(member =&gt; member.Email.Contains(emailStringToMatch));
+                        break;
+                    case StringPropertyMatchType.StartsWith:
+                        query.Where(member =&gt; member.Email.StartsWith(emailStringToMatch));
+                        break;
+                    case StringPropertyMatchType.EndsWith:
+                        query.Where(member =&gt; member.Email.EndsWith(emailStringToMatch));
+                        break;
+                    case StringPropertyMatchType.Wildcard:
+                        query.Where(member =&gt; member.Email.SqlWildcard(emailStringToMatch, TextColumnType.NVarchar));
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;matchType&quot;);
+                }
+
+                return repository.GetPagedResultsByQuery(query, pageIndex, pageSize, out totalRecords, dto =&gt; dto.Email);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Finds a list of &lt;see cref=&quot;IUser&quot;/&gt; objects by a partial username
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;login&quot;&gt;Partial username to match&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Current page index&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Size of the page&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total number of records found (out)&lt;/param&gt;
+        /// &lt;param name=&quot;matchType&quot;&gt;The type of match to make as &lt;see cref=&quot;StringPropertyMatchType&quot;/&gt;. Default is &lt;see cref=&quot;StringPropertyMatchType.StartsWith&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IUser}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IUser&gt; FindByUsername(string login, int pageIndex, int pageSize, out int totalRecords, StringPropertyMatchType matchType = StringPropertyMatchType.StartsWith)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserRepository(uow))
+            {
+                var query = new Query&lt;IUser&gt;();
+
+                switch (matchType)
+                {
+                    case StringPropertyMatchType.Exact:
+                        query.Where(member =&gt; member.Username.Equals(login));
+                        break;
+                    case StringPropertyMatchType.Contains:
+                        query.Where(member =&gt; member.Username.Contains(login));
+                        break;
+                    case StringPropertyMatchType.StartsWith:
+                        query.Where(member =&gt; member.Username.StartsWith(login));
+                        break;
+                    case StringPropertyMatchType.EndsWith:
+                        query.Where(member =&gt; member.Username.EndsWith(login));
+                        break;
+                    case StringPropertyMatchType.Wildcard:
+                        query.Where(member =&gt; member.Email.SqlWildcard(login, TextColumnType.NVarchar));
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;matchType&quot;);
+                }
+
+                return repository.GetPagedResultsByQuery(query, pageIndex, pageSize, out totalRecords, dto =&gt; dto.Username);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the total number of Users based on the count type
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// The way the Online count is done is the same way that it is done in the MS SqlMembershipProvider - We query for any members
+        /// that have their last active date within the Membership.UserIsOnlineTimeWindow (which is in minutes). It isn&#39;t exact science
+        /// but that is how MS have made theirs so we&#39;ll follow that principal.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;countType&quot;&gt;&lt;see cref=&quot;MemberCountType&quot;/&gt; to count by&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;System.int&quot;/&gt; with number of Users for passed in type&lt;/returns&gt;
+        public int GetCount(MemberCountType countType)
+        {
+            using (var repository = RepositoryFactory.CreateUserRepository(UowProvider.GetUnitOfWork()))
+            {
+                IQuery&lt;IUser&gt; query;
+
+                switch (countType)
+                {
+                    case MemberCountType.All:
+                        query = new Query&lt;IUser&gt;();
+                        return repository.Count(query);
+                    case MemberCountType.Online:
+                        throw new NotImplementedException();
+                        //var fromDate = DateTime.Now.AddMinutes(-Membership.UserIsOnlineTimeWindow);
+                        //query =
+                        //    Query&lt;IMember&gt;.Builder.Where(
+                        //        x =&gt;
+                        //        ((Member)x).PropertyTypeAlias == Constants.Conventions.Member.LastLoginDate &amp;&amp;
+                        //        ((Member)x).DateTimePropertyValue &gt; fromDate);
+                        //return repository.GetCountByQuery(query);
+                    case MemberCountType.LockedOut:
+                        query =
+                            Query&lt;IUser&gt;.Builder.Where(
+                                x =&gt; x.IsLockedOut);
+                        return repository.GetCountByQuery(query);
+                    case MemberCountType.Approved:
+                        query =
+                            Query&lt;IUser&gt;.Builder.Where(
+                                x =&gt; x.IsApproved);
+                        return repository.GetCountByQuery(query);
+                    default:
+                        throw new ArgumentOutOfRangeException(&quot;countType&quot;);
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a list of paged &lt;see cref=&quot;IUser&quot;/&gt; objects
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Current page index&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Size of the page&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total number of records found (out)&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IEnumerable{IMember}&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IUser&gt; GetAll(int pageIndex, int pageSize, out int totalRecords)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserRepository(uow))
+            {
+                return repository.GetPagedResultsByQuery(null, pageIndex, pageSize, out totalRecords, member =&gt; member.Username);
+            }
+        }
+
+        internal IEnumerable&lt;IUser&gt; GetNextUsers(int id, int count)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = (UserRepository) RepositoryFactory.CreateUserRepository(uow))
+            {
+                return repository.GetNextUsers(id, count);
+            }
+        }
+
+        #endregion
+
+        #region Implementation of IUserService
+
+        /// &lt;summary&gt;
+        /// Gets an IProfile by User Id.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the User to retrieve&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IProfile&quot;/&gt;&lt;/returns&gt;
+        public IProfile GetProfileById(int id)
+        {
+            var user = GetUserById(id);
+            return user.ProfileData;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a profile by username
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;Username&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IProfile&quot;/&gt;&lt;/returns&gt;
+        public IProfile GetProfileByUserName(string username)
+        {
+            var user = GetByUsername(username);
+            return user.ProfileData;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a user by Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the user to retrieve&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IUser&quot;/&gt;&lt;/returns&gt;
+        public IUser GetUserById(int id)
+        {
+            using (var repository = RepositoryFactory.CreateUserRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.Get(id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Replaces the same permission set for a single user to any number of entities
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;If no &#39;entityIds&#39; are specified all permissions will be removed for the specified user.&lt;/remarks&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Id of the user&lt;/param&gt;
+        /// &lt;param name=&quot;permissions&quot;&gt;Permissions as enumerable list of &lt;see cref=&quot;char&quot;/&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;entityIds&quot;&gt;Specify the nodes to replace permissions for. If nothing is specified all permissions are removed.&lt;/param&gt;
+        public void ReplaceUserPermissions(int userId, IEnumerable&lt;char&gt; permissions, params int[] entityIds)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserRepository(uow))
+            {
+                repository.ReplaceUserPermissions(userId, permissions, entityIds);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Assigns the same permission set for a single user to any number of entities
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Id of the user&lt;/param&gt;
+        /// &lt;param name=&quot;permission&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;entityIds&quot;&gt;Specify the nodes to replace permissions for&lt;/param&gt;
+        public void AssignUserPermission(int userId, char permission, params int[] entityIds)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserRepository(uow))
+            {
+                repository.AssignUserPermission(userId, permission, entityIds);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all UserTypes or thosed specified as parameters
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ids&quot;&gt;Optional Ids of UserTypes to retrieve&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;IUserType&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IUserType&gt; GetAllUserTypes(params int[] ids)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserTypeRepository(uow))
+            {
+                return repository.GetAll(ids);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a UserType by its Alias
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;Alias of the UserType to retrieve&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IUserType&quot;/&gt;&lt;/returns&gt;
+        public IUserType GetUserTypeByAlias(string alias)
+        {
+            using (var repository = RepositoryFactory.CreateUserTypeRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IUserType&gt;.Builder.Where(x =&gt; x.Alias == alias);
+                var contents = repository.GetByQuery(query);
+                return contents.SingleOrDefault();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a UserType by its Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the UserType to retrieve&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IUserType&quot;/&gt;&lt;/returns&gt;
+        public IUserType GetUserTypeById(int id)
+        {
+            using (var repository = RepositoryFactory.CreateUserTypeRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.Get(id);                
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a UserType by its Name
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Name of the UserType to retrieve&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IUserType&quot;/&gt;&lt;/returns&gt;
+        public IUserType GetUserTypeByName(string name)
+        {
+            using (var repository = RepositoryFactory.CreateUserTypeRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IUserType&gt;.Builder.Where(x =&gt; x.Name == name);
+                var contents = repository.GetByQuery(query);
+                return contents.SingleOrDefault();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a UserType
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userType&quot;&gt;UserType to save&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Optional parameter to raise events. 
+        /// Default is &lt;c&gt;True&lt;/c&gt; otherwise set to &lt;c&gt;False&lt;/c&gt; to not raise events&lt;/param&gt;
+        public void SaveUserType(IUserType userType, bool raiseEvents = true)
+        {
+            if (raiseEvents)
+            {
+                if (SavingUserType.IsRaisedEventCancelled(new SaveEventArgs&lt;IUserType&gt;(userType), this))
+                    return;
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserTypeRepository(uow))
+            {
+                repository.AddOrUpdate(userType);
+                uow.Commit();
+            }
+
+            if (raiseEvents)
+                SavedUserType.RaiseEvent(new SaveEventArgs&lt;IUserType&gt;(userType, false), this);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes a UserType
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userType&quot;&gt;UserType to delete&lt;/param&gt;
+        public void DeleteUserType(IUserType userType)
+        {
+            if (DeletingUserType.IsRaisedEventCancelled(new DeleteEventArgs&lt;IUserType&gt;(userType), this))
+                return;
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserTypeRepository(uow))
+            {
+                repository.Delete(userType);
+                uow.Commit();
+            }
+
+            DeletedUserType.RaiseEvent(new DeleteEventArgs&lt;IUserType&gt;(userType, false), this);
+        }
+
+        /// &lt;summary&gt;
+        /// Removes a specific section from all users
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;This is useful when an entire section is removed from config&lt;/remarks&gt;
+        /// &lt;param name=&quot;sectionAlias&quot;&gt;Alias of the section to remove&lt;/param&gt;
+        public void DeleteSectionFromAllUsers(string sectionAlias)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserRepository(uow))
+            {
+                var assignedUsers = repository.GetUsersAssignedToSection(sectionAlias);
+                foreach (var user in assignedUsers)
+                {
+                    //now remove the section for each user and commit
+                    user.RemoveAllowedSection(sectionAlias);
+                    repository.AddOrUpdate(user);
+                }
+                uow.Commit();
+            }
+        }
+        
+        /// &lt;summary&gt;
+        /// Add a specific section to all users or those specified as parameters
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;This is useful when a new section is created to allow specific users accessing it&lt;/remarks&gt;
+        /// &lt;param name=&quot;sectionAlias&quot;&gt;Alias of the section to add&lt;/param&gt;
+        /// &lt;param name=&quot;userIds&quot;&gt;Specifiying nothing will add the section to all user&lt;/param&gt;
+        public void AddSectionToAllUsers(string sectionAlias, params int[] userIds)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserRepository(uow))
+            {
+                IEnumerable&lt;IUser&gt; users;
+                if (userIds.Any())
+                {
+                    users = repository.GetAll(userIds);
+                }
+                else
+                {
+                    users = repository.GetAll();
+                }
+                foreach (var user in users.Where(u =&gt; !u.AllowedSections.InvariantContains(sectionAlias)))
+                {
+                    //now add the section for each user and commit
+                    user.AddAllowedSection(sectionAlias);
+                    repository.AddOrUpdate(user);
+                }
+                uow.Commit();
+            }
+        }    
+
+        /// &lt;summary&gt;
+        /// Get permissions set for a user and optional node ids
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;If no permissions are found for a particular entity then the user&#39;s default permissions will be applied&lt;/remarks&gt;
+        /// &lt;param name=&quot;user&quot;&gt;User to retrieve permissions for&lt;/param&gt;
+        /// &lt;param name=&quot;nodeIds&quot;&gt;Specifiying nothing will return all user permissions for all nodes&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;EntityPermission&quot;/&gt;&lt;/returns&gt;
+        public IEnumerable&lt;EntityPermission&gt; GetPermissions(IUser user, params int[] nodeIds)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateUserRepository(uow))
+            {
+                var explicitPermissions = repository.GetUserPermissionsForEntities(user.Id, nodeIds);
+
+                //if no permissions are assigned to a particular node then we will fill in those permissions with the user&#39;s defaults
+                var result = new List&lt;EntityPermission&gt;(explicitPermissions);
+                var missingIds = nodeIds.Except(result.Select(x =&gt; x.EntityId));
+                foreach (var id in missingIds)
+                {
+                    result.Add(
+                        new EntityPermission(
+                            user.Id,
+                            id,
+                            user.DefaultPermissions.ToArray()));
+                }
+
+                return result;
+            }
+        }
+
+        #endregion
+        
+        /// &lt;summary&gt;
+        /// Occurs before Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IUserService, SaveEventArgs&lt;IUser&gt;&gt; SavingUser;
+
+        /// &lt;summary&gt;
+        /// Occurs after Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IUserService, SaveEventArgs&lt;IUser&gt;&gt; SavedUser;
+
+        /// &lt;summary&gt;
+        /// Occurs before Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IUserService, DeleteEventArgs&lt;IUser&gt;&gt; DeletingUser;
+
+        /// &lt;summary&gt;
+        /// Occurs after Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IUserService, DeleteEventArgs&lt;IUser&gt;&gt; DeletedUser;
+
+        /// &lt;summary&gt;
+        /// Occurs before Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IUserService, SaveEventArgs&lt;IUserType&gt;&gt; SavingUserType;
+
+        /// &lt;summary&gt;
+        /// Occurs after Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IUserService, SaveEventArgs&lt;IUserType&gt;&gt; SavedUserType;
+
+        /// &lt;summary&gt;
+        /// Occurs before Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IUserService, DeleteEventArgs&lt;IUserType&gt;&gt; DeletingUserType;
+
+        /// &lt;summary&gt;
+        /// Occurs after Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IUserService, DeleteEventArgs&lt;IUserType&gt;&gt; DeletedUserType;
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[27,37,27,41,0],[27,42,27,46,1],[30,15,30,78,1],[31,9,31,10,1],[32,13,32,33,1],[33,9,33,10,1],[44,9,44,10,0],[45,20,45,108,0],[46,13,46,14,0],[47,17,47,61,0],[47,61,47,68,0],[47,68,47,80,0],[47,17,47,80,0],[49,17,49,42,0],[50,17,50,18,0],[51,21,51,92,0],[54,17,54,55,0],[55,17,55,18,0],[56,21,56,45,0],[56,45,56,72,0],[56,72,56,74,0],[56,21,56,74,0],[59,17,59,39,0],[60,17,60,18,0],[61,21,61,42,0],[65,17,65,41,0],[65,41,65,76,0],[65,76,65,78,0],[65,17,65,78,0],[67,9,67,10,0],[75,9,75,10,1],[76,20,76,104,1],[77,13,77,14,1],[78,17,78,52,1],[80,9,80,10,1],[91,9,91,10,1],[92,13,92,74,1],[93,9,93,10,1],[104,9,104,10,0],[105,13,105,64,0],[106,13,106,34,0],[107,13,107,14,0],[108,17,108,114,0],[111,13,111,85,0],[112,9,112,10,0],[125,9,125,10,1],[126,13,126,34,1],[126,35,126,79,0],[128,13,128,53,1],[129,13,129,14,1],[130,17,130,88,1],[135,13,135,51,1],[136,20,136,80,1],[137,13,137,14,1],[138,17,138,160,1],[139,17,139,33,1],[140,21,140,73,0],[142,17,154,19,1],[156,17,156,51,1],[157,17,157,49,1],[159,17,159,93,1],[160,21,160,33,0],[162,17,162,46,1],[163,17,163,30,1],[165,17,165,83,1],[167,17,167,29,1],[169,9,169,10,1],[177,9,177,10,0],[178,20,178,104,0],[179,13,179,14,0],[180,17,180,52,0],[182,17,182,29,0],[184,9,184,10,0],[192,9,192,10,0],[193,13,193,48,0],[194,13,194,31,0],[195,13,195,14,0],[196,17,196,41,0],[199,13,199,25,0],[200,9,200,10,0],[208,9,208,10,1],[209,20,209,104,1],[210,13,210,14,1],[211,17,211,84,1],[212,17,212,74,1],[214,17,214,29,1],[216,9,216,10,1],[224,9,224,10,1],[225,20,225,104,1],[226,13,226,14,1],[227,17,227,90,1],[228,17,228,74,1],[229,17,229,29,1],[231,9,231,10,1],[238,9,238,10,1],[240,13,240,47,1],[242,13,242,59,1],[243,13,243,14,1],[244,17,244,109,1],[245,13,245,14,1],[246,13,246,34,1],[247,9,247,10,1],[258,9,258,10,0],[259,13,259,30,0],[259,31,259,71,0],[261,13,261,86,0],[263,13,263,65,0],[264,17,264,185,0],[266,13,266,66,0],[269,13,269,55,0],[270,13,270,32,0],[271,13,271,14,0],[273,17,273,65,0],[274,17,274,77,0],[275,17,275,53,0],[276,13,276,14,0],[277,9,277,10,0],[285,9,285,10,1],[286,13,286,44,1],[287,13,287,14,0],[288,17,288,30,0],[289,13,289,14,0],[291,13,291,14,1],[292,17,292,97,1],[293,21,293,28,0],[295,17,295,55,1],[296,24,296,84,1],[297,17,297,18,1],[298,21,298,45,1],[299,21,299,34,1],[300,17,300,18,1],[302,17,302,87,1],[303,13,303,14,1],[304,9,304,10,1],[313,9,313,10,1],[314,13,314,29,1],[315,13,315,14,1],[316,17,316,95,1],[317,21,317,28,0],[318,13,318,14,1],[320,13,320,60,1],[321,13,321,14,1],[322,17,322,86,1],[324,13,324,56,1],[325,13,325,14,1],[326,17,326,82,1],[329,13,329,51,1],[330,20,330,80,1],[331,13,331,14,1],[332,17,332,48,1],[334,17,334,18,1],[335,21,335,34,1],[336,17,336,18,1],[337,17,337,39,0],[338,17,338,18,0],[340,21,340,46,0],[340,47,340,53,0],[342,21,342,172,0],[343,21,343,28,0],[345,13,345,14,1],[347,13,347,29,1],[348,17,348,85,1],[349,9,349,10,1],[358,9,358,10,1],[359,13,359,29,1],[360,13,360,14,1],[361,17,361,97,1],[362,21,362,28,0],[363,13,363,14,1],[365,13,365,51,1],[366,20,366,80,1],[367,13,367,14,1],[368,17,368,24,1],[368,26,368,36,1],[368,37,368,39,1],[368,40,368,48,1],[369,17,369,18,1],[370,21,370,68,1],[371,21,371,22,0],[372,25,372,94,0],[374,21,374,64,1],[375,21,375,22,0],[376,25,376,90,0],[378,21,378,52,1],[379,17,379,18,1],[381,17,381,30,1],[382,13,382,14,1],[384,13,384,29,1],[385,17,385,87,1],[386,9,386,10,1],[398,9,398,10,1],[399,13,399,51,1],[400,20,400,80,1],[401,13,401,14,1],[402,17,402,48,1],[404,17,404,35,1],[407,25,407,88,1],[408,25,408,31,1],[410,25,410,90,1],[411,25,411,31,1],[413,25,413,92,1],[414,25,414,31,1],[416,25,416,90,1],[417,25,417,31,1],[419,25,419,118,0],[420,25,420,31,0],[422,25,422,76,0],[425,17,425,122,1],[427,9,427,10,1],[439,9,439,10,0],[440,13,440,51,0],[441,20,441,80,0],[442,13,442,14,0],[443,17,443,48,0],[445,17,445,35,0],[448,25,448,78,0],[449,25,449,31,0],[451,25,451,80,0],[452,25,452,31,0],[454,25,454,82,0],[455,25,455,31,0],[457,25,457,80,0],[458,25,458,31,0],[460,25,460,105,0],[461,25,461,31,0],[463,25,463,76,0],[466,17,466,125,0],[468,9,468,10,0],[481,9,481,10,1],[482,20,482,104,1],[483,13,483,14,1],[486,17,486,35,1],[489,25,489,52,1],[490,25,490,56,1],[492,25,492,61,0],[501,25,503,53,1],[504,25,504,66,1],[506,25,508,52,1],[509,25,509,66,1],[511,25,511,76,0],[514,9,514,10,1],[524,9,524,10,1],[525,13,525,51,1],[526,20,526,80,1],[527,13,527,14,1],[528,17,528,130,1],[530,9,530,10,1],[533,9,533,10,0],[534,13,534,51,0],[535,20,535,97,0],[536,13,536,14,0],[537,17,537,59,0],[539,9,539,10,0],[551,9,551,10,1],[552,13,552,40,1],[553,13,553,37,1],[554,9,554,10,1],[562,9,562,10,1],[563,13,563,48,1],[564,13,564,37,1],[565,9,565,10,1],[573,9,573,10,1],[574,20,574,104,1],[575,13,575,14,1],[576,17,576,43,1],[578,9,578,10,1],[588,9,588,10,0],[589,13,589,51,0],[590,20,590,80,0],[591,13,591,14,0],[592,17,592,83,0],[593,13,593,14,0],[594,9,594,10,0],[603,9,603,10,0],[604,13,604,51,0],[605,20,605,80,0],[606,13,606,14,0],[607,17,607,80,0],[608,13,608,14,0],[609,9,609,10,0],[617,9,617,10,1],[618,13,618,51,1],[619,20,619,84,1],[620,13,620,14,1],[621,17,621,47,1],[623,9,623,10,1],[631,9,631,10,1],[632,20,632,108,1],[633,13,633,14,1],[634,17,634,83,1],[635,17,635,61,1],[636,17,636,51,1],[638,9,638,10,1],[646,9,646,10,0],[647,20,647,108,0],[648,13,648,14,0],[649,17,649,43,0],[651,9,651,10,0],[659,9,659,10,0],[660,20,660,108,0],[661,13,661,14,0],[662,17,662,81,0],[663,17,663,61,0],[664,17,664,51,0],[666,9,666,10,0],[675,9,675,10,1],[676,13,676,29,1],[677,13,677,14,1],[678,17,678,105,1],[679,21,679,28,0],[680,13,680,14,1],[682,13,682,51,1],[683,20,683,84,1],[684,13,684,14,1],[685,17,685,50,1],[686,17,686,30,1],[687,13,687,14,1],[689,13,689,29,1],[690,17,690,95,1],[691,9,691,10,1],[698,9,698,10,0],[699,13,699,105,0],[700,17,700,24,0],[702,13,702,51,0],[703,20,703,84,0],[704,13,704,14,0],[705,17,705,45,0],[706,17,706,30,0],[707,13,707,14,0],[709,13,709,95,0],[710,9,710,10,0],[718,9,718,10,1],[719,13,719,51,1],[720,20,720,80,1],[721,13,721,14,1],[722,17,722,88,1],[723,17,723,24,1],[723,26,723,34,1],[723,35,723,37,1],[723,38,723,51,1],[724,17,724,18,1],[726,21,726,61,1],[727,21,727,50,1],[728,17,728,18,1],[729,17,729,30,1],[730,13,730,14,1],[731,9,731,10,1],[740,9,740,10,1],[741,13,741,51,1],[742,20,742,80,1],[743,13,743,14,1],[745,17,745,35,1],[746,17,746,18,1],[747,21,747,56,1],[748,17,748,18,1],[750,17,750,18,1],[751,21,751,49,1],[752,17,752,18,1],[753,17,753,24,1],[753,26,753,34,1],[753,35,753,37,1],[753,38,753,55,1],[753,55,753,105,1],[753,105,753,106,1],[753,38,753,106,1],[754,17,754,18,1],[756,21,756,58,1],[757,21,757,50,1],[758,17,758,18,1],[759,17,759,30,1],[760,13,760,14,1],[761,9,761,10,1],[771,9,771,10,1],[772,13,772,51,1],[773,20,773,80,1],[774,13,774,14,1],[775,17,775,102,1],[778,17,778,78,1],[779,17,779,68,1],[779,68,779,78,1],[779,78,779,81,1],[779,17,779,81,1],[780,17,780,24,1],[780,26,780,32,1],[780,33,780,35,1],[780,36,780,46,1],[781,17,781,18,1],[782,21,786,65,1],[787,17,787,18,1],[789,17,789,31,1],[791,9,791,10,1]]);
+    </script>
+  </body>
+</html>

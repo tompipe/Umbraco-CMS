@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\MemberTypeRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using log4net;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.Relators;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents a repository for doing CRUD operations for &lt;see cref=&quot;IMemberType&quot;/&gt;
+    /// &lt;/summary&gt;
+    internal class MemberTypeRepository : ContentTypeBaseRepository&lt;IMemberType&gt;, IMemberTypeRepository
+    {
+
+        public MemberTypeRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax)
+            : base(work, cache, logger, sqlSyntax)
+        {
+        }
+
+        private FullDataSetRepositoryCachePolicyFactory&lt;IMemberType, int&gt; _cachePolicyFactory;
+        protected override IRepositoryCachePolicyFactory&lt;IMemberType, int&gt; CachePolicyFactory
+        {
+            get
+            {
+                //Use a FullDataSet cache policy - this will cache the entire GetAll result in a single collection
+                return _cachePolicyFactory ?? (_cachePolicyFactory = new FullDataSetRepositoryCachePolicyFactory&lt;IMemberType, int&gt;(
+                    RuntimeCache, GetEntityId, () =&gt; PerformGetAll(),
+                    //allow this cache to expire
+                    expires: true));
+            }
+        }
+        
+        protected override IMemberType PerformGet(int id)
+        {
+            //use the underlying GetAll which will force cache all content types
+            return GetAll().FirstOrDefault(x =&gt; x.Id == id);
+        }
+
+        protected override IEnumerable&lt;IMemberType&gt; PerformGetAll(params int[] ids)
+        {
+            var sql = GetBaseQuery(false);
+            if (ids.Any())
+            {
+                //NOTE: This logic should never be executed according to our cache policy
+                var statement = string.Join(&quot; OR &quot;, ids.Select(x =&gt; string.Format(&quot;umbracoNode.id=&#39;{0}&#39;&quot;, x)));
+                sql.Where(statement);
+            }
+            sql.OrderByDescending&lt;NodeDto&gt;(x =&gt; x.NodeId, SqlSyntax);
+
+            var dtos =
+                Database.Fetch&lt;MemberTypeReadOnlyDto, PropertyTypeReadOnlyDto, PropertyTypeGroupReadOnlyDto, MemberTypeReadOnlyDto&gt;(
+                    new PropertyTypePropertyGroupRelator().Map, sql);
+
+            return BuildFromDtos(dtos);
+        }
+
+        protected override IEnumerable&lt;IMemberType&gt; PerformGetByQuery(IQuery&lt;IMemberType&gt; query)
+        {
+            var sqlSubquery = GetSubquery();
+            var translator = new SqlTranslator&lt;IMemberType&gt;(sqlSubquery, query);
+            var subquery = translator.Translate();
+            var sql = GetBaseQuery(false)
+                .Append(new Sql(&quot;WHERE umbracoNode.id IN (&quot; + subquery.SQL + &quot;)&quot;, subquery.Arguments))
+                .OrderBy&lt;NodeDto&gt;(x =&gt; x.SortOrder, SqlSyntax);
+
+            var dtos =
+                Database.Fetch&lt;MemberTypeReadOnlyDto, PropertyTypeReadOnlyDto, PropertyTypeGroupReadOnlyDto, MemberTypeReadOnlyDto&gt;(
+                    new PropertyTypePropertyGroupRelator().Map, sql);
+
+            return BuildFromDtos(dtos);
+        }
+        
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+
+            if (isCount)
+            {
+                sql.Select(&quot;COUNT(*)&quot;)
+                    .From&lt;NodeDto&gt;()
+                    .InnerJoin&lt;ContentTypeDto&gt;().On&lt;ContentTypeDto, NodeDto&gt;(left =&gt; left.NodeId, right =&gt; right.NodeId)
+                    .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId);
+                return sql;
+            }
+
+            sql.Select(&quot;umbracoNode.*&quot;, &quot;cmsContentType.*&quot;, &quot;cmsPropertyType.id AS PropertyTypeId&quot;, &quot;cmsPropertyType.Alias&quot;,
+                &quot;cmsPropertyType.Name&quot;, &quot;cmsPropertyType.Description&quot;, &quot;cmsPropertyType.mandatory&quot;, &quot;cmsPropertyType.UniqueID&quot;,
+                &quot;cmsPropertyType.validationRegExp&quot;, &quot;cmsPropertyType.dataTypeId&quot;, &quot;cmsPropertyType.sortOrder AS PropertyTypeSortOrder&quot;,
+                &quot;cmsPropertyType.propertyTypeGroupId AS PropertyTypesGroupId&quot;, &quot;cmsMemberType.memberCanEdit&quot;, &quot;cmsMemberType.viewOnProfile&quot;,
+                &quot;cmsDataType.propertyEditorAlias&quot;, &quot;cmsDataType.dbType&quot;, &quot;cmsPropertyTypeGroup.id AS PropertyTypeGroupId&quot;, 
+                &quot;cmsPropertyTypeGroup.text AS PropertyGroupName&quot;, &quot;cmsPropertyTypeGroup.uniqueID AS PropertyGroupUniqueID&quot;,
+                &quot;cmsPropertyTypeGroup.sortorder AS PropertyGroupSortOrder&quot;, &quot;cmsPropertyTypeGroup.contenttypeNodeId&quot;)
+                .From&lt;NodeDto&gt;()
+                .InnerJoin&lt;ContentTypeDto&gt;().On&lt;ContentTypeDto, NodeDto&gt;(left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .LeftJoin&lt;PropertyTypeDto&gt;().On&lt;PropertyTypeDto, NodeDto&gt;(left =&gt; left.ContentTypeId, right =&gt; right.NodeId)
+                .LeftJoin&lt;MemberTypeDto&gt;().On&lt;MemberTypeDto, PropertyTypeDto&gt;(left =&gt; left.PropertyTypeId, right =&gt; right.Id)
+                .LeftJoin&lt;DataTypeDto&gt;().On&lt;DataTypeDto, PropertyTypeDto&gt;(left =&gt; left.DataTypeId, right =&gt; right.DataTypeId)
+                .LeftJoin&lt;PropertyTypeGroupDto&gt;().On&lt;PropertyTypeGroupDto, NodeDto&gt;(left =&gt; left.ContentTypeNodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId);
+            return sql;
+        }
+
+        protected Sql GetSubquery()
+        {
+            var sql = new Sql()
+                .Select(&quot;DISTINCT(umbracoNode.id)&quot;)
+                .From&lt;NodeDto&gt;()
+                .InnerJoin&lt;ContentTypeDto&gt;().On&lt;ContentTypeDto, NodeDto&gt;(left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .LeftJoin&lt;PropertyTypeDto&gt;().On&lt;PropertyTypeDto, NodeDto&gt;(left =&gt; left.ContentTypeId, right =&gt; right.NodeId)
+                .LeftJoin&lt;MemberTypeDto&gt;().On&lt;MemberTypeDto, PropertyTypeDto&gt;(left =&gt; left.PropertyTypeId, right =&gt; right.Id)
+                .LeftJoin&lt;DataTypeDto&gt;().On&lt;DataTypeDto, PropertyTypeDto&gt;(left =&gt; left.DataTypeId, right =&gt; right.DataTypeId)
+                .LeftJoin&lt;PropertyTypeGroupDto&gt;().On&lt;PropertyTypeGroupDto, NodeDto&gt;(left =&gt; left.ContentTypeNodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId);
+            return sql;
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoNode.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            var list = new List&lt;string&gt;
+                           {
+                               &quot;DELETE FROM umbracoUser2NodeNotify WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodePermission WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsTagRelationship WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentTypeAllowedContentType WHERE Id = @Id&quot;,
+                               &quot;DELETE FROM cmsContentTypeAllowedContentType WHERE AllowedId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentType2ContentType WHERE parentContentTypeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentType2ContentType WHERE childContentTypeId = @Id&quot;,
+                               &quot;DELETE FROM cmsPropertyType WHERE contentTypeId = @Id&quot;,
+                               &quot;DELETE FROM cmsPropertyTypeGroup WHERE contenttypeNodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsMemberType WHERE NodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentType WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoNode WHERE id = @Id&quot;
+                           };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { return new Guid(Constants.ObjectTypes.MemberType); }
+        }
+        
+        protected override void PersistNewItem(IMemberType entity)
+        {
+            ValidateAlias(entity);
+
+            ((MemberType)entity).AddingEntity();
+            
+            //set a default icon if one is not specified
+            if (entity.Icon.IsNullOrWhiteSpace())
+            {
+                entity.Icon = &quot;icon-user&quot;;
+            }
+
+            //By Convention we add 9 stnd PropertyTypes to an Umbraco MemberType
+            entity.AddPropertyGroup(Constants.Conventions.Member.StandardPropertiesGroupName);
+            var standardPropertyTypes = Constants.Conventions.Member.GetStandardPropertyTypeStubs();
+            foreach (var standardPropertyType in standardPropertyTypes)
+            {
+                entity.AddPropertyType(standardPropertyType.Value, Constants.Conventions.Member.StandardPropertiesGroupName);
+            }
+
+            var factory = new ContentTypeFactory();
+
+            EnsureExplicitDataTypeForBuiltInProperties(entity);
+            PersistNewBaseContentType(entity);
+
+            //Handles the MemberTypeDto (cmsMemberType table)
+            var memberTypeDtos = factory.BuildMemberTypeDtos(entity);
+            foreach (var memberTypeDto in memberTypeDtos)
+            {
+                Database.Insert(memberTypeDto);
+            }
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(IMemberType entity)
+        {
+            ValidateAlias(entity);
+
+            //Updates Modified date
+            ((MemberType)entity).UpdatingEntity();
+
+            //Look up parent to get and set the correct Path if ParentId has changed
+            if (entity.IsPropertyDirty(&quot;ParentId&quot;))
+            {
+                var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = entity.ParentId });
+                entity.Path = string.Concat(parent.Path, &quot;,&quot;, entity.Id);
+                entity.Level = parent.Level + 1;
+                var maxSortOrder =
+                    Database.ExecuteScalar&lt;int&gt;(
+                        &quot;SELECT coalesce(max(sortOrder),0) FROM umbracoNode WHERE parentid = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                        new { ParentId = entity.ParentId, NodeObjectType = NodeObjectTypeId });
+                entity.SortOrder = maxSortOrder + 1;
+            }
+
+            var factory = new ContentTypeFactory();
+
+            EnsureExplicitDataTypeForBuiltInProperties(entity);
+            PersistUpdatedBaseContentType(entity);
+
+            // remove and insert - handle cmsMemberType table
+            Database.Delete&lt;MemberTypeDto&gt;(&quot;WHERE NodeId = @Id&quot;, new { Id = entity.Id });
+            var memberTypeDtos = factory.BuildMemberTypeDtos(entity);
+            foreach (var memberTypeDto in memberTypeDtos)
+            {
+                Database.Insert(memberTypeDto);
+            }
+
+            entity.ResetDirtyProperties();
+        }
+        
+        /// &lt;summary&gt;
+        /// Override so we can specify explicit db type&#39;s on any property types that are built-in.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;propertyEditorAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dbType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;propertyTypeAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected override PropertyType CreatePropertyType(string propertyEditorAlias, DataTypeDatabaseType dbType, string propertyTypeAlias)
+        {
+            //custom property type constructor logic to set explicit dbtype&#39;s for built in properties
+            var stdProps = Constants.Conventions.Member.GetStandardPropertyTypeStubs();
+            var propDbType = GetDbTypeForBuiltInProperty(propertyTypeAlias, dbType, stdProps);
+            return new PropertyType(propertyEditorAlias, propDbType.Result,
+                //This flag tells the property type that it has an explicit dbtype and that it cannot be changed
+                // which is what we want for the built-in properties.
+                propDbType.Success,
+                propertyTypeAlias);
+        }
+
+        protected override IMemberType PerformGet(Guid id)
+        {
+            //use the underlying GetAll which will force cache all content types
+            return GetAll().FirstOrDefault(x =&gt; x.Key == id);
+        }
+
+        protected override IEnumerable&lt;IMemberType&gt; PerformGetAll(params Guid[] ids)
+        {
+            //use the underlying GetAll which will force cache all content types
+
+            if (ids.Any())
+            {
+                return GetAll().Where(x =&gt; ids.Contains(x.Key));
+            }
+            else
+            {
+                return GetAll();
+            }
+        }
+
+        protected override bool PerformExists(Guid id)
+        {
+            return GetAll().FirstOrDefault(x =&gt; x.Key == id) != null;
+        }
+
+        protected override IMemberType PerformGet(string alias)
+        {
+            //use the underlying GetAll which will force cache all content types
+            return GetAll().FirstOrDefault(x =&gt; x.Alias.InvariantEquals(alias));
+        }
+
+        /// &lt;summary&gt;
+        /// Ensure that all the built-in membership provider properties have their correct data type
+        /// and property editors assigned. This occurs prior to saving so that the correct values are persisted.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;memberType&quot;&gt;&lt;/param&gt;
+        private static void EnsureExplicitDataTypeForBuiltInProperties(IContentTypeBase memberType)
+        {
+            var stdProps = Constants.Conventions.Member.GetStandardPropertyTypeStubs();
+            foreach (var propertyType in memberType.PropertyTypes)
+            {
+                var dbTypeAttempt = GetDbTypeForBuiltInProperty(propertyType.Alias, propertyType.DataTypeDatabaseType, stdProps);
+                if (dbTypeAttempt)
+                {
+                    //this reset&#39;s it&#39;s current data type reference which will be re-assigned based on the property editor assigned on the next line
+                    propertyType.DataTypeDefinitionId = 0;
+                    propertyType.DataTypeId = GetPropertyEditorForBuiltInProperty(propertyType.Alias, propertyType.DataTypeId, stdProps).Result;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Builds a collection of entities from a collection of Dtos
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dtos&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private static IEnumerable&lt;IMemberType&gt; BuildFromDtos(List&lt;MemberTypeReadOnlyDto&gt; dtos)
+        {
+            if (dtos == null || dtos.Any() == false)
+                return Enumerable.Empty&lt;IMemberType&gt;();
+
+            var factory = new MemberTypeReadOnlyFactory();
+            return dtos.Select(factory.BuildEntity);
+        }
+
+        /// &lt;summary&gt;
+        /// If this is one of our internal properties - we will manually assign the data type since they must 
+        /// always correspond to the correct db type no matter what the backing data type is assigned.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;propAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dbType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;standardProps&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// Successful attempt if it was a built in property
+        /// &lt;/returns&gt;
+        internal static Attempt&lt;DataTypeDatabaseType&gt; GetDbTypeForBuiltInProperty(
+            string propAlias,
+            DataTypeDatabaseType dbType,
+            Dictionary&lt;string, PropertyType&gt; standardProps)
+        {
+            var aliases = standardProps.Select(x =&gt; x.Key).ToArray();
+
+            //check if it is built in
+            if (aliases.Contains(propAlias))
+            {
+                //return the pre-determined db type for this property
+                return Attempt&lt;DataTypeDatabaseType&gt;.Succeed(standardProps.Single(x =&gt; x.Key == propAlias).Value.DataTypeDatabaseType);
+            }
+
+            return Attempt&lt;DataTypeDatabaseType&gt;.Fail(dbType);
+        }
+
+        /// &lt;summary&gt;
+        /// 
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;propAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;propertyEditor&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;standardProps&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// Successful attempt if it was a built in property
+        /// &lt;/returns&gt;
+        internal static Attempt&lt;Guid&gt; GetPropertyEditorForBuiltInProperty(
+            string propAlias,
+            Guid propertyEditor,
+            Dictionary&lt;string, PropertyType&gt; standardProps)
+        {
+            var aliases = standardProps.Select(x =&gt; x.Key).ToArray();
+
+            //check if it is built in
+            if (aliases.Contains(propAlias))
+            {
+                //return the pre-determined db type for this property
+                return Attempt&lt;Guid&gt;.Succeed(standardProps.Single(x =&gt; x.Key == propAlias).Value.DataTypeId);
+            }
+
+            return Attempt&lt;Guid&gt;.Fail(propertyEditor);
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[26,15,26,51,1],[27,9,27,10,1],[28,9,28,10,1],[34,13,34,14,1],[36,17,37,54,1],[37,54,37,69,1],[37,69,39,37,1],[36,17,39,37,1],[40,13,40,14,1],[44,9,44,10,0],[46,13,46,49,0],[46,49,46,59,0],[46,59,46,61,0],[46,13,46,61,0],[47,9,47,10,0],[50,9,50,10,1],[51,13,51,43,1],[52,13,52,27,1],[53,13,53,14,0],[55,17,55,69,0],[55,69,55,109,0],[55,109,55,112,0],[55,17,55,112,0],[56,17,56,38,0],[57,13,57,14,0],[58,13,58,70,1],[60,13,62,70,1],[64,13,64,40,1],[65,9,65,10,1],[68,9,68,10,0],[69,13,69,45,0],[70,13,70,81,0],[71,13,71,51,0],[72,13,74,64,0],[76,13,78,70,0],[80,13,80,40,0],[81,9,81,10,0],[84,9,84,10,1],[85,13,85,33,1],[87,13,87,25,1],[88,13,88,14,0],[89,17,92,80,0],[93,17,93,28,0],[96,13,109,76,1],[110,13,110,24,1],[111,9,111,10,1],[114,9,114,10,0],[115,13,123,76,0],[124,13,124,24,0],[125,9,125,10,0],[128,9,128,10,0],[129,13,129,43,0],[130,9,130,10,0],[133,9,133,10,1],[134,13,148,30,1],[149,13,149,25,1],[150,9,150,10,1],[154,17,154,18,1],[154,19,154,69,1],[154,70,154,71,1],[158,9,158,10,1],[159,13,159,35,1],[161,13,161,49,1],[164,13,164,50,1],[165,13,165,14,0],[166,17,166,43,0],[167,13,167,14,0],[170,13,170,95,1],[171,13,171,101,1],[172,13,172,20,1],[172,22,172,46,1],[172,47,172,49,1],[172,50,172,71,1],[173,13,173,14,1],[174,17,174,126,1],[175,13,175,14,1],[177,13,177,52,1],[179,13,179,64,1],[180,13,180,47,1],[183,13,183,70,1],[184,13,184,20,1],[184,22,184,39,1],[184,40,184,42,1],[184,43,184,57,1],[185,13,185,14,1],[186,17,186,48,1],[187,13,187,14,1],[189,13,189,43,1],[190,9,190,10,1],[193,9,193,10,1],[194,13,194,35,1],[197,13,197,51,1],[200,13,200,52,1],[201,13,201,14,0],[202,17,202,114,0],[203,17,203,74,0],[204,17,204,49,0],[205,17,208,96,0],[209,17,209,53,0],[210,13,210,14,0],[212,13,212,52,1],[214,13,214,64,1],[215,13,215,51,1],[218,13,218,90,1],[219,13,219,70,1],[220,13,220,20,1],[220,22,220,39,1],[220,40,220,42,1],[220,43,220,57,1],[221,13,221,14,1],[222,17,222,48,1],[223,13,223,14,1],[225,13,225,43,1],[226,9,226,10,1],[236,9,236,10,0],[238,13,238,88,0],[239,13,239,95,0],[240,13,244,36,0],[245,9,245,10,0],[248,9,248,10,1],[250,13,250,49,1],[250,49,250,60,1],[250,60,250,62,1],[250,13,250,62,1],[251,9,251,10,1],[254,9,254,10,1],[257,13,257,27,1],[258,13,258,14,1],[259,17,259,44,1],[259,44,259,63,1],[259,63,259,65,1],[259,17,259,65,1],[262,13,262,14,1],[263,17,263,33,1],[265,9,265,10,1],[268,9,268,10,0],[269,13,269,49,0],[269,49,269,60,0],[269,60,269,70,0],[269,13,269,70,0],[270,9,270,10,0],[273,9,273,10,0],[275,13,275,49,0],[275,49,275,79,0],[275,79,275,81,0],[275,13,275,81,0],[276,9,276,10,0],[284,9,284,10,1],[285,13,285,88,1],[286,13,286,20,1],[286,22,286,38,1],[286,39,286,41,1],[286,42,286,66,1],[287,13,287,14,1],[288,17,288,130,1],[289,17,289,35,1],[290,17,290,18,1],[292,21,292,59,1],[293,21,293,145,1],[294,17,294,18,1],[295,13,295,14,1],[296,9,296,10,1],[304,9,304,10,1],[305,13,305,53,1],[306,17,306,56,0],[308,13,308,59,1],[309,13,309,53,1],[310,9,310,10,1],[326,9,326,10,1],[327,13,327,53,1],[327,53,327,58,1],[327,58,327,70,1],[327,13,327,70,1],[330,13,330,45,1],[331,13,331,14,1],[333,17,333,88,1],[333,88,333,106,1],[333,106,333,136,1],[333,17,333,136,1],[336,13,336,63,1],[337,9,337,10,1],[352,9,352,10,1],[353,13,353,53,1],[353,53,353,58,1],[353,58,353,70,1],[353,13,353,70,1],[356,13,356,45,1],[357,13,357,14,1],[359,17,359,72,1],[359,72,359,90,1],[359,90,359,110,1],[359,17,359,110,1],[362,13,362,55,0],[363,9,363,10,1]]);
+    </script>
+  </body>
+</html>

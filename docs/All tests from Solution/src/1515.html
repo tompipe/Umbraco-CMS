@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\LocalizedTextService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Xml;
+using System.Xml.Linq;
+using System.Xml.XPath;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Core.Services
+{
+    //TODO: Convert all of this over to Niels K&#39;s localization framework one day
+
+    public class LocalizedTextService : ILocalizedTextService
+    {
+        private readonly ILogger _logger;
+        private readonly Lazy&lt;LocalizedTextServiceFileSources&gt; _fileSources;
+        private readonly IDictionary&lt;CultureInfo, IDictionary&lt;string, IDictionary&lt;string, string&gt;&gt;&gt; _dictionarySource;
+        private readonly IDictionary&lt;CultureInfo, Lazy&lt;XDocument&gt;&gt; _xmlSource;
+
+        /// &lt;summary&gt;
+        /// Initializes with a file sources instance
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;fileSources&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        public LocalizedTextService(Lazy&lt;LocalizedTextServiceFileSources&gt; fileSources, ILogger logger)
+        {
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            _logger = logger;
+            if (fileSources == null) throw new ArgumentNullException(&quot;fileSources&quot;);
+            _fileSources = fileSources;
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes with an XML source
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;source&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        public LocalizedTextService(IDictionary&lt;CultureInfo, Lazy&lt;XDocument&gt;&gt; source, ILogger logger)
+        {
+            if (source == null) throw new ArgumentNullException(&quot;source&quot;);
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            _xmlSource = source;
+            _logger = logger;
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes with a source of a dictionary of culture -&gt; areas -&gt; sub dictionary of keys/values
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;source&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        public LocalizedTextService(IDictionary&lt;CultureInfo, IDictionary&lt;string, IDictionary&lt;string, string&gt;&gt;&gt; source, ILogger logger)
+        {            
+            if (source == null) throw new ArgumentNullException(&quot;source&quot;);
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            _dictionarySource = source;
+            _logger = logger;
+        }
+
+        public string Localize(string key, CultureInfo culture, IDictionary&lt;string, string&gt; tokens = null)
+        {
+            Mandate.ParameterNotNull(culture, &quot;culture&quot;);
+
+            //TODO: Hack, see notes on ConvertToSupportedCultureWithRegionCode
+            culture = ConvertToSupportedCultureWithRegionCode(culture);
+
+            //This is what the legacy ui service did
+            if (string.IsNullOrEmpty(key))
+                return string.Empty;
+
+            var keyParts = key.Split(new[] {&#39;/&#39;}, StringSplitOptions.RemoveEmptyEntries);
+            var area = keyParts.Length &gt; 1 ? keyParts[0] : null;
+            var alias = keyParts.Length &gt; 1 ? keyParts[1] : keyParts[0];
+
+            var xmlSource = _xmlSource ?? (_fileSources != null
+                ? _fileSources.Value.GetXmlSources()
+                : null);
+
+            if (xmlSource != null)
+            {
+                return GetFromXmlSource(xmlSource, culture, area, alias, tokens);
+            }          
+            else
+            {
+                return GetFromDictionarySource(culture, area, alias, tokens);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all key/values in storage for the given culture
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IDictionary&lt;string, string&gt; GetAllStoredValues(CultureInfo culture)
+        {
+            if (culture == null) throw new ArgumentNullException(&quot;culture&quot;);
+
+            //TODO: Hack, see notes on ConvertToSupportedCultureWithRegionCode
+            culture = ConvertToSupportedCultureWithRegionCode(culture);
+
+            var result = new Dictionary&lt;string, string&gt;();
+
+            var xmlSource = _xmlSource ?? (_fileSources != null
+                ? _fileSources.Value.GetXmlSources()
+                : null);
+
+            if (xmlSource != null)
+            {
+                if (xmlSource.ContainsKey(culture) == false)
+                {
+                    _logger.Warn&lt;LocalizedTextService&gt;(&quot;The culture specified {0} was not found in any configured sources for this service&quot;, () =&gt; culture);
+                    return result;
+                }
+
+                //convert all areas + keys to a single key with a &#39;/&#39;
+                result = GetStoredTranslations(xmlSource, culture);
+
+                //merge with the english file in case there&#39;s keys in there that don&#39;t exist in the local file
+                var englishCulture = new CultureInfo(&quot;en-US&quot;);
+                if (culture.Equals(englishCulture) == false)
+                {
+                    var englishResults = GetStoredTranslations(xmlSource, englishCulture);
+                    foreach (var englishResult in englishResults.Where(englishResult =&gt; result.ContainsKey(englishResult.Key) == false))
+                        result.Add(englishResult.Key, englishResult.Value);
+                }
+            }
+            else
+            {
+                if (_dictionarySource.ContainsKey(culture) == false)
+                {
+                    _logger.Warn&lt;LocalizedTextService&gt;(&quot;The culture specified {0} was not found in any configured sources for this service&quot;, () =&gt; culture);
+                    return result;
+                }
+
+                //convert all areas + keys to a single key with a &#39;/&#39;
+                foreach (var area in _dictionarySource[culture])
+                {
+                    foreach (var key in area.Value)
+                    {
+                        var dictionaryKey = string.Format(&quot;{0}/{1}&quot;, area.Key, key.Key);
+                        //i don&#39;t think it&#39;s possible to have duplicates because we&#39;re dealing with a dictionary in the first place, but we&#39;ll double check here just in case.
+                        if (result.ContainsKey(dictionaryKey) == false)
+                        {
+                            result.Add(dictionaryKey, key.Value);
+                        }
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        private Dictionary&lt;string, string&gt; GetStoredTranslations(IDictionary&lt;CultureInfo, Lazy&lt;XDocument&gt;&gt; xmlSource, CultureInfo cult)
+        {
+            var result = new Dictionary&lt;string, string&gt;();
+            var areas = xmlSource[cult].Value.XPathSelectElements(&quot;//area&quot;);
+            foreach (var area in areas)
+            {
+                var keys = area.XPathSelectElements(&quot;./key&quot;);
+                foreach (var key in keys)
+                {
+                    var dictionaryKey = string.Format(&quot;{0}/{1}&quot;, (string)area.Attribute(&quot;alias&quot;),
+                        (string)key.Attribute(&quot;alias&quot;));
+                    //there could be duplicates if the language file isn&#39;t formatted nicely - which is probably the case for quite a few lang files
+                    if (result.ContainsKey(dictionaryKey) == false)
+                        result.Add(dictionaryKey, key.Value);
+                }
+            }
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a list of all currently supported cultures
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;CultureInfo&gt; GetSupportedCultures()
+        {
+            var xmlSource = _xmlSource ?? (_fileSources != null
+                ? _fileSources.Value.GetXmlSources()
+                : null);
+
+            return xmlSource != null ? xmlSource.Keys : _dictionarySource.Keys;
+        }
+
+        /// &lt;summary&gt;
+        /// Tries to resolve a full 4 letter culture from a 2 letter culture name
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;currentCulture&quot;&gt;
+        /// The culture to determine if it is only a 2 letter culture, if so we&#39;ll try to convert it, otherwise it will just be returned
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// TODO: This is just a hack due to the way we store the language files, they should be stored with 4 letters since that 
+        /// is what they reference but they are stored with 2, further more our user&#39;s languages are stored with 2. So this attempts
+        /// to resolve the full culture if possible.
+        /// 
+        /// This only works when this service is constructed with the LocalizedTextServiceFileSources
+        /// &lt;/remarks&gt;
+        public CultureInfo ConvertToSupportedCultureWithRegionCode(CultureInfo currentCulture)
+        {
+            if (currentCulture == null) throw new ArgumentNullException(&quot;currentCulture&quot;);
+            
+            if (_fileSources == null) return currentCulture;
+            if (currentCulture.Name.Length &gt; 2) return currentCulture;
+
+            var attempt = _fileSources.Value.TryConvert2LetterCultureTo4Letter(currentCulture.TwoLetterISOLanguageName);
+            return attempt ? attempt.Result : currentCulture;
+        }
+
+        /// &lt;summary&gt;
+        /// HAAAAAAAAAAACK! Used for backwards compat to convert a user&#39;s real culture code to a region code - normally this would be two letters
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;currentCulture&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public string ConvertToRegionCodeFromSupportedCulture(CultureInfo currentCulture)
+        {
+            if (currentCulture == null) throw new ArgumentNullException(&quot;currentCulture&quot;);
+
+            if (_fileSources == null) return currentCulture.Name;
+            
+            var attempt = _fileSources.Value.TryConvert4LetterCultureTo2Letter(currentCulture);
+            return attempt 
+                ? attempt.Result 
+                : currentCulture.Name;
+        }
+
+        private string GetFromDictionarySource(CultureInfo culture, string area, string key, IDictionary&lt;string, string&gt; tokens)
+        {
+            if (_dictionarySource.ContainsKey(culture) == false)
+            {
+                _logger.Warn&lt;LocalizedTextService&gt;(&quot;The culture specified {0} was not found in any configured sources for this service&quot;, () =&gt; culture);
+                return &quot;[&quot; + key + &quot;]&quot;;  
+            }
+
+            var cultureSource = _dictionarySource[culture];
+            
+            string found;
+            if (area.IsNullOrWhiteSpace())
+            {
+                found = cultureSource
+                    .SelectMany(x =&gt; x.Value)
+                    .Where(keyvals =&gt; keyvals.Key.InvariantEquals(key))
+                    .Select(x =&gt; x.Value)
+                    .FirstOrDefault();
+            }
+            else
+            {
+                found = cultureSource
+                    .Where(areas =&gt; areas.Key.InvariantEquals(area))
+                    .SelectMany(a =&gt; a.Value)
+                    .Where(keyvals =&gt; keyvals.Key.InvariantEquals(key))
+                    .Select(x =&gt; x.Value)
+                    .FirstOrDefault();
+            }
+
+            if (found != null)
+            {
+                return ParseTokens(found, tokens);
+            }
+
+            //NOTE: Based on how legacy works, the default text does not contain the area, just the key
+            return &quot;[&quot; + key + &quot;]&quot;;
+        }
+
+        private string GetFromXmlSource(IDictionary&lt;CultureInfo, Lazy&lt;XDocument&gt;&gt; xmlSource, CultureInfo culture, string area, string key, IDictionary&lt;string, string&gt; tokens)
+        {
+            if (xmlSource.ContainsKey(culture) == false)
+            {
+                _logger.Warn&lt;LocalizedTextService&gt;(&quot;The culture specified {0} was not found in any configured sources for this service&quot;, () =&gt; culture);
+                return &quot;[&quot; + key + &quot;]&quot;;                
+            }
+
+            var found = FindTranslation(xmlSource, culture, area, key);
+
+            if (found != null)
+            {
+                return ParseTokens(found.Value, tokens);
+            }
+            
+            // Fall back to English by default if we can&#39;t find the key
+            found = FindTranslation(xmlSource, new CultureInfo(&quot;en-US&quot;), area, key);
+            if (found != null)
+                return ParseTokens(found.Value, tokens);
+
+            // If it can&#39;t be found in either file, fall back  to the default, showing just the key in square brackets
+            // NOTE: Based on how legacy works, the default text does not contain the area, just the key
+            return &quot;[&quot; + key + &quot;]&quot;;
+        }
+
+        private XElement FindTranslation(IDictionary&lt;CultureInfo, Lazy&lt;XDocument&gt;&gt; xmlSource, CultureInfo culture, string area, string key)
+        {
+            var cultureSource = xmlSource[culture].Value;
+
+            var xpath = area.IsNullOrWhiteSpace()
+                ? string.Format(&quot;//key [@alias = &#39;{0}&#39;]&quot;, key)
+                : string.Format(&quot;//area [@alias = &#39;{0}&#39;]/key [@alias = &#39;{1}&#39;]&quot;, area, key);
+
+            var found = cultureSource.XPathSelectElement(xpath);
+            return found;
+        }
+
+        /// &lt;summary&gt;
+        /// Parses the tokens in the value
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;tokens&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This is based on how the legacy ui localized text worked, each token was just a sequential value delimited with a % symbol. 
+        /// For example: hello %0%, you are %1% !
+        /// 
+        /// Since we&#39;re going to continue using the same language files for now, the token system needs to remain the same. With our new service
+        /// we support a dictionary which means in the future we can really have any sort of token system. 
+        /// Currently though, the token key&#39;s will need to be an integer and sequential - though we aren&#39;t going to throw exceptions if that is not the case.
+        /// &lt;/remarks&gt;
+        internal static string ParseTokens(string value, IDictionary&lt;string, string&gt; tokens)
+        {
+            if (tokens == null || tokens.Any() == false)
+            {
+                return value;
+            }
+
+            foreach (var token in tokens)
+            {
+                value = value.Replace(string.Format(&quot;{0}{1}{0}&quot;, &quot;%&quot;, token.Key), token.Value);
+            }
+
+            return value;
+        }
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[26,9,26,103,1],[27,9,27,10,1],[28,13,28,32,1],[28,33,28,75,0],[29,13,29,30,1],[30,13,30,37,1],[30,38,30,85,0],[31,13,31,40,1],[32,9,32,10,1],[39,9,39,102,1],[40,9,40,10,1],[41,13,41,32,1],[41,33,41,75,0],[42,13,42,32,1],[42,33,42,75,0],[43,13,43,33,1],[44,13,44,30,1],[45,9,45,10,1],[52,9,52,135,1],[53,9,53,10,1],[54,13,54,32,1],[54,33,54,75,0],[55,13,55,32,1],[55,33,55,75,0],[56,13,56,40,1],[57,13,57,30,1],[58,9,58,10,1],[61,9,61,10,1],[62,13,62,58,1],[65,13,65,72,1],[68,13,68,43,1],[69,17,69,37,0],[71,13,71,90,1],[72,13,72,65,1],[73,13,73,73,1],[75,13,77,25,1],[79,13,79,35,1],[80,13,80,14,1],[81,17,81,82,1],[84,13,84,14,1],[85,17,85,78,1],[87,9,87,10,1],[94,9,94,10,1],[95,13,95,33,1],[95,34,95,77,0],[98,13,98,72,1],[100,13,100,59,1],[102,13,104,25,1],[106,13,106,35,1],[107,13,107,14,1],[108,17,108,61,1],[109,17,109,18,0],[110,21,110,148,0],[110,148,110,155,0],[110,155,110,157,0],[110,21,110,157,0],[111,21,111,35,0],[115,17,115,68,1],[118,17,118,63,1],[119,17,119,61,1],[120,17,120,18,0],[121,21,121,91,0],[122,21,122,28,0],[122,30,122,47,0],[122,48,122,50,0],[122,51,122,89,0],[122,89,122,135,0],[122,135,122,136,0],[122,51,122,136,0],[123,25,123,76,0],[124,17,124,18,0],[125,13,125,14,1],[127,13,127,14,1],[128,17,128,69,1],[129,17,129,18,0],[130,21,130,148,0],[130,148,130,155,0],[130,155,130,157,0],[130,21,130,157,0],[131,21,131,35,0],[135,17,135,24,1],[135,26,135,34,1],[135,35,135,37,1],[135,38,135,64,1],[136,17,136,18,1],[137,21,137,28,1],[137,30,137,37,1],[137,38,137,40,1],[137,41,137,51,1],[138,21,138,22,1],[139,25,139,89,1],[141,25,141,72,1],[142,25,142,26,1],[143,29,143,66,1],[144,25,144,26,1],[145,21,145,22,1],[146,17,146,18,1],[147,13,147,14,1],[149,13,149,27,1],[150,9,150,10,1],[153,9,153,10,1],[154,13,154,59,1],[155,13,155,77,1],[156,13,156,20,1],[156,22,156,30,1],[156,31,156,33,1],[156,34,156,39,1],[157,13,157,14,1],[158,17,158,62,1],[159,17,159,24,1],[159,26,159,33,1],[159,34,159,36,1],[159,37,159,41,1],[160,17,160,18,1],[161,21,162,57,1],[164,21,164,68,1],[165,25,165,62,1],[166,17,166,18,1],[167,13,167,14,1],[168,13,168,27,1],[169,9,169,10,1],[176,9,176,10,0],[177,13,179,25,0],[181,13,181,80,0],[182,9,182,10,0],[199,9,199,10,1],[200,13,200,40,1],[200,41,200,91,0],[202,13,202,38,1],[202,39,202,61,1],[203,13,203,48,1],[203,49,203,71,1],[205,13,205,121,1],[206,13,206,62,1],[207,9,207,10,1],[215,9,215,10,0],[216,13,216,40,0],[216,41,216,91,0],[218,13,218,38,0],[218,39,218,66,0],[220,13,220,96,0],[221,13,223,39,0],[224,9,224,10,0],[227,9,227,10,1],[228,13,228,65,1],[229,13,229,14,1],[230,17,230,144,1],[230,144,230,151,0],[230,151,230,153,1],[230,17,230,153,1],[231,17,231,40,1],[234,13,234,60,1],[237,13,237,43,1],[238,13,238,14,1],[239,17,240,38,1],[240,38,240,45,1],[240,45,241,39,1],[241,39,241,71,1],[241,71,242,34,1],[242,34,242,41,1],[242,41,243,39,1],[239,17,243,39,1],[244,13,244,14,1],[246,13,246,14,1],[247,17,248,37,1],[248,37,248,68,1],[248,68,249,38,1],[249,38,249,45,1],[249,45,250,39,1],[250,39,250,71,1],[250,71,251,34,1],[251,34,251,41,1],[251,41,252,39,1],[247,17,252,39,1],[253,13,253,14,1],[255,13,255,31,1],[256,13,256,14,1],[257,17,257,51,1],[261,13,261,36,1],[262,9,262,10,1],[265,9,265,10,1],[266,13,266,57,1],[267,13,267,14,1],[268,17,268,144,1],[268,144,268,151,1],[268,151,268,153,1],[268,17,268,153,1],[269,17,269,40,1],[272,13,272,72,1],[274,13,274,31,1],[275,13,275,14,1],[276,17,276,57,1],[280,13,280,85,1],[281,13,281,31,1],[282,17,282,57,0],[286,13,286,36,1],[287,9,287,10,1],[290,9,290,10,1],[291,13,291,58,1],[293,13,295,92,1],[297,13,297,65,1],[298,13,298,26,1],[299,9,299,10,1],[316,9,316,10,1],[317,13,317,57,1],[318,13,318,14,1],[319,17,319,30,1],[322,13,322,20,1],[322,22,322,31,1],[322,32,322,34,1],[322,35,322,41,1],[323,13,323,14,1],[324,17,324,96,1],[325,13,325,14,1],[327,13,327,26,1],[328,9,328,10,1]]);
+    </script>
+  </body>
+</html>

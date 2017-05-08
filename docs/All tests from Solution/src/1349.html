@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Editors\BackOfficeController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web;
+using System.Web.Configuration;
+using System.Web.Mvc;
+using System.Web.UI;
+using ClientDependency.Core.Config;
+using Microsoft.AspNet.Identity;
+using Microsoft.AspNet.Identity.Owin;
+using Microsoft.Owin.Security;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Manifest;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Identity;
+using Umbraco.Core.Security;
+using Umbraco.Web.HealthCheck;
+using Umbraco.Web.Models;
+using Umbraco.Web.Models.ContentEditing;
+using Umbraco.Web.Mvc;
+using Umbraco.Web.PropertyEditors;
+using Umbraco.Web.Security.Identity;
+using Umbraco.Web.Trees;
+using Umbraco.Web.UI.JavaScript;
+using Umbraco.Web.WebApi.Filters;
+using Umbraco.Web.WebServices;
+using Umbraco.Core.Services;
+using Umbraco.Web.Security;
+using Action = umbraco.BusinessLogic.Actions.Action;
+using Constants = Umbraco.Core.Constants;
+
+namespace Umbraco.Web.Editors
+{
+    /// &lt;summary&gt;
+    /// A controller to render out the default back office view and JS results
+    /// &lt;/summary&gt;
+    [UmbracoRequireHttps]
+    [DisableClientCache]
+    public class BackOfficeController : UmbracoController
+    {
+        private BackOfficeUserManager&lt;BackOfficeIdentityUser&gt; _userManager;
+        private BackOfficeSignInManager _signInManager;
+
+        private const string TokenExternalSignInError = &quot;ExternalSignInError&quot;;
+        private const string TokenPasswordResetCode = &quot;PasswordResetCode&quot;;
+        private static readonly string[] TempDataTokenNames = { TokenExternalSignInError, TokenPasswordResetCode };
+
+        protected BackOfficeSignInManager SignInManager
+        {
+            get { return _signInManager ?? (_signInManager = OwinContext.GetBackOfficeSignInManager()); }
+        }
+        protected BackOfficeUserManager&lt;BackOfficeIdentityUser&gt; UserManager
+        {
+            get { return _userManager ?? (_userManager = OwinContext.GetBackOfficeUserManager()); }
+        }
+
+        protected IAuthenticationManager AuthenticationManager
+        {
+            get { return OwinContext.Authentication; }
+        }
+
+        /// &lt;summary&gt;
+        /// Render the default view
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public async Task&lt;ActionResult&gt; Default()
+        {
+            return await RenderDefaultOrProcessExternalLoginAsync(
+                () =&gt; View(GlobalSettings.Path.EnsureEndsWith(&#39;/&#39;) + &quot;Views/Default.cshtml&quot;),
+                () =&gt; View(GlobalSettings.Path.EnsureEndsWith(&#39;/&#39;) + &quot;Views/Default.cshtml&quot;));
+        }
+
+        /// &lt;summary&gt;
+        /// This Action is used by the installer when an upgrade is detected but the admin user is not logged in. We need to 
+        /// ensure the user is authenticated before the install takes place so we redirect here to show the standard login screen.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;      
+        [HttpGet]
+        public async Task&lt;ActionResult&gt; AuthorizeUpgrade()
+        {
+            return await RenderDefaultOrProcessExternalLoginAsync(
+                //The default view to render when there is no external login info or errors
+                () =&gt; View(GlobalSettings.Path.EnsureEndsWith(&#39;/&#39;) + &quot;Views/AuthorizeUpgrade.cshtml&quot;),
+                //The ActionResult to perform if external login is successful
+                () =&gt; Redirect(&quot;/&quot;));
+        }
+
+        /// &lt;summary&gt;
+        /// Get the json localized text for a given culture or the culture for the current user
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;culture&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpGet]
+        public JsonNetResult LocalizedText(string culture = null)
+        {
+            var cultureInfo = string.IsNullOrWhiteSpace(culture)
+                //if the user is logged in, get their culture, otherwise default to &#39;en&#39;
+                ? Security.IsAuthenticated()
+                    //current culture is set at the very beginning of each request
+                    ? Thread.CurrentThread.CurrentCulture
+                    : CultureInfo.GetCultureInfo(&quot;en&quot;)
+                : CultureInfo.GetCultureInfo(culture);
+
+            var textForCulture = Services.TextService.GetAllStoredValues(cultureInfo)
+                //the dictionary returned is fine but the delimiter between an &#39;area&#39; and a &#39;value&#39; is a &#39;/&#39; but the javascript
+                // in the back office requres the delimiter to be a &#39;_&#39; so we&#39;ll just replace it
+                .ToDictionary(key =&gt; key.Key.Replace(&quot;/&quot;, &quot;_&quot;), val =&gt; val.Value);
+
+            return new JsonNetResult { Data = textForCulture, Formatting = Formatting.Indented };
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the JavaScript main file including all references found in manifests
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [MinifyJavaScriptResult(Order = 0)]
+        [OutputCache(Order = 1, VaryByParam = &quot;none&quot;, Location = OutputCacheLocation.Server, Duration = 5000)]
+        public JavaScriptResult Application()
+        {
+            var plugins = new DirectoryInfo(Server.MapPath(&quot;~/App_Plugins&quot;));
+            var parser = new ManifestParser(plugins, ApplicationContext.ApplicationCache.RuntimeCache);
+            var initJs = new JsInitialization(parser);
+            var initCss = new CssInitialization(parser);
+
+            //get the legacy ActionJs file references to append as well
+            var legacyActionJsRef = new JArray(GetLegacyActionJs(LegacyJsActionType.JsUrl));
+
+            var result = initJs.GetJavascriptInitialization(HttpContext, JsInitialization.GetDefaultInitialization(), legacyActionJsRef);
+            result += initCss.GetStylesheetInitialization(HttpContext);
+
+            return JavaScript(result);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a js array of all of the manifest assets
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [UmbracoAuthorize(Order = 0)]
+        [HttpGet]
+        public JsonNetResult GetManifestAssetList()
+        {
+            Func&lt;JArray&gt; getResult = () =&gt;
+            {
+                var plugins = new DirectoryInfo(Server.MapPath(&quot;~/App_Plugins&quot;));
+                var parser = new ManifestParser(plugins, ApplicationContext.ApplicationCache.RuntimeCache);
+                var initJs = new JsInitialization(parser);
+                var initCss = new CssInitialization(parser);
+                var jsResult = initJs.GetJavascriptInitializationArray(HttpContext, new JArray());
+                var cssResult = initCss.GetStylesheetInitializationArray(HttpContext);
+                ManifestParser.MergeJArrays(jsResult, cssResult);
+                return jsResult;
+            };
+
+            //cache the result if debugging is disabled
+            var result = HttpContext.IsDebuggingEnabled
+                ? getResult()
+                : ApplicationContext.ApplicationCache.RuntimeCache.GetCacheItem&lt;JArray&gt;(
+                    typeof(BackOfficeController) + &quot;GetManifestAssetList&quot;,
+                    () =&gt; getResult(),
+                    new TimeSpan(0, 10, 0));
+
+            return new JsonNetResult { Data = result, Formatting = Formatting.Indented };
+        }
+
+        [UmbracoAuthorize(Order = 0)]
+        [HttpGet]
+        public JsonNetResult GetGridConfig()
+        {
+            var gridConfig = UmbracoConfig.For.GridConfig(
+                Logger,
+                ApplicationContext.ApplicationCache.RuntimeCache,
+                new DirectoryInfo(Server.MapPath(SystemDirectories.AppPlugins)),
+                new DirectoryInfo(Server.MapPath(SystemDirectories.Config)),
+                HttpContext.IsDebuggingEnabled);
+
+            return new JsonNetResult { Data = gridConfig.EditorsConfig.Editors, Formatting = Formatting.Indented };
+        }
+
+        private string GetMaxRequestLength()
+        {
+            var section = ConfigurationManager.GetSection(&quot;system.web/httpRuntime&quot;) as HttpRuntimeSection;
+            if (section == null) return string.Empty;
+            return section.MaxRequestLength.ToString();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the JavaScript object representing the static server variables javascript object
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [UmbracoAuthorize(Order = 0)]
+        [MinifyJavaScriptResult(Order = 1)]
+        public JavaScriptResult ServerVariables()
+        {
+            Func&lt;string&gt; getResult = () =&gt;
+            {
+                var defaultVals = new Dictionary&lt;string, object&gt;
+                {
+                    {
+                        &quot;umbracoUrls&quot;, new Dictionary&lt;string, object&gt;
+                        {
+                            //TODO: Add &#39;umbracoApiControllerBaseUrl&#39; which people can use in JS
+                            // to prepend their URL. We could then also use this in our own resources instead of
+                            // having each url defined here explicitly - we can do that in v8! for now
+                            // for umbraco services we&#39;ll stick to explicitly defining the endpoints.
+
+                            {&quot;externalLoginsUrl&quot;, Url.Action(&quot;ExternalLogin&quot;, &quot;BackOffice&quot;)},
+                            {&quot;externalLinkLoginsUrl&quot;, Url.Action(&quot;LinkLogin&quot;, &quot;BackOffice&quot;)},
+                            {&quot;legacyTreeJs&quot;, Url.Action(&quot;LegacyTreeJs&quot;, &quot;BackOffice&quot;)},
+                            {&quot;manifestAssetList&quot;, Url.Action(&quot;GetManifestAssetList&quot;, &quot;BackOffice&quot;)},
+                            {&quot;gridConfig&quot;, Url.Action(&quot;GetGridConfig&quot;, &quot;BackOffice&quot;)},
+                            {&quot;serverVarsJs&quot;, Url.Action(&quot;Application&quot;, &quot;BackOffice&quot;)},
+                            //API URLs
+                            {
+                                &quot;redirectUrlManagementApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;RedirectUrlManagementController&gt;(
+                                    controller =&gt; controller.GetEnableState())
+                            },
+                            {
+                                &quot;embedApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;RteEmbedController&gt;(
+                                    controller =&gt; controller.GetEmbed(&quot;&quot;, 0, 0))
+                            },
+                            {
+                                &quot;userApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;UserController&gt;(
+                                    controller =&gt; controller.PostDisableUser(0))
+                            },
+                            {
+                                &quot;contentApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;ContentController&gt;(
+                                    controller =&gt; controller.PostSave(null))
+                            },
+                            {
+                                &quot;mediaApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;MediaController&gt;(
+                                    controller =&gt; controller.GetRootMedia())
+                            },
+                            {
+                                &quot;imagesApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;ImagesController&gt;(
+                                    controller =&gt; controller.GetBigThumbnail(0))
+                            },
+                            {
+                                &quot;sectionApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;SectionController&gt;(
+                                    controller =&gt; controller.GetSections())
+                            },
+                            {
+                                &quot;treeApplicationApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;ApplicationTreeController&gt;(
+                                    controller =&gt; controller.GetApplicationTrees(null, null, null))
+                            },
+                            {
+                                &quot;contentTypeApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;ContentTypeController&gt;(
+                                    controller =&gt; controller.GetAllowedChildren(0))
+                            },
+                            {
+                                &quot;mediaTypeApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;MediaTypeController&gt;(
+                                    controller =&gt; controller.GetAllowedChildren(0))
+                            },
+                            {
+                                &quot;macroApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;MacroController&gt;(
+                                    controller =&gt; controller.GetMacroParameters(0))
+                            },
+                            {
+                                &quot;authenticationApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;AuthenticationController&gt;(
+                                    controller =&gt; controller.PostLogin(null))
+                            },
+                            {
+                                &quot;currentUserApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;CurrentUserController&gt;(
+                                    controller =&gt; controller.GetMembershipProviderConfig())
+                            },
+                            {
+                                &quot;legacyApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;LegacyController&gt;(
+                                    controller =&gt; controller.DeleteLegacyItem(null, null, null))
+                            },
+                            {
+                                &quot;entityApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;EntityController&gt;(
+                                    controller =&gt; controller.GetById(0, UmbracoEntityTypes.Media))
+                            },
+                            {
+                                &quot;dataTypeApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;DataTypeController&gt;(
+                                    controller =&gt; controller.GetById(0))
+                            },
+                            {
+                                &quot;dashboardApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;DashboardController&gt;(
+                                    controller =&gt; controller.GetDashboard(null))
+                            },
+                            {
+                                &quot;logApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;LogController&gt;(
+                                    controller =&gt; controller.GetEntityLog(0))
+                            },
+                            {
+                                &quot;gravatarApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;GravatarController&gt;(
+                                    controller =&gt; controller.GetCurrentUserGravatarUrl())
+                            },
+                            {
+                                &quot;memberApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;MemberController&gt;(
+                                    controller =&gt; controller.GetByKey(Guid.Empty))
+                            },
+                            {
+                                &quot;packageInstallApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;PackageInstallController&gt;(
+                                    controller =&gt; controller.Fetch(string.Empty))
+                            },
+                            {
+                                &quot;relationApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;RelationController&gt;(
+                                    controller =&gt; controller.GetById(0))
+                            },
+                            {
+                                &quot;rteApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;RichTextPreValueController&gt;(
+                                    controller =&gt; controller.GetConfiguration())
+                            },
+                            {
+                                &quot;stylesheetApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;StylesheetController&gt;(
+                                    controller =&gt; controller.GetAll())
+                            },
+                            {
+                                &quot;memberTypeApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;MemberTypeController&gt;(
+                                    controller =&gt; controller.GetAllTypes())
+                            },
+                            {
+                                &quot;updateCheckApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;UpdateCheckController&gt;(
+                                    controller =&gt; controller.GetCheck())
+                            },
+                            {
+                                &quot;tagApiBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;TagsController&gt;(
+                                    controller =&gt; controller.GetAllTags(null))
+                            },
+                            {
+                                &quot;memberTreeBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;MemberTreeController&gt;(
+                                    controller =&gt; controller.GetNodes(&quot;-1&quot;, null))
+                            },
+                            {
+                                &quot;mediaTreeBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;MediaTreeController&gt;(
+                                    controller =&gt; controller.GetNodes(&quot;-1&quot;, null))
+                            },
+                            {
+                                &quot;contentTreeBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;ContentTreeController&gt;(
+                                    controller =&gt; controller.GetNodes(&quot;-1&quot;, null))
+                            },
+                            {
+                                &quot;tagsDataBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;TagsDataController&gt;(
+                                    controller =&gt; controller.GetTags(&quot;&quot;))
+                            },
+                            {
+                                &quot;examineMgmtBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;ExamineManagementApiController&gt;(
+                                    controller =&gt; controller.GetIndexerDetails())
+                            },
+                            {
+                                &quot;xmlDataIntegrityBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;XmlDataIntegrityController&gt;(
+                                    controller =&gt; controller.CheckContentXmlTable())
+                            },
+                            {
+                                &quot;healthCheckBaseUrl&quot;, Url.GetUmbracoApiServiceBaseUrl&lt;HealthCheckController&gt;(
+                                    controller =&gt; controller.GetAllHealthChecks())
+                            }
+                        }
+                    },
+                    {
+                        &quot;umbracoSettings&quot;, new Dictionary&lt;string, object&gt;
+                        {
+                            {&quot;umbracoPath&quot;, GlobalSettings.Path},
+                            {&quot;mediaPath&quot;, IOHelper.ResolveUrl(SystemDirectories.Media).TrimEnd(&#39;/&#39;)},
+                            {&quot;appPluginsPath&quot;, IOHelper.ResolveUrl(SystemDirectories.AppPlugins).TrimEnd(&#39;/&#39;)},
+                            {
+                                &quot;imageFileTypes&quot;,
+                                string.Join(&quot;,&quot;, UmbracoConfig.For.UmbracoSettings().Content.ImageFileTypes)
+                            },
+                            {
+                                &quot;disallowedUploadFiles&quot;,
+                                string.Join(&quot;,&quot;, UmbracoConfig.For.UmbracoSettings().Content.DisallowedUploadFiles)
+                            },
+                            {
+                                &quot;maxFileSize&quot;,
+                                GetMaxRequestLength()
+                            },
+                            {&quot;keepUserLoggedIn&quot;, UmbracoConfig.For.UmbracoSettings().Security.KeepUserLoggedIn},
+                            {&quot;cssPath&quot;, IOHelper.ResolveUrl(SystemDirectories.Css).TrimEnd(&#39;/&#39;)},
+                            {&quot;allowPasswordReset&quot;, UmbracoConfig.For.UmbracoSettings().Security.AllowPasswordReset},
+                        }
+                    },
+                    {
+                        &quot;umbracoPlugins&quot;, new Dictionary&lt;string, object&gt;
+                        {
+                            {&quot;trees&quot;, GetTreePluginsMetaData()}
+                        }
+                    },
+                    {
+                        &quot;isDebuggingEnabled&quot;, HttpContext.IsDebuggingEnabled
+                    },
+                    {
+                        &quot;application&quot;, GetApplicationState()
+                    },
+                    {
+                        &quot;externalLogins&quot;, new Dictionary&lt;string, object&gt;
+                        {
+                            {
+                                &quot;providers&quot;, HttpContext.GetOwinContext().Authentication.GetExternalAuthenticationTypes()
+                                    .Where(p =&gt; p.Properties.ContainsKey(&quot;UmbracoBackOffice&quot;))
+                                    .Select(p =&gt; new
+                                    {
+                                        authType = p.AuthenticationType, caption = p.Caption,
+                                        //TODO: Need to see if this exposes any sensitive data!
+                                        properties = p.Properties
+                                    })
+                                    .ToArray()
+                            }
+                        }
+                    }
+                };
+
+                //Parse the variables to a string
+                return ServerVariablesParser.Parse(defaultVals);
+            };
+
+            //cache the result if debugging is disabled
+            var result = HttpContext.IsDebuggingEnabled
+                ? getResult()
+                : ApplicationContext.ApplicationCache.RuntimeCache.GetCacheItem&lt;string&gt;(
+                    typeof(BackOfficeController) + &quot;ServerVariables&quot;,
+                    () =&gt; getResult(),
+                    new TimeSpan(0, 10, 0));
+
+            return JavaScript(result);
+        }
+        
+        [HttpPost]
+        public ActionResult ExternalLogin(string provider, string redirectUrl = null)
+        {
+            if (redirectUrl == null)
+            {
+                redirectUrl = Url.Action(&quot;Default&quot;, &quot;BackOffice&quot;);
+            }
+
+            // Request a redirect to the external login provider
+            return new ChallengeResult(provider, redirectUrl);
+        }
+
+        [UmbracoAuthorize]
+        [HttpPost]
+        public ActionResult LinkLogin(string provider)
+        {
+            // Request a redirect to the external login provider to link a login for the current user
+            return new ChallengeResult(provider,
+                Url.Action(&quot;ExternalLinkLoginCallback&quot;, &quot;BackOffice&quot;),
+                User.Identity.GetUserId());
+        }
+
+        [HttpGet]
+        public async Task&lt;ActionResult&gt; ValidatePasswordResetCode([Bind(Prefix = &quot;u&quot;)]int userId, [Bind(Prefix = &quot;r&quot;)]string resetCode)
+        {
+            var user = UserManager.FindById(userId);
+            if (user != null)
+            {
+                var result = await UserManager.UserTokenProvider.ValidateAsync(&quot;ResetPassword&quot;, resetCode, UserManager, user);
+                if (result)
+                {
+                    //Add a flag and redirect for it to be displayed
+                    TempData[TokenPasswordResetCode] = new ValidatePasswordResetCodeModel {UserId = userId, ResetCode = resetCode};
+                    return RedirectToLocal(Url.Action(&quot;Default&quot;, &quot;BackOffice&quot;));
+                }
+            }
+
+            //Add error and redirect for it to be displayed
+            TempData[TokenPasswordResetCode] = new[] { Services.TextService.Localize(&quot;login/resetCodeExpired&quot;) };
+            return RedirectToLocal(Url.Action(&quot;Default&quot;, &quot;BackOffice&quot;));
+        }
+
+        [HttpGet]
+        public async Task&lt;ActionResult&gt; ExternalLinkLoginCallback()
+        {
+            var loginInfo = await AuthenticationManager.GetExternalLoginInfoAsync(
+                Constants.Security.BackOfficeExternalAuthenticationType,
+                XsrfKey, User.Identity.GetUserId());
+
+            if (loginInfo == null)
+            {
+                //Add error and redirect for it to be displayed
+                TempData[TokenExternalSignInError] = new[] { &quot;An error occurred, could not get external login info&quot; };
+                return RedirectToLocal(Url.Action(&quot;Default&quot;, &quot;BackOffice&quot;));
+            }
+
+            var result = await UserManager.AddLoginAsync(User.Identity.GetUserId&lt;int&gt;(), loginInfo.Login);
+            if (result.Succeeded)
+            {
+                return RedirectToLocal(Url.Action(&quot;Default&quot;, &quot;BackOffice&quot;));
+            }
+
+            //Add errors and redirect for it to be displayed
+            TempData[TokenExternalSignInError] = result.Errors;
+            return RedirectToLocal(Url.Action(&quot;Default&quot;, &quot;BackOffice&quot;));
+        }
+
+        /// &lt;summary&gt;
+        /// Used by Default and AuthorizeUpgrade to render as per normal if there&#39;s no external login info, 
+        /// otherwise process the external login info.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;       
+        private async Task&lt;ActionResult&gt; RenderDefaultOrProcessExternalLoginAsync(
+            Func&lt;ActionResult&gt; defaultResponse, 
+            Func&lt;ActionResult&gt; externalSignInResponse)
+        {
+            if (defaultResponse == null) throw new ArgumentNullException(&quot;defaultResponse&quot;);
+            if (externalSignInResponse == null) throw new ArgumentNullException(&quot;externalSignInResponse&quot;);
+
+            ViewBag.UmbracoPath = GlobalSettings.UmbracoMvcArea;
+
+            //check if there is the TempData with the any token name specified, if so, assign to view bag and render the view
+            foreach (var tempDataTokenName in TempDataTokenNames)
+            {                
+                if (TempData[tempDataTokenName] != null)
+                {
+                    ViewData[tempDataTokenName] = TempData[tempDataTokenName];
+                    return defaultResponse();
+                }
+            }
+
+            //First check if there&#39;s external login info, if there&#39;s not proceed as normal
+            var loginInfo = await OwinContext.Authentication.GetExternalLoginInfoAsync(
+                Constants.Security.BackOfficeExternalAuthenticationType);
+
+            if (loginInfo == null || loginInfo.ExternalIdentity.IsAuthenticated == false)
+            {
+                return defaultResponse();
+            }
+
+            //we&#39;re just logging in with an external source, not linking accounts
+            return await ExternalSignInAsync(loginInfo, externalSignInResponse);
+        }
+
+        private async Task&lt;ActionResult&gt; ExternalSignInAsync(ExternalLoginInfo loginInfo, Func&lt;ActionResult&gt; response)
+        {
+            if (loginInfo == null) throw new ArgumentNullException(&quot;loginInfo&quot;);
+            if (response == null) throw new ArgumentNullException(&quot;response&quot;);
+
+            // Sign in the user with this external login provider if the user already has a login
+            var user = await UserManager.FindAsync(loginInfo.Login);
+            if (user != null)
+            {
+                //TODO: It might be worth keeping some of the claims associated with the ExternalLoginInfo, in which case we 
+                // wouldn&#39;t necessarily sign the user in here with the standard login, instead we&#39;d update the 
+                // UseUmbracoBackOfficeExternalCookieAuthentication extension method to have the correct provider and claims factory,
+                // ticket format, etc.. to create our back office user including the claims assigned and in this method we&#39;d just ensure 
+                // that the ticket is created and stored and that the user is logged in.
+
+                //sign in
+                await SignInManager.SignInAsync(user, isPersistent: false, rememberBrowser: false);
+            }
+            else
+            {
+                if (await AutoLinkAndSignInExternalAccount(loginInfo) == false)
+                {
+                    ViewData[TokenExternalSignInError] = new[] { &quot;The requested provider (&quot; + loginInfo.Login.LoginProvider + &quot;) has not been linked to to an account&quot; };
+                }
+
+                //Remove the cookie otherwise this message will keep appearing
+                if (Response.Cookies[Constants.Security.BackOfficeExternalCookieName] != null)
+                {
+                    Response.Cookies[Constants.Security.BackOfficeExternalCookieName].Expires = DateTime.MinValue;
+                }
+            }
+
+            return response();
+        }
+
+        private async Task&lt;bool&gt; AutoLinkAndSignInExternalAccount(ExternalLoginInfo loginInfo)
+        {
+            //Here we can check if the provider associated with the request has been configured to allow
+            // new users (auto-linked external accounts). This would never be used with public providers such as 
+            // Google, unless you for some reason wanted anybody to be able to access the backend if they have a Google account
+            // .... not likely! 
+
+            var authType = OwinContext.Authentication.GetExternalAuthenticationTypes().FirstOrDefault(x =&gt; x.AuthenticationType == loginInfo.Login.LoginProvider);
+            if (authType == null)
+            {
+                Logger.Warn&lt;BackOfficeController&gt;(&quot;Could not find external authentication provider registered: &quot; + loginInfo.Login.LoginProvider);
+                return false;
+            }
+
+            var autoLinkOptions = authType.GetExternalAuthenticationOptions();
+            if (autoLinkOptions != null)
+            {
+                if (autoLinkOptions.ShouldAutoLinkExternalAccount(UmbracoContext, loginInfo))
+                {
+                    //we are allowing auto-linking/creating of local accounts
+                    if (loginInfo.Email.IsNullOrWhiteSpace())
+                    {
+                        ViewData[TokenExternalSignInError] = new[] { &quot;The requested provider (&quot; + loginInfo.Login.LoginProvider + &quot;) has not provided an email address, the account cannot be linked.&quot; };
+                    }
+                    else
+                    {
+
+                        //Now we need to perform the auto-link, so first we need to lookup/create a user with the email address
+                        var foundByEmail = Services.UserService.GetByEmail(loginInfo.Email);
+                        if (foundByEmail != null)
+                        {
+                            ViewData[TokenExternalSignInError] = new[] { &quot;A user with this email address already exists locally. You will need to login locally to Umbraco and link this external provider: &quot; + loginInfo.Login.LoginProvider };
+                        }
+                        else
+                        {
+                            var defaultUserType = autoLinkOptions.GetDefaultUserType(UmbracoContext, loginInfo);
+                            var userType = Services.UserService.GetUserTypeByAlias(defaultUserType);
+                            if (userType == null)
+                            {
+                                ViewData[TokenExternalSignInError] = new[] { &quot;Could not auto-link this account, the specified User Type does not exist: &quot; + defaultUserType };
+                            }
+                            else
+                            {
+
+                                if (loginInfo.Email.IsNullOrWhiteSpace()) throw new InvalidOperationException(&quot;The Email value cannot be null&quot;);
+                                if (loginInfo.ExternalIdentity.Name.IsNullOrWhiteSpace()) throw new InvalidOperationException(&quot;The Name value cannot be null&quot;);
+
+                                var autoLinkUser = new BackOfficeIdentityUser()
+                                {
+                                    Email = loginInfo.Email,
+                                    Name = loginInfo.ExternalIdentity.Name,
+                                    UserTypeAlias = userType.Alias,
+                                    AllowedSections = autoLinkOptions.GetDefaultAllowedSections(UmbracoContext, loginInfo),
+                                    Culture = autoLinkOptions.GetDefaultCulture(UmbracoContext, loginInfo),
+                                    UserName = loginInfo.Email
+                                };
+
+                                //call the callback if one is assigned
+                                if (autoLinkOptions.OnAutoLinking != null)
+                                {
+                                    autoLinkOptions.OnAutoLinking(autoLinkUser, loginInfo);
+                                }
+
+                                var userCreationResult = await UserManager.CreateAsync(autoLinkUser);
+
+                                if (userCreationResult.Succeeded == false)
+                                {
+                                    ViewData[TokenExternalSignInError] = userCreationResult.Errors;
+                                }
+                                else
+                                {
+                                    var linkResult = await UserManager.AddLoginAsync(autoLinkUser.Id, loginInfo.Login);
+                                    if (linkResult.Succeeded == false)
+                                    {
+                                        ViewData[TokenExternalSignInError] = linkResult.Errors;
+
+                                        //If this fails, we should really delete the user since it will be in an inconsistent state!
+                                        var deleteResult = await UserManager.DeleteAsync(autoLinkUser);
+                                        if (deleteResult.Succeeded == false)
+                                        {
+                                            //DOH! ... this isn&#39;t good, combine all errors to be shown
+                                            ViewData[TokenExternalSignInError] = linkResult.Errors.Concat(deleteResult.Errors);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        //sign in
+                                        await SignInManager.SignInAsync(autoLinkUser, isPersistent: false, rememberBrowser: false);
+                                    }
+                                }
+                            }
+                        }
+
+                    }
+                }
+                return true;
+            }
+
+            return false;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the server variables regarding the application state
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private Dictionary&lt;string, object&gt; GetApplicationState()
+        {
+            if (ApplicationContext.IsConfigured == false)
+                return null;
+
+            var app = new Dictionary&lt;string, object&gt;
+                {
+                    {&quot;assemblyVersion&quot;, UmbracoVersion.AssemblyVersion}
+                };
+
+            var version = UmbracoVersion.GetSemanticVersion().ToSemanticString();
+
+            app.Add(&quot;version&quot;, version);
+            app.Add(&quot;cdf&quot;, ClientDependencySettings.Instance.Version);
+            //useful for dealing with virtual paths on the client side when hosted in virtual directories especially
+            app.Add(&quot;applicationPath&quot;, HttpContext.Request.ApplicationPath.EnsureEndsWith(&#39;/&#39;));
+
+            //add the server&#39;s GMT time offset in minutes
+            app.Add(&quot;serverTimeOffset&quot;, Convert.ToInt32(DateTimeOffset.Now.Offset.TotalMinutes));
+
+            return app;
+        }
+        
+
+        private IEnumerable&lt;Dictionary&lt;string, string&gt;&gt; GetTreePluginsMetaData()
+        {
+            var treeTypes = PluginManager.Current.ResolveAttributedTreeControllers();
+            //get all plugin trees with their attributes
+            var treesWithAttributes = treeTypes.Select(x =&gt; new
+            {
+                tree = x,
+                attributes =
+                    x.GetCustomAttributes(false)
+            }).ToArray();
+
+            var pluginTreesWithAttributes = treesWithAttributes
+                //don&#39;t resolve any tree decorated with CoreTreeAttribute
+                .Where(x =&gt; x.attributes.All(a =&gt; (a is CoreTreeAttribute) == false))
+                //we only care about trees with the PluginControllerAttribute
+                .Where(x =&gt; x.attributes.Any(a =&gt; a is PluginControllerAttribute))
+                .ToArray();
+
+            return (from p in pluginTreesWithAttributes
+                    let treeAttr = p.attributes.OfType&lt;TreeAttribute&gt;().Single()
+                    let pluginAttr = p.attributes.OfType&lt;PluginControllerAttribute&gt;().Single()
+                    select new Dictionary&lt;string, string&gt;
+                        {
+                            {&quot;alias&quot;, treeAttr.Alias}, {&quot;packageFolder&quot;, pluginAttr.AreaName}
+                        }).ToArray();
+
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the JavaScript blocks for any legacy trees declared
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [UmbracoAuthorize(Order = 0)]
+        [MinifyJavaScriptResult(Order = 1)]
+        public JavaScriptResult LegacyTreeJs()
+        {
+            Func&lt;string&gt; getResult = () =&gt;
+            {
+                var javascript = new StringBuilder();
+                javascript.AppendLine(LegacyTreeJavascript.GetLegacyTreeJavascript());
+                javascript.AppendLine(LegacyTreeJavascript.GetLegacyIActionJavascript());
+                //add all of the menu blocks
+                foreach (var file in GetLegacyActionJs(LegacyJsActionType.JsBlock))
+                {
+                    javascript.AppendLine(file);
+                }
+                return javascript.ToString();
+            };
+
+            //cache the result if debugging is disabled
+            var result = HttpContext.IsDebuggingEnabled
+                ? getResult()
+                : ApplicationContext.ApplicationCache.RuntimeCache.GetCacheItem&lt;string&gt;(
+                    typeof(BackOfficeController) + &quot;LegacyTreeJs&quot;,
+                    () =&gt; getResult(),
+                    new TimeSpan(0, 10, 0));
+
+            return JavaScript(result);
+        }
+
+        internal static IEnumerable&lt;string&gt; GetLegacyActionJsForActions(LegacyJsActionType type, IEnumerable&lt;string&gt; values)
+        {
+            var blockList = new List&lt;string&gt;();
+            var urlList = new List&lt;string&gt;();
+            foreach (var jsFile in values)
+            {
+                var isJsPath = jsFile.DetectIsJavaScriptPath();
+                if (isJsPath.Success)
+
+                {
+                    urlList.Add(isJsPath.Result);
+                }
+                else
+                {
+                    blockList.Add(isJsPath.Result);
+                }
+            }
+
+            switch (type)
+            {
+                case LegacyJsActionType.JsBlock:
+                    return blockList;
+                case LegacyJsActionType.JsUrl:
+                    return urlList;
+            }
+
+            return blockList;
+        }
+
+        /// &lt;summary&gt;
+        /// Renders out all JavaScript references that have bee declared in IActions
+        /// &lt;/summary&gt;
+        private static IEnumerable&lt;string&gt; GetLegacyActionJs(LegacyJsActionType type)
+        {
+            return GetLegacyActionJsForActions(type, Action.GetJavaScriptFileReferences());
+        }
+
+        internal enum LegacyJsActionType
+        {
+            JsBlock,
+            JsUrl
+        }
+
+        private ActionResult RedirectToLocal(string returnUrl)
+        {
+            if (Url.IsLocalUrl(returnUrl))
+            {
+                return Redirect(returnUrl);
+            }
+            return Redirect(&quot;/&quot;);
+        }
+
+        // Used for XSRF protection when adding external logins
+        private const string XsrfKey = &quot;XsrfId&quot;;
+
+        private class ChallengeResult : HttpUnauthorizedResult
+        {
+            public ChallengeResult(string provider, string redirectUri, string userId = null)
+            {
+                LoginProvider = provider;
+                RedirectUri = redirectUri;
+                UserId = userId;
+            }
+
+            private string LoginProvider { get; set; }
+            private string RedirectUri { get; set; }
+            private string UserId { get; set; }
+
+            public override void ExecuteResult(ControllerContext context)
+            {
+                //Ensure the forms auth module doesn&#39;t do a redirect!
+                context.HttpContext.Response.SuppressFormsAuthenticationRedirect = true;
+
+                var owinCtx = context.HttpContext.GetOwinContext();
+
+                //First, see if a custom challenge result callback is specified for the provider
+                // and use it instead of the default if one is supplied.
+                var loginProvider = owinCtx.Authentication
+                    .GetExternalAuthenticationTypes()
+                    .FirstOrDefault(p =&gt; p.AuthenticationType == LoginProvider);
+                if (loginProvider != null)
+                {
+                    var providerChallengeResult = loginProvider.GetSignInChallengeResult(owinCtx);
+                    if (providerChallengeResult != null)
+                    {
+                        owinCtx.Authentication.Challenge(providerChallengeResult, LoginProvider);
+                        return;
+                    }
+                }
+
+                var properties = new AuthenticationProperties() { RedirectUri = RedirectUri.EnsureEndsWith(&#39;/&#39;) };
+                if (UserId != null)
+                {
+                    properties.Dictionary[XsrfKey] = UserId;
+                }
+                owinCtx.Authentication.Challenge(properties, LoginProvider);
+            }
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[60,9,60,116,1],[64,17,64,18,0],[64,19,64,104,0],[64,105,64,106,0],[68,17,68,18,0],[68,19,68,98,0],[68,99,68,100,0],[73,17,73,18,0],[73,19,73,53,0],[73,54,73,55,0],[81,9,81,10,0],[82,13,83,23,0],[83,23,83,93,0],[83,93,84,23,0],[84,23,84,93,0],[84,93,84,95,0],[82,13,84,95,0],[85,9,85,10,0],[94,9,94,10,0],[95,13,97,23,0],[97,23,97,102,0],[97,102,99,23,0],[99,23,99,36,0],[99,36,99,38,0],[95,13,99,38,0],[100,9,100,10,0],[109,9,109,10,0],[110,13,116,55,0],[118,13,121,38,0],[121,38,121,63,0],[121,63,121,72,0],[121,72,121,81,0],[121,81,121,83,0],[118,13,121,83,0],[123,13,123,98,0],[124,9,124,10,0],[133,9,133,10,0],[134,13,134,78,0],[135,13,135,104,0],[136,13,136,55,0],[137,13,137,57,0],[140,13,140,93,0],[142,13,142,138,0],[143,13,143,72,0],[145,13,145,39,0],[146,9,146,10,0],[155,9,155,10,0],[156,13,157,13,0],[157,13,157,14,0],[157,14,158,17,0],[158,17,158,82,0],[158,82,159,17,0],[159,17,159,108,0],[159,108,160,17,0],[160,17,160,59,0],[160,59,161,17,0],[161,17,161,61,0],[161,61,162,17,0],[162,17,162,99,0],[162,99,163,17,0],[163,17,163,87,0],[163,87,164,17,0],[164,17,164,66,0],[164,66,165,17,0],[165,17,165,33,0],[165,33,166,13,0],[166,13,166,14,0],[166,14,166,15,0],[156,13,166,15,0],[169,13,173,27,0],[173,27,173,38,0],[173,38,174,45,0],[169,13,174,45,0],[176,13,176,90,0],[177,9,177,10,0],[182,9,182,10,0],[183,13,188,49,0],[190,13,190,116,0],[191,9,191,10,0],[194,9,194,10,0],[195,13,195,107,0],[196,13,196,33,0],[196,34,196,54,0],[197,13,197,56,0],[198,9,198,10,0],[207,9,207,10,0],[208,13,335,15,0],[423,13,427,27,0],[427,27,427,38,0],[427,38,428,45,0],[423,13,428,45,0],[430,13,430,39,0],[431,9,431,10,0],[435,9,435,10,0],[436,13,436,37,0],[437,13,437,14,0],[438,17,438,67,0],[439,13,439,14,0],[442,13,442,63,0],[443,9,443,10,0],[448,9,448,10,0],[450,13,452,44,0],[453,9,453,10,0],[457,9,457,10,0],[458,13,458,53,0],[459,13,459,30,0],[460,13,460,14,0],[461,17,461,127,0],[462,17,462,28,0],[463,17,463,18,0],[465,21,465,132,0],[466,21,466,81,0],[468,13,468,14,0],[471,13,471,114,0],[472,13,472,73,0],[473,9,473,10,0],[477,9,477,10,0],[478,13,480,53,0],[482,13,482,35,0],[483,13,483,14,0],[485,17,485,119,0],[486,17,486,77,0],[489,13,489,107,0],[490,13,490,34,0],[491,13,491,14,0],[492,17,492,77,0],[496,13,496,64,0],[497,13,497,73,0],[498,9,498,10,0],[508,9,508,10,0],[509,13,509,41,0],[509,42,509,93,0],[510,13,510,48,0],[510,49,510,107,0],[512,13,512,65,0],[515,13,515,20,0],[515,22,515,43,0],[515,44,515,46,0],[515,47,515,65,0],[516,13,516,14,0],[517,17,517,57,0],[518,17,518,18,0],[519,21,519,79,0],[520,21,520,46,0],[522,13,522,14,0],[525,13,526,74,0],[528,13,528,90,0],[529,13,529,14,0],[530,17,530,42,0],[534,13,534,81,0],[535,9,535,10,0],[538,9,538,10,0],[539,13,539,35,0],[539,36,539,81,0],[540,13,540,34,0],[540,35,540,79,0],[543,13,543,69,0],[544,13,544,30,0],[545,13,545,14,0],[553,17,553,100,0],[554,13,554,14,0],[556,13,556,14,0],[557,17,557,80,0],[558,17,558,18,0],[559,21,559,170,0],[560,17,560,18,0],[563,17,563,95,0],[564,17,564,18,0],[565,21,565,115,0],[566,17,566,18,0],[567,13,567,14,0],[569,13,569,31,0],[570,9,570,10,0],[573,9,573,10,0],[579,13,579,108,0],[579,108,579,161,0],[579,161,579,163,0],[579,13,579,163,0],[580,13,580,34,0],[581,13,581,14,0],[582,17,582,147,0],[583,17,583,30,0],[586,13,586,79,0],[587,13,587,41,0],[588,13,588,14,0],[589,17,589,94,0],[590,17,590,18,0],[592,21,592,62,0],[593,21,593,22,0],[594,25,594,202,0],[595,21,595,22,0],[597,21,597,22,0],[600,25,600,93,0],[601,25,601,50,0],[602,25,602,26,0],[603,29,603,241,0],[604,25,604,26,0],[606,25,606,26,0],[607,29,607,113,0],[608,29,608,101,0],[609,29,609,50,0],[610,29,610,30,0],[611,33,611,175,0],[612,29,612,30,0],[614,29,614,30,0],[616,33,616,74,0],[616,75,616,145,0],[617,33,617,90,0],[617,91,617,160,0],[619,33,627,35,0],[630,33,630,75,0],[631,33,631,34,0],[632,37,632,92,0],[633,33,633,34,0],[635,33,635,102,0],[637,33,637,75,0],[638,33,638,34,0],[639,37,639,100,0],[640,33,640,34,0],[642,33,642,34,0],[643,37,643,120,0],[644,37,644,71,0],[645,37,645,38,0],[646,41,646,96,0],[649,41,649,104,0],[650,41,650,77,0],[651,41,651,42,0],[653,45,653,128,0],[654,41,654,42,0],[655,37,655,38,0],[657,37,657,38,0],[659,41,659,132,0],[660,37,660,38,0],[661,33,661,34,0],[662,29,662,30,0],[663,25,663,26,0],[665,21,665,22,0],[666,17,666,18,0],[667,17,667,29,0],[670,13,670,26,0],[671,9,671,10,0],[678,9,678,10,0],[679,13,679,58,0],[680,17,680,29,0],[682,13,685,19,0],[687,13,687,82,0],[689,13,689,41,0],[690,13,690,71,0],[692,13,692,97,0],[695,13,695,98,0],[697,13,697,24,0],[698,9,698,10,0],[702,9,702,10,0],[703,13,703,86,0],[705,13,705,61,0],[705,61,710,14,0],[710,14,710,26,0],[705,13,710,26,0],[712,13,714,29,0],[714,29,714,51,0],[714,51,714,84,0],[714,84,714,85,0],[714,29,714,85,0],[714,85,716,29,0],[716,29,716,51,0],[716,51,716,81,0],[716,81,716,82,0],[716,29,716,82,0],[716,82,717,28,0],[712,13,717,28,0],[719,13,720,36,0],[720,36,720,81,0],[720,81,721,38,0],[721,38,721,95,0],[721,95,722,28,0],[722,28,725,26,0],[725,26,725,38,0],[719,13,725,38,0],[727,9,727,10,0],[736,9,736,10,0],[737,13,738,13,0],[738,13,738,14,0],[738,14,739,17,0],[739,17,739,54,0],[739,54,740,17,0],[740,17,740,87,0],[740,87,741,17,0],[741,17,741,90,0],[741,90,743,17,0],[743,17,743,24,0],[743,24,743,26,0],[743,26,743,34,0],[743,34,743,35,0],[743,35,743,37,0],[743,37,743,38,0],[743,38,743,83,0],[743,83,744,17,0],[744,17,744,18,0],[744,18,745,21,0],[745,21,745,49,0],[745,49,746,17,0],[746,17,746,18,0],[746,18,747,17,0],[747,17,747,46,0],[747,46,748,13,0],[748,13,748,14,0],[748,14,748,15,0],[737,13,748,15,0],[751,13,755,27,0],[755,27,755,38,0],[755,38,756,45,0],[751,13,756,45,0],[758,13,758,39,0],[759,9,759,10,0],[762,9,762,10,1],[763,13,763,48,1],[764,13,764,46,1],[765,13,765,20,1],[765,22,765,32,1],[765,33,765,35,1],[765,36,765,42,1],[766,13,766,14,1],[767,17,767,64,1],[768,17,768,38,1],[770,17,770,18,1],[771,21,771,50,1],[772,17,772,18,1],[774,17,774,18,1],[775,21,775,52,1],[776,17,776,18,1],[777,13,777,14,1],[779,13,779,26,1],[782,21,782,38,1],[784,21,784,36,1],[787,13,787,30,0],[788,9,788,10,1],[794,9,794,10,0],[795,13,795,92,0],[796,9,796,10,0],[805,9,805,10,0],[806,13,806,43,0],[807,13,807,14,0],[808,17,808,44,0],[810,13,810,34,0],[811,9,811,10,0],[818,13,818,94,0],[819,13,819,14,0],[820,17,820,42,0],[821,17,821,43,0],[822,17,822,33,0],[823,13,823,14,0],[825,44,825,48,0],[825,49,825,53,0],[826,42,826,46,0],[826,47,826,51,0],[827,37,827,41,0],[827,42,827,46,0],[830,13,830,14,0],[832,17,832,89,0],[834,17,834,68,0],[838,17,840,42,0],[840,42,840,79,0],[840,79,840,81,0],[838,17,840,81,0],[841,17,841,43,0],[842,17,842,18,0],[843,21,843,99,0],[844,21,844,57,0],[845,21,845,22,0],[846,25,846,98,0],[847,25,847,32,0],[849,17,849,18,0],[851,17,851,115,0],[852,17,852,36,0],[853,17,853,18,0],[854,21,854,61,0],[855,17,855,18,0],[856,17,856,77,0],[857,13,857,14,0]]);
+    </script>
+  </body>
+</html>

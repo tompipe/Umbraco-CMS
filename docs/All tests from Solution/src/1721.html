@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\RecycleBinRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    internal abstract class RecycleBinRepository&lt;TId, TEntity&gt; : VersionableRepositoryBase&lt;TId, TEntity&gt;, IRecycleBinRepository&lt;TEntity&gt; 
+        where TEntity : class, IUmbracoEntity
+    {
+        protected RecycleBinRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax, IContentSection contentSection)
+            : base(work, cache, logger, sqlSyntax, contentSection)
+        {
+        }
+
+        protected abstract int RecycleBinId { get; }
+
+        public virtual IEnumerable&lt;TEntity&gt; GetEntitiesInRecycleBin()
+        {
+            return GetByQuery(new Query&lt;TEntity&gt;().Where(entity =&gt; entity.Trashed));
+        }
+
+        /// &lt;summary&gt;
+        /// Empties the Recycle Bin by running single bulk-Delete queries
+        /// against the Content- or Media&#39;s Recycle Bin.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual bool EmptyRecycleBin()
+        {
+            var db = this.Database;
+
+            //Construct and execute delete statements for all trashed items by &#39;nodeObjectType&#39;
+            var deletes = new List&lt;string&gt;
+            {
+                FormatDeleteStatement(&quot;umbracoUser2NodeNotify&quot;, &quot;nodeId&quot;),
+                FormatDeleteStatement(&quot;umbracoUser2NodePermission&quot;, &quot;nodeId&quot;),
+                @&quot;DELETE FROM umbracoAccessRule WHERE umbracoAccessRule.accessId IN (
+                    SELECT TB1.id FROM umbracoAccess as TB1 
+                    INNER JOIN umbracoNode as TB2 ON TB1.nodeId = TB2.id 
+                    WHERE TB2.trashed = &#39;1&#39; AND TB2.nodeObjectType = @NodeObjectType)&quot;,
+                FormatDeleteStatement(&quot;umbracoAccess&quot;, &quot;nodeId&quot;),
+                @&quot;DELETE FROM umbracoRedirectUrl WHERE umbracoRedirectUrl.id IN(
+                    SELECT TB1.id FROM umbracoRedirectUrl as TB1
+                    INNER JOIN umbracoNode as TB2 ON TB1.contentKey = TB2.uniqueId
+                    WHERE TB2.trashed = &#39;1&#39; AND TB2.nodeObjectType = @NodeObjectType)&quot;,
+                FormatDeleteStatement(&quot;umbracoRelation&quot;, &quot;parentId&quot;),
+                FormatDeleteStatement(&quot;umbracoRelation&quot;, &quot;childId&quot;),
+                FormatDeleteStatement(&quot;cmsTagRelationship&quot;, &quot;nodeId&quot;),
+                FormatDeleteStatement(&quot;umbracoDomains&quot;, &quot;domainRootStructureID&quot;),
+                FormatDeleteStatement(&quot;cmsDocument&quot;, &quot;nodeId&quot;),
+                FormatDeleteStatement(&quot;cmsPropertyData&quot;, &quot;contentNodeId&quot;),
+                FormatDeleteStatement(&quot;cmsPreviewXml&quot;, &quot;nodeId&quot;),
+                FormatDeleteStatement(&quot;cmsContentVersion&quot;, &quot;ContentId&quot;),
+                FormatDeleteStatement(&quot;cmsContentXml&quot;, &quot;nodeId&quot;),
+                FormatDeleteStatement(&quot;cmsContent&quot;, &quot;nodeId&quot;),
+                //TODO: Why is this being done? We just delete this exact data in the next line
+                &quot;UPDATE umbracoNode SET parentID = &#39;&quot; + RecycleBinId + &quot;&#39; WHERE trashed = &#39;1&#39; AND nodeObjectType = @NodeObjectType&quot;,
+                &quot;DELETE FROM umbracoNode WHERE trashed = &#39;1&#39; AND nodeObjectType = @NodeObjectType&quot;
+            };
+
+            //Wraps in transaction - this improves performance and also ensures
+            // that if any of the deletions fails that the whole thing is rolled back.
+            using (var trans = db.GetTransaction())
+            {
+                try
+                {
+                    foreach (var delete in deletes)
+                    {
+                        db.Execute(delete, new { NodeObjectType = NodeObjectTypeId });
+                    }
+
+                    trans.Complete();
+
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    // transaction will rollback
+                    Logger.Error&lt;RecycleBinRepository&lt;TId, TEntity&gt;&gt;(&quot;An error occurred while emptying the Recycle Bin: &quot; + ex.Message, ex);
+                    throw;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// A delete statement that will delete anything in the table specified where its PK (keyName) is found in the
+        /// list of umbracoNode.id that have trashed flag set
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;tableName&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;keyName&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private string FormatDeleteStatement(string tableName, string keyName)
+        {
+            return
+                string.Format(
+                    &quot;DELETE FROM {0} WHERE {0}.{1} IN (SELECT id FROM umbracoNode WHERE trashed = &#39;1&#39; AND nodeObjectType = @NodeObjectType)&quot;,
+                    tableName, keyName);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a list of files, which are referenced on items in the Recycle Bin.
+        /// The list is generated by the convention that a file is referenced by 
+        /// the Upload data type or a property type with the alias &#39;umbracoFile&#39;.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This is purely for backwards compatibility
+        /// &lt;/remarks&gt;
+        internal List&lt;string&gt; GetFilesInRecycleBinForUploadField()
+        {
+            var db = this.Database;
+
+            //Issue query to get all trashed content or media that has the Upload field as a property
+            //The value for each field is stored in a list: FilesToDelete&lt;string&gt;()
+            //Alias: Constants.Conventions.Media.File and PropertyEditorAlias: Constants.PropertyEditors.UploadField
+            var sql = new Sql();
+            sql.Select(&quot;DISTINCT(dataNvarchar)&quot;)
+                .From&lt;PropertyDataDto&gt;()
+                .InnerJoin&lt;NodeDto&gt;().On&lt;PropertyDataDto, NodeDto&gt;(left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;PropertyTypeDto&gt;().On&lt;PropertyDataDto, PropertyTypeDto&gt;(left =&gt; left.PropertyTypeId, right =&gt; right.Id)
+                .InnerJoin&lt;DataTypeDto&gt;().On&lt;PropertyTypeDto, DataTypeDto&gt;(left =&gt; left.DataTypeId, right =&gt; right.DataTypeId)
+                .Where(&quot;umbracoNode.trashed = &#39;1&#39; AND umbracoNode.nodeObjectType = @NodeObjectType AND dataNvarchar IS NOT NULL AND (cmsPropertyType.Alias = @FileAlias OR cmsDataType.propertyEditorAlias = @PropertyEditorAlias)&quot;,
+                    new { FileAlias = Constants.Conventions.Media.File, NodeObjectType = NodeObjectTypeId, PropertyEditorAlias = Constants.PropertyEditors.UploadFieldAlias });
+
+            var files = db.Fetch&lt;string&gt;(sql);
+            return files;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,15,22,67,1],[23,9,23,10,1],[24,9,24,10,1],[29,9,29,10,1],[30,13,30,85,1],[31,9,31,10,1],[39,9,39,10,1],[40,13,40,36,1],[43,13,69,15,1],[73,20,73,51,1],[74,13,74,14,1],[76,17,76,18,1],[77,21,77,28,1],[77,30,77,40,1],[77,41,77,43,1],[77,44,77,51,1],[78,21,78,22,1],[79,25,79,87,1],[80,21,80,22,1],[82,21,82,38,1],[84,21,84,33,1],[86,17,86,37,0],[87,17,87,18,0],[89,21,89,141,0],[90,21,90,27,0],[93,9,93,10,1],[103,9,103,10,1],[104,13,107,41,1],[108,9,108,10,1],[120,9,120,10,1],[121,13,121,36,1],[126,13,126,33,1],[127,13,133,176,1],[135,13,135,47,1],[136,13,136,26,1],[137,9,137,10,1]]);
+    </script>
+  </body>
+</html>

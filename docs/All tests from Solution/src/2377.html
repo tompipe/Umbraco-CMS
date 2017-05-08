@@ -1,0 +1,1397 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\CMSNode.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Xml;
+using Umbraco.Core;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Persistence;
+
+using umbraco.cms.businesslogic.web;
+using umbraco.DataLayer;
+using umbraco.BusinessLogic;
+using System.IO;
+using System.Text.RegularExpressions;
+using System.ComponentModel;
+using Umbraco.Core.IO;
+using System.Collections;
+using umbraco.cms.businesslogic.task;
+using umbraco.cms.businesslogic.workflow;
+using umbraco.cms.businesslogic.Tags;
+using File = System.IO.File;
+using Media = umbraco.cms.businesslogic.media.Media;
+using Tag = umbraco.cms.businesslogic.Tags.Tag;
+using Notification = umbraco.cms.businesslogic.workflow.Notification;
+using Task = umbraco.cms.businesslogic.task.Task;
+
+namespace umbraco.cms.businesslogic
+{
+    /// &lt;summary&gt;
+    /// CMSNode class serves as the base class for many of the other components in the cms.businesslogic.xx namespaces.
+    /// Providing the basic hierarchical data structure and properties Text (name), Creator, Createdate, updatedate etc.
+    /// which are shared by most umbraco objects.
+    /// 
+    /// The child classes are required to implement an identifier (Guid) which is used as the objecttype identifier, for 
+    /// distinguishing the different types of CMSNodes (ex. Documents/Medias/Stylesheets/documenttypes and so forth).
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;Obsolete, This class will eventually be phased out&quot;, false)]
+    public class CMSNode : BusinessLogic.console.IconI
+    {
+        #region Private Members
+
+        private string _text;
+        private int _id = 0;
+        private Guid _uniqueID;
+        private int _parentid;
+        private Guid _nodeObjectType;
+        private int _level;
+        private string _path;
+        private bool _hasChildren;
+        private int _sortOrder;
+        private int _userId;
+        private DateTime _createDate;
+        private bool _hasChildrenInitialized;
+        private string m_image = &quot;default.png&quot;;
+        private bool? _isTrashed = null;
+        protected IUmbracoEntity Entity;
+
+        #endregion
+
+        #region Private static
+
+        private static readonly string DefaultIconCssFile = IOHelper.MapPath(SystemDirectories.UmbracoClient + &quot;/Tree/treeIcons.css&quot;);
+        private static readonly List&lt;string&gt; InternalDefaultIconClasses = new List&lt;string&gt;();
+        private static readonly ReaderWriterLockSlim Locker = new ReaderWriterLockSlim();
+
+        private static void InitializeIconClasses()
+        {
+            StreamReader re = File.OpenText(DefaultIconCssFile);
+            string content = string.Empty;
+            string input = null;
+            while ((input = re.ReadLine()) != null)
+            {
+                content += input.Replace(&quot;\n&quot;, &quot;&quot;) + &quot;\n&quot;;
+            }
+            re.Close();
+
+            // parse the classes
+            var m = Regex.Matches(content, &quot;([^{]*){([^}]*)}&quot;, RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+
+            foreach (Match match in m)
+            {
+                var groups = match.Groups;
+                var cssClass = groups[1].Value.Replace(&quot;\n&quot;, &quot;&quot;).Replace(&quot;\r&quot;, &quot;&quot;).Trim().Trim(Environment.NewLine.ToCharArray());
+                if (string.IsNullOrEmpty(cssClass) == false)
+                {
+                    InternalDefaultIconClasses.Add(cssClass);
+                }
+            }
+        }
+        private const string SqlSingle = &quot;SELECT id, createDate, trashed, parentId, nodeObjectType, nodeUser, level, path, sortOrder, uniqueID, text FROM umbracoNode WHERE id = @id&quot;;
+        private const string SqlDescendants = @&quot;
+            SELECT id, createDate, trashed, parentId, nodeObjectType, nodeUser, level, path, sortOrder, uniqueID, text 
+            FROM umbracoNode 
+            WHERE path LIKE &#39;%,{0},%&#39;&quot;;
+
+        #endregion
+
+        #region Public static
+
+        /// &lt;summary&gt;
+        /// Get a count on all CMSNodes given the objecttype
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;objectType&quot;&gt;The objecttype identifier&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The number of CMSNodes of the given objecttype
+        /// &lt;/returns&gt;
+        public static int CountByObjectType(Guid objectType)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                return sqlHelper.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) from umbracoNode WHERE nodeObjectType = @type&quot;, sqlHelper.CreateParameter(&quot;@type&quot;, objectType));
+        }
+
+        /// &lt;summary&gt;
+        /// Number of ancestors of the current CMSNode
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Id&quot;&gt;The CMSNode Id&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The number of ancestors from the given CMSNode
+        /// &lt;/returns&gt;
+        public static int CountSubs(int Id)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                return sqlHelper.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM umbracoNode WHERE &#39;,&#39;+path+&#39;,&#39; LIKE &#39;%,@nodeId,%&#39;&quot;, 
+                    sqlHelper.CreateParameter(&quot;nodeId&quot;, Id));
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the number of leaf nodes from the newParent id for a given object type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;objectType&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static int CountLeafNodes(int parentId, Guid objectType)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                return sqlHelper.ExecuteScalar&lt;int&gt;(&quot;Select count(uniqueID) from umbracoNode where nodeObjectType = @type And parentId = @parentId&quot;,
+	                sqlHelper.CreateParameter(&quot;@type&quot;, objectType),
+	                sqlHelper.CreateParameter(&quot;@parentId&quot;, parentId));
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the default icon classes.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The default icon classes.&lt;/value&gt;
+        public static List&lt;string&gt; DefaultIconClasses
+        {
+            get
+            {
+                using (var l = new UpgradeableReadLock(Locker))
+                {
+                    if (InternalDefaultIconClasses.Count == 0)
+                    {
+                        l.UpgradeToWriteLock();
+                        InitializeIconClasses();
+                    }
+                    return InternalDefaultIconClasses;
+                }
+
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Method for checking if a CMSNode exits with the given Guid
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uniqueID&quot;&gt;Identifier&lt;/param&gt;
+        /// &lt;returns&gt;True if there is a CMSNode with the given Guid&lt;/returns&gt;
+        public static bool IsNode(Guid uniqueID)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                return sqlHelper.ExecuteScalar&lt;int&gt;(&quot;select count(id) from umbracoNode where uniqueID = @uniqueID&quot;, sqlHelper.CreateParameter(&quot;@uniqueId&quot;, uniqueID)) &gt; 0;
+        }
+
+        /// &lt;summary&gt;
+        /// Method for checking if a CMSNode exits with the given id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Id&quot;&gt;Identifier&lt;/param&gt;
+        /// &lt;returns&gt;True if there is a CMSNode with the given id&lt;/returns&gt;
+        public static bool IsNode(int Id)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                return sqlHelper.ExecuteScalar&lt;int&gt;(&quot;select count(id) from umbracoNode where id = @id&quot;, sqlHelper.CreateParameter(&quot;@id&quot;, Id)) &gt; 0;
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a list of the unique id&#39;s of all CMSNodes given the objecttype
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;objectType&quot;&gt;The objecttype identifier&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A list of all unique identifiers which each are associated to a CMSNode
+        /// &lt;/returns&gt;
+        public static Guid[] getAllUniquesFromObjectType(Guid objectType)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+            using (IRecordsReader dr = sqlHelper.ExecuteReader(&quot;Select uniqueID from umbracoNode where nodeObjectType = @type&quot;,
+                sqlHelper.CreateParameter(&quot;@type&quot;, objectType)))
+            {
+                System.Collections.ArrayList tmp = new System.Collections.ArrayList();
+
+                while (dr.Read()) tmp.Add(dr.GetGuid(&quot;uniqueID&quot;));
+                dr.Close();
+
+                Guid[] retval = new Guid[tmp.Count];
+                for (int i = 0; i &lt; tmp.Count; i++) retval[i] = (Guid)tmp[i];
+                return retval;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a list of the node id&#39;s of all CMSNodes given the objecttype
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;objectType&quot;&gt;The objecttype identifier&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A list of all node ids which each are associated to a CMSNode
+        /// &lt;/returns&gt;
+        public static int[] getAllUniqueNodeIdsFromObjectType(Guid objectType)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+            using (IRecordsReader dr = sqlHelper.ExecuteReader(&quot;Select id from umbracoNode where nodeObjectType = @type&quot;,
+                sqlHelper.CreateParameter(&quot;@type&quot;, objectType)))
+            {
+                System.Collections.ArrayList tmp = new System.Collections.ArrayList();
+
+                while (dr.Read()) tmp.Add(dr.GetInt(&quot;id&quot;));
+                dr.Close();
+
+                return (int[])tmp.ToArray(typeof(int));
+            }
+        }
+
+
+        /// &lt;summary&gt;
+        /// Retrieves the top level nodes in the hierarchy
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ObjectType&quot;&gt;The Guid identifier of the type of objects&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A list of all top level nodes given the objecttype
+        /// &lt;/returns&gt;
+        public static Guid[] TopMostNodeIds(Guid ObjectType)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+            using (IRecordsReader dr = sqlHelper.ExecuteReader(&quot;Select uniqueID from umbracoNode where nodeObjectType = @type And parentId = -1 order by sortOrder&quot;, 
+                sqlHelper.CreateParameter(&quot;@type&quot;, ObjectType)))
+            {
+                System.Collections.ArrayList tmp = new System.Collections.ArrayList();
+
+                while (dr.Read()) tmp.Add(dr.GetGuid(&quot;uniqueID&quot;));
+                dr.Close();
+
+                Guid[] retval = new Guid[tmp.Count];
+                for (int i = 0; i &lt; tmp.Count; i++) retval[i] = (Guid)tmp[i];
+                return retval;
+            }
+        }
+
+        #endregion
+
+        #region Protected static
+
+
+        /// &lt;summary&gt;
+        /// Given the protected modifier the CMSNode.MakeNew method can only be accessed by
+        /// derived classes &amp;gt; who by definition knows of its own objectType.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;The newParent CMSNode id&lt;/param&gt;
+        /// &lt;param name=&quot;objectType&quot;&gt;The objecttype identifier&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Creator&lt;/param&gt;
+        /// &lt;param name=&quot;level&quot;&gt;The level in the tree hieararchy&lt;/param&gt;
+        /// &lt;param name=&quot;text&quot;&gt;The name of the CMSNode&lt;/param&gt;
+        /// &lt;param name=&quot;uniqueID&quot;&gt;The unique identifier&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected static CMSNode MakeNew(int parentId, Guid objectType, int userId, int level, string text, Guid uniqueID)
+        {
+            CMSNode parent = null;
+            string path = &quot;&quot;;
+            int sortOrder = 0;
+
+            if (level &gt; 0)
+            {
+                parent = new CMSNode(parentId);
+                sortOrder = GetNewDocumentSortOrder(parentId);
+                path = parent.Path;
+            }
+            else
+                path = &quot;-1&quot;;
+
+            // Ruben 8/1/2007: I replace this with a parameterized version.
+            // But does anyone know what the &#39;level++&#39; is supposed to be doing there?
+            // Nothing obviously, since it&#39;s a postfix.
+            using (var sqlHelper = Application.SqlHelper)
+                sqlHelper.ExecuteNonQuery(&quot;INSERT INTO umbracoNode(trashed, parentID, nodeObjectType, nodeUser, level, path, sortOrder, uniqueID, text, createDate) VALUES(@trashed, @parentID, @nodeObjectType, @nodeUser, @level, @path, @sortOrder, @uniqueID, @text, @createDate)&quot;,
+                                        sqlHelper.CreateParameter(&quot;@trashed&quot;, 0),
+                                        sqlHelper.CreateParameter(&quot;@parentID&quot;, parentId),
+                                        sqlHelper.CreateParameter(&quot;@nodeObjectType&quot;, objectType),
+                                        sqlHelper.CreateParameter(&quot;@nodeUser&quot;, userId),
+                                        sqlHelper.CreateParameter(&quot;@level&quot;, level++),
+                                        sqlHelper.CreateParameter(&quot;@path&quot;, path),
+                                        sqlHelper.CreateParameter(&quot;@sortOrder&quot;, sortOrder),
+                                        sqlHelper.CreateParameter(&quot;@uniqueID&quot;, uniqueID),
+                                        sqlHelper.CreateParameter(&quot;@text&quot;, text),
+                                        sqlHelper.CreateParameter(&quot;@createDate&quot;, DateTime.Now));
+
+            CMSNode retVal = new CMSNode(uniqueID);
+            retVal.Path = path + &quot;,&quot; + retVal.Id.ToString();
+
+            // NH 4.7.1 duplicate permissions because of refactor
+            if (parent != null)
+            {
+                IEnumerable&lt;Permission&gt; permissions = Permission.GetNodePermissions(parent);
+                foreach (Permission p in permissions)
+                {
+                    Permission.MakeNew(User.GetUser(p.UserId), retVal, p.PermissionId);
+                }
+
+            }
+
+            //event
+            NewEventArgs e = new NewEventArgs();
+            retVal.FireAfterNew(e);
+
+            return retVal;
+        }
+
+        private static int GetNewDocumentSortOrder(int parentId)
+        {
+            var sortOrder = 0;
+            using (var sqlHelper = Application.SqlHelper)
+            using (IRecordsReader dr = sqlHelper.ExecuteReader(
+                    &quot;SELECT MAX(sortOrder) AS sortOrder FROM umbracoNode WHERE parentID = @parentID AND nodeObjectType = @GuidForNodesOfTypeDocument&quot;,
+                    sqlHelper.CreateParameter(&quot;@parentID&quot;, parentId),
+                    sqlHelper.CreateParameter(&quot;@GuidForNodesOfTypeDocument&quot;, Document._objectType)
+                ))
+            {
+                while (dr.Read())
+                    sortOrder = dr.GetInt(&quot;sortOrder&quot;) + 1;
+            }
+
+            return sortOrder;
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a list of the id&#39;s of all CMSNodes given the objecttype and the first letter of the name.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;objectType&quot;&gt;The objecttype identifier&lt;/param&gt;
+        /// &lt;param name=&quot;letter&quot;&gt;Firstletter&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A list of all CMSNodes which has the objecttype and a name that starts with the given letter
+        /// &lt;/returns&gt;
+        protected static int[] getUniquesFromObjectTypeAndFirstLetter(Guid objectType, char letter)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+            using (IRecordsReader dr = sqlHelper.ExecuteReader(&quot;Select id from umbracoNode where nodeObjectType = @objectType AND text like @letter&quot;, sqlHelper.CreateParameter(&quot;@objectType&quot;, objectType), sqlHelper.CreateParameter(&quot;@letter&quot;, letter.ToString() + &quot;%&quot;)))
+            {
+                List&lt;int&gt; tmp = new List&lt;int&gt;();
+                while (dr.Read()) tmp.Add(dr.GetInt(&quot;id&quot;));
+                return tmp.ToArray();
+            }
+        }
+        
+        /// &lt;summary&gt;
+        /// Unused, please do not use
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Obsolete, For querying the database use the new UmbracoDatabase object ApplicationContext.Current.DatabaseContext.Database&quot;, false)]
+        protected static ISqlHelper SqlHelper
+        {
+            get { return Application.SqlHelper; }
+        }
+
+        internal static UmbracoDatabase Database
+        {
+            get { return ApplicationContext.Current.DatabaseContext.Database; }
+        }
+        #endregion
+
+        #region Constructors
+
+        /// &lt;summary&gt;
+        /// Empty constructor that is not suported
+        /// ...why is it here?
+        /// &lt;/summary&gt;
+        public CMSNode()
+        {
+            throw new NotSupportedException();
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;CMSNode&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Id&quot;&gt;The id.&lt;/param&gt;
+        public CMSNode(int Id)
+        {
+            _id = Id;
+            setupNode();
+        }
+
+        /// &lt;summary&gt;
+        /// This is purely for a hackity hack hack hack in order to make the new Document(id, version) constructor work because
+        /// the Version property needs to be set on the object before setupNode is called, otherwise it never works! this allows
+        /// inheritors to set default data before setupNode() is called.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;ctorArgs&quot;&gt;&lt;/param&gt;
+        internal CMSNode(int id, object[] ctorArgs)
+        {
+            _id = id;
+            PreSetupNode(ctorArgs);
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;CMSNode&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;The id.&lt;/param&gt;
+        /// &lt;param name=&quot;noSetup&quot;&gt;if set to &lt;c&gt;true&lt;/c&gt; [no setup].&lt;/param&gt;
+        public CMSNode(int id, bool noSetup)
+        {
+            _id = id;
+
+            if (!noSetup)
+                setupNode();
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;CMSNode&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uniqueID&quot;&gt;The unique ID.&lt;/param&gt;
+        public CMSNode(Guid uniqueID)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                _id = sqlHelper.ExecuteScalar&lt;int&gt;(&quot;SELECT id FROM umbracoNode WHERE uniqueID = @uniqueId&quot;, sqlHelper.CreateParameter(&quot;@uniqueId&quot;, uniqueID));
+            setupNode();
+        }
+
+        public CMSNode(Guid uniqueID, bool noSetup)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+                _id = sqlHelper.ExecuteScalar&lt;int&gt;(&quot;SELECT id FROM umbracoNode WHERE uniqueID = @uniqueId&quot;, sqlHelper.CreateParameter(&quot;@uniqueId&quot;, uniqueID));
+
+            if (!noSetup)
+                setupNode();
+        }
+
+        protected internal CMSNode(IRecordsReader reader)
+        {
+            _id = reader.GetInt(&quot;id&quot;);
+            PopulateCMSNodeFromReader(reader);
+        }
+
+        protected internal CMSNode(IUmbracoEntity entity)
+        {
+            _id = entity.Id;
+            Entity = entity;
+        }
+
+        protected internal CMSNode(IEntity entity)
+        {
+            _id = entity.Id;
+        }
+
+        #endregion
+
+        #region Public Methods
+
+        /// &lt;summary&gt;
+        /// Ensures uniqueness by id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;obj&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override bool Equals(object obj)
+        {
+            var l = obj as CMSNode;
+            if (l != null)
+            {
+                return this._id.Equals(l._id);
+            }
+            return false;
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures uniqueness by id
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override int GetHashCode()
+        {
+            return _id.GetHashCode();
+        }
+
+        /// &lt;summary&gt;
+        /// An xml representation of the CMSNOde
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xd&quot;&gt;Xmldocument context&lt;/param&gt;
+        /// &lt;param name=&quot;Deep&quot;&gt;If true the xml will append the CMSNodes child xml&lt;/param&gt;
+        /// &lt;returns&gt;The CMSNode Xmlrepresentation&lt;/returns&gt;
+        public virtual XmlNode ToXml(XmlDocument xd, bool Deep)
+        {
+            XmlNode x = xd.CreateNode(XmlNodeType.Element, &quot;node&quot;, &quot;&quot;);
+            XmlPopulate(xd, x, Deep);
+            return x;
+        }
+
+        public virtual XmlNode ToPreviewXml(XmlDocument xd)
+        {
+            // If xml already exists
+            if (!PreviewExists(UniqueId))
+            {
+                SavePreviewXml(ToXml(xd, false), UniqueId);
+            }
+            return GetPreviewXml(xd, UniqueId);
+        }
+
+        public virtual List&lt;CMSPreviewNode&gt; GetNodesForPreview(bool childrenOnly)
+        {
+            List&lt;CMSPreviewNode&gt; nodes = new List&lt;CMSPreviewNode&gt;();
+            string sql = @&quot;
+select umbracoNode.id, umbracoNode.parentId, umbracoNode.level, umbracoNode.sortOrder, cmsPreviewXml.xml
+from umbracoNode 
+inner join cmsPreviewXml on cmsPreviewXml.nodeId = umbracoNode.id 
+where trashed = 0 and path like &#39;{0}&#39; 
+order by level,sortOrder&quot;;
+
+            var pathExp = childrenOnly ? Path + &quot;,%&quot; : Path;
+
+            using (var sqlHelper = Application.SqlHelper)
+            using (IRecordsReader dr = sqlHelper.ExecuteReader(string.Format(sql, pathExp)))
+            {
+                while (dr.Read())
+                    nodes.Add(new CMSPreviewNode(dr.GetInt(&quot;id&quot;), dr.GetGuid(&quot;uniqueID&quot;), dr.GetInt(&quot;parentId&quot;), dr.GetShort(&quot;level&quot;), dr.GetInt(&quot;sortOrder&quot;), dr.GetString(&quot;xml&quot;), false));
+                dr.Close();
+
+                return nodes;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Used to persist object changes to the database. In Version3.0 it&#39;s just a stub for future compatibility
+        /// &lt;/summary&gt;
+        public virtual void Save()
+        {
+            SaveEventArgs e = new SaveEventArgs();
+            this.FireBeforeSave(e);
+            if (!e.Cancel)
+            {
+                //In the future there will be SQL stuff happening here... 
+                this.FireAfterSave(e);
+            }
+        }
+
+        public override string ToString()
+        {
+            if (Id != int.MinValue || !string.IsNullOrEmpty(Text))
+            {
+                return string.Format(&quot;{{ Id: {0}, Text: {1}, ParentId: {2} }}&quot;,
+                    Id,
+                    Text,
+                    _parentid
+                );
+            }
+
+            return base.ToString();
+        }
+
+        private void Move(CMSNode newParent)
+        {
+            MoveEventArgs e = new MoveEventArgs();
+            FireBeforeMove(e);
+
+            if (!e.Cancel)
+            {
+                //first we need to establish if the node already exists under the newParent node
+                //var isNewParentInPath = (Path.Contains(&quot;,&quot; + newParent.Id + &quot;,&quot;));
+
+                //if it&#39;s the same newParent, we can save some SQL calls since we know these wont change.
+                //level and path might change even if it&#39;s the same newParent because the newParent could be moving somewhere.
+                if (ParentId != newParent.Id)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                    {
+                        int maxSortOrder = sqlHelper.ExecuteScalar&lt;int&gt;(&quot;select coalesce(max(sortOrder),0) from umbracoNode where parentid = @parentId&quot;,
+                                sqlHelper.CreateParameter(&quot;@parentId&quot;, newParent.Id));
+                        this.Parent = newParent;
+                        this.sortOrder = maxSortOrder + 1;
+                    }
+                }
+
+                //detect if we have moved, then update the level and path
+                // issue: http://issues.umbraco.org/issue/U4-1579
+                if (this.Path != newParent.Path + &quot;,&quot; + this.Id.ToString())
+                {
+                    this.Level = newParent.Level + 1;
+                    this.Path = newParent.Path + &quot;,&quot; + this.Id.ToString();
+                }
+
+                //this code block should not be here but since the class structure is very poor and doesn&#39;t use 
+                //overrides (instead using shadows/new) for the Children property, when iterating over the children
+                //and calling Move(), the super classes overridden OnMove or Move methods never get fired, so 
+                //we now need to hard code this here :(
+
+                if (Path.Contains(&quot;,&quot; + ((int)RecycleBin.RecycleBinType.Content).ToString() + &quot;,&quot;)
+                    || Path.Contains(&quot;,&quot; + ((int)RecycleBin.RecycleBinType.Media).ToString() + &quot;,&quot;))
+                {
+                    //if we&#39;ve moved this to the recyle bin, we need to update the trashed property
+                    if (!IsTrashed) IsTrashed = true; //don&#39;t update if it&#39;s not necessary
+                }
+                else
+                {
+                    if (IsTrashed) IsTrashed = false; //don&#39;t update if it&#39;s not necessary
+                }
+
+                //make sure the node type is a document/media, if it is a recycle bin then this will not be equal
+                if (!IsTrashed &amp;&amp; newParent.nodeObjectType == Document._objectType)
+                {
+                    // regenerate the xml of the current document
+                    var movedDocument = new Document(this.Id);
+                    movedDocument.XmlGenerate(new XmlDocument());
+
+                    //regenerate the xml for the newParent node
+                    var parentDocument = new Document(newParent.Id);
+                    parentDocument.XmlGenerate(new XmlDocument());
+
+                }
+                else if (!IsTrashed &amp;&amp; newParent.nodeObjectType == Media._objectType)
+                {
+                    //regenerate the xml for the newParent node
+                    var m = new Media(newParent.Id);
+                    m.XmlGenerate(new XmlDocument());
+                }
+
+                var children = this.Children;
+                foreach (CMSNode c in children)
+                {
+                    c.Move(this);
+                }
+                
+                FireAfterMove(e);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Moves the CMSNode from the current position in the hierarchy to the target
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;NewParentId&quot;&gt;Target CMSNode id&lt;/param&gt;
+        [Obsolete(&quot;Obsolete, Use Umbraco.Core.Services.ContentService.Move() or Umbraco.Core.Services.MediaService.Move()&quot;, false)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public virtual void Move(int newParentId)
+        {
+            CMSNode parent = new CMSNode(newParentId);
+            Move(parent);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes this instance.
+        /// &lt;/summary&gt;
+        public virtual void delete()
+        {
+            DeleteEventArgs e = new DeleteEventArgs();
+            FireBeforeDelete(e);
+            if (!e.Cancel)
+            {
+                // remove relations
+                var rels = Relations;
+                foreach (relation.Relation rel in rels)
+                {
+                    rel.Delete();
+                }
+
+                //removes tasks
+                foreach (Task t in Tasks)
+                {
+                    t.Delete();
+                }
+
+                //remove notifications
+                Notification.DeleteNotifications(this);
+
+                //remove permissions
+                Permission.DeletePermissions(this);
+
+                //removes tag associations (i know the key is set to cascade but do it anyways)
+                Tag.RemoveTagsFromNode(this.Id);
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(&quot;DELETE FROM umbracoNode WHERE uniqueID= @uniqueId&quot;, sqlHelper.CreateParameter(&quot;@uniqueId&quot;, _uniqueID));
+                FireAfterDelete(e);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Does the current CMSNode have any child nodes.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;
+        /// 	&lt;c&gt;true&lt;/c&gt; if this instance has children; otherwise, &lt;c&gt;false&lt;/c&gt;.
+        /// &lt;/value&gt;
+        public virtual bool HasChildren
+        {
+            get
+            {
+                if (!_hasChildrenInitialized)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                    {
+                        int tmpChildrenCount = sqlHelper.ExecuteScalar&lt;int&gt;(&quot;select count(id) from umbracoNode where ParentId = @id&quot;,
+                                sqlHelper.CreateParameter(&quot;@id&quot;, Id));
+                        HasChildren = (tmpChildrenCount &gt; 0);
+                    }
+                }
+                return _hasChildren;
+            }
+            set
+            {
+                _hasChildrenInitialized = true;
+                _hasChildren = value;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all descendant nodes from this node.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This doesn&#39;t return a strongly typed IEnumerable object so that we can override in in super clases
+        /// and since this class isn&#39;t a generic (thought it should be) this is not strongly typed.
+        /// &lt;/remarks&gt;
+        public virtual IEnumerable GetDescendants()
+        {
+            var descendants = new List&lt;CMSNode&gt;();
+            using (var sqlHelper = Application.SqlHelper)
+            using (IRecordsReader dr = sqlHelper.ExecuteReader(string.Format(SqlDescendants, Id)))
+            {
+                while (dr.Read())
+                {
+                    var node = new CMSNode(dr.GetInt(&quot;id&quot;), true);
+                    node.PopulateCMSNodeFromReader(dr);
+                    descendants.Add(node);
+                }
+            }
+            return descendants;
+        }
+
+        #endregion
+
+        #region Public properties
+
+        /// &lt;summary&gt;
+        /// Determines if the node is in the recycle bin.
+        /// This is only relavent for node types that support a recyle bin (such as Document/Media)
+        /// &lt;/summary&gt;
+        public virtual bool IsTrashed
+        {
+            get
+            {
+                if (!_isTrashed.HasValue)
+                {
+                    using (var sqlHelper = Application.SqlHelper)
+                    {
+                        const string query = &quot;SELECT trashed FROM umbracoNode where id=@id&quot;;
+                        _isTrashed = Convert.ToBoolean(sqlHelper.ExecuteScalar&lt;object&gt;(query, sqlHelper.CreateParameter(&quot;@id&quot;, this.Id)));
+                    }
+                }
+                return _isTrashed.Value;
+            }
+            set
+            {
+                _isTrashed = value;
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(&quot;update umbracoNode set trashed = @trashed where id = @id&quot;,
+                    sqlHelper.CreateParameter(&quot;@trashed&quot;, value),
+                    sqlHelper.CreateParameter(&quot;@id&quot;, this.Id));
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the sort order.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The sort order.&lt;/value&gt;
+        public virtual int sortOrder
+        {
+            get { return _sortOrder; }
+            set
+            {
+                _sortOrder = value;
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(&quot;update umbracoNode set sortOrder = &#39;&quot; + value + &quot;&#39; where id = &quot; + this.Id);
+
+                if (Entity != null)
+                    Entity.SortOrder = value;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the create date time.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The create date time.&lt;/value&gt;
+        public virtual DateTime CreateDateTime
+        {
+            get { return _createDate; }
+            set
+            {
+                _createDate = value;
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(&quot;update umbracoNode set createDate = @createDate where id = &quot; + this.Id, sqlHelper.CreateParameter(&quot;@createDate&quot;, _createDate));
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the creator
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The user.&lt;/value&gt;
+        public BusinessLogic.User User
+        {
+            get
+            {
+                return BusinessLogic.User.GetUser(_userId);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the id.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The id.&lt;/value&gt;
+        public int Id
+        {
+            get { return _id; }
+        }
+
+        /// &lt;summary&gt;
+        /// Get the newParent id of the node
+        /// &lt;/summary&gt;
+        public virtual int ParentId
+        {
+            get { return _parentid; }
+            internal set { _parentid = value; }
+        }
+
+        private IUmbracoEntity _parent;
+        /// &lt;summary&gt;
+        /// Given the hierarchical tree structure a CMSNode has only one newParent but can have many children
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The newParent.&lt;/value&gt;
+        public CMSNode Parent
+        {
+            get
+            {
+                if (Level == 1) throw new ArgumentException(&quot;No newParent node&quot;);
+                if (_parent == null)
+                {
+                    _parent = ApplicationContext.Current.Services.EntityService.Get(_parentid);
+                }
+                return new CMSNode(_parent);
+            }
+            set
+            {
+                _parentid = value.Id;
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(&quot;update umbracoNode set parentId = &quot; + value.Id + &quot; where id = &quot; + this.Id.ToString());
+
+                if (Entity != null)
+                    Entity.ParentId = value.Id;
+
+                _parent = value.Entity;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// An comma separated string consisting of integer node id&#39;s
+        /// that indicates the path from the topmost node to the given node
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The path.&lt;/value&gt;
+        public virtual string Path
+        {
+            get { return _path; }
+            set
+            {
+                _path = value;
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(&quot;update umbracoNode set path = &#39;&quot; + _path + &quot;&#39; where id = &quot; + this.Id.ToString());
+
+                if (Entity != null)
+                    Entity.Path = value;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns an integer value that indicates in which level of the
+        /// tree structure the given node is
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The level.&lt;/value&gt;
+        public virtual int Level
+        {
+            get { return _level; }
+            set
+            {
+                _level = value;
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(&quot;update umbracoNode set level = &quot; + _level.ToString() + &quot; where id = &quot; + this.Id.ToString());
+
+                if (Entity != null)
+                    Entity.Level = value;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// All CMSNodes has an objecttype ie. Webpage, StyleSheet etc., used to distinguish between the different
+        /// object types for for fast loading children to the tree.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The type of the node object.&lt;/value&gt;
+        public Guid nodeObjectType
+        {
+            get { return _nodeObjectType; }
+        }
+
+        /// &lt;summary&gt;
+        /// Besides the hierarchy it&#39;s possible to relate one CMSNode to another, use this for alternative
+        /// non-strict hierarchy
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The relations.&lt;/value&gt;
+        public relation.Relation[] Relations
+        {
+            get { return relation.Relation.GetRelations(this.Id); }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all tasks associated with this node
+        /// &lt;/summary&gt;
+        public Tasks Tasks
+        {
+            get { return Task.GetTasks(this.Id); }
+        }
+
+        public virtual int ChildCount
+        {
+            get
+            {
+                using (var sqlHelper = Application.SqlHelper)
+                    return sqlHelper.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM umbracoNode where ParentID = @parentId&quot;,
+                                                    sqlHelper.CreateParameter(&quot;@parentId&quot;, this.Id));
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// The basic recursive tree pattern
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The children.&lt;/value&gt;
+        public virtual BusinessLogic.console.IconI[] Children
+        {
+            get
+            {
+                System.Collections.ArrayList tmp = new System.Collections.ArrayList();
+                using (var sqlHelper = Application.SqlHelper)
+                using (IRecordsReader dr = sqlHelper.ExecuteReader(&quot;SELECT id, createDate, trashed, parentId, nodeObjectType, nodeUser, level, path, sortOrder, uniqueID, text FROM umbracoNode WHERE ParentID = @ParentID AND nodeObjectType = @type order by sortOrder&quot;,
+                    sqlHelper.CreateParameter(&quot;@type&quot;, this.nodeObjectType),
+                    sqlHelper.CreateParameter(&quot;ParentID&quot;, this.Id)))
+                {
+                    while (dr.Read())
+                    {
+                        tmp.Add(new CMSNode(dr));
+                    }
+                }
+
+                CMSNode[] retval = new CMSNode[tmp.Count];
+
+                for (int i = 0; i &lt; tmp.Count; i++)
+                {
+                    retval[i] = (CMSNode)tmp[i];
+                }
+                return retval;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve all CMSNodes in the umbraco installation
+        /// Use with care.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The children of all object types.&lt;/value&gt;
+        public BusinessLogic.console.IconI[] ChildrenOfAllObjectTypes
+        {
+            get
+            {
+                System.Collections.ArrayList tmp = new System.Collections.ArrayList();
+                using (var sqlHelper = Application.SqlHelper)
+                using (IRecordsReader dr = sqlHelper.ExecuteReader(&quot;select id from umbracoNode where ParentID = &quot; + this.Id + &quot; order by sortOrder&quot;))
+                {
+                    while (dr.Read())
+                        tmp.Add(dr.GetInt(&quot;Id&quot;));
+                }
+
+                CMSNode[] retval = new CMSNode[tmp.Count];
+
+                for (int i = 0; i &lt; tmp.Count; i++)
+                    retval[i] = new CMSNode((int)tmp[i]);
+
+                return retval;
+            }
+        }
+        
+        #region IconI members
+
+        // Unique identifier of the given node
+        /// &lt;summary&gt;
+        /// Unique identifier of the CMSNode, used when locating data.
+        /// &lt;/summary&gt;
+        public Guid UniqueId
+        {
+            get { return _uniqueID; }
+        }
+
+        /// &lt;summary&gt;
+        /// Human readable name/label
+        /// &lt;/summary&gt;
+        public virtual string Text
+        {
+            get { return _text; }
+            set
+            {
+                _text = value;
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(&quot;UPDATE umbracoNode SET text = @text WHERE id = @id&quot;,
+                                          sqlHelper.CreateParameter(&quot;@text&quot;, value.Trim()),
+                                          sqlHelper.CreateParameter(&quot;@id&quot;, this.Id));
+
+                if (Entity != null)
+                    Entity.Name = value;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// The menu items used in the tree view
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;this is not used anywhere&quot;)]
+        public virtual BusinessLogic.console.MenuItemI[] MenuItems
+        {
+            get { return new BusinessLogic.console.MenuItemI[0]; }
+        }
+
+        /// &lt;summary&gt;
+        /// Not implemented, always returns &quot;about:blank&quot;
+        /// &lt;/summary&gt;
+        public virtual string DefaultEditorURL
+        {
+            get { return &quot;about:blank&quot;; }
+        }
+
+        /// &lt;summary&gt;
+        /// The icon in the tree
+        /// &lt;/summary&gt;
+        public virtual string Image
+        {
+            get { return m_image; }
+            set { m_image = value; }
+
+        }
+
+        /// &lt;summary&gt;
+        /// The &quot;open/active&quot; icon in the tree
+        /// &lt;/summary&gt;
+        public virtual string OpenImage
+        {
+            get { return &quot;&quot;; }
+        }
+
+        #endregion
+
+        #endregion
+
+        #region Protected methods
+
+        /// &lt;summary&gt;
+        /// This allows inheritors to set the underlying text property without persisting the change to the database.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;txt&quot;&gt;&lt;/param&gt;
+        protected void SetText(string txt)
+        {
+            _text = txt;
+
+            if (Entity != null)
+                Entity.Name = txt;
+        }
+
+        /// &lt;summary&gt;
+        /// This is purely for a hackity hack hack hack in order to make the new Document(id, version) constructor work because
+        /// the Version property needs to be set on the object before setupNode is called, otherwise it never works!
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ctorArgs&quot;&gt;&lt;/param&gt;
+        internal virtual void PreSetupNode(params object[] ctorArgs)
+        {
+            //if people want to override then awesome but then we call setupNode so they need to ensure
+            // to call base.PreSetupNode
+            setupNode();
+        }
+
+        /// &lt;summary&gt;
+        /// Sets up the internal data of the CMSNode, used by the various constructors
+        /// &lt;/summary&gt;
+        protected virtual void setupNode()
+        {
+            using (var sqlHelper = Application.SqlHelper)
+            using (IRecordsReader dr = sqlHelper.ExecuteReader(SqlSingle, 
+                sqlHelper.CreateParameter(&quot;@id&quot;, this.Id)))
+            {
+                if (dr.Read())
+                {
+                    PopulateCMSNodeFromReader(dr);
+                }
+                else
+                {
+                    throw new ArgumentException(string.Format(&quot;No node exists with id &#39;{0}&#39;&quot;, Id));
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Sets up the node for the content tree, this makes no database calls, just sets the underlying properties
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uniqueID&quot;&gt;The unique ID.&lt;/param&gt;
+        /// &lt;param name=&quot;nodeObjectType&quot;&gt;Type of the node object.&lt;/param&gt;
+        /// &lt;param name=&quot;Level&quot;&gt;The level.&lt;/param&gt;
+        /// &lt;param name=&quot;ParentId&quot;&gt;The newParent id.&lt;/param&gt;
+        /// &lt;param name=&quot;UserId&quot;&gt;The user id.&lt;/param&gt;
+        /// &lt;param name=&quot;Path&quot;&gt;The path.&lt;/param&gt;
+        /// &lt;param name=&quot;Text&quot;&gt;The text.&lt;/param&gt;
+        /// &lt;param name=&quot;CreateDate&quot;&gt;The create date.&lt;/param&gt;
+        /// &lt;param name=&quot;hasChildren&quot;&gt;if set to &lt;c&gt;true&lt;/c&gt; [has children].&lt;/param&gt;
+        protected void SetupNodeForTree(Guid uniqueID, Guid nodeObjectType, int leve, int parentId, int userId, string path, string text,
+            DateTime createDate, bool hasChildren)
+        {
+            _uniqueID = uniqueID;
+            _nodeObjectType = nodeObjectType;
+            _level = leve;
+            _parentid = parentId;
+            _userId = userId;
+            _path = path;
+            _text = text;
+            _createDate = createDate;
+            HasChildren = hasChildren;
+        }
+
+        /// &lt;summary&gt;
+        /// Updates the temp path for the content tree.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Path&quot;&gt;The path.&lt;/param&gt;
+        protected void UpdateTempPathForTree(string Path)
+        {
+            this._path = Path;
+        }
+
+        protected virtual XmlNode GetPreviewXml(XmlDocument xd, Guid version)
+        {
+            var xmlDoc = new XmlDocument();
+
+            var xmlStr = ApplicationContext.Current.DatabaseContext.Database.ExecuteScalar&lt;string&gt;(
+                &quot;select xml from cmsPreviewXml where nodeID = @nodeId and versionId = @versionId&quot;,
+                new { nodeId = Id, versionId = version });
+
+            if (xmlStr.IsNullOrWhiteSpace()) return null;
+
+            xmlDoc.LoadXml(xmlStr);
+            
+            return xd.ImportNode(xmlDoc.FirstChild, true);
+        }
+
+        protected internal virtual bool PreviewExists(Guid versionId)
+        {
+            return ApplicationContext.Current.DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                        &quot;SELECT COUNT(nodeId) FROM cmsPreviewXml WHERE nodeId=@nodeId and versionId = @versionId&quot;,
+                        new {nodeId = Id, versionId = versionId}) != 0;
+
+        }
+
+        /// &lt;summary&gt;
+        /// This needs to be synchronized since we are doing multiple sql operations in one method
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;x&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;versionId&quot;&gt;&lt;/param&gt;
+        [MethodImpl(MethodImplOptions.Synchronized)]
+        protected void SavePreviewXml(XmlNode x, Guid versionId)
+        {
+            string sql = PreviewExists(versionId) ? &quot;UPDATE cmsPreviewXml SET xml = @xml, timestamp = @timestamp WHERE nodeId=@nodeId AND versionId = @versionId&quot;
+                                : &quot;INSERT INTO cmsPreviewXml(nodeId, versionId, timestamp, xml) VALUES (@nodeId, @versionId, @timestamp, @xml)&quot;;
+
+            ApplicationContext.Current.DatabaseContext.Database.Execute(
+                sql, new {nodeId = Id, versionId = versionId, timestamp = DateTime.Now, xml = x.OuterXml});
+            
+        }
+
+        protected void PopulateCMSNodeFromReader(IRecordsReader dr)
+        {
+            // testing purposes only &gt; original umbraco data hasn&#39;t any unique values ;)
+            // And we need to have a newParent in order to create a new node ..
+            // Should automatically add an unique value if no exists (or throw a decent exception)
+            if (dr.IsNull(&quot;uniqueID&quot;)) _uniqueID = Guid.NewGuid();
+            else _uniqueID = dr.GetGuid(&quot;uniqueID&quot;);
+
+            _nodeObjectType = dr.GetGuid(&quot;nodeObjectType&quot;);
+            _level = dr.GetShort(&quot;level&quot;);
+            _path = dr.GetString(&quot;path&quot;);
+            _parentid = dr.GetInt(&quot;parentId&quot;);
+            _text = dr.GetString(&quot;text&quot;);
+            _sortOrder = dr.GetInt(&quot;sortOrder&quot;);
+            _userId = dr.GetInt(&quot;nodeUser&quot;);
+            _createDate = dr.GetDateTime(&quot;createDate&quot;);
+            _isTrashed = dr.GetBoolean(&quot;trashed&quot;);
+        }
+
+        internal protected void PopulateCMSNodeFromUmbracoEntity(IUmbracoEntity content, Guid objectType)
+        {
+            _uniqueID = content.Key;
+            _nodeObjectType = objectType;
+            _level = content.Level;
+            _path = content.Path;
+            _parentid = content.ParentId;
+            _text = content.Name;
+            _sortOrder = content.SortOrder;
+            _userId = content.CreatorId;
+            _createDate = content.CreateDate;
+            _isTrashed = content.Trashed;
+            Entity = content;
+        }
+
+        internal protected void PopulateCMSNodeFromUmbracoEntity(IAggregateRoot content, Guid objectType)
+        {
+            _uniqueID = content.Key;
+            _nodeObjectType = objectType;            
+            _createDate = content.CreateDate;
+        }
+
+        #endregion
+
+        #region Private Methods
+
+        private void XmlPopulate(XmlDocument xd, XmlNode x, bool Deep)
+        {
+            // attributes
+            x.Attributes.Append(xmlHelper.addAttribute(xd, &quot;id&quot;, this.Id.ToString()));
+            x.Attributes.Append(xmlHelper.addAttribute(xd, &quot;key&quot;, this.UniqueId.ToString()));
+            if (this.Level &gt; 1)
+                x.Attributes.Append(xmlHelper.addAttribute(xd, &quot;parentID&quot;, this.ParentId.ToString()));
+            else
+                x.Attributes.Append(xmlHelper.addAttribute(xd, &quot;parentID&quot;, &quot;-1&quot;));
+            x.Attributes.Append(xmlHelper.addAttribute(xd, &quot;level&quot;, this.Level.ToString()));
+            x.Attributes.Append(xmlHelper.addAttribute(xd, &quot;writerID&quot;, this.User.Id.ToString()));
+            x.Attributes.Append(xmlHelper.addAttribute(xd, &quot;sortOrder&quot;, this.sortOrder.ToString()));
+            x.Attributes.Append(xmlHelper.addAttribute(xd, &quot;createDate&quot;, this.CreateDateTime.ToString(&quot;s&quot;)));
+            x.Attributes.Append(xmlHelper.addAttribute(xd, &quot;nodeName&quot;, this.Text));
+            x.Attributes.Append(xmlHelper.addAttribute(xd, &quot;path&quot;, this.Path));
+
+            if (Deep)
+            {
+                //store children array here because iterating over an Array property object is very inneficient.
+                var children = this.Children;
+                foreach (Content c in children)
+                    x.AppendChild(c.ToXml(xd, true));
+            }
+        }
+
+        #endregion
+
+        #region Events
+        /// &lt;summary&gt;
+        /// Calls the subscribers of a cancelable event handler,
+        /// stopping at the event handler which cancels the event (if any).
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;Type of the event arguments.&lt;/typeparam&gt;
+        /// &lt;param name=&quot;cancelableEvent&quot;&gt;The event to fire.&lt;/param&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;Sender of the event.&lt;/param&gt;
+        /// &lt;param name=&quot;eventArgs&quot;&gt;Event arguments.&lt;/param&gt;
+        protected virtual void FireCancelableEvent&lt;T&gt;(EventHandler&lt;T&gt; cancelableEvent, object sender, T eventArgs) where T : CancelEventArgs
+        {
+            if (cancelableEvent != null)
+            {
+                foreach (Delegate invocation in cancelableEvent.GetInvocationList())
+                {
+                    invocation.DynamicInvoke(sender, eventArgs);
+                    if (eventArgs.Cancel)
+                        break;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs before a node is saved.
+        /// &lt;/summary&gt;
+        public static event EventHandler&lt;SaveEventArgs&gt; BeforeSave;
+
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:BeforeSave&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireBeforeSave(SaveEventArgs e)
+        {
+            FireCancelableEvent(BeforeSave, this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs after a node is saved. 
+        /// &lt;/summary&gt;
+        public static event EventHandler&lt;SaveEventArgs&gt; AfterSave;
+
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:AfterSave&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireAfterSave(SaveEventArgs e)
+        {
+            if (AfterSave != null)
+                AfterSave(this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs after a new node is created.
+        /// &lt;/summary&gt;
+        public static event EventHandler&lt;NewEventArgs&gt; AfterNew;
+
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:AfterNew&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireAfterNew(NewEventArgs e)
+        {
+            if (AfterNew != null)
+                AfterNew(this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs before a node is deleted.
+        /// &lt;/summary&gt;
+        public static event EventHandler&lt;DeleteEventArgs&gt; BeforeDelete;
+
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:BeforeDelete&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireBeforeDelete(DeleteEventArgs e)
+        {
+            FireCancelableEvent(BeforeDelete, this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs after a node is deleted.
+        /// &lt;/summary&gt;
+        public static event EventHandler&lt;DeleteEventArgs&gt; AfterDelete;
+
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:AfterDelete&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireAfterDelete(DeleteEventArgs e)
+        {
+            if (AfterDelete != null)
+                AfterDelete(this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs before a node is moved.
+        /// &lt;/summary&gt;
+        public static event EventHandler&lt;MoveEventArgs&gt; BeforeMove;
+
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:BeforeMove&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireBeforeMove(MoveEventArgs e)
+        {
+            FireCancelableEvent(BeforeMove, this, e);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs after a node is moved.
+        /// &lt;/summary&gt;
+        public static event EventHandler&lt;MoveEventArgs&gt; AfterMove;
+
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:AfterMove&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        protected virtual void FireAfterMove(MoveEventArgs e)
+        {
+            if (AfterMove != null)
+                AfterMove(this, e);
+        }
+
+        #endregion
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[44,9,44,29,0],[44,9,44,29,1],[44,9,44,29,0],[44,9,44,29,0],[44,9,44,29,0],[44,9,44,29,0],[44,9,44,29,1],[44,9,44,29,0],[44,9,44,29,1],[55,9,55,48,0],[55,9,55,48,1],[55,9,55,48,0],[55,9,55,48,0],[55,9,55,48,0],[55,9,55,48,1],[55,9,55,48,1],[55,9,55,48,0],[55,9,55,48,0],[56,9,56,41,1],[56,9,56,41,0],[56,9,56,41,1],[56,9,56,41,0],[56,9,56,41,1],[56,9,56,41,0],[56,9,56,41,0],[56,9,56,41,0],[56,9,56,41,0],[63,9,63,135,1],[64,9,64,94,1],[65,9,65,90,1],[68,9,68,10,0],[69,13,69,65,0],[70,13,70,43,0],[71,13,71,33,0],[72,13,72,52,0],[73,13,73,14,0],[74,17,74,59,0],[75,13,75,14,0],[76,13,76,24,0],[79,13,79,128,0],[81,13,81,20,0],[81,22,81,33,0],[81,34,81,36,0],[81,37,81,38,0],[82,13,82,14,0],[83,17,83,43,0],[84,17,84,131,0],[85,17,85,61,0],[86,17,86,18,0],[87,21,87,62,0],[88,17,88,18,0],[89,13,89,14,0],[90,9,90,10,0],[109,9,109,10,0],[110,20,110,57,0],[111,17,111,166,0],[112,9,112,10,0],[122,9,122,10,0],[123,20,123,57,0],[124,17,125,62,0],[126,9,126,10,0],[135,9,135,10,0],[136,20,136,57,0],[137,17,139,68,0],[140,9,140,10,0],[149,13,149,14,0],[150,24,150,63,0],[151,17,151,18,0],[152,21,152,63,0],[153,21,153,22,0],[154,25,154,48,0],[155,25,155,49,0],[156,21,156,22,0],[157,21,157,55,0],[160,13,160,14,0],[169,9,169,10,0],[170,20,170,57,0],[171,17,171,171,0],[172,9,172,10,0],[180,9,180,10,0],[181,20,181,57,0],[182,17,182,147,0],[183,9,183,10,0],[193,9,193,10,0],[194,20,194,57,0],[195,20,196,64,0],[197,13,197,14,0],[198,17,198,87,0],[200,17,200,34,0],[200,35,200,67,0],[201,17,201,28,0],[203,17,203,53,0],[204,22,204,31,0],[204,33,204,46,0],[204,48,204,51,0],[204,53,204,78,0],[205,17,205,31,0],[207,9,207,10,0],[217,9,217,10,0],[218,20,218,57,0],[219,20,220,64,0],[221,13,221,14,0],[222,17,222,87,0],[224,17,224,34,0],[224,35,224,60,0],[225,17,225,28,0],[227,17,227,56,0],[229,9,229,10,0],[240,9,240,10,0],[241,20,241,57,0],[242,20,243,64,0],[244,13,244,14,0],[245,17,245,87,0],[247,17,247,34,0],[247,35,247,67,0],[248,17,248,28,0],[250,17,250,53,0],[251,22,251,31,0],[251,33,251,46,0],[251,48,251,51,0],[251,53,251,78,0],[252,17,252,31,0],[254,9,254,10,0],[273,9,273,10,0],[274,13,274,35,0],[275,13,275,30,0],[276,13,276,31,0],[278,13,278,27,0],[279,13,279,14,0],[280,17,280,48,0],[281,17,281,63,0],[282,17,282,36,0],[283,13,283,14,0],[285,17,285,29,0],[290,20,290,57,0],[291,17,301,97,0],[303,13,303,52,0],[304,13,304,61,0],[307,13,307,32,0],[308,13,308,14,0],[309,17,309,93,0],[310,17,310,24,0],[310,26,310,38,0],[310,39,310,41,0],[310,42,310,53,0],[311,17,311,18,0],[312,21,312,88,0],[313,17,313,18,0],[315,13,315,14,0],[318,13,318,49,0],[319,13,319,36,0],[321,13,321,27,0],[322,9,322,10,0],[325,9,325,10,0],[326,13,326,31,0],[327,20,327,57,0],[328,20,332,18,0],[333,13,333,14,0],[334,17,334,34,0],[335,21,335,60,0],[336,13,336,14,0],[338,13,338,30,0],[339,9,339,10,0],[350,9,350,10,0],[351,20,351,57,0],[352,20,352,267,0],[353,13,353,14,0],[354,17,354,49,0],[355,17,355,34,0],[355,35,355,60,0],[356,17,356,38,0],[358,9,358,10,0],[366,17,366,18,0],[366,19,366,48,0],[366,49,366,50,0],[371,17,371,18,0],[371,19,371,78,0],[371,79,371,80,0],[381,9,381,25,0],[382,9,382,10,0],[383,13,383,47,0],[390,9,390,31,1],[391,9,391,10,1],[392,13,392,22,1],[393,13,393,25,1],[394,9,394,10,1],[403,9,403,52,0],[404,9,404,10,0],[405,13,405,22,0],[406,13,406,36,0],[407,9,407,10,0],[414,9,414,45,0],[415,9,415,10,0],[416,13,416,22,0],[418,13,418,26,0],[419,17,419,29,0],[420,9,420,10,0],[426,9,426,38,0],[427,9,427,10,0],[428,20,428,57,0],[429,17,429,159,0],[430,13,430,25,0],[431,9,431,10,0],[433,9,433,52,0],[434,9,434,10,0],[435,20,435,57,0],[436,17,436,159,0],[438,13,438,26,0],[439,17,439,29,0],[440,9,440,10,0],[442,9,442,58,0],[443,9,443,10,0],[444,13,444,39,0],[445,13,445,47,0],[446,9,446,10,0],[448,9,448,58,1],[449,9,449,10,1],[450,13,450,29,1],[451,13,451,29,1],[452,9,452,10,1],[454,9,454,51,1],[455,9,455,10,1],[456,13,456,29,1],[457,9,457,10,1],[469,9,469,10,0],[470,13,470,36,0],[471,13,471,27,0],[472,13,472,14,0],[473,17,473,47,0],[475,13,475,26,0],[476,9,476,10,0],[483,9,483,10,0],[484,13,484,38,0],[485,9,485,10,0],[494,9,494,10,0],[495,13,495,72,0],[496,13,496,38,0],[497,13,497,22,0],[498,9,498,10,0],[501,9,501,10,0],[503,13,503,42,0],[504,13,504,14,0],[505,17,505,60,0],[506,13,506,14,0],[507,13,507,48,0],[508,9,508,10,0],[511,9,511,10,0],[512,13,512,69,0],[513,13,518,27,0],[520,13,520,61,0],[522,20,522,57,0],[523,20,523,92,0],[524,13,524,14,0],[525,17,525,34,0],[526,21,526,189,0],[527,17,527,28,0],[529,17,529,30,0],[531,9,531,10,0],[537,9,537,10,0],[538,13,538,51,0],[539,13,539,36,0],[540,13,540,27,0],[541,13,541,14,0],[543,17,543,39,0],[544,13,544,14,0],[545,9,545,10,0],[548,9,548,10,0],[549,13,549,67,0],[550,13,550,14,0],[551,17,555,19,0],[558,13,558,36,0],[559,9,559,10,0],[562,9,562,10,0],[563,13,563,51,0],[564,13,564,31,0],[566,13,566,27,0],[567,13,567,14,0],[573,17,573,46,0],[574,17,574,18,0],[575,28,575,65,0],[576,21,576,22,0],[577,25,578,87,0],[579,25,579,49,0],[580,25,580,59,0],[581,21,581,22,0],[582,17,582,18,0],[586,17,586,76,0],[587,17,587,18,0],[588,21,588,54,0],[589,21,589,75,0],[590,17,590,18,0],[597,17,598,101,0],[599,17,599,18,0],[601,21,601,36,0],[601,37,601,54,0],[602,17,602,18,0],[604,17,604,18,0],[605,21,605,35,0],[605,36,605,54,0],[606,17,606,18,0],[609,17,609,84,0],[610,17,610,18,0],[612,21,612,63,0],[613,21,613,66,0],[616,21,616,69,0],[617,21,617,67,0],[619,17,619,18,0],[620,22,620,86,0],[621,17,621,18,0],[623,21,623,53,0],[624,21,624,54,0],[625,17,625,18,0],[627,17,627,46,0],[628,17,628,24,0],[628,26,628,35,0],[628,36,628,38,0],[628,39,628,47,0],[629,17,629,18,0],[630,21,630,34,0],[631,17,631,18,0],[633,17,633,34,0],[634,13,634,14,0],[635,9,635,10,0],[644,9,644,10,0],[645,13,645,55,0],[646,13,646,26,0],[647,9,647,10,0],[653,9,653,10,0],[654,13,654,55,0],[655,13,655,33,0],[656,13,656,27,0],[657,13,657,14,0],[659,17,659,38,0],[660,17,660,24,0],[660,26,660,47,0],[660,48,660,50,0],[660,51,660,55,0],[661,17,661,18,0],[662,21,662,34,0],[663,17,663,18,0],[666,17,666,24,0],[666,26,666,32,0],[666,33,666,35,0],[666,36,666,41,0],[667,17,667,18,0],[668,21,668,32,0],[669,17,669,18,0],[672,17,672,56,0],[675,17,675,52,0],[678,17,678,49,0],[679,24,679,61,0],[680,21,680,151,0],[681,17,681,36,0],[682,13,682,14,0],[683,9,683,10,0],[694,13,694,14,0],[695,17,695,46,0],[696,17,696,18,0],[697,28,697,65,0],[698,21,698,22,0],[699,25,700,71,0],[701,25,701,62,0],[702,21,702,22,0],[703,17,703,18,0],[704,17,704,37,0],[705,13,705,14,0],[707,13,707,14,0],[708,17,708,48,0],[709,17,709,38,0],[710,13,710,14,0],[722,9,722,10,0],[723,13,723,51,0],[724,20,724,57,0],[725,20,725,98,0],[726,13,726,14,0],[727,17,727,34,0],[728,17,728,18,0],[729,21,729,67,0],[730,21,730,56,0],[731,21,731,43,0],[732,17,732,18,0],[733,13,733,14,0],[734,13,734,32,0],[735,9,735,10,0],[748,13,748,14,0],[749,17,749,42,0],[750,17,750,18,0],[751,28,751,65,0],[752,21,752,22,0],[754,25,754,139,0],[755,21,755,22,0],[756,17,756,18,0],[757,17,757,41,0],[758,13,758,14,0],[760,13,760,14,0],[761,17,761,36,0],[762,24,762,61,0],[763,21,765,64,0],[766,13,766,14,0],[775,17,775,18,0],[775,19,775,37,0],[775,38,775,39,0],[777,13,777,14,0],[778,17,778,36,0],[779,24,779,61,0],[780,21,780,123,0],[782,17,782,36,0],[783,21,783,46,0],[784,13,784,14,0],[793,17,793,18,1],[793,19,793,38,1],[793,39,793,40,1],[795,13,795,14,0],[796,17,796,37,0],[797,24,797,61,0],[798,21,798,175,0],[799,13,799,14,0],[809,13,809,14,1],[810,17,810,60,1],[811,13,811,14,1],[820,17,820,18,1],[820,19,820,30,1],[820,31,820,32,1],[828,17,828,18,0],[828,19,828,36,0],[828,37,828,38,0],[829,26,829,27,0],[829,28,829,46,0],[829,47,829,48,0],[840,13,840,14,0],[841,17,841,32,0],[841,33,841,82,0],[842,17,842,37,0],[843,17,843,18,0],[844,21,844,96,0],[845,17,845,18,0],[846,17,846,45,0],[847,13,847,14,0],[849,13,849,14,0],[850,17,850,38,0],[851,24,851,61,0],[852,21,852,134,0],[854,17,854,36,0],[855,21,855,48,0],[857,17,857,40,0],[858,13,858,14,0],[868,17,868,18,0],[868,19,868,32,0],[868,33,868,34,0],[870,13,870,14,0],[871,17,871,31,0],[872,24,872,61,0],[873,21,873,129,0],[875,17,875,36,0],[876,21,876,41,0],[877,13,877,14,0],[887,17,887,18,0],[887,19,887,33,0],[887,34,887,35,0],[889,13,889,14,0],[890,17,890,32,0],[891,24,891,61,0],[892,21,892,140,0],[894,17,894,36,0],[895,21,895,42,0],[896,13,896,14,0],[906,17,906,18,1],[906,19,906,42,1],[906,43,906,44,1],[916,17,916,18,0],[916,19,916,66,0],[916,67,916,68,0],[924,17,924,18,0],[924,19,924,49,0],[924,50,924,51,0],[930,13,930,14,0],[931,24,931,61,0],[932,21,933,102,0],[934,13,934,14,0],[944,13,944,14,0],[945,17,945,87,0],[946,24,946,61,0],[947,24,949,68,0],[950,17,950,18,0],[951,21,951,38,0],[952,21,952,22,0],[953,25,953,50,0],[954,21,954,22,0],[955,17,955,18,0],[957,17,957,59,0],[959,22,959,31,0],[959,33,959,46,0],[959,48,959,51,0],[960,17,960,18,0],[961,21,961,49,0],[962,17,962,18,0],[963,17,963,31,0],[964,13,964,14,0],[975,13,975,14,0],[976,17,976,87,0],[977,24,977,61,0],[978,24,978,149,0],[979,17,979,18,0],[980,21,980,38,0],[981,25,981,50,0],[982,17,982,18,0],[984,17,984,59,0],[986,22,986,31,0],[986,33,986,46,0],[986,48,986,51,0],[987,21,987,58,0],[989,17,989,31,0],[990,13,990,14,0],[1001,17,1001,18,0],[1001,19,1001,36,0],[1001,37,1001,38,0],[1009,17,1009,18,0],[1009,19,1009,32,0],[1009,33,1009,34,0],[1011,13,1011,14,0],[1012,17,1012,31,0],[1013,24,1013,61,0],[1014,21,1016,86,0],[1018,17,1018,36,0],[1019,21,1019,41,0],[1020,13,1020,14,0],[1029,17,1029,18,0],[1029,19,1029,65,0],[1029,66,1029,67,0],[1037,17,1037,18,0],[1037,19,1037,40,0],[1037,41,1037,42,0],[1045,17,1045,18,0],[1045,19,1045,34,0],[1045,35,1045,36,0],[1046,17,1046,18,0],[1046,19,1046,35,0],[1046,36,1046,37,0],[1055,17,1055,18,0],[1055,19,1055,29,0],[1055,30,1055,31,0],[1069,9,1069,10,0],[1070,13,1070,25,0],[1072,13,1072,32,0],[1073,17,1073,35,0],[1074,9,1074,10,0],[1082,9,1082,10,0],[1085,13,1085,25,0],[1086,9,1086,10,0],[1092,9,1092,10,1],[1093,20,1093,57,1],[1094,20,1095,59,1],[1096,13,1096,14,1],[1097,17,1097,31,1],[1098,17,1098,18,1],[1099,21,1099,51,1],[1100,17,1100,18,1],[1102,17,1102,18,0],[1103,21,1103,100,0],[1105,13,1105,14,1],[1106,9,1106,10,1],[1122,9,1122,10,0],[1123,13,1123,34,0],[1124,13,1124,46,0],[1125,13,1125,27,0],[1126,13,1126,34,0],[1127,13,1127,30,0],[1128,13,1128,26,0],[1129,13,1129,26,0],[1130,13,1130,38,0],[1131,13,1131,39,0],[1132,9,1132,10,0],[1139,9,1139,10,0],[1140,13,1140,31,0],[1141,9,1141,10,0],[1144,9,1144,10,0],[1145,13,1145,44,0],[1147,13,1149,59,0],[1151,13,1151,45,0],[1151,46,1151,58,0],[1153,13,1153,36,0],[1155,13,1155,59,0],[1156,9,1156,10,0],[1159,9,1159,10,0],[1160,13,1162,72,0],[1164,9,1164,10,0],[1173,9,1173,10,0],[1174,13,1175,145,0],[1177,13,1178,108,0],[1180,9,1180,10,0],[1183,9,1183,10,1],[1187,13,1187,39,1],[1187,40,1187,67,0],[1188,18,1188,53,1],[1190,13,1190,60,1],[1191,13,1191,43,1],[1192,13,1192,42,1],[1193,13,1193,47,1],[1194,13,1194,42,1],[1195,13,1195,49,1],[1196,13,1196,45,1],[1197,13,1197,56,1],[1198,13,1198,51,1],[1199,9,1199,10,1],[1202,9,1202,10,1],[1203,13,1203,37,1],[1204,13,1204,42,1],[1205,13,1205,36,1],[1206,13,1206,34,1],[1207,13,1207,42,1],[1208,13,1208,34,1],[1209,13,1209,44,1],[1210,13,1210,41,1],[1211,13,1211,46,1],[1212,13,1212,42,1],[1213,13,1213,30,1],[1214,9,1214,10,1],[1217,9,1217,10,0],[1218,13,1218,37,0],[1219,13,1219,42,0],[1220,13,1220,46,0],[1221,9,1221,10,0],[1228,9,1228,10,0],[1230,13,1230,87,0],[1231,13,1231,94,0],[1232,13,1232,32,0],[1233,17,1233,103,0],[1235,17,1235,83,0],[1236,13,1236,93,0],[1237,13,1237,98,0],[1238,13,1238,101,0],[1239,13,1239,110,0],[1240,13,1240,84,0],[1241,13,1241,80,0],[1243,13,1243,22,0],[1244,13,1244,14,0],[1246,17,1246,46,0],[1247,17,1247,24,0],[1247,26,1247,35,0],[1247,36,1247,38,0],[1247,39,1247,47,0],[1248,21,1248,54,0],[1249,13,1249,14,0],[1250,9,1250,10,0],[1264,9,1264,10,0],[1265,13,1265,41,0],[1266,13,1266,14,0],[1267,17,1267,24,0],[1267,26,1267,45,0],[1267,46,1267,48,0],[1267,49,1267,84,0],[1268,17,1268,18,0],[1269,21,1269,65,0],[1270,21,1270,42,0],[1271,25,1271,31,0],[1272,17,1272,18,0],[1273,13,1273,14,0],[1274,9,1274,10,0],[1286,9,1286,10,0],[1287,13,1287,54,0],[1288,9,1288,10,0],[1300,9,1300,10,0],[1301,13,1301,35,0],[1302,17,1302,36,0],[1303,9,1303,10,0],[1315,9,1315,10,0],[1316,13,1316,34,0],[1317,17,1317,35,0],[1318,9,1318,10,0],[1330,9,1330,10,0],[1331,13,1331,56,0],[1332,9,1332,10,0],[1344,9,1344,10,0],[1345,13,1345,37,0],[1346,17,1346,38,0],[1347,9,1347,10,0],[1359,9,1359,10,0],[1360,13,1360,54,0],[1361,9,1361,10,0],[1373,9,1373,10,0],[1374,13,1374,35,0],[1375,17,1375,36,0],[1376,9,1376,10,0]]);
+    </script>
+  </body>
+</html>

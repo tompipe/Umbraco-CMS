@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\HealthCheck\Checks\Config\AbstractConfigCheck.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Umbraco.Core.IO;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Web.HealthCheck.Checks.Config
+{
+
+    public abstract class AbstractConfigCheck : HealthCheck
+    {
+        private readonly ConfigurationService _configurationService;
+        private readonly ILocalizedTextService _textService;
+
+        /// &lt;summary&gt;
+        /// Gets the config file path.
+        /// &lt;/summary&gt;
+        public abstract string FilePath { get; }
+
+        /// &lt;summary&gt;
+        /// Gets XPath statement to the config element to check.
+        /// &lt;/summary&gt;
+        public abstract string XPath { get; }
+
+        /// &lt;summary&gt;
+        /// Gets the values to compare against.
+        /// &lt;/summary&gt;
+        public abstract IEnumerable&lt;AcceptableConfiguration&gt; Values { get; }
+
+        /// &lt;summary&gt;
+        /// Gets the current value
+        /// &lt;/summary&gt;
+        public string CurrentValue { get; set; }
+
+        /// &lt;summary&gt;
+        /// Gets the provided value
+        /// &lt;/summary&gt;
+        public string ProvidedValue { get; set; }
+
+        /// &lt;summary&gt;
+        /// Gets the comparison type for checking the value.
+        /// &lt;/summary&gt;
+        public abstract ValueComparisonType ValueComparisonType { get; }
+
+        protected AbstractConfigCheck(HealthCheckContext healthCheckContext) : base(healthCheckContext)
+        {
+            _textService = healthCheckContext.ApplicationContext.Services.TextService;
+            _configurationService = new ConfigurationService(AbsoluteFilePath, XPath);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the name of the file.
+        /// &lt;/summary&gt;
+        private string FileName
+        {
+            get { return Path.GetFileName(FilePath); }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the absolute file path.
+        /// &lt;/summary&gt;
+        private string AbsoluteFilePath
+        {
+            get { return IOHelper.MapPath(FilePath); }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the message for when the check has succeeded.
+        /// &lt;/summary&gt;
+        public virtual string CheckSuccessMessage
+        {
+            get
+            {
+                return _textService.Localize(&quot;healthcheck/checkSuccessMessage&quot;,
+                    new[] { CurrentValue, Values.First(v =&gt; v.IsRecommended).Value, XPath, AbsoluteFilePath  });
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the message for when the check has failed.
+        /// &lt;/summary&gt;
+        public virtual string CheckErrorMessage
+        {
+            get
+            {
+                return ValueComparisonType == ValueComparisonType.ShouldEqual
+                    ? _textService.Localize(&quot;healthcheck/checkErrorMessageDifferentExpectedValue&quot;,
+                        new[] { CurrentValue, Values.First(v =&gt; v.IsRecommended).Value, XPath, AbsoluteFilePath })
+                    : _textService.Localize(&quot;healthcheck/checkErrorMessageUnexpectedValue&quot;,
+                        new[] { CurrentValue, Values.First(v =&gt; v.IsRecommended).Value, XPath, AbsoluteFilePath });
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the rectify success message.
+        /// &lt;/summary&gt;
+        public virtual string RectifySuccessMessage
+        {
+            get
+            {
+                var recommendedValue = Values.FirstOrDefault(v =&gt; v.IsRecommended);
+                var rectifiedValue = recommendedValue != null
+                    ? recommendedValue.Value
+                    : ProvidedValue;
+                return _textService.Localize(&quot;healthcheck/rectifySuccessMessage&quot;,
+                    new[]
+                    {
+                        CurrentValue,
+                        rectifiedValue,
+                        XPath,
+                        AbsoluteFilePath
+                    });
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether this check can be rectified automatically.
+        /// &lt;/summary&gt;
+        public virtual bool CanRectify
+        {
+            get { return ValueComparisonType == ValueComparisonType.ShouldEqual; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether this check can be rectified automatically if a value is provided.
+        /// &lt;/summary&gt;
+        public virtual bool CanRectifyWithValue
+        {
+            get { return ValueComparisonType == ValueComparisonType.ShouldNotEqual; }
+        }
+
+        public override IEnumerable&lt;HealthCheckStatus&gt; GetStatus()
+        {
+            var configValue = _configurationService.GetConfigurationValue();
+            if (configValue.Success == false)
+            {
+                var message = configValue.Result;
+                return new[] { new HealthCheckStatus(message) { ResultType = StatusResultType.Error } };
+            }
+
+            CurrentValue = configValue.Result;
+
+            var valueFound = Values.Any(value =&gt; string.Equals(CurrentValue, value.Value, StringComparison.InvariantCultureIgnoreCase));
+            if (ValueComparisonType == ValueComparisonType.ShouldEqual &amp;&amp; valueFound || ValueComparisonType == ValueComparisonType.ShouldNotEqual &amp;&amp; valueFound == false)
+            {
+                var message = string.Format(CheckSuccessMessage, FileName, XPath, Values, CurrentValue);
+                return new[] { new HealthCheckStatus(message) { ResultType = StatusResultType.Success } };
+            }
+
+            // Declare the action for rectifying the config value
+            var rectifyAction = new HealthCheckAction(&quot;rectify&quot;, Id)
+            {
+                Name = _textService.Localize(&quot;healthcheck/rectifyButton&quot;),
+                ValueRequired = CanRectifyWithValue,
+            };
+
+            var resultMessage = string.Format(CheckErrorMessage, FileName, XPath, Values, CurrentValue);
+            return new[]
+            {
+                new HealthCheckStatus(resultMessage)
+                {
+                    ResultType = StatusResultType.Error,
+                    Actions = CanRectify || CanRectifyWithValue ? new[] { rectifyAction } : new HealthCheckAction[0]
+                }
+            };
+        }
+
+        /// &lt;summary&gt;
+        /// Rectifies this check.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual HealthCheckStatus Rectify()
+        {
+            if (ValueComparisonType == ValueComparisonType.ShouldNotEqual)
+                throw new InvalidOperationException(_textService.Localize(&quot;healthcheck/cannotRectifyShouldNotEqual&quot;));
+
+            var recommendedValue = Values.First(v =&gt; v.IsRecommended).Value;
+            return UpdateConfigurationValue(recommendedValue);
+        }
+
+        /// &lt;summary&gt;
+        /// Rectifies this check with a provided value.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;Value provided&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual HealthCheckStatus Rectify(string value)
+        {
+            if (ValueComparisonType == ValueComparisonType.ShouldEqual)
+                throw new InvalidOperationException(_textService.Localize(&quot;healthcheck/cannotRectifyShouldEqualWithValue&quot;));
+
+            if (string.IsNullOrWhiteSpace(value))
+                throw new InvalidOperationException(_textService.Localize(&quot;healthcheck/valueToRectifyNotProvided&quot;));
+
+            // Need to track provided value in order to correctly put together the rectify message
+            ProvidedValue = value;
+
+            return UpdateConfigurationValue(value);
+        }
+
+        private HealthCheckStatus UpdateConfigurationValue(string value)
+        {
+            var updateConfigFile = _configurationService.UpdateConfigFile(value);
+
+            if (updateConfigFile.Success == false)
+            {
+                var message = updateConfigFile.Result;
+                return new HealthCheckStatus(message) { ResultType = StatusResultType.Error };
+            }
+
+            var resultMessage = string.Format(RectifySuccessMessage, FileName, XPath, Values);
+            return new HealthCheckStatus(resultMessage) { ResultType = StatusResultType.Success };
+        }
+
+        public override HealthCheckStatus ExecuteAction(HealthCheckAction action)
+        {
+            return string.IsNullOrEmpty(action.ProvidedValue)
+                ? Rectify()
+                : Rectify(action.ProvidedValue);
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[34,38,34,42,0],[34,43,34,47,0],[39,39,39,43,0],[39,44,39,48,0],[46,80,46,104,0],[47,9,47,10,0],[48,13,48,87,0],[49,13,49,87,0],[50,9,50,10,0],[57,17,57,18,0],[57,19,57,53,0],[57,54,57,55,0],[65,17,65,18,0],[65,19,65,53,0],[65,54,65,55,0],[74,13,74,14,0],[75,17,76,61,0],[76,61,76,76,0],[76,76,76,113,0],[75,17,76,113,0],[77,13,77,14,0],[86,13,86,14,0],[87,17,89,65,0],[89,65,89,80,0],[89,80,91,65,0],[91,65,91,80,0],[91,80,91,116,0],[87,17,91,116,0],[92,13,92,14,0],[101,13,101,14,0],[102,17,102,67,0],[102,67,102,82,0],[102,82,102,84,0],[102,17,102,84,0],[103,17,105,37,0],[106,17,113,24,0],[114,13,114,14,0],[122,17,122,18,0],[122,19,122,81,0],[122,82,122,83,0],[130,17,130,18,0],[130,19,130,84,0],[130,85,130,86,0],[134,9,134,10,0],[135,13,135,77,0],[136,13,136,46,0],[137,13,137,14,0],[138,17,138,50,0],[139,17,139,105,0],[142,13,142,47,0],[144,13,144,50,0],[144,50,144,135,0],[144,135,144,137,0],[144,13,144,137,0],[145,13,145,170,0],[146,13,146,14,0],[147,17,147,105,0],[148,17,148,107,0],[152,13,156,15,0],[158,13,158,105,0],[159,13,166,15,0],[167,9,167,10,0],[174,9,174,10,0],[175,13,175,75,0],[176,17,176,119,0],[178,13,178,54,0],[178,54,178,69,0],[178,69,178,77,0],[178,13,178,77,0],[179,13,179,63,0],[180,9,180,10,0],[188,9,188,10,0],[189,13,189,72,0],[190,17,190,125,0],[192,13,192,50,0],[193,17,193,117,0],[196,13,196,35,0],[198,13,198,52,0],[199,9,199,10,0],[202,9,202,10,0],[203,13,203,82,0],[205,13,205,51,0],[206,13,206,14,0],[207,17,207,55,0],[208,17,208,95,0],[211,13,211,95,0],[212,13,212,99,0],[213,9,213,10,0],[216,9,216,10,0],[217,13,219,49,0],[220,9,220,10,0]]);
+    </script>
+  </body>
+</html>

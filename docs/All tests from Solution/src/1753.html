@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Migrations\MigrationRunner.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Linq;
+using System.Text;
+using log4net;
+using Semver;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Events;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Persistence.Migrations.Syntax.IfDatabase;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Core.Persistence.Migrations
+{
+    /// &lt;summary&gt;
+    /// Represents the Migration Runner, which is used to apply migrations to
+    /// the umbraco database.
+    /// &lt;/summary&gt;
+    public class MigrationRunner
+    {
+        private readonly IMigrationEntryService _migrationEntryService;
+        private readonly ILogger _logger;
+        private readonly SemVersion _currentVersion;
+        private readonly SemVersion _targetVersion;
+        private readonly string _productName;
+        private readonly IMigration[] _migrations;
+
+        [Obsolete(&quot;Use the ctor that specifies all dependencies instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public MigrationRunner(Version currentVersion, Version targetVersion, string productName)
+            : this(LoggerResolver.Current.Logger, currentVersion, targetVersion, productName)
+        {
+        }
+
+        [Obsolete(&quot;Use the ctor that specifies all dependencies instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public MigrationRunner(ILogger logger, Version currentVersion, Version targetVersion, string productName)
+            : this(logger, currentVersion, targetVersion, productName, null)
+        {
+        }
+
+        [Obsolete(&quot;Use the ctor that specifies all dependencies instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public MigrationRunner(ILogger logger, Version currentVersion, Version targetVersion, string productName, params IMigration[] migrations)
+            : this(ApplicationContext.Current.Services.MigrationEntryService, logger, new SemVersion(currentVersion), new SemVersion(targetVersion), productName, migrations)
+        {
+            
+        }
+
+        public MigrationRunner(IMigrationEntryService migrationEntryService, ILogger logger, SemVersion currentVersion, SemVersion targetVersion, string productName, params IMigration[] migrations)
+        {
+            if (migrationEntryService == null) throw new ArgumentNullException(&quot;migrationEntryService&quot;);
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            if (currentVersion == null) throw new ArgumentNullException(&quot;currentVersion&quot;);
+            if (targetVersion == null) throw new ArgumentNullException(&quot;targetVersion&quot;);
+            Mandate.ParameterNotNullOrEmpty(productName, &quot;productName&quot;);
+
+            _migrationEntryService = migrationEntryService;
+            _logger = logger;
+            _currentVersion = currentVersion;
+            _targetVersion = targetVersion;
+            _productName = productName;
+            //ensure this is null if there aren&#39;t any
+            _migrations = migrations == null || migrations.Length == 0 ? null : migrations;
+        }
+
+        /// &lt;summary&gt;
+        /// Executes the migrations against the database.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;database&quot;&gt;The PetaPoco Database, which the migrations will be run against&lt;/param&gt;
+        /// &lt;param name=&quot;isUpgrade&quot;&gt;Boolean indicating whether this is an upgrade or downgrade&lt;/param&gt;
+        /// &lt;returns&gt;&lt;c&gt;True&lt;/c&gt; if migrations were applied, otherwise &lt;c&gt;False&lt;/c&gt;&lt;/returns&gt;
+        public virtual bool Execute(Database database, bool isUpgrade = true)
+        {
+            return Execute(database, database.GetDatabaseProvider(), isUpgrade);
+        }
+
+        /// &lt;summary&gt;
+        /// Executes the migrations against the database.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;database&quot;&gt;The PetaPoco Database, which the migrations will be run against&lt;/param&gt;
+        /// &lt;param name=&quot;databaseProvider&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;isUpgrade&quot;&gt;Boolean indicating whether this is an upgrade or downgrade&lt;/param&gt;
+        /// &lt;returns&gt;&lt;c&gt;True&lt;/c&gt; if migrations were applied, otherwise &lt;c&gt;False&lt;/c&gt;&lt;/returns&gt;
+        public virtual bool Execute(Database database, DatabaseProviders databaseProvider, bool isUpgrade = true)
+        {
+            _logger.Info&lt;MigrationRunner&gt;(&quot;Initializing database migrations&quot;);
+
+            var foundMigrations = FindMigrations();
+
+            //filter all non-schema migrations
+            var migrations = isUpgrade
+                                 ? OrderedUpgradeMigrations(foundMigrations).ToList()
+                                 : OrderedDowngradeMigrations(foundMigrations).ToList();
+
+            
+            if (Migrating.IsRaisedEventCancelled(new MigrationEventArgs(migrations, _currentVersion, _targetVersion, _productName, true), this))
+            {
+                _logger.Warn&lt;MigrationRunner&gt;(&quot;Migration was cancelled by an event&quot;);
+                return false;
+            }
+
+            //Loop through migrations to generate sql
+            var migrationContext = InitializeMigrations(migrations, database, databaseProvider, isUpgrade);
+
+            try
+            {
+                ExecuteMigrations(migrationContext, database);
+            }
+            catch (Exception ex)
+            {
+                //if this fails then the transaction will be rolled back, BUT if we are using MySql this is not the case,
+                //since it does not support schema changes in a transaction, see: http://dev.mysql.com/doc/refman/5.0/en/implicit-commit.html
+                //so in that case we have to downgrade
+                if (databaseProvider == DatabaseProviders.MySql)
+                {
+                    throw new DataLossException(
+                            &quot;An error occurred running a schema migration but the changes could not be rolled back. Error: &quot; + ex.Message + &quot;. In some cases, it may be required that the database be restored to it&#39;s original state before running this upgrade process again.&quot;,
+                            ex);
+                }
+
+                //continue throwing the exception
+                throw;
+            }
+
+            Migrated.RaiseEvent(new MigrationEventArgs(migrations, migrationContext, _currentVersion, _targetVersion, _productName, false), this);
+
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Filters and orders migrations based on the migrations listed and the currently configured version and the target installation version
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;foundMigrations&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMigration&gt; OrderedUpgradeMigrations(IEnumerable&lt;IMigration&gt; foundMigrations)
+        {
+            //get the version instance to compare with the migrations, this will be a normal c# Version object with only 3 parts
+            var targetVersionToCompare = _targetVersion.GetVersion(3);
+            var currentVersionToCompare = _currentVersion.GetVersion(3);
+
+            var migrations = (from migration in foundMigrations
+                let migrationAttributes = migration.GetType().GetCustomAttributes&lt;MigrationAttribute&gt;(false)
+                from migrationAttribute in migrationAttributes
+                where migrationAttribute != null
+                where migrationAttribute.TargetVersion &gt; currentVersionToCompare &amp;&amp;
+                      migrationAttribute.TargetVersion &lt;= targetVersionToCompare &amp;&amp;
+                      migrationAttribute.ProductName == _productName &amp;&amp;
+                      //filter if the migration specifies a minimum current version for which to execute
+                      (migrationAttribute.MinimumCurrentVersion == null || currentVersionToCompare &gt;= migrationAttribute.MinimumCurrentVersion)
+                orderby migrationAttribute.TargetVersion, migrationAttribute.SortOrder ascending
+                select migration).Distinct();
+            return migrations;
+        }
+
+        /// &lt;summary&gt;
+        /// Filters and orders migrations based on the migrations listed and the currently configured version and the target installation version
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;foundMigrations&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;IMigration&gt; OrderedDowngradeMigrations(IEnumerable&lt;IMigration&gt; foundMigrations)
+        {
+            //get the version instance to compare with the migrations, this will be a normal c# Version object with only 3 parts
+            var targetVersionToCompare = _targetVersion.GetVersion(3);
+            var currentVersionToCompare = _currentVersion.GetVersion(3);
+
+            var migrations = (from migration in foundMigrations
+                let migrationAttributes = migration.GetType().GetCustomAttributes&lt;MigrationAttribute&gt;(false)
+                from migrationAttribute in migrationAttributes
+                where migrationAttribute != null
+                where
+                    migrationAttribute.TargetVersion &gt; currentVersionToCompare &amp;&amp;
+                    migrationAttribute.TargetVersion &lt;= targetVersionToCompare &amp;&amp;
+                    migrationAttribute.ProductName == _productName &amp;&amp;
+                    //filter if the migration specifies a minimum current version for which to execute
+                    (migrationAttribute.MinimumCurrentVersion == null || currentVersionToCompare &gt;= migrationAttribute.MinimumCurrentVersion)
+                orderby migrationAttribute.TargetVersion, migrationAttribute.SortOrder descending
+                select migration).Distinct();
+            return migrations;
+        }
+
+        /// &lt;summary&gt;
+        /// Find all migrations that are available through the &lt;see cref=&quot;MigrationResolver&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;An array of &lt;see cref=&quot;IMigration&quot;/&gt;&lt;/returns&gt;
+        protected virtual IMigration[] FindMigrations()
+        {
+            //MCH NOTE: Consider adding the ProductName filter to the Resolver so we don&#39;t get a bunch of irrelevant migrations
+            return _migrations ?? MigrationResolver.Current.Migrations.ToArray();
+        }
+
+        internal MigrationContext InitializeMigrations(List&lt;IMigration&gt; migrations, Database database, DatabaseProviders databaseProvider, bool isUpgrade = true)
+        {
+            //Loop through migrations to generate sql
+            var context = new MigrationContext(databaseProvider, database, _logger);
+
+            foreach (var migration in migrations)
+            {
+                var baseMigration = migration as MigrationBase;
+                if (baseMigration != null)
+                {
+                    if (isUpgrade)
+                    {
+                        baseMigration.GetUpExpressions(context);
+                        _logger.Info&lt;MigrationRunner&gt;(string.Format(&quot;Added UPGRADE migration &#39;{0}&#39; to context&quot;, baseMigration.GetType().Name));
+                    }
+                    else
+                    {
+                        baseMigration.GetDownExpressions(context);
+                        _logger.Info&lt;MigrationRunner&gt;(string.Format(&quot;Added DOWNGRADE migration &#39;{0}&#39; to context&quot;, baseMigration.GetType().Name));
+                    }
+                }
+                else
+                {
+                    //this is just a normal migration so we can only call Up/Down
+                    if (isUpgrade)
+                    {
+                        migration.Up();
+                        _logger.Info&lt;MigrationRunner&gt;(string.Format(&quot;Added UPGRADE migration &#39;{0}&#39; to context&quot;, migration.GetType().Name));
+                    }
+                    else
+                    {
+                        migration.Down();
+                        _logger.Info&lt;MigrationRunner&gt;(string.Format(&quot;Added DOWNGRADE migration &#39;{0}&#39; to context&quot;, migration.GetType().Name));
+                    }
+                }
+            }
+
+            return context;
+        }
+
+        private void ExecuteMigrations(IMigrationContext context, Database database)
+        {
+            //Transactional execution of the sql that was generated from the found migrations
+            using (var transaction = database.GetTransaction())
+            {
+                int i = 1;
+                foreach (var expression in context.Expressions)
+                {
+                    var sql = expression.Process(database);
+                    if (string.IsNullOrEmpty(sql))
+                    {
+                        i++;
+                        continue;
+                    }
+
+                    //TODO: We should output all of these SQL calls to files in a migration folder in App_Data/TEMP
+                    // so if people want to executed them manually on another environment, they can.
+
+                    //The following ensures the multiple statement sare executed one at a time, this is a requirement
+                    // of SQLCE, it&#39;s unfortunate but necessary.
+                    // http://stackoverflow.com/questions/13665491/sql-ce-inconsistent-with-multiple-statements
+                    var sb = new StringBuilder();
+                    using (var reader = new StringReader(sql))
+                    {
+                        string line;
+                        while ((line = reader.ReadLine()) != null)
+                        {
+                            line = line.Trim();
+                            if (line.Equals(&quot;GO&quot;, StringComparison.OrdinalIgnoreCase))
+                            {
+                                //Execute the SQL up to the point of a GO statement
+                                var exeSql = sb.ToString();
+                                _logger.Info&lt;MigrationRunner&gt;(&quot;Executing sql statement &quot; + i + &quot;: &quot; + exeSql);
+                                database.Execute(exeSql);
+                                
+                                //restart the string builder
+                                sb.Remove(0, sb.Length);
+                            }
+                            else
+                            {
+                                sb.AppendLine(line);
+                            }
+                        }
+                        //execute anything remaining
+                        if (sb.Length &gt; 0)
+                        {
+                            var exeSql = sb.ToString();
+                            _logger.Info&lt;MigrationRunner&gt;(&quot;Executing sql statement &quot; + i + &quot;: &quot; + exeSql);
+                            database.Execute(exeSql);
+                        }
+                    }
+                    
+                    i++;
+                }
+
+                transaction.Complete();
+
+                //Now that this is all complete, we need to add an entry to the migrations table flagging that migrations
+                // for this version have executed.
+                //NOTE: We CANNOT do this as part of the transaction!!! This is because when upgrading to 7.3, we cannot
+                // create the migrations table and then add data to it in the same transaction without issuing things like GO
+                // commands and since we need to support all Dbs, we need to just do this after the fact.
+                var exists = _migrationEntryService.FindEntry(_productName, _targetVersion);
+                if (exists == null)
+                {
+                    _migrationEntryService.CreateEntry(_productName, _targetVersion);    
+                }
+               
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs before Migration
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;MigrationRunner, MigrationEventArgs&gt; Migrating;
+
+        /// &lt;summary&gt;
+        /// Occurs after Migration
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;MigrationRunner, MigrationEventArgs&gt; Migrated;
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[33,15,33,94,0],[34,9,34,10,0],[35,9,35,10,0],[40,15,40,77,0],[41,9,41,10,0],[42,9,42,10,0],[47,15,47,174,0],[48,9,48,10,0],[50,9,50,10,0],[52,9,52,198,1],[53,9,53,10,1],[54,13,54,47,1],[54,48,54,105,0],[55,13,55,32,1],[55,33,55,75,0],[56,13,56,40,1],[56,41,56,91,0],[57,13,57,39,1],[57,40,57,89,0],[58,13,58,73,1],[60,13,60,60,1],[61,13,61,30,1],[62,13,62,46,1],[63,13,63,44,1],[64,13,64,40,1],[66,13,66,92,1],[67,9,67,10,1],[76,9,76,10,0],[77,13,77,81,0],[78,9,78,10,0],[88,9,88,10,1],[89,13,89,79,1],[91,13,91,52,1],[94,13,96,89,1],[99,13,99,145,1],[100,13,100,14,0],[101,17,101,86,0],[102,17,102,30,0],[106,13,106,108,1],[109,13,109,14,1],[110,17,110,63,1],[111,13,111,14,1],[112,13,112,33,0],[113,13,113,14,0],[117,17,117,65,0],[118,17,118,18,0],[119,21,121,33,0],[125,17,125,23,0],[128,13,128,147,1],[130,13,130,25,1],[131,9,131,10,1],[139,9,139,10,1],[141,13,141,71,1],[142,13,142,73,1],[144,13,145,43,1],[145,43,145,109,1],[145,109,146,17,1],[146,17,146,63,1],[146,63,147,23,1],[147,23,147,49,1],[147,49,148,23,1],[148,23,152,144,1],[152,144,153,25,1],[153,25,153,57,1],[153,57,153,59,1],[153,59,153,87,1],[153,87,154,24,1],[154,24,154,33,1],[154,33,154,46,1],[144,13,154,46,1],[146,44,146,63,1],[155,13,155,31,1],[156,9,156,10,1],[164,9,164,10,1],[166,13,166,71,1],[167,13,167,73,1],[169,13,170,43,1],[170,43,170,109,1],[170,109,171,17,1],[171,17,171,63,0],[171,63,172,23,1],[172,23,172,49,0],[172,49,174,21,1],[174,21,178,142,0],[178,142,179,25,1],[179,25,179,57,0],[179,57,179,59,1],[179,59,179,87,0],[179,87,180,24,1],[180,24,180,33,0],[180,33,180,46,1],[169,13,180,46,1],[171,44,171,63,1],[181,13,181,31,1],[182,9,182,10,1],[189,9,189,10,1],[191,13,191,82,1],[192,9,192,10,1],[195,9,195,10,1],[197,13,197,85,1],[199,13,199,20,1],[199,22,199,35,1],[199,36,199,38,1],[199,39,199,49,1],[200,13,200,14,1],[201,17,201,64,1],[202,17,202,43,1],[203,17,203,18,1],[204,21,204,35,1],[205,21,205,22,1],[206,25,206,65,1],[207,25,207,144,1],[208,21,208,22,1],[210,21,210,22,0],[211,25,211,67,0],[212,25,212,146,0],[213,21,213,22,0],[214,17,214,18,1],[216,17,216,18,0],[218,21,218,35,0],[219,21,219,22,0],[220,25,220,40,0],[221,25,221,140,0],[222,21,222,22,0],[224,21,224,22,0],[225,25,225,42,0],[226,25,226,142,0],[227,21,227,22,0],[228,17,228,18,0],[229,13,229,14,1],[231,13,231,28,1],[232,9,232,10,1],[235,9,235,10,1],[237,20,237,63,1],[238,13,238,14,1],[239,17,239,27,1],[240,17,240,24,1],[240,26,240,40,1],[240,41,240,43,1],[240,44,240,63,1],[241,17,241,18,1],[242,21,242,60,1],[243,21,243,51,1],[244,21,244,22,1],[245,25,245,29,1],[246,25,246,34,1],[255,21,255,50,1],[256,28,256,62,1],[257,21,257,22,1],[259,25,259,67,1],[260,25,260,26,1],[261,29,261,48,1],[262,29,262,87,1],[263,29,263,30,1],[265,33,265,60,1],[266,33,266,111,1],[267,33,267,58,1],[270,33,270,57,1],[271,29,271,30,1],[273,29,273,30,1],[274,33,274,53,1],[275,29,275,30,1],[276,25,276,26,1],[278,25,278,43,1],[279,25,279,26,1],[280,29,280,56,1],[281,29,281,107,1],[282,29,282,54,1],[283,25,283,26,1],[284,21,284,22,1],[286,21,286,25,1],[287,17,287,18,1],[289,17,289,40,1],[296,17,296,93,1],[297,17,297,36,1],[298,17,298,18,1],[299,21,299,86,1],[300,17,300,18,1],[302,13,302,14,1],[303,9,303,10,1]]);
+    </script>
+  </body>
+</html>

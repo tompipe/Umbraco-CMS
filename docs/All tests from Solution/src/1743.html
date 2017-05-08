@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Querying\ModelToSqlExpressionVisitor.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Linq.Expressions;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Persistence.Mappers;
+using Umbraco.Core.Persistence.SqlSyntax;
+
+namespace Umbraco.Core.Persistence.Querying
+{
+    /// &lt;summary&gt;
+    /// An expression tree parser to create SQL statements and SQL parameters based on a strongly typed expression,
+    /// based on Umbraco&#39;s business logic models.
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;This object is stateful and cannot be re-used to parse an expression.&lt;/remarks&gt;
+    internal class ModelToSqlExpressionVisitor&lt;T&gt; : ExpressionVisitorBase
+    {
+        private readonly MappingResolver _mappingResolver;
+        private readonly BaseMapper _mapper;
+
+        public ModelToSqlExpressionVisitor(ISqlSyntaxProvider sqlSyntax, MappingResolver mappingResolver)
+            : base(sqlSyntax)
+        {
+            _mapper = mappingResolver.ResolveMapperByType(typeof(T));
+            _mappingResolver = mappingResolver;
+        }
+
+        [Obsolete(&quot;Use the overload the specifies a SqlSyntaxProvider&quot;)]
+        public ModelToSqlExpressionVisitor()
+            : this(SqlSyntaxContext.SqlSyntaxProvider, MappingResolver.Current)
+        { }
+
+        protected override string VisitMemberAccess(MemberExpression m)
+        {
+            if (m.Expression != null &amp;&amp;
+                m.Expression.NodeType == ExpressionType.Parameter
+                &amp;&amp; m.Expression.Type == typeof(T))
+            {
+                //don&#39;t execute if compiled
+                if (Visited == false)
+                {
+                    var field = _mapper.Map(m.Member.Name, true);
+                    if (field.IsNullOrWhiteSpace())
+                        throw new InvalidOperationException(string.Format(&quot;The mapper returned an empty field for the member name: {0} for type: {1}&quot;, m.Member.Name, m.Expression.Type));
+                    return field;
+                }
+                //already compiled, return
+                return string.Empty;
+            }
+
+            if (m.Expression != null &amp;&amp; m.Expression.NodeType == ExpressionType.Convert)
+            {
+                //don&#39;t execute if compiled
+                if (Visited == false)
+                {
+                    var field = _mapper.Map(m.Member.Name, true);
+                    if (field.IsNullOrWhiteSpace())
+                        throw new InvalidOperationException(string.Format(&quot;The mapper returned an empty field for the member name: {0} for type: {1}&quot;, m.Member.Name, m.Expression.Type));
+                    return field;
+                }
+                //already compiled, return
+                return string.Empty;
+            }
+
+            if (m.Expression != null 
+                &amp;&amp; m.Expression.Type != typeof(T) 
+                &amp;&amp; TypeHelper.IsTypeAssignableFrom&lt;IUmbracoEntity&gt;(m.Expression.Type)
+                &amp;&amp; EndsWithConstant(m) == false)
+            {
+                //if this is the case, it means we have a sub expression / nested property access, such as: x.ContentType.Alias == &quot;Test&quot;;
+                //and since the sub type (x.ContentType) is not the same as x, we need to resolve a mapper for x.ContentType to get it&#39;s mapped SQL column
+
+                //don&#39;t execute if compiled
+                if (Visited == false)
+                {
+                    var subMapper = _mappingResolver.ResolveMapperByType(m.Expression.Type);
+                    if (subMapper == null)
+                        throw new NullReferenceException(&quot;No mapper found for type &quot; + m.Expression.Type);
+                    var field = subMapper.Map(m.Member.Name, true);
+                    if (field.IsNullOrWhiteSpace())
+                        throw new InvalidOperationException(string.Format(&quot;The mapper returned an empty field for the member name: {0} for type: {1}&quot;, m.Member.Name, m.Expression.Type));
+                    return field;
+                }
+                //already compiled, return
+                return string.Empty;
+            }
+
+            //TODO: When m.Expression.NodeType == ExpressionType.Constant and it&#39;s an expression like: content =&gt; aliases.Contains(content.ContentType.Alias);
+            // then an SQL parameter will be added for aliases as an array, however in SqlIn on the subclass it will manually add these SqlParameters anyways,
+            // however the query will still execute because the SQL that is written will only contain the correct indexes of SQL parameters, this would be ignored,
+            // I&#39;m just unsure right now due to time constraints how to make it correct. It won&#39;t matter right now and has been working already with this bug but I&#39;ve
+            // only just discovered what it is actually doing.
+
+            var member = Expression.Convert(m, typeof(object));
+            var lambda = Expression.Lambda&lt;Func&lt;object&gt;&gt;(member);
+            var getter = lambda.Compile();
+            var o = getter();
+
+            SqlParameters.Add(o);
+
+            //don&#39;t execute if compiled
+            if (Visited == false)
+                return string.Format(&quot;@{0}&quot;, SqlParameters.Count - 1);
+            //already compiled, return
+            return string.Empty;
+
+        }
+
+        /// &lt;summary&gt;
+        /// Determines if the MemberExpression ends in a Constant value
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;m&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private bool EndsWithConstant(MemberExpression m)
+        {
+            Expression expr = m;
+            
+            while (expr is MemberExpression)
+            {
+                var memberExpr = expr as MemberExpression;
+                expr = memberExpr.Expression;
+            }
+            
+            var constExpr = expr as ConstantExpression;
+            return constExpr != null;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[20,15,20,30,1],[21,9,21,10,1],[22,13,22,70,1],[23,13,23,48,1],[24,9,24,10,1],[28,15,28,80,1],[29,9,29,10,1],[29,11,29,12,1],[32,9,32,10,1],[33,13,35,51,1],[36,13,36,14,1],[38,17,38,38,1],[39,17,39,18,1],[40,21,40,66,1],[41,21,41,52,1],[42,25,42,187,0],[43,21,43,34,1],[46,17,46,37,1],[49,13,49,89,1],[50,13,50,14,1],[52,17,52,38,1],[53,17,53,18,1],[54,21,54,66,1],[55,21,55,52,1],[56,25,56,187,0],[57,21,57,34,1],[60,17,60,37,0],[63,13,66,49,1],[67,13,67,14,1],[72,17,72,38,1],[73,17,73,18,1],[74,21,74,93,1],[75,21,75,43,1],[76,25,76,107,0],[77,21,77,68,1],[78,21,78,52,1],[79,25,79,187,0],[80,21,80,34,1],[83,17,83,37,0],[92,13,92,64,1],[93,13,93,66,1],[94,13,94,43,1],[95,13,95,30,1],[97,13,97,34,1],[100,13,100,34,1],[101,17,101,71,1],[103,13,103,33,0],[105,9,105,10,1],[113,9,113,10,1],[114,13,114,33,1],[116,13,116,45,1],[117,13,117,14,1],[118,17,118,59,1],[119,17,119,46,1],[120,13,120,14,1],[122,13,122,56,1],[123,13,123,38,1],[124,9,124,10,1]]);
+    </script>
+  </body>
+</html>

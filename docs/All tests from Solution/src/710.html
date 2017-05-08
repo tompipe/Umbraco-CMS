@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\UmbracoComponentRenderer.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Web;
+using System.Web.Security;
+using System.Web.UI;
+using System.Xml.Linq;
+using System.Xml.XPath;
+using HtmlAgilityPack;
+using Umbraco.Core;
+using Umbraco.Core.Dictionary;
+using Umbraco.Core.Dynamics;
+using Umbraco.Core.Models;
+using Umbraco.Core.Security;
+using Umbraco.Core.Services;
+using Umbraco.Core.Xml;
+using Umbraco.Web.Routing;
+using Umbraco.Web.Security;
+using Umbraco.Web.Templates;
+using umbraco;
+using System.Collections.Generic;
+using umbraco.cms.businesslogic.web;
+using umbraco.presentation.templateControls;
+using Umbraco.Core.Cache;
+
+namespace Umbraco.Web
+{
+
+    /// &lt;summary&gt;
+    /// Methods used to render umbraco components as HTML in templates
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// Used by UmbracoHelper
+    /// &lt;/remarks&gt;
+    internal class UmbracoComponentRenderer : IUmbracoComponentRenderer
+    {
+        private readonly UmbracoContext _umbracoContext;
+
+        public UmbracoComponentRenderer(UmbracoContext umbracoContext)
+        {
+            _umbracoContext = umbracoContext;
+        }
+
+        /// &lt;summary&gt;
+        /// Renders the template for the specified pageId and an optional altTemplateId
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pageId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;altTemplateId&quot;&gt;If not specified, will use the template assigned to the node&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IHtmlString RenderTemplate(int pageId, int? altTemplateId = null)
+        {
+            var templateRenderer = new TemplateRenderer(_umbracoContext, pageId, altTemplateId);
+            using (var sw = new StringWriter())
+            {
+                try
+                {
+                    templateRenderer.Render(sw);
+                }
+                catch (Exception ex)
+                {
+                    sw.Write(&quot;&lt;!-- Error rendering template with id {0}: &#39;{1}&#39; --&gt;&quot;, pageId, ex);
+                }
+                return new HtmlString(sw.ToString());
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Renders the macro with the specified alias.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;The alias.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IHtmlString RenderMacro(string alias)
+        {
+            return RenderMacro(alias, new { });
+        }
+
+        /// &lt;summary&gt;
+        /// Renders the macro with the specified alias, passing in the specified parameters.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;The alias.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IHtmlString RenderMacro(string alias, object parameters)
+        {
+            return RenderMacro(alias, parameters.ToDictionary&lt;object&gt;());
+        }
+
+        /// &lt;summary&gt;
+        /// Renders the macro with the specified alias, passing in the specified parameters.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;The alias.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IHtmlString RenderMacro(string alias, IDictionary&lt;string, object&gt; parameters)
+        {
+
+            if (_umbracoContext.PublishedContentRequest == null)
+            {
+                throw new InvalidOperationException(&quot;Cannot render a macro when there is no current PublishedContentRequest.&quot;);
+            }
+
+            return RenderMacro(alias, parameters, _umbracoContext.PublishedContentRequest.UmbracoPage);
+        }
+
+        /// &lt;summary&gt;
+        /// Renders the macro with the specified alias, passing in the specified parameters.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;The alias.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;param name=&quot;umbracoPage&quot;&gt;The legacy umbraco page object that is required for some macros&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IHtmlString RenderMacro(string alias, IDictionary&lt;string, object&gt; parameters, page umbracoPage)
+        {
+            if (alias == null) throw new ArgumentNullException(&quot;alias&quot;);
+            if (umbracoPage == null) throw new ArgumentNullException(&quot;umbracoPage&quot;);
+
+            var m = macro.GetMacro(alias);
+            if (m == null)
+            {
+                throw new KeyNotFoundException(&quot;Could not find macro with alias &quot; + alias);
+            }
+
+            return RenderMacro(m, parameters, umbracoPage);
+        }
+
+        /// &lt;summary&gt;
+        /// Renders the macro with the specified alias, passing in the specified parameters.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;m&quot;&gt;The macro.&lt;/param&gt;
+        /// &lt;param name=&quot;parameters&quot;&gt;The parameters.&lt;/param&gt;
+        /// &lt;param name=&quot;umbracoPage&quot;&gt;The legacy umbraco page object that is required for some macros&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IHtmlString RenderMacro(macro m, IDictionary&lt;string, object&gt; parameters, page umbracoPage)
+        {
+            if (umbracoPage == null) throw new ArgumentNullException(&quot;umbracoPage&quot;);
+            if (m == null) throw new ArgumentNullException(&quot;m&quot;);
+
+            if (_umbracoContext.PageId == null)
+            {
+                throw new InvalidOperationException(&quot;Cannot render a macro when UmbracoContext.PageId is null.&quot;);
+            }
+
+            var macroProps = new Hashtable();
+            foreach (var i in parameters)
+            {
+                //TODO: We are doing at ToLower here because for some insane reason the UpdateMacroModel method of macro.cs 
+                // looks for a lower case match. WTF. the whole macro concept needs to be rewritten.
+
+
+                //NOTE: the value could have html encoded values, so we need to deal with that
+                macroProps.Add(i.Key.ToLowerInvariant(), (i.Value is string) ? HttpUtility.HtmlDecode(i.Value.ToString()) : i.Value);
+            }
+            var macroControl = m.renderMacro(macroProps,
+                umbracoPage.Elements,
+                _umbracoContext.PageId.Value);
+
+            string html;
+            if (macroControl is LiteralControl)
+            {
+                // no need to execute, we already have text
+                html = (macroControl as LiteralControl).Text;
+            }
+            else
+            {
+                var containerPage = new FormlessPage();
+                containerPage.Controls.Add(macroControl);
+
+                using (var output = new StringWriter())
+                {
+                    // .Execute() does a PushTraceContext/PopTraceContext and writes trace output straight into &#39;output&#39;
+                    // and I do not see how we could wire the trace context to the current context... so it creates dirty
+                    // trace output right in the middle of the page.
+                    //
+                    // The only thing we can do is fully disable trace output while .Execute() runs and restore afterwards
+                    // which means trace output is lost if the macro is a control (.ascx or user control) that is invoked
+                    // from within Razor -- which makes sense anyway because the control can _not_ run correctly from
+                    // within Razor since it will never be inserted into the page pipeline (which may even not exist at all
+                    // if we&#39;re running MVC).
+                    //
+                    // I&#39;m sure there&#39;s more things that will get lost with this context changing but I guess we&#39;ll figure 
+                    // those out as we go along. One thing we lose is the content type response output.
+                    // http://issues.umbraco.org/issue/U4-1599 if it is setup during the macro execution. So 
+                    // here we&#39;ll save the content type response and reset it after execute is called.
+
+                    var contentType = _umbracoContext.HttpContext.Response.ContentType;
+                    var traceIsEnabled = containerPage.Trace.IsEnabled;
+                    containerPage.Trace.IsEnabled = false;
+                    _umbracoContext.HttpContext.Server.Execute(containerPage, output, true);
+                    containerPage.Trace.IsEnabled = traceIsEnabled;
+                    //reset the content type
+                    _umbracoContext.HttpContext.Response.ContentType = contentType;
+
+                    //Now, we need to ensure that local links are parsed
+                    html = TemplateUtilities.ParseInternalLinks(output.ToString());
+                }
+            }
+
+            return new HtmlString(html);
+        }
+
+        /// &lt;summary&gt;
+        /// Renders an field to the template
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;currentPage&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;fieldAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;altFieldAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;altText&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;insertBefore&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;insertAfter&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;recursive&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;convertLineBreaks&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;removeParagraphTags&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;casing&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;encoding&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;formatAsDate&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;formatAsDateWithTime&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;formatAsDateWithTimeSeparator&quot;&gt;&lt;/param&gt;
+        //// &lt;param name=&quot;formatString&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IHtmlString Field(IPublishedContent currentPage, string fieldAlias,
+            string altFieldAlias = &quot;&quot;, string altText = &quot;&quot;, string insertBefore = &quot;&quot;, string insertAfter = &quot;&quot;,
+            bool recursive = false, bool convertLineBreaks = false, bool removeParagraphTags = false,
+            RenderFieldCaseType casing = RenderFieldCaseType.Unchanged,
+            RenderFieldEncodingType encoding = RenderFieldEncodingType.Unchanged,
+            bool formatAsDate = false,
+            bool formatAsDateWithTime = false,
+            string formatAsDateWithTimeSeparator = &quot;&quot;)
+
+            //TODO: commented out until as it is not implemented by umbraco:item yet
+        //,string formatString = &quot;&quot;)
+        {
+            Mandate.ParameterNotNull(currentPage, &quot;currentPage&quot;);
+            Mandate.ParameterNotNullOrEmpty(fieldAlias, &quot;fieldAlias&quot;);
+
+            //TODO: This is real nasty and we should re-write the &#39;item&#39; and &#39;ItemRenderer&#39; class but si fine for now
+
+            var attributes = new Dictionary&lt;string, string&gt;
+				{
+					{&quot;field&quot;, fieldAlias},
+					{&quot;recursive&quot;, recursive.ToString().ToLowerInvariant()},
+					{&quot;useifempty&quot;, altFieldAlias},
+					{&quot;textifempty&quot;, altText},
+					{&quot;stripparagraph&quot;, removeParagraphTags.ToString().ToLowerInvariant()},
+					{
+						&quot;case&quot;, casing == RenderFieldCaseType.Lower ? &quot;lower&quot;
+						        	: casing == RenderFieldCaseType.Upper ? &quot;upper&quot;
+						        	  	: casing == RenderFieldCaseType.Title ? &quot;title&quot;
+						        	  	  	: string.Empty
+						},
+					{&quot;inserttextbefore&quot;, insertBefore},
+					{&quot;inserttextafter&quot;, insertAfter},
+					{&quot;convertlinebreaks&quot;, convertLineBreaks.ToString().ToLowerInvariant()},
+                    {&quot;formatasdate&quot;, formatAsDate.ToString().ToLowerInvariant()},
+                    {&quot;formatasdatewithtime&quot;, formatAsDateWithTime.ToString().ToLowerInvariant()},
+                    {&quot;formatasdatewithtimeseparator&quot;, formatAsDateWithTimeSeparator}
+				};
+            switch (encoding)
+            {
+                case RenderFieldEncodingType.Url:
+                    attributes.Add(&quot;urlencode&quot;, &quot;true&quot;);
+                    break;
+                case RenderFieldEncodingType.Html:
+                    attributes.Add(&quot;htmlencode&quot;, &quot;true&quot;);
+                    break;
+                case RenderFieldEncodingType.Unchanged:
+                default:
+                    break;
+            }
+
+            //need to convert our dictionary over to this weird dictionary type
+            var attributesForItem = new AttributeCollectionAdapter(
+                new AttributeCollection(
+                    new StateBag()));
+            foreach (var i in attributes)
+            {
+                attributesForItem.Add(i.Key, i.Value);
+            }
+
+
+
+            var item = new Item(currentPage)
+            {
+                Field = fieldAlias,
+                TextIfEmpty = altText,
+                LegacyAttributes = attributesForItem
+            };
+
+            //here we are going to check if we are in the context of an Umbraco routed page, if we are we 
+            //will leave the NodeId empty since the underlying ItemRenderer will work ever so slightly faster
+            //since it already knows about the current page. Otherwise, we&#39;ll assign the id based on our
+            //currently assigned node. The PublishedContentRequest will be null if:
+            // * we are rendering a partial view or child action
+            // * we are rendering a view from a custom route
+            if ((_umbracoContext.PublishedContentRequest == null
+                || _umbracoContext.PublishedContentRequest.PublishedContent.Id != currentPage.Id)
+                &amp;&amp; currentPage.Id &gt; 0) // in case we&#39;re rendering a detached content (id == 0)
+            {
+                item.NodeId = currentPage.Id.ToString(CultureInfo.InvariantCulture);
+            }
+
+
+            var containerPage = new FormlessPage();
+            containerPage.Controls.Add(item);
+
+            using (var output = new StringWriter())
+            using (var htmlWriter = new HtmlTextWriter(output))
+            {
+                ItemRenderer.Instance.Init(item);
+                ItemRenderer.Instance.Load(item);
+                ItemRenderer.Instance.Render(item, htmlWriter);
+
+                //because we are rendering the output through the legacy Item (webforms) stuff, the {localLinks} will already be replaced.
+                return new HtmlString(output.ToString());
+            }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[42,9,42,71,0],[43,9,43,10,0],[44,13,44,46,0],[45,9,45,10,0],[54,9,54,10,0],[55,13,55,97,0],[56,20,56,47,0],[57,13,57,14,0],[59,17,59,18,0],[60,21,60,49,0],[61,17,61,18,0],[62,17,62,37,0],[63,17,63,18,0],[64,21,64,98,0],[65,17,65,18,0],[66,17,66,54,0],[68,9,68,10,0],[76,9,76,10,0],[77,13,77,48,0],[78,9,78,10,0],[87,9,87,10,0],[88,13,88,74,0],[89,9,89,10,0],[98,9,98,10,0],[100,13,100,65,0],[101,13,101,14,0],[102,17,102,128,0],[105,13,105,104,0],[106,9,106,10,0],[116,9,116,10,0],[117,13,117,31,0],[117,32,117,73,0],[118,13,118,37,0],[118,38,118,85,0],[120,13,120,43,0],[121,13,121,27,0],[122,13,122,14,0],[123,17,123,92,0],[126,13,126,60,0],[127,9,127,10,0],[137,9,137,10,0],[138,13,138,37,0],[138,38,138,85,0],[139,13,139,27,0],[139,28,139,65,0],[141,13,141,48,0],[142,13,142,14,0],[143,17,143,114,0],[146,13,146,46,0],[147,13,147,20,0],[147,22,147,27,0],[147,28,147,30,0],[147,31,147,41,0],[148,13,148,14,0],[154,17,154,134,0],[155,13,155,14,0],[156,13,158,47,0],[161,13,161,48,0],[162,13,162,14,0],[164,17,164,62,0],[165,13,165,14,0],[167,13,167,14,0],[168,17,168,56,0],[169,17,169,58,0],[171,24,171,55,0],[172,17,172,18,0],[188,21,188,88,0],[189,21,189,72,0],[190,21,190,59,0],[191,21,191,93,0],[192,21,192,68,0],[194,21,194,84,0],[197,21,197,84,0],[198,17,198,18,0],[199,13,199,14,0],[201,13,201,41,0],[202,9,202,10,0],[234,9,234,10,0],[235,13,235,66,0],[236,13,236,71,0],[240,13,259,7,0],[260,13,260,30,0],[263,21,263,57,0],[264,21,264,27,0],[266,21,266,58,0],[267,21,267,27,0],[270,21,270,27,0],[274,13,276,38,0],[277,13,277,20,0],[277,22,277,27,0],[277,28,277,30,0],[277,31,277,41,0],[278,13,278,14,0],[279,17,279,55,0],[280,13,280,14,0],[284,13,289,15,0],[297,13,299,39,0],[300,13,300,14,0],[301,17,301,85,0],[302,13,302,14,0],[305,13,305,52,0],[306,13,306,46,0],[308,20,308,51,0],[309,20,309,63,0],[310,13,310,14,0],[311,17,311,50,0],[312,17,312,50,0],[313,17,313,64,0],[316,17,316,58,0],[318,9,318,10,0]]);
+    </script>
+  </body>
+</html>

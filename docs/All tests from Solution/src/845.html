@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Strategies\ServerRegistrationEventHandler.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web;
+using Newtonsoft.Json;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Services;
+using Umbraco.Core.Sync;
+using Umbraco.Web.Routing;
+using Umbraco.Web.Scheduling;
+
+namespace Umbraco.Web.Strategies
+{
+    /// &lt;summary&gt;
+    /// Ensures that servers are automatically registered in the database, when using the database server registrar.
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// &lt;para&gt;At the moment servers are automatically registered upon first request and then on every
+    /// request but not more than once per (configurable) period. This really is &quot;for information &amp; debug&quot; purposes so
+    /// we can look at the table and see what servers are registered - but the info is not used anywhere.&lt;/para&gt;
+    /// &lt;para&gt;Should we actually want to use this, we would need a better and more deterministic way of figuring
+    /// out the &quot;server address&quot; ie the address to which server-to-server requests should be sent - because it
+    /// probably is not the &quot;current request address&quot; - especially in multi-domains configurations.&lt;/para&gt;
+    /// &lt;/remarks&gt;
+    public sealed class ServerRegistrationEventHandler : ApplicationEventHandler
+    {
+        private DatabaseServerRegistrar _registrar;
+        private BackgroundTaskRunner&lt;IBackgroundTask&gt; _backgroundTaskRunner;
+        private bool _started = false;
+        private TouchServerTask _task;
+        private object _lock = new object();
+
+        // bind to events
+        protected override void ApplicationStarted(UmbracoApplicationBase umbracoApplication, ApplicationContext applicationContext)
+        {
+            _registrar = ServerRegistrarResolver.Current.Registrar as DatabaseServerRegistrar;
+            
+            // only for the DatabaseServerRegistrar
+            if (_registrar == null) return;
+
+            _backgroundTaskRunner = new BackgroundTaskRunner&lt;IBackgroundTask&gt;(
+                new BackgroundTaskRunnerOptions { AutoStart = true },
+                applicationContext.ProfilingLogger.Logger);
+
+            //We will start the whole process when a successful request is made
+            UmbracoModule.RouteAttempt += UmbracoModuleRouteAttempt;
+        }
+
+        /// &lt;summary&gt;
+        /// Handle when a request is made
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// We require this because:
+        /// - ApplicationContext.UmbracoApplicationUrl is initialized by UmbracoModule in BeginRequest
+        /// - RegisterServer is called on UmbracoModule.RouteAttempt which is triggered in ProcessRequest
+        ///      we are safe, UmbracoApplicationUrl has been initialized
+        /// &lt;/remarks&gt;
+        private void UmbracoModuleRouteAttempt(object sender, RoutableAttemptEventArgs e)
+        {
+            switch (e.Outcome)
+            {
+                case EnsureRoutableOutcome.IsRoutable:
+                case EnsureRoutableOutcome.NotDocumentRequest:
+                    RegisterBackgroundTasks(e);
+                    break;                
+            }
+        }
+        
+        private void RegisterBackgroundTasks(UmbracoRequestEventArgs e)
+        {
+            //remove handler, we&#39;re done
+            UmbracoModule.RouteAttempt -= UmbracoModuleRouteAttempt;
+
+            //only perform this one time ever
+            LazyInitializer.EnsureInitialized(ref _task, ref _started, ref _lock, () =&gt;
+            {
+                var serverAddress = e.UmbracoContext.Application.UmbracoApplicationUrl;
+                var svc = e.UmbracoContext.Application.Services.ServerRegistrationService;
+
+                var task = new TouchServerTask(_backgroundTaskRunner,
+                    15000, //delay before first execution
+                    _registrar.Options.RecurringSeconds*1000, //amount of ms between executions
+                    svc, _registrar, serverAddress);
+                
+                //Perform the rest async, we don&#39;t want to block the startup sequence
+                // this will just reoccur on a background thread
+                _backgroundTaskRunner.TryAdd(task);
+
+                return task;
+            });
+        }
+
+        private class TouchServerTask : RecurringTaskBase
+        {
+            private readonly IServerRegistrationService _svc;
+            private readonly DatabaseServerRegistrar _registrar;
+            private readonly string _serverAddress;
+
+            /// &lt;summary&gt;
+            /// Initializes a new instance of the &lt;see cref=&quot;RecurringTaskBase&quot;/&gt; class.
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;runner&quot;&gt;The task runner.&lt;/param&gt;
+            /// &lt;param name=&quot;delayMilliseconds&quot;&gt;The delay.&lt;/param&gt;
+            /// &lt;param name=&quot;periodMilliseconds&quot;&gt;The period.&lt;/param&gt;
+            /// &lt;param name=&quot;svc&quot;&gt;&lt;/param&gt;
+            /// &lt;param name=&quot;registrar&quot;&gt;&lt;/param&gt;
+            /// &lt;param name=&quot;serverAddress&quot;&gt;&lt;/param&gt;
+            /// &lt;remarks&gt;The task will repeat itself periodically. Use this constructor to create a new task.&lt;/remarks&gt;
+            public TouchServerTask(IBackgroundTaskRunner&lt;RecurringTaskBase&gt; runner, int delayMilliseconds, int periodMilliseconds,
+                IServerRegistrationService svc, DatabaseServerRegistrar registrar, string serverAddress)
+                : base(runner, delayMilliseconds, periodMilliseconds)
+            {
+                if (svc == null) throw new ArgumentNullException(&quot;svc&quot;);
+                _svc = svc;
+                _registrar = registrar;
+                _serverAddress = serverAddress;
+            }
+
+            public override bool IsAsync
+            {
+                get { return false; }
+            }
+
+            public override bool RunsOnShutdown
+            {
+                get { return false; }
+            }
+
+            /// &lt;summary&gt;
+            /// Runs the background task.
+            /// &lt;/summary&gt;
+            /// &lt;returns&gt;A value indicating whether to repeat the task.&lt;/returns&gt;
+            public override bool PerformRun()
+            {
+                try
+                {
+                    _svc.TouchServer(_serverAddress, _svc.CurrentServerIdentity, _registrar.Options.StaleServerTimeout);
+
+                    return true; // repeat
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.Error&lt;ServerRegistrationEventHandler&gt;(&quot;Failed to update server record in database.&quot;, ex);
+
+                    return false; // probably stop if we have an error
+                }
+            }
+
+            public override Task&lt;bool&gt; PerformRunAsync(CancellationToken token)
+            {
+                throw new NotImplementedException();
+            }
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[30,9,30,39,0],[32,9,32,45,0],[36,9,36,10,0],[37,13,37,95,0],[40,13,40,36,0],[40,37,40,44,0],[42,13,44,60,0],[47,13,47,69,0],[48,9,48,10,0],[62,9,62,10,0],[63,13,63,31,0],[67,21,67,48,0],[68,21,68,27,0],[70,9,70,10,0],[73,9,73,10,0],[75,13,75,69,0],[78,13,79,13,0],[79,13,79,14,0],[79,14,80,17,0],[80,17,80,88,0],[80,88,81,17,0],[81,17,81,91,0],[81,91,83,17,0],[83,17,86,53,0],[86,53,90,17,0],[90,17,90,52,0],[90,52,92,17,0],[92,17,92,29,0],[92,29,93,13,0],[93,13,93,14,0],[93,14,93,16,0],[78,13,93,16,0],[94,9,94,10,0],[114,19,114,70,0],[115,13,115,14,0],[116,17,116,33,0],[116,34,116,73,0],[117,17,117,28,0],[118,17,118,40,0],[119,17,119,48,0],[120,13,120,14,0],[124,21,124,22,0],[124,23,124,36,0],[124,37,124,38,0],[129,21,129,22,0],[129,23,129,36,0],[129,37,129,38,0],[137,13,137,14,0],[139,17,139,18,0],[140,21,140,121,0],[142,21,142,33,0],[144,17,144,37,0],[145,17,145,18,0],[146,21,146,120,0],[148,21,148,34,0],[150,13,150,14,0],[153,13,153,14,0],[154,17,154,53,0]]);
+    </script>
+  </body>
+</html>

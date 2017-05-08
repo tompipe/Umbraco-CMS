@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Routing\ContentFinderByUrlAlias.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Text;
+using System.Linq;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core;
+using Umbraco.Core.Xml;
+using Umbraco.Web.PublishedCache;
+
+namespace Umbraco.Web.Routing
+{
+	/// &lt;summary&gt;
+	/// Provides an implementation of &lt;see cref=&quot;IContentFinder&quot;/&gt; that handles page aliases.
+	/// &lt;/summary&gt;
+	/// &lt;remarks&gt;
+	/// &lt;para&gt;Handles &lt;c&gt;/just/about/anything&lt;/c&gt; where &lt;c&gt;/just/about/anything&lt;/c&gt; is contained in the &lt;c&gt;umbracoUrlAlias&lt;/c&gt; property of a document.&lt;/para&gt;
+	/// &lt;para&gt;The alias is the full path to the document. There can be more than one alias, separated by commas.&lt;/para&gt;
+	/// &lt;/remarks&gt;
+    public class ContentFinderByUrlAlias : IContentFinder
+    {
+		/// &lt;summary&gt;
+		/// Tries to find and assign an Umbraco document to a &lt;c&gt;PublishedContentRequest&lt;/c&gt;.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;docRequest&quot;&gt;The &lt;c&gt;PublishedContentRequest&lt;/c&gt;.&lt;/param&gt;		
+		/// &lt;returns&gt;A value indicating whether an Umbraco document was found and assigned.&lt;/returns&gt;
+		public bool TryFindContent(PublishedContentRequest docRequest)
+		{
+			IPublishedContent node = null;
+
+			if (docRequest.Uri.AbsolutePath != &quot;/&quot;) // no alias if &quot;/&quot;
+			{
+				node = FindContentByAlias(docRequest.RoutingContext.UmbracoContext.ContentCache,
+					docRequest.HasDomain ? docRequest.Domain.RootNodeId : 0, 
+					docRequest.Uri.GetAbsolutePathDecoded());
+
+				if (node != null)
+				{					
+					docRequest.PublishedContent = node;
+					LogHelper.Debug&lt;ContentFinderByUrlAlias&gt;(&quot;Path \&quot;{0}\&quot; is an alias for id={1}&quot;, () =&gt; docRequest.Uri.AbsolutePath, () =&gt; docRequest.PublishedContent.Id);
+				}
+			}
+
+			return node != null;
+		}
+
+        private static IPublishedContent FindContentByAlias(ContextualPublishedContentCache cache, int rootNodeId, string alias)
+        {
+            if (alias == null) throw new ArgumentNullException(&quot;alias&quot;);
+
+            // the alias may be &quot;foo/bar&quot; or &quot;/foo/bar&quot;
+            // there may be spaces as in &quot;/foo/bar,  /foo/nil&quot;
+            // these should probably be taken care of earlier on
+
+            alias = alias.TrimStart(&#39;/&#39;);
+            var xpathBuilder = new StringBuilder();
+            xpathBuilder.Append(XPathStringsDefinition.Root);
+
+            if (rootNodeId &gt; 0)
+                xpathBuilder.AppendFormat(XPathStrings.DescendantDocumentById, rootNodeId);
+
+            XPathVariable var = null;
+            if (alias.Contains(&#39;\&#39;&#39;) || alias.Contains(&#39;&quot;&#39;))
+            {
+                // use a var, as escaping gets ugly pretty quickly
+                var = new XPathVariable(&quot;alias&quot;, alias);
+                alias = &quot;$alias&quot;;
+            }
+            xpathBuilder.AppendFormat(XPathStrings.DescendantDocumentByAlias, alias);
+
+            var xpath = xpathBuilder.ToString();
+
+            // note: it&#39;s OK if var is null, will be ignored
+            return cache.GetSingleByXPath(xpath, var);
+        }
+
+        #region XPath Strings
+
+        class XPathStringsDefinition
+		{
+			public int Version { get; private set; }
+
+			public static string Root { get { return &quot;/root&quot;; } }
+			public string DescendantDocumentById { get; private set; }
+			public string DescendantDocumentByAlias { get; private set; }
+
+			public XPathStringsDefinition(int version)
+			{
+				Version = version;
+
+				switch (version)
+				{
+					// legacy XML schema
+					case 0:
+						DescendantDocumentById = &quot;//node [@id={0}]&quot;;
+						DescendantDocumentByAlias = &quot;//node[(&quot;
+							+ &quot;contains(concat(&#39;,&#39;,translate(data [@alias=&#39;umbracoUrlAlias&#39;], &#39; &#39;, &#39;&#39;),&#39;,&#39;),&#39;,{0},&#39;)&quot;
+							+ &quot; or contains(concat(&#39;,&#39;,translate(data [@alias=&#39;umbracoUrlAlias&#39;], &#39; &#39;, &#39;&#39;),&#39;,&#39;),&#39;,/{0},&#39;)&quot;
+							+ &quot;)]&quot;;
+						break;
+
+					// default XML schema as of 4.10
+					case 1:
+						DescendantDocumentById = &quot;//* [@isDoc and @id={0}]&quot;;
+						DescendantDocumentByAlias = &quot;//* [@isDoc and (&quot;
+							+ &quot;contains(concat(&#39;,&#39;,translate(umbracoUrlAlias, &#39; &#39;, &#39;&#39;),&#39;,&#39;),&#39;,{0},&#39;)&quot;
+							+ &quot; or contains(concat(&#39;,&#39;,translate(umbracoUrlAlias, &#39; &#39;, &#39;&#39;),&#39;,&#39;),&#39;,/{0},&#39;)&quot;
+							+ &quot;)]&quot;;
+						break;
+
+					default:
+						throw new Exception(string.Format(&quot;Unsupported Xml schema version &#39;{0}&#39;).&quot;, version));
+				}
+			}
+		}
+
+		static XPathStringsDefinition _xPathStringsValue;
+		static XPathStringsDefinition XPathStrings
+		{
+			get
+			{
+				// in theory XPathStrings should be a static variable that
+				// we should initialize in a static ctor - but then test cases
+				// that switch schemas fail - so cache and refresh when needed,
+				// ie never when running the actual site
+
+				var version = UmbracoConfig.For.UmbracoSettings().Content.UseLegacyXmlSchema ? 0 : 1;
+				if (_xPathStringsValue == null || _xPathStringsValue.Version != version)
+					_xPathStringsValue = new XPathStringsDefinition(version);
+				return _xPathStringsValue;
+			}
+		}
+
+		#endregion
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[28,3,28,4,1],[29,4,29,34,1],[31,4,31,43,1],[32,4,32,5,1],[33,5,35,47,1],[37,5,37,22,1],[38,5,38,6,1],[39,6,39,41,1],[40,6,40,92,1],[40,92,40,119,0],[40,119,40,127,1],[40,127,40,157,0],[40,157,40,159,1],[40,6,40,159,1],[41,5,41,6,1],[42,4,42,5,1],[44,4,44,24,1],[45,3,45,4,1],[48,9,48,10,1],[49,13,49,31,1],[49,32,49,73,0],[55,13,55,42,1],[56,13,56,52,1],[57,13,57,62,1],[59,13,59,32,1],[60,17,60,92,1],[62,13,62,38,1],[63,13,63,61,1],[64,13,64,14,0],[66,17,66,57,0],[67,17,67,34,0],[68,13,68,14,0],[69,13,69,86,1],[71,13,71,49,1],[74,13,74,55,1],[75,9,75,10,1],[81,25,81,29,1],[81,30,81,42,1],[83,36,83,37,1],[83,38,83,53,1],[83,54,83,55,1],[84,43,84,47,1],[84,48,84,60,1],[85,46,85,50,1],[85,51,85,63,1],[87,4,87,46,1],[88,4,88,5,1],[89,5,89,23,1],[91,5,91,21,1],[95,7,95,51,0],[96,7,99,15,0],[100,7,100,13,0],[104,7,104,59,1],[105,7,108,15,1],[109,7,109,13,1],[112,7,112,93,0],[114,4,114,5,1],[121,4,121,5,1],[127,5,127,90,1],[128,5,128,77,1],[129,6,129,63,1],[130,5,130,31,1],[131,4,131,5,1]]);
+    </script>
+  </body>
+</html>

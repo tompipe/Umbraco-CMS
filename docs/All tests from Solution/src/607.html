@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\developer\Packages\Installer.aspx.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.ComponentModel;
+using System.Data;
+using System.Drawing;
+using System.Globalization;
+using System.Threading;
+using System.Web;
+using System.Web.SessionState;
+using System.Web.UI;
+using System.Web.UI.WebControls;
+using System.Web.UI.HtmlControls;
+using System.Xml;
+using System.Xml.XPath;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Web;
+using umbraco.BasePages;
+using umbraco.BusinessLogic;
+using umbraco.cms.presentation.Trees;
+using Umbraco.Core;
+using BizLogicAction = umbraco.BusinessLogic.Actions.Action;
+
+namespace umbraco.presentation.developer.packages
+{
+    /// &lt;summary&gt;
+    /// Summary description for packager.
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;This should not be used and will be removed in v8, this is kept here only for backwards compat reasons, this page should never be rendered/used&quot;)]
+    public class Installer : UmbracoEnsuredPage
+    {
+        public Installer()
+        {
+            CurrentApp = DefaultApps.developer.ToString();
+            _installer = new cms.businesslogic.packager.Installer(UmbracoUser.Id);
+        }
+
+        private Control _configControl;
+        private cms.businesslogic.packager.repositories.Repository _repo;
+        private readonly cms.businesslogic.packager.Installer _installer = null;
+        private string _tempFileName = &quot;&quot;;
+
+        protected string RefreshQueryString { get; set; }
+
+        protected void Page_Load(object sender, EventArgs e)
+        {
+            var ex = new Exception();
+            if (!cms.businesslogic.packager.Settings.HasFileAccess(ref ex))
+            {
+                fb.Style.Add(&quot;margin-top&quot;, &quot;7px&quot;);
+                fb.type = uicontrols.Feedback.feedbacktype.error;
+                fb.Text = &quot;&lt;strong&gt;&quot; + ui.Text(&quot;errors&quot;, &quot;filePermissionsError&quot;) + &quot;:&lt;/strong&gt;&lt;br/&gt;&quot; + ex.Message;
+            }
+
+            if (!IsPostBack)
+            {
+                ButtonInstall.Attributes.Add(&quot;onClick&quot;, &quot;jQuery(this).hide(); jQuery(&#39;#installingMessage&#39;).show();; return true;&quot;);
+                ButtonLoadPackage.Attributes.Add(&quot;onClick&quot;, &quot;jQuery(this).hide(); jQuery(&#39;#loadingbar&#39;).show();; return true;&quot;);
+            }
+
+            //if we are actually in the middle of installing something... meaning we keep redirecting back to this page with 
+            // custom query strings 
+            // TODO: SD: This process needs to be fixed/changed/etc... to use the InstallPackageController
+            //	http://issues.umbraco.org/issue/U4-1047
+            if (!string.IsNullOrEmpty(Request.GetItemAsString(&quot;installing&quot;)))
+            {
+                HideAllPanes();
+                pane_installing.Visible = true;
+                ProcessInstall(Request.GetItemAsString(&quot;installing&quot;)); //process the current step
+
+            }
+            else if (tempFile.Value.IsNullOrWhiteSpace() //if we haven&#39;t downloaded the .umb temp file yet
+                &amp;&amp; (!Request.GetItemAsString(&quot;guid&quot;).IsNullOrWhiteSpace() &amp;&amp; !Request.GetItemAsString(&quot;repoGuid&quot;).IsNullOrWhiteSpace()))
+            {
+                //we&#39;ll fetch the local information we have about our repo, to find out what webservice to query.
+                _repo = cms.businesslogic.packager.repositories.Repository.getByGuid(Request.GetItemAsString(&quot;repoGuid&quot;));
+
+                if (_repo != null &amp;&amp; _repo.HasConnection())
+                {
+                    //from the webservice we&#39;ll fetch some info about the package.
+                    cms.businesslogic.packager.repositories.Package pack = _repo.Webservice.PackageByGuid(Request.GetItemAsString(&quot;guid&quot;));
+
+                    //if the package is protected we will ask for the users credentials. (this happens every time they try to fetch anything)
+                    if (!pack.Protected)
+                    {
+                        //if it isn&#39;t then go straigt to the accept licens screen
+                        tempFile.Value = _installer.Import(_repo.fetch(Request.GetItemAsString(&quot;guid&quot;), UmbracoUser.Id));
+                        UpdateSettings();
+
+                    }
+                    else if (!IsPostBack)
+                    {
+
+                        //Authenticate against the repo
+                        HideAllPanes();
+                        pane_authenticate.Visible = true;
+
+                    }
+                }
+                else
+                {
+                    fb.Style.Add(&quot;margin-top&quot;, &quot;7px&quot;);
+                    fb.type = uicontrols.Feedback.feedbacktype.error;
+                    fb.Text = &quot;&lt;strong&gt;No connection to repository.&lt;/strong&gt; Runway could not be installed as there was no connection to: &#39;&quot; + _repo.RepositoryUrl + &quot;&#39;&quot;;
+                    pane_upload.Visible = false;
+                }
+            }
+        }
+
+        protected override void OnPreRender(EventArgs e)
+        {
+            base.OnPreRender(e);
+            acceptCheckbox.Attributes.Add(&quot;onmouseup&quot;, &quot;document.getElementById(&#39;&quot; + ButtonInstall.ClientID + &quot;&#39;).disabled = false;&quot;);
+        }
+
+        protected void uploadFile(object sender, EventArgs e)
+        {
+            try
+            {
+                _tempFileName = Guid.NewGuid().ToString() + &quot;.umb&quot;;
+                string fileName = SystemDirectories.Data + System.IO.Path.DirectorySeparatorChar + _tempFileName;
+                file1.PostedFile.SaveAs(IOHelper.MapPath(fileName));
+                tempFile.Value = _installer.Import(_tempFileName);
+                UpdateSettings();
+            }
+            catch (Exception ex)
+            {
+                fb.type = global::umbraco.uicontrols.Feedback.feedbacktype.error;
+                fb.Text = &quot;&lt;strong&gt;Could not upload file&lt;/strong&gt;&lt;br/&gt;&quot; + ex.ToString();
+            }
+        }
+
+        //this fetches the protected package from the repo.
+        protected void fetchProtectedPackage(object sender, EventArgs e)
+        {
+            //we auth against the webservice. This key will be used to fetch the protected package.
+            string memberGuid = _repo.Webservice.authenticate(tb_email.Text, library.md5(tb_password.Text));
+
+            //if we auth correctly and get a valid key back, we will fetch the file from the repo webservice.
+            if (string.IsNullOrEmpty(memberGuid) == false)
+            {
+                tempFile.Value = _installer.Import(_repo.fetch(helper.Request(&quot;guid&quot;), memberGuid));
+                UpdateSettings();
+            }
+        }
+
+        //this loads the accept license screen
+        private void UpdateSettings()
+        {
+            HideAllPanes();
+
+            pane_acceptLicense.Visible = true;
+            pane_acceptLicenseInner.Text = &quot;Installing the package: &quot; + _installer.Name;
+            Panel1.Text = &quot;Installing the package: &quot; + _installer.Name;
+
+
+            if (_installer.ContainsUnsecureFiles)
+            {
+                pp_unsecureFiles.Visible = true;
+                foreach (string str in _installer.UnsecureFiles)
+                {
+                    lt_files.Text += &quot;&lt;li&gt;&quot; + str + &quot;&lt;/li&gt;&quot;;
+                }
+            }
+
+            if (_installer.ContainsLegacyPropertyEditors)
+            {
+                LegacyPropertyEditorPanel.Visible = true;
+            }
+
+            if (_installer.ContainsBinaryFileErrors)
+            {
+                BinaryFileErrorsPanel.Visible = true;
+                foreach (var str in _installer.BinaryFileErrors)
+                {
+                    BinaryFileErrorReport.Text += &quot;&lt;li&gt;&quot; + str + &quot;&lt;/li&gt;&quot;;
+                }
+            }
+
+            if (_installer.ContainsMacroConflict)
+            {
+                pp_macroConflicts.Visible = true;
+                foreach (var item in _installer.ConflictingMacroAliases)
+                {
+                    ltrMacroAlias.Text += &quot;&lt;li&gt;&quot; + item.Key + &quot; (Alias: &quot; + item.Value + &quot;)&lt;/li&gt;&quot;;
+                }
+            }
+
+            if (_installer.ContainsTemplateConflicts)
+            {
+                pp_templateConflicts.Visible = true;
+                foreach (var item in _installer.ConflictingTemplateAliases)
+                {
+                    ltrTemplateAlias.Text += &quot;&lt;li&gt;&quot; + item.Key + &quot; (Alias: &quot; + item.Value + &quot;)&lt;/li&gt;&quot;;
+                }
+            }
+
+            if (_installer.ContainsStyleSheeConflicts)
+            {
+                pp_stylesheetConflicts.Visible = true;
+                foreach (var item in _installer.ConflictingStyleSheetNames)
+                {
+                    ltrStylesheetNames.Text += &quot;&lt;li&gt;&quot; + item.Key + &quot; (Alias: &quot; + item.Value + &quot;)&lt;/li&gt;&quot;;
+                }
+            }
+
+            LabelName.Text = _installer.Name + &quot; Version: &quot; + _installer.Version;
+            LabelMore.Text = &quot;&lt;a href=\&quot;&quot; + _installer.Url + &quot;\&quot; target=\&quot;_blank\&quot;&gt;&quot; + _installer.Url + &quot;&lt;/a&gt;&quot;;
+            LabelAuthor.Text = &quot;&lt;a href=\&quot;&quot; + _installer.AuthorUrl + &quot;\&quot; target=\&quot;_blank\&quot;&gt;&quot; + _installer.Author + &quot;&lt;/a&gt;&quot;;
+            LabelLicense.Text = &quot;&lt;a href=\&quot;&quot; + _installer.LicenseUrl + &quot;\&quot; target=\&quot;_blank\&quot;&gt;&quot; + _installer.License + &quot;&lt;/a&gt;&quot;;
+
+            if (_installer.ReadMe != &quot;&quot;)
+                readme.Text = &quot;&lt;div style=\&quot;border: 1px solid #999; padding: 5px; overflow: auto; width: 370px; height: 160px;\&quot;&gt;&quot; + library.ReplaceLineBreaks(library.StripHtml(_installer.ReadMe)) + &quot;&lt;/div&gt;&quot;;
+            else
+                readme.Text = &quot;&lt;span style=\&quot;color: #999\&quot;&gt;No information&lt;/span&gt;&lt;br/&gt;&quot;;
+        }
+
+
+        private void ProcessInstall(string currentStep)
+        {
+            var dir = Request.GetItemAsString(&quot;dir&quot;);
+            var packageId = 0;
+            int.TryParse(Request.GetItemAsString(&quot;pId&quot;), out packageId);
+
+            switch (currentStep.ToLowerInvariant())
+            {
+                case &quot;businesslogic&quot;:
+                    //first load in the config from the temporary directory
+                    //this will ensure that the installer have access to all the new files and the package manifest
+                    _installer.LoadConfig(dir);
+                    _installer.InstallBusinessLogic(packageId, dir);
+
+
+                    //making sure that publishing actions performed from the cms layer gets pushed to the presentation
+                    library.RefreshContent();
+
+                    if (string.IsNullOrEmpty(_installer.Control) == false)
+                    {
+                        Response.Redirect(&quot;installer.aspx?installing=refresh&amp;dir=&quot; + dir + &quot;&amp;pId=&quot; + packageId.ToString() + &quot;&amp;customControl=&quot; + Server.UrlEncode(_installer.Control) + &quot;&amp;customUrl=&quot; + Server.UrlEncode(_installer.Url));
+                    }
+                    else
+                    {
+                        Response.Redirect(&quot;installer.aspx?installing=refresh&amp;dir=&quot; + dir + &quot;&amp;pId=&quot; + packageId.ToString() + &quot;&amp;customUrl=&quot; + Server.UrlEncode(_installer.Url));
+                    }
+                    break;
+                case &quot;custominstaller&quot;:
+                    var customControl = Request.GetItemAsString(&quot;customControl&quot;);
+
+                    if (customControl.IsNullOrWhiteSpace() == false)
+                    {
+                        HideAllPanes();
+
+                        _configControl = LoadControl(SystemDirectories.Root + customControl);
+                        _configControl.ID = &quot;packagerConfigControl&quot;;
+
+                        pane_optional.Controls.Add(_configControl);
+                        pane_optional.Visible = true;
+
+                        if (!IsPostBack)
+                        {
+                            //We still need to clean everything up which is normally done in the Finished Action
+                            PerformPostInstallCleanup(packageId, dir);
+                        }
+
+                    }
+                    else
+                    {
+                        //if the custom installer control is empty here (though it should never be because we&#39;ve already checked for it previously)
+                        //then we should run the normal FinishedAction
+                        PerformFinishedAction(packageId, dir, Request.GetItemAsString(&quot;customUrl&quot;));
+                    }
+                    break;
+                case &quot;refresh&quot;:
+                    PerformRefreshAction(packageId, dir, Request.GetItemAsString(&quot;customUrl&quot;), Request.GetItemAsString(&quot;customControl&quot;));
+                    break;
+                case &quot;finished&quot;:
+                    PerformFinishedAction(packageId, dir, Request.GetItemAsString(&quot;customUrl&quot;));
+                    break;
+                case &quot;uninstalled&quot;:
+                    PerformUninstalledAction();
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Perform the &#39;Finished&#39; action of the installer
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;packageId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dir&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;url&quot;&gt;&lt;/param&gt;
+        private void PerformFinishedAction(int packageId, string dir, string url)
+        {
+            HideAllPanes();
+            //string url = _installer.Url;
+            string packageViewUrl = &quot;installedPackage.aspx?id=&quot; + packageId.ToString(CultureInfo.InvariantCulture);
+
+            bt_viewInstalledPackage.OnClientClick = &quot;document.location = &#39;&quot; + packageViewUrl + &quot;&#39;; return false;&quot;;
+
+            if (!string.IsNullOrEmpty(url))
+                lit_authorUrl.Text = &quot; &lt;em&gt;&quot; + ui.Text(&quot;or&quot;) + &quot;&lt;/em&gt; &lt;a href=&#39;&quot; + url + &quot;&#39; target=\&quot;_blank\&quot;&gt;&quot; + ui.Text(&quot;viewPackageWebsite&quot;) + &quot;&lt;/a&gt;&quot;;
+
+
+            pane_success.Visible = true;
+
+            PerformPostInstallCleanup(packageId, dir);
+        }
+
+        private void PerformUninstalledAction()
+        {
+            HideAllPanes();
+            Panel1.Text = &quot;Package has been uninstalled&quot;;
+            pane_uninstalled.Visible = true;
+        }
+
+        /// &lt;summary&gt;
+        /// Perform the &#39;Refresh&#39; action of the installer
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;packageId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dir&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;url&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;customControl&quot;&gt;&lt;/param&gt;
+        private void PerformRefreshAction(int packageId, string dir, string url, string customControl)
+        {
+            HideAllPanes();
+
+            //create the URL to refresh to
+            // /umbraco/developer/packages/installer.aspx?installing=finished
+            //          &amp;dir=X:\Projects\Umbraco\Umbraco_7.0\src\Umbraco.Web.UI\App_Data\aef8c41f-63a0-494b-a1e2-10d761647033
+            //          &amp;pId=3
+            //          &amp;customUrl=http:%2f%2four.umbraco.org%2fprojects%2fwebsite-utilities%2fmerchello
+
+            if (customControl.IsNullOrWhiteSpace())
+            {
+                RefreshQueryString = Server.UrlEncode(string.Format(
+                &quot;installing=finished&amp;dir={0}&amp;pId={1}&amp;customUrl={2}&quot;,
+                dir, packageId, url));
+            }
+            else
+            {
+                RefreshQueryString = Server.UrlEncode(string.Format(
+                &quot;installing=customInstaller&amp;dir={0}&amp;pId={1}&amp;customUrl={2}&amp;customControl={3}&quot;,
+                dir, packageId, url, customControl));
+            }
+
+            pane_refresh.Visible = true;
+
+            PerformPostInstallCleanup(packageId, dir);
+        }
+
+        /// &lt;summary&gt;
+        /// Runs Post refresh actions such reloading the correct tree nodes, etc...
+        /// &lt;/summary&gt;
+        private void PerformPostRefreshAction()
+        {
+            BasePage.Current.ClientTools.ReloadActionNode(true, true);
+        }
+
+        /// &lt;summary&gt;
+        /// Runs Post install actions such as clearning any necessary cache, reloading the correct tree nodes, etc...
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;packageId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dir&quot;&gt;&lt;/param&gt;
+        private void PerformPostInstallCleanup(int packageId, string dir)
+        {   
+            _installer.InstallCleanUp(packageId, dir);
+
+            // Update ClientDependency version
+            var clientDependencyConfig = new Umbraco.Core.Configuration.ClientDependencyConfiguration(LoggerResolver.Current.Logger);
+            var clientDependencyUpdated = clientDependencyConfig.IncreaseVersionNumber();
+            
+            //clear the tree cache - we&#39;ll do this here even though the browser will reload, but just in case it doesn&#39;t can&#39;t hurt.
+            ClientTools.ClearClientTreeCache().RefreshTree(&quot;packager&quot;);
+            TreeDefinitionCollection.Instance.ReRegisterTrees();
+            BizLogicAction.ReRegisterActionsAndHandlers();
+        }
+
+        //this accepts the package, creates the manifest and then installs the files.
+        protected void startInstall(object sender, System.EventArgs e)
+        {
+            //we will now create the installer manifest, which means that umbraco can register everything that gets added to the system
+            //this returns an id of the manifest.
+
+            _installer.LoadConfig(tempFile.Value);
+
+            int pId = _installer.CreateManifest(tempFile.Value, helper.Request(&quot;guid&quot;), helper.Request(&quot;repoGuid&quot;));
+
+            //and then copy over the files. This will take some time if it contains .dlls that will reboot the system..
+            _installer.InstallFiles(pId, tempFile.Value);
+
+            //TODO: This is a total hack, we need to refactor the installer to be just like the package installer during the 
+            // install process and use AJAX to ensure that app pool restarts and restarts PROPERLY before installing the business
+            // logic. Until then, we are going to put a thread sleep here for 2 seconds in hopes that we always fluke out and the app 
+            // pool will be restarted after redirect.
+            Thread.Sleep(2000);
+
+            Response.Redirect(&quot;installer.aspx?installing=businesslogic&amp;dir=&quot; + tempFile.Value + &quot;&amp;pId=&quot; + pId.ToString());
+        }
+
+        private void HideAllPanes()
+        {
+            pane_authenticate.Visible = false;
+            pane_acceptLicense.Visible = false;
+            pane_installing.Visible = false;
+            pane_optional.Visible = false;
+            pane_success.Visible = false;
+            pane_refresh.Visible = false;
+            pane_upload.Visible = false;
+        }
+
+        /// &lt;summary&gt;
+        /// Panel1 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.UmbracoPanel Panel1;
+
+        /// &lt;summary&gt;
+        /// fb control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.Feedback fb;
+
+        /// &lt;summary&gt;
+        /// pane_upload control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.Pane pane_upload;
+
+        /// &lt;summary&gt;
+        /// PropertyPanel9 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel PropertyPanel9;
+
+        /// &lt;summary&gt;
+        /// file1 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.HtmlControls.HtmlInputFile file1;
+
+        /// &lt;summary&gt;
+        /// ButtonLoadPackage control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Button ButtonLoadPackage;
+
+        /// &lt;summary&gt;
+        /// progbar1 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.ProgressBar progbar1;
+
+        /// &lt;summary&gt;
+        /// pane_authenticate control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.Pane pane_authenticate;
+
+        /// &lt;summary&gt;
+        /// tb_email control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.TextBox tb_email;
+
+        /// &lt;summary&gt;
+        /// PropertyPanel1 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel PropertyPanel1;
+
+        /// &lt;summary&gt;
+        /// tb_password control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.TextBox tb_password;
+
+        /// &lt;summary&gt;
+        /// PropertyPanel2 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel PropertyPanel2;
+
+        /// &lt;summary&gt;
+        /// Button1 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Button Button1;
+
+        /// &lt;summary&gt;
+        /// pane_acceptLicense control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Panel pane_acceptLicense;
+
+        /// &lt;summary&gt;
+        /// pane_acceptLicenseInner control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.Pane pane_acceptLicenseInner;
+
+        /// &lt;summary&gt;
+        /// PropertyPanel3 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel PropertyPanel3;
+
+        /// &lt;summary&gt;
+        /// LabelName control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Label LabelName;
+
+        /// &lt;summary&gt;
+        /// PropertyPanel5 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel PropertyPanel5;
+
+        /// &lt;summary&gt;
+        /// LabelAuthor control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Label LabelAuthor;
+
+        /// &lt;summary&gt;
+        /// PropertyPanel4 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel PropertyPanel4;
+
+        /// &lt;summary&gt;
+        /// LabelMore control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Label LabelMore;
+
+        /// &lt;summary&gt;
+        /// PropertyPanel6 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel PropertyPanel6;
+
+        /// &lt;summary&gt;
+        /// LabelLicense control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Label LabelLicense;
+
+        /// &lt;summary&gt;
+        /// PropertyPanel7 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel PropertyPanel7;
+
+        /// &lt;summary&gt;
+        /// acceptCheckbox control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.CheckBox acceptCheckbox;
+
+        /// &lt;summary&gt;
+        /// PropertyPanel8 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel PropertyPanel8;
+
+        /// &lt;summary&gt;
+        /// readme control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Literal readme;
+
+        /// &lt;summary&gt;
+        /// pp_unsecureFiles control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel pp_unsecureFiles;
+
+        /// &lt;summary&gt;
+        /// lt_files control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Literal lt_files;
+
+        /// &lt;summary&gt;
+        /// pp_macroConflicts control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel pp_macroConflicts;
+
+        /// &lt;summary&gt;
+        /// ltrMacroAlias control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Literal ltrMacroAlias;
+
+        /// &lt;summary&gt;
+        /// pp_templateConflicts control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel pp_templateConflicts;
+
+        protected global::umbraco.uicontrols.PropertyPanel BinaryFileErrorsPanel;
+        protected global::umbraco.uicontrols.PropertyPanel LegacyPropertyEditorPanel;
+        protected global::System.Web.UI.WebControls.Literal BinaryFileErrorReport;
+
+        /// &lt;summary&gt;
+        /// ltrTemplateAlias control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Literal ltrTemplateAlias;
+
+        /// &lt;summary&gt;
+        /// pp_stylesheetConflicts control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.PropertyPanel pp_stylesheetConflicts;
+
+        /// &lt;summary&gt;
+        /// ltrStylesheetNames control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Literal ltrStylesheetNames;
+
+        /// &lt;summary&gt;
+        /// _progbar1 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.ProgressBar _progbar1;
+
+        /// &lt;summary&gt;
+        /// ButtonInstall control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Button ButtonInstall;
+
+        /// &lt;summary&gt;
+        /// pane_installing control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.Pane pane_installing;
+
+        protected global::umbraco.uicontrols.Pane pane_uninstalled;
+
+
+        /// &lt;summary&gt;
+        /// progBar2 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.ProgressBar progBar2;
+
+        /// &lt;summary&gt;
+        /// lit_installStatus control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Literal lit_installStatus;
+
+        /// &lt;summary&gt;
+        /// pane_optional control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.Pane pane_optional;
+
+        /// &lt;summary&gt;
+        /// pane_success control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::umbraco.uicontrols.Pane pane_success;
+
+        protected global::umbraco.uicontrols.Pane pane_refresh;
+
+        /// &lt;summary&gt;
+        /// bt_viewInstalledPackage control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Button bt_viewInstalledPackage;
+
+        /// &lt;summary&gt;
+        /// lit_authorUrl control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.WebControls.Literal lit_authorUrl;
+
+        /// &lt;summary&gt;
+        /// tempFile control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.HtmlControls.HtmlInputHidden tempFile;
+
+        /// &lt;summary&gt;
+        /// processState control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.HtmlControls.HtmlInputHidden processState;
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[32,9,32,27,0],[33,9,33,10,0],[34,13,34,59,0],[35,13,35,83,0],[36,9,36,10,0],[40,9,40,81,0],[41,9,41,43,0],[43,47,43,51,0],[43,52,43,56,0],[46,9,46,10,0],[47,13,47,38,0],[48,13,48,76,0],[49,13,49,14,0],[50,17,50,51,0],[51,17,51,66,0],[52,17,52,115,0],[53,13,53,14,0],[55,13,55,29,0],[56,13,56,14,0],[57,17,57,132,0],[58,17,58,129,0],[59,13,59,14,0],[65,13,65,78,0],[66,13,66,14,0],[67,17,67,32,0],[68,17,68,48,0],[69,17,69,71,0],[71,13,71,14,0],[72,18,73,137,0],[74,13,74,14,0],[76,17,76,123,0],[78,17,78,60,0],[79,17,79,18,0],[81,21,81,140,0],[84,21,84,41,0],[85,21,85,22,0],[87,25,87,122,0],[88,25,88,42,0],[90,21,90,22,0],[91,26,91,42,0],[92,21,92,22,0],[95,25,95,40,0],[96,25,96,58,0],[98,21,98,22,0],[99,17,99,18,0],[101,17,101,18,0],[102,21,102,55,0],[103,21,103,70,0],[104,21,104,170,0],[105,21,105,49,0],[106,17,106,18,0],[107,13,107,14,0],[108,9,108,10,0],[111,9,111,10,0],[112,13,112,33,0],[113,13,113,135,0],[114,9,114,10,0],[117,9,117,10,0],[119,13,119,14,0],[120,17,120,68,0],[121,17,121,114,0],[122,17,122,69,0],[123,17,123,67,0],[124,17,124,34,0],[125,13,125,14,0],[126,13,126,33,0],[127,13,127,14,0],[128,17,128,82,0],[129,17,129,89,0],[130,13,130,14,0],[131,9,131,10,0],[135,9,135,10,0],[137,13,137,109,0],[140,13,140,59,0],[141,13,141,14,0],[142,17,142,101,0],[143,17,143,34,0],[144,13,144,14,0],[145,9,145,10,0],[149,9,149,10,0],[150,13,150,28,0],[152,13,152,47,0],[153,13,153,89,0],[154,13,154,72,0],[157,13,157,50,0],[158,13,158,14,0],[159,17,159,49,0],[160,17,160,24,0],[160,26,160,36,0],[160,37,160,39,0],[160,40,160,64,0],[161,17,161,18,0],[162,21,162,61,0],[163,17,163,18,0],[164,13,164,14,0],[166,13,166,58,0],[167,13,167,14,0],[168,17,168,58,0],[169,13,169,14,0],[171,13,171,53,0],[172,13,172,14,0],[173,17,173,54,0],[174,17,174,24,0],[174,26,174,33,0],[174,34,174,36,0],[174,37,174,64,0],[175,17,175,18,0],[176,21,176,74,0],[177,17,177,18,0],[178,13,178,14,0],[180,13,180,50,0],[181,13,181,14,0],[182,17,182,50,0],[183,17,183,24,0],[183,26,183,34,0],[183,35,183,37,0],[183,38,183,72,0],[184,17,184,18,0],[185,21,185,99,0],[186,17,186,18,0],[187,13,187,14,0],[189,13,189,54,0],[190,13,190,14,0],[191,17,191,53,0],[192,17,192,24,0],[192,26,192,34,0],[192,35,192,37,0],[192,38,192,75,0],[193,17,193,18,0],[194,21,194,102,0],[195,17,195,18,0],[196,13,196,14,0],[198,13,198,55,0],[199,13,199,14,0],[200,17,200,55,0],[201,17,201,24,0],[201,26,201,34,0],[201,35,201,37,0],[201,38,201,75,0],[202,17,202,18,0],[203,21,203,104,0],[204,17,204,18,0],[205,13,205,14,0],[207,13,207,82,0],[208,13,208,112,0],[209,13,209,123,0],[210,13,210,126,0],[212,13,212,41,0],[213,17,213,209,0],[215,17,215,88,0],[216,9,216,10,0],[220,9,220,10,0],[221,13,221,54,0],[222,13,222,31,0],[223,13,223,73,0],[225,13,225,52,0],[230,21,230,48,0],[231,21,231,69,0],[235,21,235,46,0],[237,21,237,75,0],[238,21,238,22,0],[239,25,239,234,0],[240,21,240,22,0],[242,21,242,22,0],[243,25,243,175,0],[244,21,244,22,0],[245,21,245,27,0],[247,21,247,82,0],[249,21,249,69,0],[250,21,250,22,0],[251,25,251,40,0],[253,25,253,94,0],[254,25,254,69,0],[256,25,256,68,0],[257,25,257,54,0],[259,25,259,41,0],[260,25,260,26,0],[262,29,262,71,0],[263,25,263,26,0],[265,21,265,22,0],[267,21,267,22,0],[270,25,270,101,0],[271,21,271,22,0],[272,21,272,27,0],[274,21,274,138,0],[275,21,275,27,0],[277,21,277,97,0],[278,21,278,27,0],[280,21,280,48,0],[281,21,281,27,0],[283,21,283,27,0],[285,9,285,10,0],[294,9,294,10,0],[295,13,295,28,0],[297,13,297,116,0],[299,13,299,115,0],[301,13,301,44,0],[302,17,302,154,0],[305,13,305,41,0],[307,13,307,55,0],[308,9,308,10,0],[311,9,311,10,0],[312,13,312,28,0],[313,13,313,58,0],[314,13,314,45,0],[315,9,315,10,0],[325,9,325,10,0],[326,13,326,28,0],[334,13,334,52,0],[335,13,335,14,0],[336,17,338,39,0],[339,13,339,14,0],[341,13,341,14,0],[342,17,344,54,0],[345,13,345,14,0],[347,13,347,41,0],[349,13,349,55,0],[350,9,350,10,0],[356,9,356,10,0],[357,13,357,71,0],[358,9,358,10,0],[366,9,366,10,0],[367,13,367,55,0],[370,13,370,134,0],[371,13,371,90,0],[374,13,374,72,0],[375,13,375,65,0],[376,13,376,59,0],[377,9,377,10,0],[381,9,381,10,0],[385,13,385,51,0],[387,13,387,117,0],[390,13,390,58,0],[396,13,396,32,0],[398,13,398,123,0],[399,9,399,10,0],[402,9,402,10,0],[403,13,403,47,0],[404,13,404,48,0],[405,13,405,45,0],[406,13,406,43,0],[407,13,407,42,0],[408,13,408,42,0],[409,13,409,41,0],[410,9,410,10,0]]);
+    </script>
+  </body>
+</html>

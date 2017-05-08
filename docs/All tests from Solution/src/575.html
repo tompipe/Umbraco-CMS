@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\preview\PreviewContent.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Configuration;
+using System.Globalization;
+using System.Linq;
+using System.Web;
+using System.Web.Security;
+using System.Web.UI;
+using System.Web.UI.HtmlControls;
+using System.Web.UI.WebControls;
+using System.Web.UI.WebControls.WebParts;
+using System.Xml.Linq;
+using System.Xml;
+using System.IO;
+using Umbraco.Core;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using umbraco.cms.businesslogic.web;
+using umbraco.BusinessLogic;
+using umbraco.cms.businesslogic;
+using Umbraco.Core.IO;
+
+namespace umbraco.presentation.preview
+{
+    //TODO : Migrate this to a new API!
+
+    public class PreviewContent
+    {
+        // zb-00004 #29956 : refactor cookies names &amp; handling
+
+        public XmlDocument XmlContent { get; set; }
+        public Guid PreviewSet { get; set; }
+        public string PreviewsetPath { get; set; }
+
+        public bool ValidPreviewSet { get; set; }
+
+        private int _userId = -1;
+
+        public PreviewContent()
+        {
+            _initialized = false;
+        }
+
+        private readonly object _initLock = new object();
+        private bool _initialized = true;
+
+        public void EnsureInitialized(User user, string previewSet, bool validate, Action initialize)
+        {
+            lock (_initLock)
+            {
+                if (_initialized) return;
+
+                _userId = user.Id;
+                ValidPreviewSet = UpdatePreviewPaths(new Guid(previewSet), validate);
+                initialize();
+                _initialized = true;
+            }
+        }
+
+        public PreviewContent(User user)
+        {
+            _userId = user.Id;
+        }
+
+        public PreviewContent(Guid previewSet)
+        {
+            ValidPreviewSet = UpdatePreviewPaths(previewSet, true);
+        }
+        public PreviewContent(User user, Guid previewSet, bool validate)
+        {
+            _userId = user.Id;
+            ValidPreviewSet = UpdatePreviewPaths(previewSet, validate);
+        }
+
+
+        public void PrepareDocument(User user, Document documentObject, bool includeSubs)
+        {
+            _userId = user.Id;
+
+            // clone xml
+            XmlContent = (XmlDocument)content.Instance.XmlContent.Clone();
+
+            var previewNodes = new List&lt;Document&gt;();
+
+            var parentId = documentObject.Level == 1 ? -1 : documentObject.ParentId;
+
+            while (parentId &gt; 0 &amp;&amp; XmlContent.GetElementById(parentId.ToString(CultureInfo.InvariantCulture)) == null)
+            {
+                var document = new Document(parentId);
+                previewNodes.Insert(0, document);
+                parentId = document.ParentId;
+            }
+
+            previewNodes.Add(documentObject);
+
+            foreach (var document in previewNodes)
+            {
+                //Inject preview xml
+                parentId = document.Level == 1 ? -1 : document.ParentId;
+                var previewXml = document.ToPreviewXml(XmlContent);
+                if (document.ContentEntity.Published == false
+                    &amp;&amp; ApplicationContext.Current.Services.ContentService.HasPublishedVersion(document.Id))
+                    previewXml.Attributes.Append(XmlContent.CreateAttribute(&quot;isDraft&quot;));
+                XmlContent = content.GetAddOrUpdateXmlNode(XmlContent, document.Id, document.Level, parentId, previewXml);
+            }
+
+            if (includeSubs)
+            {
+                foreach (var prevNode in documentObject.GetNodesForPreview(true))
+                {
+                    var previewXml = XmlContent.ReadNode(XmlReader.Create(new StringReader(prevNode.Xml)));
+                    if (prevNode.IsDraft)
+                        previewXml.Attributes.Append(XmlContent.CreateAttribute(&quot;isDraft&quot;));
+                    XmlContent = content.GetAddOrUpdateXmlNode(XmlContent, prevNode.NodeId, prevNode.Level, prevNode.ParentId, previewXml);
+                }
+            }
+
+        }
+
+        private bool UpdatePreviewPaths(Guid previewSet, bool validate)
+        {
+            if (_userId == -1)
+            {
+                throw new ArgumentException(&quot;No current Umbraco User registered in Preview&quot;, &quot;m_userId&quot;);
+            }
+
+            PreviewSet = previewSet;
+            PreviewsetPath = GetPreviewsetPath(_userId, previewSet);
+
+            if (validate &amp;&amp; !ValidatePreviewPath())
+            {
+                // preview cookie failed so we&#39;ll log the error and clear the cookie
+                LogHelper.Debug&lt;PreviewContent&gt;(string.Format(&quot;Preview failed for preview set {0} for user {1}&quot;, previewSet, _userId));
+
+                PreviewSet = Guid.Empty;
+                PreviewsetPath = String.Empty;
+
+                ClearPreviewCookie();
+
+                return false;
+            }
+
+            return true;
+        }
+
+        private static string GetPreviewsetPath(int userId, Guid previewSet)
+        {
+            return IOHelper.MapPath(
+                Path.Combine(SystemDirectories.Preview, userId + &quot;_&quot; + previewSet + &quot;.config&quot;));
+        }
+
+        /// &lt;summary&gt;
+        /// Checks a preview file exist based on preview cookie
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public bool ValidatePreviewPath()
+        {
+            if (!File.Exists(PreviewsetPath))
+                return false;
+
+            return true;
+        }
+
+
+
+        public void LoadPreviewset()
+        {
+            XmlContent = new XmlDocument();
+            XmlContent.Load(PreviewsetPath);
+        }
+
+        public void SavePreviewSet()
+        {
+            //make sure the preview folder exists first
+            var dir = new DirectoryInfo(IOHelper.MapPath(SystemDirectories.Preview));
+            if (!dir.Exists)
+            {
+                dir.Create();
+            }
+
+            // check for old preview sets and try to clean
+            CleanPreviewDirectory(_userId, dir);
+
+            XmlContent.Save(PreviewsetPath);
+        }
+
+        private static void CleanPreviewDirectory(int userId, DirectoryInfo dir)
+        {
+            // also delete any files accessed more than 10 minutes ago
+            var now = DateTime.Now;
+            foreach (var file in dir.GetFiles(&quot;*.config&quot;))
+            {
+                if ((now - file.LastAccessTime).TotalMinutes &gt; 10)
+                    DeletePreviewFile(userId, file);
+            }
+        }
+
+        private static void DeletePreviewFile(int userId, FileInfo file)
+        {
+            try
+            {
+                file.Delete();
+            }
+            catch (IOException)
+            {
+                // for *some* reason deleting the file can fail,
+                // and it will work later on (long-lasting locks, etc),
+                // so just ignore the exception
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Error&lt;PreviewContent&gt;(string.Format(&quot;Couldn&#39;t delete preview set: {0} - User {1}&quot;, file.Name, userId), ex);
+            }
+        }
+
+        public void ActivatePreviewCookie()
+        {
+            // zb-00004 #29956 : refactor cookies names &amp; handling
+            StateHelper.Cookies.Preview.SetValue(PreviewSet.ToString());
+        }
+
+        public static void ClearPreviewCookie()
+        {
+            // zb-00004 #29956 : refactor cookies names &amp; handling
+            if (UmbracoContext.Current.UmbracoUser != null)
+            {
+                if (StateHelper.Cookies.Preview.HasValue)
+                {
+
+                    DeletePreviewFile(
+                        UmbracoContext.Current.UmbracoUser.Id,
+                        new FileInfo(GetPreviewsetPath(
+                            UmbracoContext.Current.UmbracoUser.Id,
+                            new Guid(StateHelper.Cookies.Preview.GetValue()))));
+                }
+            }
+            StateHelper.Cookies.Preview.Clear();
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[32,41,32,45,0],[32,46,32,50,0],[33,34,33,38,0],[33,39,33,43,0],[34,40,34,44,0],[34,45,34,49,0],[36,39,36,43,0],[36,44,36,48,0],[38,9,38,34,0],[38,9,38,34,0],[38,9,38,34,0],[38,9,38,34,0],[40,9,40,32,0],[41,9,41,10,0],[42,13,42,34,0],[43,9,43,10,0],[45,9,45,58,0],[45,9,45,58,0],[45,9,45,58,0],[45,9,45,58,0],[46,9,46,42,0],[46,9,46,42,0],[46,9,46,42,0],[46,9,46,42,0],[49,9,49,10,0],[50,13,50,29,0],[51,13,51,14,0],[52,17,52,34,0],[52,35,52,42,0],[54,17,54,35,0],[55,17,55,86,0],[56,17,56,30,0],[57,17,57,37,0],[58,13,58,14,0],[59,9,59,10,0],[61,9,61,41,0],[62,9,62,10,0],[63,13,63,31,0],[64,9,64,10,0],[66,9,66,47,0],[67,9,67,10,0],[68,13,68,68,0],[69,9,69,10,0],[70,9,70,73,0],[71,9,71,10,0],[72,13,72,31,0],[73,13,73,72,0],[74,9,74,10,0],[78,9,78,10,0],[79,13,79,31,0],[82,13,82,75,0],[84,13,84,53,0],[86,13,86,85,0],[88,13,88,119,0],[89,13,89,14,0],[90,17,90,55,0],[91,17,91,50,0],[92,17,92,46,0],[93,13,93,14,0],[95,13,95,46,0],[97,13,97,20,0],[97,22,97,34,0],[97,35,97,37,0],[97,38,97,50,0],[98,13,98,14,0],[100,17,100,73,0],[101,17,101,68,0],[102,17,103,108,0],[104,21,104,89,0],[105,17,105,123,0],[106,13,106,14,0],[108,13,108,29,0],[109,13,109,14,0],[110,17,110,24,0],[110,26,110,38,0],[110,39,110,41,0],[110,42,110,81,0],[111,17,111,18,0],[112,21,112,108,0],[113,21,113,42,0],[114,25,114,93,0],[115,21,115,140,0],[116,17,116,18,0],[117,13,117,14,0],[119,9,119,10,0],[122,9,122,10,0],[123,13,123,31,0],[124,13,124,14,0],[125,17,125,106,0],[128,13,128,37,0],[129,13,129,69,0],[131,13,131,52,0],[132,13,132,14,0],[134,17,134,136,0],[136,17,136,41,0],[137,17,137,47,0],[139,17,139,38,0],[141,17,141,30,0],[144,13,144,25,0],[145,9,145,10,0],[148,9,148,10,0],[149,13,150,97,0],[151,9,151,10,0],[158,9,158,10,0],[159,13,159,46,0],[160,17,160,30,0],[162,13,162,25,0],[163,9,163,10,0],[168,9,168,10,0],[169,13,169,44,0],[170,13,170,45,0],[171,9,171,10,0],[174,9,174,10,0],[176,13,176,86,0],[177,13,177,29,0],[178,13,178,14,0],[179,17,179,30,0],[180,13,180,14,0],[183,13,183,49,0],[185,13,185,45,0],[186,9,186,10,0],[189,9,189,10,0],[191,13,191,36,0],[192,13,192,20,0],[192,22,192,30,0],[192,31,192,33,0],[192,34,192,58,0],[193,13,193,14,0],[194,17,194,67,0],[195,21,195,53,0],[196,13,196,14,0],[197,9,197,10,0],[200,9,200,10,0],[202,13,202,14,0],[203,17,203,31,0],[204,13,204,14,0],[205,13,205,32,0],[206,13,206,14,0],[210,13,210,14,0],[211,13,211,33,0],[212,13,212,14,0],[213,17,213,134,0],[214,13,214,14,0],[215,9,215,10,0],[218,9,218,10,0],[220,13,220,73,0],[221,9,221,10,0],[224,9,224,10,0],[226,13,226,60,0],[227,13,227,14,0],[228,17,228,58,0],[229,17,229,18,0],[231,21,235,81,0],[236,17,236,18,0],[237,13,237,14,0],[238,13,238,49,0],[239,9,239,10,0]]);
+    </script>
+  </body>
+</html>

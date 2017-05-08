@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Sync\ApplicationUrlHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Web;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.IO;
+using Umbraco.Core.ObjectResolution;
+
+namespace Umbraco.Core.Sync
+{
+    /// &lt;summary&gt;
+    /// A helper used to determine the current server umbraco application url.
+    /// &lt;/summary&gt;
+    public static class ApplicationUrlHelper
+    {
+        // because we cannot logger.Info&lt;ApplicationUrlHelper&gt; because type is static
+        private static readonly Type TypeOfApplicationUrlHelper = typeof(ApplicationUrlHelper);
+
+        private static Func&lt;HttpRequestBase, string&gt; _applicationUrlProvider;
+
+        /// &lt;summary&gt;
+        /// Gets or sets a custom provider for the umbraco application url.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// &lt;para&gt;Receives the current request as a parameter, and it may be null. Must return a properly
+        /// formatted url with scheme and umbraco dir and no trailing slash eg &quot;http://www.mysite.com/umbraco&quot;,
+        /// or &lt;c&gt;null&lt;/c&gt;. To be used in auto-load-balancing scenarios where the application url is not
+        /// in config files but is determined programmatically.&lt;/para&gt;
+        /// &lt;para&gt;Must be assigned before resolution is frozen.&lt;/para&gt;
+        /// &lt;/remarks&gt;
+        public static Func&lt;HttpRequestBase, string&gt; ApplicationUrlProvider 
+        {
+            get
+            {
+                return _applicationUrlProvider;
+            }
+            set
+            {
+                using (Resolution.Configuration)
+                {
+                    _applicationUrlProvider = value;
+                }
+            } 
+        } 
+
+        // request: will be null if called from ApplicationContext
+        // settings: for unit tests only
+        internal static void EnsureApplicationUrl(ApplicationContext appContext, HttpRequestBase request = null, IUmbracoSettingsSection settings = null)
+        {
+            // if initialized, return
+            if (appContext._umbracoApplicationUrl != null) return;
+
+            var logger = appContext.ProfilingLogger.Logger;
+
+            // try settings and IServerRegistrar
+            if (TrySetApplicationUrl(appContext, settings ?? UmbracoConfig.For.UmbracoSettings()))
+                return;
+
+            // try custom provider
+            if (_applicationUrlProvider != null)
+            {
+                var url = _applicationUrlProvider(request);
+                if (url.IsNullOrWhiteSpace() == false)
+                {
+                    appContext._umbracoApplicationUrl = url.TrimEnd(&#39;/&#39;);
+                    logger.Info(TypeOfApplicationUrlHelper, &quot;ApplicationUrl: &quot; + appContext.UmbracoApplicationUrl + &quot; (provider)&quot;);
+                    return;
+                }
+            }
+
+            // last chance,
+            // use the current request as application url
+            if (request == null) return;
+            SetApplicationUrlFromCurrentRequest(appContext, request);
+        }
+
+        // internal for tests
+        internal static bool TrySetApplicationUrl(ApplicationContext appContext, IUmbracoSettingsSection settings)
+        {
+            var logger = appContext.ProfilingLogger.Logger;
+
+            // try umbracoSettings:settings/web.routing/@umbracoApplicationUrl
+            // which is assumed to:
+            // - end with SystemDirectories.Umbraco
+            // - contain a scheme
+            // - end or not with a slash, it will be taken care of
+            // eg &quot;http://www.mysite.com/umbraco&quot;
+            var url = settings.WebRouting.UmbracoApplicationUrl;
+            if (url.IsNullOrWhiteSpace() == false)
+            {
+                appContext._umbracoApplicationUrl = url.TrimEnd(&#39;/&#39;);
+                logger.Info(TypeOfApplicationUrlHelper, &quot;ApplicationUrl: &quot; + appContext.UmbracoApplicationUrl + &quot; (using web.routing/@umbracoApplicationUrl)&quot;);
+                return true;
+            }
+
+            // try umbracoSettings:settings/scheduledTasks/@baseUrl
+            // which is assumed to:
+            // - end with SystemDirectories.Umbraco
+            // - NOT contain any scheme (because, legacy)
+            // - end or not with a slash, it will be taken care of
+            // eg &quot;mysite.com/umbraco&quot;
+            url = settings.ScheduledTasks.BaseUrl;
+            if (url.IsNullOrWhiteSpace() == false)
+            {
+                var ssl = GlobalSettings.UseSSL ? &quot;s&quot; : &quot;&quot;;
+                url = &quot;http&quot; + ssl + &quot;://&quot; + url;
+                appContext._umbracoApplicationUrl = url.TrimEnd(&#39;/&#39;);
+                logger.Info(TypeOfApplicationUrlHelper, &quot;ApplicationUrl: &quot; + appContext.UmbracoApplicationUrl + &quot; (using scheduledTasks/@baseUrl)&quot;);
+                return true;
+            }
+
+            // try the server registrar
+            // which is assumed to return a url that:
+            // - end with SystemDirectories.Umbraco
+            // - contain a scheme
+            // - end or not with a slash, it will be taken care of
+            // eg &quot;http://www.mysite.com/umbraco&quot;
+            var resolver = ServerRegistrarResolver.HasCurrent ? ServerRegistrarResolver.Current : null;
+            var registrar = resolver == null ? null : resolver.Registrar as IServerRegistrar2;
+            url = registrar == null ? null : registrar.GetCurrentServerUmbracoApplicationUrl();
+            if (url.IsNullOrWhiteSpace() == false)
+            {
+                appContext._umbracoApplicationUrl = url.TrimEnd(&#39;/&#39;);
+                logger.Info(TypeOfApplicationUrlHelper, &quot;ApplicationUrl: &quot; + appContext.UmbracoApplicationUrl + &quot; (IServerRegistrar)&quot;);
+                return true;
+            }
+
+            // else give up...
+            return false;
+        }
+
+        private static void SetApplicationUrlFromCurrentRequest(ApplicationContext appContext, HttpRequestBase request)
+        {
+            var logger = appContext.ProfilingLogger.Logger;
+
+            // if (HTTP and SSL not required) or (HTTPS and SSL required),
+            //  use ports from request
+            // otherwise,
+            //  if non-standard ports used,
+            //  user may need to set umbracoApplicationUrl manually per 
+            //  http://our.umbraco.org/documentation/Using-Umbraco/Config-files/umbracoSettings/#ScheduledTasks
+            var port = (request.IsSecureConnection == false &amp;&amp; GlobalSettings.UseSSL == false)
+                        || (request.IsSecureConnection &amp;&amp; GlobalSettings.UseSSL)
+                ? &quot;:&quot; + request.ServerVariables[&quot;SERVER_PORT&quot;]
+                : &quot;&quot;;
+
+            var useSsl = GlobalSettings.UseSSL || port == &quot;443&quot;;
+            var ssl = useSsl ? &quot;s&quot; : &quot;&quot;; // force, whatever the first request
+            var url = &quot;http&quot; + ssl + &quot;://&quot; + request.ServerVariables[&quot;SERVER_NAME&quot;] + port + IOHelper.ResolveUrl(SystemDirectories.Umbraco);
+
+            appContext._umbracoApplicationUrl = url.TrimEnd(&#39;/&#39;);
+            logger.Info(TypeOfApplicationUrlHelper, &quot;ApplicationUrl: &quot; + appContext.UmbracoApplicationUrl + &quot; (UmbracoModule request)&quot;);
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[16,9,16,96,1],[33,13,33,14,0],[34,17,34,48,0],[35,13,35,14,0],[37,13,37,14,1],[38,17,38,49,1],[39,17,39,18,1],[40,21,40,53,1],[41,17,41,18,1],[42,13,42,14,1],[48,9,48,10,1],[50,13,50,59,1],[50,60,50,67,1],[52,13,52,60,1],[55,13,55,99,1],[56,17,56,24,0],[59,13,59,49,1],[60,13,60,14,1],[61,17,61,60,1],[62,17,62,55,1],[63,17,63,18,1],[64,21,64,74,1],[65,21,65,132,1],[66,21,66,28,1],[68,13,68,14,0],[72,13,72,33,0],[72,34,72,41,0],[73,13,73,70,0],[74,9,74,10,1],[78,9,78,10,1],[79,13,79,60,1],[87,13,87,65,1],[88,13,88,51,1],[89,13,89,14,1],[90,17,90,70,1],[91,17,91,160,1],[92,17,92,29,1],[101,13,101,51,1],[102,13,102,51,1],[103,13,103,14,1],[104,17,104,60,1],[105,17,105,50,1],[106,17,106,70,1],[107,17,107,149,1],[108,17,108,29,1],[117,13,117,104,1],[118,13,118,95,1],[119,13,119,96,1],[120,13,120,51,1],[121,13,121,14,1],[122,17,122,70,1],[123,17,123,136,1],[124,17,124,29,1],[128,13,128,26,1],[129,9,129,10,1],[132,9,132,10,0],[133,13,133,60,0],[141,13,144,22,0],[146,13,146,65,0],[147,13,147,41,0],[148,13,148,141,0],[150,13,150,66,0],[151,13,151,137,0],[152,9,152,10,0]]);
+    </script>
+  </body>
+</html>

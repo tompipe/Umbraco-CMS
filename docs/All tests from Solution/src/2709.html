@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.editorControls\MultiNodeTreePicker\MNTP_DataEditor.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Web;
+using System.Web.UI;
+using System.Web.UI.HtmlControls;
+using System.Web.UI.WebControls;
+using System.Xml.Linq;
+using ClientDependency.Core;
+using Umbraco.Core;
+using Umbraco.Core.IO;
+using umbraco.BusinessLogic;
+using umbraco.cms.presentation.Trees;
+using umbraco.controls.Images;
+using umbraco.controls.Tree;
+
+[assembly: WebResource(&quot;umbraco.editorControls.MultiNodeTreePicker.MultiNodePickerStyles.css&quot;, &quot;text/css&quot;)]
+[assembly: WebResource(&quot;umbraco.editorControls.MultiNodeTreePicker.MultiNodePickerScripts.js&quot;, &quot;application/x-javascript&quot;)]
+
+namespace umbraco.editorControls.MultiNodeTreePicker
+{
+	/// &lt;summary&gt;
+	/// The user interface to display to the content editor
+	/// &lt;/summary&gt;
+	[ClientDependency(ClientDependencyType.Javascript, &quot;ui/jqueryui.js&quot;, &quot;UmbracoClient&quot;)]
+	[ClientDependency(ClientDependencyType.Javascript, &quot;ui/jquery.tooltip.min.js&quot;, &quot;UmbracoClient&quot;)]
+	[ClientDependency(ClientDependencyType.Javascript, &quot;controls/Images/ImageViewer.js&quot;, &quot;UmbracoRoot&quot;)]
+    [ValidationProperty(&quot;Value&quot;)]
+    [Obsolete(&quot;IDataType and all other references to the legacy property editors are no longer used this will be removed from the codebase in future versions&quot;)]
+	public class MNTP_DataEditor : Control, INamingContainer
+	{
+		#region Static Constructor
+
+		/// &lt;summary&gt;
+		/// This adds our filtered tree definition to the TreeDefinitionCollection at runtime
+		/// instead of having to declare it in the database 
+		/// &lt;/summary&gt;
+		static MNTP_DataEditor()
+		{
+			//NOTE: Before we had locking here but static ctors are always threadsafe
+
+			if (TreeDefinitionCollection.Instance.Any(x =&gt; x.TreeType == typeof (FilteredContentTree))) 
+				return;
+			
+			
+			//need to add our tree definitions to the collection.
+
+			//find the content tree to duplicate
+			var contentTree = TreeDefinitionCollection.Instance.SingleOrDefault(x =&gt; string.Equals(x.Tree.Alias, Umbraco.Core.Constants.Applications.Content, StringComparison.OrdinalIgnoreCase));
+            //have put this here because the legacy content tree no longer exists as a tree def
+            if (contentTree == null)
+            {
+                contentTree = new TreeDefinition(
+                    typeof (loadContent),
+                    new ApplicationTree(false, true, 0, &quot;content&quot;, &quot;content&quot;, &quot;Content&quot;, &quot;.sprTreeFolder&quot;, &quot;.sprTreeFolder_o&quot;, &quot;&quot;, typeof (loadContent).GetFullNameWithAssembly(), &quot;&quot;),
+                    new Application(&quot;Content&quot;, &quot;content&quot;, &quot;content&quot;));
+            }
+			var filteredContentTree = new TreeDefinition(typeof(FilteredContentTree),
+			                                             new umbraco.BusinessLogic.ApplicationTree(true, false, 0,
+			                                                                                       contentTree.Tree.ApplicationAlias,
+			                                                                                       &quot;FilteredContentTree&quot;,
+			                                                                                       contentTree.Tree.Title,
+			                                                                                       contentTree.Tree.IconClosed,
+			                                                                                       contentTree.Tree.IconOpened,
+			                                                                                       &quot;umbraco.editorControls&quot;,
+			                                                                                       &quot;MultiNodeTreePicker.FilteredContentTree&quot;,
+			                                                                                       contentTree.Tree.Action),
+                                                                                                   contentTree.App);
+
+			//find the media tree to duplicate
+			var mediaTree = TreeDefinitionCollection.Instance.SingleOrDefault(x =&gt; string.Equals(x.Tree.Alias, Umbraco.Core.Constants.Applications.Media, StringComparison.OrdinalIgnoreCase));
+            //have put this here because the legacy content tree no longer exists as a tree def
+            if (mediaTree == null)
+            {
+                mediaTree = new TreeDefinition(
+                    typeof(loadMedia),
+                    new ApplicationTree(false, true, 0, &quot;media&quot;, &quot;media&quot;, &quot;Media&quot;, &quot;.sprTreeFolder&quot;, &quot;.sprTreeFolder_o&quot;, &quot;&quot;, typeof(loadMedia).GetFullNameWithAssembly(), &quot;&quot;),
+                    new Application(&quot;Media&quot;, &quot;media&quot;, &quot;media&quot;));
+            }
+			var filteredMediaTree = new TreeDefinition(typeof(FilteredMediaTree),
+			                                           new umbraco.BusinessLogic.ApplicationTree(true, false, 0,
+			                                                                                     mediaTree.Tree.ApplicationAlias,
+			                                                                                     &quot;FilteredMediaTree&quot;,
+                                                                                                 mediaTree.Tree.Title,
+                                                                                                 mediaTree.Tree.IconClosed,
+                                                                                                 mediaTree.Tree.IconOpened,
+			                                                                                     &quot;umbraco.editorControls&quot;,
+			                                                                                     &quot;MultiNodeTreePicker.FilteredMediaTree&quot;,
+                                                                                                 mediaTree.Tree.Action),
+                                                                                                 mediaTree.App);
+
+			//add it to the collection at runtime
+			TreeDefinitionCollection.Instance.Add(filteredContentTree);
+			TreeDefinitionCollection.Instance.Add(filteredMediaTree);
+		}
+
+		#endregion
+
+		/// &lt;summary&gt;
+		/// Initializes a new instance of the &lt;see cref=&quot;MNTP_DataEditor&quot;/&gt; class.
+		/// &lt;/summary&gt;
+		public MNTP_DataEditor()
+		{
+			this.MediaTypesWithThumbnails = new string[] { Umbraco.Core.Constants.Conventions.MediaTypes.Image };
+			ShowThumbnailsForMedia = true;
+			TreeToRender = Umbraco.Core.Constants.Applications.Content;
+			MaxNodeCount = -1;
+			MinNodeCount = 0;
+			StartNodeId = uQuery.RootNodeId;
+			ShowToolTips = true;
+			ControlHeight = 200;
+		}
+
+        /// &lt;summary&gt;
+        /// This is used for validation purposes only, see the [ValidationProperty(&quot;Value&quot;)] attribute above.
+        /// &lt;/summary&gt;
+	    public string Value
+	    {
+	        get { return string.Join(&quot;,&quot;, SelectedIds); }
+	    }
+
+	    #region Protected members
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		protected CustomValidator MinItemsValidator;
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		protected CustomTreeControl TreePickerControl;
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		protected Repeater SelectedValues;
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		protected HiddenField PickedValue;
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		protected HtmlGenericControl RightColumn;
+		#endregion
+
+		#region public Properties
+
+		/// &lt;summary&gt;
+		/// gets/sets the value based on an array of IDs selected
+		/// &lt;/summary&gt;
+		public string[] SelectedIds
+		{
+			get
+			{
+				List&lt;string&gt; val = new List&lt;string&gt;();
+				var splitVals = PickedValue.Value.Split(new char[] { &#39;,&#39; }, StringSplitOptions.RemoveEmptyEntries);
+				//this will make sure only the node count specified is saved
+				//into umbraco, even if people try to hack the front end for whatever reason.
+				if (MaxNodeCount &gt;= 0)
+				{
+					for (var i = 0; i &lt; splitVals.Length; i++)
+					{
+						if (i &lt; MaxNodeCount)
+						{
+							val.Add(splitVals[i]);
+						}
+						else break;
+					}
+				}
+				else
+				{
+					val = splitVals.ToList();
+				}
+				return val.ToArray();
+			}
+			set
+			{
+				XmlValue = ConvertToXDocument(value);
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// get/set the value for the selected nodes in xml format
+		/// &lt;/summary&gt;
+		public XDocument XmlValue
+		{
+			get
+			{
+				return ConvertToXDocument(SelectedIds);
+			}
+			set
+			{
+				if (value == null)
+				{
+					SelectedValues.DataSource = null;
+					PickedValue.Value = &quot;&quot;;
+				}
+				else
+				{
+					//set the data source for the repeater and hidden field
+					var nodes = value.Descendants(&quot;nodeId&quot;);
+					SelectedValues.DataSource = nodes;
+					PickedValue.Value = string.Join(&quot;,&quot;, nodes.Select(x =&gt; x.Value).ToArray());
+				}
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// The property name being edited with the current data editor. This is used for the min items validation statement.
+		/// &lt;/summary&gt;
+		public string PropertyName { get; set; }
+
+		/// &lt;summary&gt;
+		/// The tree type alias to render
+		/// &lt;/summary&gt;
+		public string TreeToRender { get; set; }
+
+		/// &lt;summary&gt;
+		///  An xpath filter to match nodes that will be disabled from being clicked
+		/// &lt;/summary&gt;
+		public string XPathFilter { get; set; }
+
+		/// &lt;summary&gt;
+		/// The minimum amount of nodes that can be selected
+		/// &lt;/summary&gt;
+		public int MinNodeCount { get; set; }
+
+		/// &lt;summary&gt;
+		/// The maximum amount of nodes that can be selected
+		/// &lt;/summary&gt;
+		public int MaxNodeCount { get; set; }
+
+		/// &lt;summary&gt;
+		/// The start node id
+		/// &lt;/summary&gt;
+		public int StartNodeId { get; set; }
+
+		/// &lt;summary&gt;
+		/// The start node selection type
+		/// &lt;/summary&gt;
+		public NodeSelectionType StartNodeSelectionType { get; set; }
+
+		/// &lt;summary&gt;
+		/// The xpath expression type to select the start node when the StartNodeSelectionType is XPath
+		/// &lt;/summary&gt;
+		public XPathExpressionType StartNodeXPathExpressionType { get; set; }
+
+		/// &lt;summary&gt;
+		/// The XPath expression to use to determine the start node when the StartNodeSelectionType is XPath
+		/// &lt;/summary&gt;
+		public string StartNodeXPathExpression { get; set; }
+
+		/// &lt;summary&gt;
+		/// Gets or sets a value indicating whether [show tool tips].
+		/// &lt;/summary&gt;
+		/// &lt;value&gt;&lt;c&gt;true&lt;/c&gt; if [show tool tips]; otherwise, &lt;c&gt;false&lt;/c&gt;.&lt;/value&gt;
+		/// &lt;remarks&gt;Shows/Hides the tooltip info bubble.&lt;/remarks&gt;
+		public bool ShowToolTips { get; set; }
+
+		/// &lt;summary&gt;
+		/// The XPathFilterType to match
+		/// &lt;/summary&gt;
+		public XPathFilterType XPathFilterMatchType { get; set; }
+
+		/// &lt;summary&gt;
+		/// Gets or sets a value indicating whether [show thumbnails for media].
+		/// &lt;/summary&gt;
+		/// &lt;value&gt;
+		/// 	&lt;c&gt;true&lt;/c&gt; if [show thumbnails for media]; otherwise, &lt;c&gt;false&lt;/c&gt;.
+		/// &lt;/value&gt;
+		/// &lt;remarks&gt;Whether or not to show thumbnails for media&lt;/remarks&gt;
+		public bool ShowThumbnailsForMedia { get; set; }
+
+		/// &lt;summary&gt;
+		/// A list of media type names that can have thumbnails (i.e. &#39;image&#39;)
+		/// &lt;/summary&gt;
+		public string[] MediaTypesWithThumbnails { get; set; }
+
+		/// &lt;summary&gt;
+		/// This is set by the data type and allows us to save a cookie value
+		/// for persistence for the data type.
+		/// &lt;/summary&gt;
+		public int DataTypeDefinitionId { get; set; }
+
+		/// &lt;summary&gt;
+		/// The height of the tree control box in pixels
+		/// &lt;/summary&gt;
+		public int ControlHeight { get; set; }
+
+		#endregion
+
+		/// &lt;summary&gt;
+		/// Initialize the control, make sure children are created
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;e&quot;&gt;An &lt;see cref=&quot;T:System.EventArgs&quot;/&gt; object that contains the event data.&lt;/param&gt;
+		protected override void OnInit(EventArgs e)
+		{
+			base.OnInit(e);
+
+			EnsureChildControls();
+		}
+
+		/// &lt;summary&gt;
+		/// Add the resources (sytles/scripts)
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+		protected override void OnLoad(EventArgs e)
+		{
+			base.OnLoad(e);
+
+			//add the js/css required
+			this.RegisterEmbeddedClientResource(&quot;umbraco.editorControls.MultiNodeTreePicker.MultiNodePickerStyles.css&quot;, ClientDependencyType.Css);
+			this.RegisterEmbeddedClientResource(&quot;umbraco.editorControls.MultiNodeTreePicker.MultiNodePickerScripts.js&quot;, ClientDependencyType.Javascript);
+
+			//update the tree type (we need to do this each time because i don&#39;t think view state works with these controls)
+			switch (TreeToRender)
+			{
+				case Umbraco.Core.Constants.Applications.Media:
+					TreePickerControl.TreeType = &quot;FilteredMediaTree&quot;;
+					TreePickerControl.App = Umbraco.Core.Constants.Applications.Media;
+					break;
+				case Umbraco.Core.Constants.Applications.Content:
+				default:
+					TreePickerControl.TreeType = &quot;FilteredContentTree&quot;;
+					TreePickerControl.App = Umbraco.Core.Constants.Applications.Content;
+					break;
+			}
+
+			if (Page.IsPostBack)
+			{
+				//since it is a post back, bind the data source to the view state values
+				XmlValue = ConvertToXDocument(SelectedIds);
+			}
+
+			//bind the repeater if theres a data source, or if there&#39;s no datasource but this is a postback (i.e. nodes deleted)
+			if (SelectedValues.DataSource != null || Page.IsPostBack)
+			{
+				SelectedValues.DataBind();
+			}
+
+		}
+
+		/// &lt;summary&gt;
+		/// Creates the child controls for this control
+		/// &lt;/summary&gt;
+		protected override void CreateChildControls()
+		{
+			base.CreateChildControls();
+
+			EnsureChildControls();
+
+			//create the tree control
+			TreePickerControl = new CustomTreeControl
+				{
+					ID = &quot;TreePicker&quot;,
+					IsDialog = true,
+					ShowContextMenu = false,
+					DialogMode = TreeDialogModes.id,
+					Height = Unit.Pixel(ControlHeight),
+					StartNodeID = StartNodeId
+				};
+
+			//create the hidden field
+			PickedValue = new HiddenField { ID = &quot;PickedValue&quot; };
+
+			//create the right column
+			RightColumn = new HtmlGenericControl(&quot;div&quot;) { ID = &quot;RightColumn&quot; };
+			RightColumn.Attributes.Add(&quot;class&quot;, &quot;right propertypane&quot;);
+
+			//create the repeater
+			SelectedValues = new Repeater
+				{
+					//EnableViewState = false,
+					ID = &quot;SelectedValues&quot;,
+					ItemTemplate = new SelectedItemsTemplate()
+				};
+
+			SelectedValues.ItemDataBound += SelectedValues_ItemDataBound;
+
+			//add the repeater to the right column
+			RightColumn.Controls.Add(SelectedValues);
+
+			MinItemsValidator = new CustomValidator()
+									{
+										ID = &quot;MinItemsValidator&quot;,
+										ErrorMessage =
+											string.Format(MNTPResources.Val_MinItemsInvalid, MinNodeCount)
+									};
+			MinItemsValidator.ServerValidate += new ServerValidateEventHandler(MinItemsValidator_ServerValidate);
+
+			//add the controls
+			this.Controls.Add(MinItemsValidator);
+			this.Controls.Add(TreePickerControl);
+			this.Controls.Add(PickedValue);
+			this.Controls.Add(RightColumn);
+		}
+        
+		/// &lt;summary&gt;
+		/// Ensure the repeater is data bound
+		/// &lt;/summary&gt;
+		public override void DataBind()
+		{
+			base.DataBind();
+			SelectedValues.DataBind();
+		}
+
+		void MinItemsValidator_ServerValidate(object source, ServerValidateEventArgs args)
+		{
+			args.IsValid = true;
+			if (MinNodeCount &gt; 0 &amp;&amp; SelectedIds.Length &lt; MinNodeCount)
+			{
+				args.IsValid = false;
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// Event handler for the selected node repeater. 
+		/// This will fill in all of the text values, icons, etc.. for nodes based on their ID.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;sender&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+		void SelectedValues_ItemDataBound(object sender, RepeaterItemEventArgs e)
+		{
+			var liSelectNode = (HtmlGenericControl)e.Item.FindControl(&quot;SelectedNodeListItem&quot;);
+			var lnkSelectNode = (HtmlAnchor)e.Item.FindControl(&quot;SelectedNodeLink&quot;);
+			var litSelectNodeName = (Literal)e.Item.FindControl(&quot;SelectedNodeText&quot;);
+			var infoButton = (HtmlAnchor)e.Item.FindControl(&quot;InfoButton&quot;);
+
+			//hide the info button if tooltips are hidden
+			if (!ShowToolTips)
+			{
+				infoButton.Style.Add(HtmlTextWriterStyle.Display, &quot;none&quot;);
+			}
+
+			var thisNode = (XElement)e.Item.DataItem;
+			int thisNodeId;
+			if (int.TryParse(thisNode.Value, out thisNodeId))
+			{
+				umbraco.cms.businesslogic.Content loadedNode;
+
+				try
+				{
+					loadedNode = new umbraco.cms.businesslogic.Content(thisNodeId);
+
+					//add the node id
+					liSelectNode.Attributes[&quot;rel&quot;] = thisNodeId.ToString();
+					//add the path to be referenced
+					liSelectNode.Attributes[&quot;umb:nodedata&quot;] = loadedNode.Path;
+					lnkSelectNode.HRef = &quot;javascript:void(0);&quot;;
+					litSelectNodeName.Text = loadedNode.Text;
+
+					if (loadedNode.IsTrashed)
+					{
+						//need to flag this to be removed which will be done after all items are data bound
+						liSelectNode.Attributes[&quot;rel&quot;] = &quot;trashed&quot;;
+					}
+					else
+					{
+						//we need to set the icon
+						if (loadedNode.ContentTypeIcon.StartsWith(&quot;.spr&quot;))
+							lnkSelectNode.Attributes[&quot;class&quot;] += &quot; &quot; + loadedNode.ContentTypeIcon.TrimStart(&#39;.&#39;);
+						else
+						{
+							//it&#39;s a real icon, so make it a background image
+							lnkSelectNode.Style.Add(HtmlTextWriterStyle.BackgroundImage,
+								string.Format(&quot;url(&#39;{0}&#39;)&quot;, IconPath + loadedNode.ContentTypeIcon));
+							//set the nospr class since it&#39;s not a sprite
+							lnkSelectNode.Attributes[&quot;class&quot;] += &quot; noSpr&quot;;
+						}
+
+						//show the media preview if media and allowed
+						if (TreeToRender == Umbraco.Core.Constants.Applications.Media &amp;&amp; ShowThumbnailsForMedia)
+						{
+							var imgPreview = (ImageViewer)e.Item.FindControl(&quot;ImgPreview&quot;);
+							//show the thubmnail controls
+							imgPreview.Visible = true;
+
+							//add the item class
+							var item = (HtmlGenericControl)e.Item.FindControl(&quot;Item&quot;);
+							item.Attributes[&quot;class&quot;] += &quot; thumb-item&quot;;
+
+							//item.Style.Add(HtmlTextWriterStyle.Height, &quot;50px&quot;);
+							////make the content sit beside the item
+							//var inner = (HtmlGenericControl)e.Item.FindControl(&quot;InnerItem&quot;);
+							//inner.Style.Add(HtmlTextWriterStyle.Width, &quot;224px&quot;);
+
+							//check if it&#39;s a thumbnail type element, we need to check both schemas
+							if (MediaTypesWithThumbnails.Select(x =&gt; x.ToUpper())
+								.Contains(loadedNode.ContentType.Alias.ToUpper()))
+							{
+								imgPreview.MediaId = thisNodeId;
+								imgPreview.DataBind();
+							}
+						}
+					}
+
+				}
+				catch (ArgumentException)
+				{
+					//the node no longer exists, so we display a msg
+					litSelectNodeName.Text = &quot;&lt;i&gt;NODE NO LONGER EXISTS&lt;/i&gt;&quot;;
+				}
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// set the nodekey to the id of this datatype
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// this is how get the xpath out of the cookie to know how the tree knows how to filter things.
+		/// generally the nodekey is used for a string id, but we&#39;ll use it for something different.
+		/// &lt;/remarks&gt;
+		/// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+		protected override void OnPreRender(EventArgs e)
+		{
+			base.OnPreRender(e);
+
+			TreePickerControl.NodeKey = this.DataTypeDefinitionId.ToString();
+
+			SavePersistentValuesForTree(XPathFilter);
+		}
+
+		/// &lt;summary&gt;
+		/// Override render to control the exact output of what is rendered this includes instantiating the jquery plugin
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;writer&quot;&gt;The &lt;see cref=&quot;T:System.Web.UI.HtmlTextWriter&quot;/&gt; object that receives the server control content.&lt;/param&gt;
+		/// &lt;remarks&gt;
+		/// Generally i don&#39;t like to do this but there&#39;s a few div&#39;s, etc... to render so this makes more sense.
+		/// &lt;/remarks&gt;
+		protected override void Render(HtmlTextWriter writer)
+		{
+			//&lt;div class=&quot;multiTreePicker&quot;&gt;
+			//    &lt;div class=&quot;header propertypane&quot;&gt;
+			//        &lt;div&gt;Select items&lt;/div&gt;
+			//    &lt;/div&gt;
+			//    &lt;div class=&quot;left propertypane&quot;&gt;        
+			//        &lt;umb:tree runat=&quot;server&quot; ID=&quot;TreePickerControl&quot; 
+			//            CssClass=&quot;myTreePicker&quot; Mode=&quot;Standard&quot; 
+			//            DialogMode=&quot;id&quot; ShowContextMenu=&quot;false&quot; 
+			//            IsDialog=&quot;true&quot; TreeType=&quot;content&quot; /&gt;
+			//    &lt;/div&gt;
+			//    &lt;div class=&quot;right propertypane&quot;&gt;
+			//    &lt;/div&gt;
+			//&lt;/div&gt;
+
+			RenderTooltip(writer);
+
+			writer.AddAttribute(&quot;class&quot;, (!MinItemsValidator.IsValid ? &quot;error &quot; : &quot;&quot;) + &quot;multiNodePicker clearfix&quot;);
+			writer.AddAttribute(&quot;id&quot;, this.ClientID);
+			writer.RenderBeginTag(HtmlTextWriterTag.Div);
+
+			writer.AddAttribute(&quot;class&quot;, &quot;header propertypane&quot;);
+			writer.RenderBeginTag(HtmlTextWriterTag.Div);
+			writer.RenderBeginTag(HtmlTextWriterTag.Div);
+			writer.Write(&quot;Select Items&quot;);
+			writer.RenderEndTag();
+			writer.RenderEndTag();
+
+			writer.AddAttribute(&quot;class&quot;, &quot;left propertypane&quot;);
+			writer.AddStyleAttribute(HtmlTextWriterStyle.Height, ((ControlHeight + 10).ToString() + &quot;px&quot;));
+			writer.RenderBeginTag(HtmlTextWriterTag.Div);
+			//add the tree control here
+			TreePickerControl.RenderControl(writer);
+			writer.RenderEndTag();
+
+			RightColumn.RenderControl(writer);
+
+			//render the hidden field
+			PickedValue.RenderControl(writer);
+
+			writer.RenderEndTag(); //end multiNodePicker div
+
+			var tooltipAjaxUrl = IOHelper.ResolveUrl(SystemDirectories.Umbraco) + @&quot;/controls/Tree/CustomTreeService.asmx/GetNodeInfo&quot;;
+
+			//add jquery window load event to create the js tree picker
+			var jsMethod = string.Format(&quot;jQuery(&#39;#{0}&#39;).MultiNodeTreePicker(&#39;{1}&#39;, {2}, &#39;{3}&#39;, {4}, {5}, &#39;{6}&#39;, &#39;{7}&#39;);&quot;,
+				TreePickerControl.ClientID,
+				this.ClientID,
+				MaxNodeCount,
+				tooltipAjaxUrl,
+				ShowToolTips.ToString().ToLower(),
+				(TreeToRender == Umbraco.Core.Constants.Applications.Media &amp;&amp; ShowThumbnailsForMedia).ToString().ToLower(),
+				IOHelper.ResolveUrl(SystemDirectories.Umbraco),
+				TreeToRender);
+			var js = &quot;jQuery(window).load(function() { &quot; + jsMethod + &quot; });&quot;;
+
+			writer.WriteLine(&quot;&lt;script type=&#39;text/javascript&#39;&gt;&quot; + js + &quot;&lt;/script&gt;&quot;);
+
+		}
+
+		/// &lt;summary&gt;
+		/// converts a list of Ids to the XDocument structure
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;val&quot;&gt;The value.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		private XDocument ConvertToXDocument(IEnumerable&lt;string&gt; val)
+		{
+			if (val.Count() &gt; 0)
+			{
+				return new XDocument(new XElement(&quot;MultiNodePicker&quot;,
+					new XAttribute(&quot;type&quot;, TreeToRender),
+					val.Select(x =&gt; new XElement(&quot;nodeId&quot;, x.ToString()))));
+			}
+			else
+			{
+				//return null to support recursive values
+				return null;
+
+				//return an empty node set
+				//return new XDocument(new XElement(&quot;MultiNodePicker&quot;));
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// this will render the tooltip object on the page so long as another 
+		/// one hasn&#39;t already been registered. There should only be one tooltip.
+		/// &lt;/summary&gt;
+		private void RenderTooltip(HtmlTextWriter writer)
+		{
+			if (this.Page.Items.Contains(&quot;MNTPTooltip&quot;))
+			{
+				return;
+			}
+
+			//render the tooltip holder
+			//&lt;div class=&quot;tooltip&quot;&gt;
+			//  &lt;div class=&quot;throbber&quot;&gt;&lt;/div&gt;
+			//  &lt;div class=&quot;tooltipInfo&quot;&gt;&lt;/div&gt;
+			//&lt;/div&gt;
+			//this.Page.Controls.AddAt(0, new LiteralControl(&quot;&lt;div id=&#39;MNTPTooltip&#39;&gt;&lt;div class=&#39;throbber&#39;&gt;&lt;/div&gt;&lt;div class=&#39;tooltipInfo&#39;&gt;&lt;/div&gt;&lt;/div&gt;&quot;));
+			writer.AddAttribute(&quot;id&quot;, &quot;MNTPTooltip&quot;);
+			writer.RenderBeginTag(HtmlTextWriterTag.Div);
+			writer.AddAttribute(&quot;class&quot;, &quot;throbber&quot;);
+			writer.RenderBeginTag(HtmlTextWriterTag.Div);
+			writer.RenderEndTag(); //end throbber
+			writer.AddAttribute(&quot;class&quot;, &quot;tooltipInfo&quot;);
+			writer.RenderBeginTag(HtmlTextWriterTag.Div);
+			writer.RenderEndTag(); //end tooltipInfo
+			writer.RenderEndTag(); //end tooltipo
+
+			//ensure we add this to our page items so it&#39;s not duplicated
+			this.Page.Items.Add(&quot;MNTPTooltip&quot;, true);
+		}
+
+		/// &lt;summary&gt;
+		/// This will update the multi-node tree picker data which is used to store
+		/// the xpath data and xpath match type for this control id.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;xpath&quot;&gt;The xpath.&lt;/param&gt;
+		/// &lt;remarks&gt;
+		/// This will save the data into a cookie and also into the request cookie. It must save
+		/// it to both locations in case the request cookie has been changed and the request cookie
+		/// is different than the response cookie.
+		/// &lt;/remarks&gt;
+		private void SavePersistentValuesForTree(string xpath)
+		{
+
+			//create the output cookie with all of the values of the request cookie
+
+			var newCookie = HttpContext.Current.Response.Cookies[MNTP_DataType.PersistenceCookieName] ?? new HttpCookie(MNTP_DataType.PersistenceCookieName);
+
+			//store the xpath for this data type definition
+			newCookie.MntpAddXPathFilter(this.DataTypeDefinitionId, xpath);
+			//store the match type
+			newCookie.MntpAddXPathFilterType(this.DataTypeDefinitionId, XPathFilterMatchType);
+			//store the start node id
+			newCookie.MntpAddStartNodeId(this.DataTypeDefinitionId, StartNodeId);
+			//store the start node selection type
+			newCookie.MntpAddStartNodeSelectionType(this.DataTypeDefinitionId, StartNodeSelectionType);
+			//store the start node xpath expression type
+			newCookie.MntpAddStartNodeXPathExpressionType(this.DataTypeDefinitionId, StartNodeXPathExpressionType);
+			//store the start node xpath expression
+			newCookie.MntpAddStartNodeXPathExpression(this.DataTypeDefinitionId, StartNodeXPathExpression);
+			//store the current editing node if found
+			if (!string.IsNullOrEmpty(HttpContext.Current.Request[&quot;id&quot;]))
+			{
+				var id = 0;
+				if (int.TryParse(HttpContext.Current.Request[&quot;id&quot;], out id))
+				{
+					newCookie.MntpAddCurrentEditingNode(this.DataTypeDefinitionId, id);
+				}
+			}
+
+			HttpContext.Current.Response.Cookies.Add(newCookie);
+
+			//add it to the request cookies too, thus overriding any old data
+			if (HttpContext.Current.Request.Cookies[MNTP_DataType.PersistenceCookieName] != null &amp;&amp; HttpContext.Current.Request.Cookies[MNTP_DataType.PersistenceCookieName].Values.Count &gt; 0)
+			{
+				//remove the incoming one and replace with new one
+				HttpContext.Current.Request.Cookies.Remove(MNTP_DataType.PersistenceCookieName);
+			}
+			HttpContext.Current.Request.Cookies.Add(newCookie);
+
+		}
+
+		/// &lt;summary&gt;
+		/// A reference path to where the icons are actually stored as compared to where the tree themes folder is
+		/// &lt;/summary&gt;
+		private static readonly string IconPath = IOHelper.ResolveUrl(SystemDirectories.Umbraco) + &quot;/images/umbraco/&quot;;
+	}
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[40,3,40,4,0],[43,4,43,51,0],[43,51,43,93,0],[43,93,43,95,0],[43,4,43,95,0],[44,5,44,12,0],[50,4,50,77,0],[50,77,50,185,0],[50,185,50,187,0],[50,4,50,187,0],[52,13,52,37,0],[53,13,53,14,0],[54,17,57,71,0],[58,13,58,14,0],[59,4,69,117,0],[72,4,72,75,0],[72,75,72,181,0],[72,181,72,183,0],[72,4,72,183,0],[74,13,74,35,0],[75,13,75,14,0],[76,17,79,65,0],[80,13,80,14,0],[81,4,91,113,0],[94,4,94,63,0],[95,4,95,61,0],[96,3,96,4,0],[103,3,103,27,0],[104,3,104,4,0],[105,4,105,105,0],[106,4,106,34,0],[107,4,107,63,0],[108,4,108,22,0],[109,4,109,21,0],[110,4,110,36,0],[111,4,111,24,0],[112,4,112,24,0],[113,3,113,4,0],[120,14,120,15,0],[120,16,120,53,0],[120,54,120,55,0],[159,4,159,5,0],[160,5,160,43,0],[161,5,161,104,0],[164,5,164,27,0],[165,5,165,6,0],[166,11,166,20,0],[166,22,166,42,0],[166,44,166,47,0],[167,6,167,7,0],[168,7,168,28,0],[169,7,169,8,0],[170,8,170,30,0],[171,7,171,8,0],[172,12,172,18,0],[173,6,173,7,0],[174,5,174,6,0],[176,5,176,6,0],[177,6,177,31,0],[178,5,178,6,0],[179,5,179,26,0],[180,4,180,5,0],[182,4,182,5,0],[183,5,183,42,0],[184,4,184,5,0],[193,4,193,5,0],[194,5,194,44,0],[195,4,195,5,0],[197,4,197,5,0],[198,5,198,23,0],[199,5,199,6,0],[200,6,200,39,0],[201,6,201,29,0],[202,5,202,6,0],[204,5,204,6,0],[206,6,206,46,0],[207,6,207,40,0],[208,6,208,61,0],[208,61,208,68,0],[208,68,208,81,0],[208,6,208,81,0],[209,5,209,6,0],[210,4,210,5,0],[216,32,216,36,0],[216,37,216,41,0],[221,32,221,36,0],[221,37,221,41,0],[226,31,226,35,0],[226,36,226,40,0],[231,29,231,33,0],[231,34,231,38,0],[236,29,236,33,0],[236,34,236,38,0],[241,28,241,32,0],[241,33,241,37,0],[246,53,246,57,0],[246,58,246,62,0],[251,61,251,65,0],[251,66,251,70,0],[256,44,256,48,0],[256,49,256,53,0],[263,30,263,34,0],[263,35,263,39,0],[268,49,268,53,0],[268,54,268,58,0],[277,40,277,44,0],[277,45,277,49,0],[282,46,282,50,0],[282,51,282,55,0],[288,37,288,41,0],[288,42,288,46,0],[293,30,293,34,0],[293,35,293,39,0],[302,3,302,4,0],[303,4,303,19,0],[305,4,305,26,0],[306,3,306,4,0],[313,3,313,4,0],[314,4,314,19,0],[317,4,317,138,0],[318,4,318,145,0],[321,4,321,25,0],[324,6,324,55,0],[325,6,325,72,0],[326,6,326,12,0],[329,6,329,57,0],[330,6,330,74,0],[331,6,331,12,0],[334,4,334,24,0],[335,4,335,5,0],[337,5,337,48,0],[338,4,338,5,0],[341,4,341,61,0],[342,4,342,5,0],[343,5,343,31,0],[344,4,344,5,0],[346,3,346,4,0],[352,3,352,4,0],[353,4,353,31,0],[355,4,355,26,0],[358,4,366,7,0],[369,4,369,57,0],[372,4,372,71,0],[373,4,373,62,0],[376,4,381,7,0],[383,4,383,65,0],[386,4,386,45,0],[388,4,393,12,0],[394,4,394,105,0],[397,4,397,41,0],[398,4,398,41,0],[399,4,399,35,0],[400,4,400,35,0],[401,3,401,4,0],[407,3,407,4,0],[408,4,408,20,0],[409,4,409,30,0],[410,3,410,4,0],[413,3,413,4,0],[414,4,414,24,0],[415,4,415,62,0],[416,4,416,5,0],[417,5,417,26,0],[418,4,418,5,0],[419,3,419,4,0],[428,3,428,4,0],[429,4,429,86,0],[430,4,430,75,0],[431,4,431,76,0],[432,4,432,66,0],[435,4,435,22,0],[436,4,436,5,0],[437,5,437,63,0],[438,4,438,5,0],[440,4,440,45,0],[442,4,442,53,0],[443,4,443,5,0],[447,5,447,6,0],[448,6,448,69,0],[451,6,451,61,0],[453,6,453,64,0],[454,6,454,49,0],[455,6,455,47,0],[457,6,457,31,0],[458,6,458,7,0],[460,7,460,50,0],[461,6,461,7,0],[463,6,463,7,0],[465,7,465,57,0],[466,8,466,93,0],[468,7,468,8,0],[470,8,471,77,0],[473,8,473,54,0],[474,7,474,8,0],[477,7,477,95,0],[478,7,478,8,0],[479,8,479,71,0],[481,8,481,34,0],[484,8,484,66,0],[485,8,485,50,0],[493,8,493,49,0],[493,49,493,60,0],[493,60,494,59,0],[493,8,494,59,0],[495,8,495,9,0],[496,9,496,41,0],[497,9,497,31,0],[498,8,498,9,0],[499,7,499,8,0],[500,6,500,7,0],[502,5,502,6,0],[503,5,503,30,0],[504,5,504,6,0],[506,6,506,62,0],[507,5,507,6,0],[508,4,508,5,0],[509,3,509,4,0],[520,3,520,4,0],[521,4,521,24,0],[523,4,523,69,0],[525,4,525,45,0],[526,3,526,4,0],[536,3,536,4,0],[551,4,551,26,0],[553,4,553,108,0],[554,4,554,45,0],[555,4,555,49,0],[557,4,557,56,0],[558,4,558,49,0],[559,4,559,49,0],[560,4,560,33,0],[561,4,561,26,0],[562,4,562,26,0],[564,4,564,54,0],[565,4,565,99,0],[566,4,566,49,0],[568,4,568,44,0],[569,4,569,26,0],[571,4,571,38,0],[574,4,574,38,0],[576,4,576,26,0],[578,4,578,127,0],[581,4,589,19,0],[590,4,590,69,0],[592,4,592,75,0],[594,3,594,4,0],[602,3,602,4,0],[603,4,603,24,0],[604,4,604,5,0],[605,5,607,22,0],[607,22,607,58,0],[607,58,607,62,0],[605,5,607,62,0],[610,4,610,5,0],[612,5,612,17,0],[617,3,617,4,0],[624,3,624,4,0],[625,4,625,48,0],[626,4,626,5,0],[627,5,627,12,0],[636,4,636,45,0],[637,4,637,49,0],[638,4,638,45,0],[639,4,639,49,0],[640,4,640,26,0],[641,4,641,48,0],[642,4,642,49,0],[643,4,643,26,0],[644,4,644,26,0],[647,4,647,45,0],[648,3,648,4,0],[661,3,661,4,0],[665,4,665,149,0],[668,4,668,67,0],[670,4,670,86,0],[672,4,672,73,0],[674,4,674,95,0],[676,4,676,107,0],[678,4,678,99,0],[680,4,680,65,0],[681,4,681,5,0],[682,5,682,16,0],[683,5,683,65,0],[684,5,684,6,0],[685,6,685,73,0],[686,5,686,6,0],[687,4,687,5,0],[689,4,689,56,0],[692,4,692,182,0],[693,4,693,5,0],[695,5,695,85,0],[696,4,696,5,0],[697,4,697,55,0],[699,3,699,4,0],[704,3,704,113,0]]);
+    </script>
+  </body>
+</html>

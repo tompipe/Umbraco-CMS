@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\templateControls\ItemRenderer.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Web;
+using System.Web.Caching;
+using System.Web.UI;
+using System.Xml;
+using StackExchange.Profiling;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Macros;
+using Umbraco.Core.Profiling;
+using Umbraco.Web;
+using Umbraco.Web.PublishedCache;
+using Umbraco.Web.PublishedCache.XmlPublishedCache;
+using Umbraco.Web.Routing;
+using Umbraco.Web.Templates;
+using umbraco.cms.businesslogic;
+using umbraco.cms.businesslogic.property;
+using umbraco.cms.businesslogic.web;
+using Umbraco.Core.IO;
+
+namespace umbraco.presentation.templateControls
+{
+    public class ItemRenderer
+    {
+        public readonly static ItemRenderer Instance = new ItemRenderer();
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;ItemRenderer&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        protected ItemRenderer()
+        { }
+
+        /// &lt;summary&gt;
+        /// Renders the specified item.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;item&quot;&gt;The item.&lt;/param&gt;
+        /// &lt;param name=&quot;writer&quot;&gt;The writer.&lt;/param&gt;
+        public virtual void Render(Item item, HtmlTextWriter writer)
+        {
+            if (item.DebugMode)
+            {
+                writer.AddAttribute(HtmlTextWriterAttribute.Title, string.Format(&quot;Field Tag: &#39;{0}&#39;&quot;, item.Field));
+                writer.AddAttribute(&quot;style&quot;, &quot;border: 1px solid #fc6;&quot;);
+                writer.RenderBeginTag(HtmlTextWriterTag.Div);
+            }
+
+            try
+            {
+                StringWriter renderOutputWriter = new StringWriter();
+                HtmlTextWriter htmlWriter = new HtmlTextWriter(renderOutputWriter);
+                foreach (Control control in item.Controls)
+                {
+                    try
+                    {
+                        control.RenderControl(htmlWriter);
+                    }
+                    catch (Exception renderException)
+                    {
+                        // TODO: Validate that the current control is within the scope of a form control
+                        // Even controls that are inside this scope, can produce this error in async postback.
+                        HttpContext.Current.Trace.Warn(&quot;ItemRenderer&quot;,
+                            String.Format(&quot;Error rendering control {0} of {1}.&quot;, control.ClientID, item), renderException);
+                    }
+                }
+
+                // parse macros and execute the XSLT transformation on the result if not empty
+                string renderOutput = renderOutputWriter.ToString();
+                string xsltTransformedOutput = renderOutput.Trim().Length == 0
+                                               ? String.Empty
+                                               : XsltTransform(item.Xslt, renderOutput, item.XsltDisableEscaping);
+                // handle text before/after
+                xsltTransformedOutput = AddBeforeAfterText(xsltTransformedOutput, helper.FindAttribute(item.LegacyAttributes, &quot;insertTextBefore&quot;), helper.FindAttribute(item.LegacyAttributes, &quot;insertTextAfter&quot;));
+                string finalResult = xsltTransformedOutput.Trim().Length &gt; 0 ? xsltTransformedOutput : GetEmptyText(item);
+
+                //Don&#39;t parse urls if a content item is assigned since that is taken care
+                // of with the value converters
+                if (item.ContentItem == null)
+                {
+                    writer.Write(TemplateUtilities.ResolveUrlsFromTextString(finalResult));
+                }
+                else
+                {
+                    writer.Write(finalResult);
+                }
+                
+            }
+            catch (Exception renderException)
+            {
+                HttpContext.Current.Trace.Warn(&quot;ItemRenderer&quot;, String.Format(&quot;Error rendering {0}.&quot;, item), renderException);
+            }
+            finally
+            {
+                if (item.DebugMode)
+                {
+                    writer.RenderEndTag();
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Renders the field contents.
+        /// Checks via the NodeId attribute whether to fetch data from another page than the current one.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;A string of field contents (macros not parsed)&lt;/returns&gt;
+        protected virtual string GetFieldContents(Item item)
+        {
+            var tempElementContent = string.Empty;
+
+            // if a nodeId is specified we should get the data from another page than the current one
+            if (string.IsNullOrEmpty(item.NodeId) == false)
+            {
+                var tempNodeId = item.GetParsedNodeId();
+                if (tempNodeId != null &amp;&amp; tempNodeId.Value != 0)
+                {
+                    //moved the following from the catch block up as this will allow fallback options alt text etc to work
+                    var cache = Umbraco.Web.UmbracoContext.Current.ContentCache.InnerCache as PublishedContentCache;
+                    if (cache == null) throw new InvalidOperationException(&quot;Unsupported IPublishedContentCache, only the Xml one is supported.&quot;);
+                    var xml = cache.GetXml(Umbraco.Web.UmbracoContext.Current, Umbraco.Web.UmbracoContext.Current.InPreviewMode);
+                    var itemPage = new page(xml.GetElementById(tempNodeId.ToString()));
+                    tempElementContent = 
+                        new item(item.ContentItem, itemPage.Elements, item.LegacyAttributes).FieldContent;
+                }
+            }
+            else
+            {
+                // gets the field content from the current page (via the PageElements collection)
+                tempElementContent =
+                    new item(item.ContentItem, item.PageElements, item.LegacyAttributes).FieldContent;
+            }
+
+            return tempElementContent;
+        }
+
+        /// &lt;summary&gt;
+        /// Inits the specified item. To be called from the OnInit method of Item.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;item&quot;&gt;The item.&lt;/param&gt;
+        public virtual void Init(Item item)
+        { }
+
+        /// &lt;summary&gt;
+        /// Loads the specified item. To be called from the OnLoad method of Item.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;item&quot;&gt;The item.&lt;/param&gt;
+        public virtual void Load(Item item)
+        {
+            using (DisposableTimer.DebugDuration&lt;ItemRenderer&gt;(string.Format(&quot;Item: {0}&quot;, item.Field)))
+            {
+                ParseMacros(item);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Parses the macros inside the text, by creating child elements for each item.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;item&quot;&gt;The item.&lt;/param&gt;
+        protected virtual void ParseMacros(Item item)
+        {  
+            // do nothing if the macros have already been rendered
+            if (item.Controls.Count &gt; 0)
+                return;
+            
+            var elementText = GetFieldContents(item);
+
+            //Don&#39;t parse macros if there&#39;s a content item assigned since the content value
+            // converters take care of that, just add the already parsed text
+            if (item.ContentItem != null)
+            {
+                item.Controls.Add(new LiteralControl(elementText));
+            }
+            else
+            {
+                using (DisposableTimer.DebugDuration&lt;ItemRenderer&gt;(&quot;Parsing Macros&quot;))
+                {
+
+                    MacroTagParser.ParseMacros(
+                        elementText,
+
+                        //callback for when a text block is parsed
+                        textBlock =&gt; item.Controls.Add(new LiteralControl(textBlock)),
+
+                        //callback for when a macro is parsed:
+                        (macroAlias, attributes) =&gt;
+                        {
+                            var macroControl = new Macro
+                            {
+                                Alias = macroAlias
+                            };
+                            foreach (var i in attributes.Where(i =&gt; macroControl.Attributes[i.Key] == null))
+                            {
+                                macroControl.Attributes.Add(i.Key, i.Value);
+                            }
+                            item.Controls.Add(macroControl);
+                        });
+                }
+            }
+            
+        }
+
+        /// &lt;summary&gt;
+        /// Transforms the content using the XSLT attribute, if provided.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xpath&quot;&gt;The xpath expression.&lt;/param&gt;
+        /// &lt;param name=&quot;itemData&quot;&gt;The item&#39;s rendered content.&lt;/param&gt;
+        /// &lt;param name=&quot;disableEscaping&quot;&gt;if set to &lt;c&gt;true&lt;/c&gt;, escaping is disabled.&lt;/param&gt;
+        /// &lt;returns&gt;The transformed content if the XSLT attribute is present, otherwise the original content.&lt;/returns&gt;
+        protected virtual string XsltTransform(string xpath, string itemData, bool disableEscaping)
+        {
+            if (!String.IsNullOrEmpty(xpath))
+            {
+                // XML-encode the expression and add the itemData parameter to it
+                string xpathEscaped = xpath.Replace(&quot;&lt;&quot;, &quot;&amp;lt;&quot;).Replace(&quot;&gt;&quot;, &quot;&amp;gt;&quot;).Replace(&quot;\&quot;&quot;, &quot;&amp;quot;&quot;);
+                string xpathExpression = string.Format(xpathEscaped, &quot;$itemData&quot;);
+
+                // prepare support for XSLT extensions
+                StringBuilder namespaceList = new StringBuilder();
+                StringBuilder namespaceDeclaractions = new StringBuilder();
+                foreach (KeyValuePair&lt;string, object&gt; extension in macro.GetXsltExtensions())
+                {
+                    namespaceList.Append(extension.Key).Append(&#39; &#39;);
+                    namespaceDeclaractions.AppendFormat(&quot;xmlns:{0}=\&quot;urn:{0}\&quot; &quot;, extension.Key);
+                }
+
+                // add the XSLT expression into the full XSLT document, together with the needed parameters
+                string xslt = string.Format(Umbraco.Web.umbraco.presentation.umbraco.templateControls.Resources.InlineXslt, xpathExpression, disableEscaping ? &quot;yes&quot; : &quot;no&quot;,
+                                                                  namespaceList, namespaceDeclaractions);
+
+                // create the parameter
+                Dictionary&lt;string, object&gt; parameters = new Dictionary&lt;string, object&gt;(1);
+                parameters.Add(&quot;itemData&quot;, itemData);
+
+                // apply the XSLT transformation
+                XmlTextReader xslReader = new XmlTextReader(new StringReader(xslt));
+                System.Xml.Xsl.XslCompiledTransform xsl = macro.CreateXsltTransform(xslReader, false);
+                itemData = macro.GetXsltTransformResult(new XmlDocument(), xsl, parameters);
+                xslReader.Close();
+            }
+            return itemData;
+        }
+
+        protected string AddBeforeAfterText(string text, string before, string after)
+        {
+            if (!String.IsNullOrEmpty(text))
+            {
+                if (!String.IsNullOrEmpty(before))
+                    text = String.Format(&quot;{0}{1}&quot;, HttpContext.Current.Server.HtmlDecode(before), text);
+                if (!String.IsNullOrEmpty(after))
+                    text = String.Format(&quot;{0}{1}&quot;, text, HttpContext.Current.Server.HtmlDecode(after));
+            }
+
+            return text;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the text to display if the field contents are empty.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;item&quot;&gt;The item.&lt;/param&gt;
+        /// &lt;returns&gt;The text to display.&lt;/returns&gt;
+        protected virtual string GetEmptyText(Item item)
+        {
+            return item.TextIfEmpty;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the field content from database instead of the published XML via the APIs.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;itemAttributes&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;nodeIdInt&quot;&gt;The node id.&lt;/param&gt;
+        /// &lt;param name=&quot;currentField&quot;&gt;The field that should be fetched.&lt;/param&gt;
+        /// &lt;returns&gt;The contents of the &lt;paramref name=&quot;currentField&quot;/&gt; from the &lt;paramref name=&quot;nodeIdInt&quot;/&gt; content object&lt;/returns&gt;
+        [Obsolete(&quot;This is no longer used in the codebase and will be removed in future versions&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        protected virtual string GetContentFromDatabase(AttributeCollectionAdapter itemAttributes, int nodeIdInt, string currentField)
+        {
+            var c = new Content(nodeIdInt);
+
+            var property = c.getProperty(currentField);
+            if (property == null)
+                throw new ArgumentException(String.Format(&quot;Could not find property {0} of node {1}.&quot;, currentField, nodeIdInt));
+
+            var umbItem = new item(property.Value.ToString(), itemAttributes);
+            var tempElementContent = umbItem.FieldContent;
+
+            // If the current content object is a document object, we&#39;ll only output it if it&#39;s published
+            if (c.nodeObjectType == Document._objectType)
+            {
+                try
+                {
+                    var d = (Document)c;
+                    if (!d.Published)
+                        tempElementContent = &quot;&quot;;
+                }
+                catch { }
+            }
+
+            // Add the content to the cache
+            if (!string.IsNullOrEmpty(tempElementContent))
+            {
+                ApplicationContext.Current.ApplicationCache.RuntimeCache.InsertCacheItem(
+                    string.Format(&quot;{0}{1}_{2}&quot;, CacheKeys.ContentItemCacheKey, nodeIdInt, currentField),
+                    priority:       CacheItemPriority.Default, 
+                    getCacheItem:   () =&gt; tempElementContent);
+            }
+            return tempElementContent;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the content from cache.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;nodeIdInt&quot;&gt;The node id.&lt;/param&gt;
+        /// &lt;param name=&quot;field&quot;&gt;The field.&lt;/param&gt;
+        /// &lt;returns&gt;The cached contents of the &lt;paramref name=&quot;field&quot;/&gt; from the &lt;paramref name=&quot;nodeIdInt&quot;/&gt; content object&lt;/returns&gt;
+        [Obsolete(&quot;This is no longer used in the codebase and will be removed in future versions&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        protected virtual object GetContentFromCache(int nodeIdInt, string field)
+        {
+            var content = ApplicationContext.Current.ApplicationCache.RuntimeCache.GetCacheItem&lt;object&gt;(
+                string.Format(&quot;{0}{1}_{2}&quot;, CacheKeys.ContentItemCacheKey, nodeIdInt, field));
+            return content;
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[31,9,31,75,0],[35,9,35,33,0],[36,9,36,10,0],[36,11,36,12,0],[44,9,44,10,0],[45,13,45,32,0],[46,13,46,14,0],[47,17,47,115,0],[48,17,48,73,0],[49,17,49,62,0],[50,13,50,14,0],[53,13,53,14,0],[54,17,54,70,0],[55,17,55,84,0],[56,17,56,24,0],[56,26,56,41,0],[56,42,56,44,0],[56,45,56,58,0],[57,17,57,18,0],[59,21,59,22,0],[60,25,60,59,0],[61,21,61,22,0],[62,21,62,54,0],[63,21,63,22,0],[66,25,67,124,0],[68,21,68,22,0],[69,17,69,18,0],[72,17,72,69,0],[73,17,75,115,0],[77,17,77,212,0],[78,17,78,123,0],[82,17,82,46,0],[83,17,83,18,0],[84,21,84,92,0],[85,17,85,18,0],[87,17,87,18,0],[88,21,88,47,0],[89,17,89,18,0],[91,13,91,14,0],[92,13,92,46,0],[93,13,93,14,0],[94,17,94,126,0],[95,13,95,14,0],[97,13,97,14,0],[98,17,98,36,0],[99,17,99,18,0],[100,21,100,43,0],[101,17,101,18,0],[102,13,102,14,0],[103,9,103,10,0],[111,9,111,10,0],[112,13,112,51,0],[115,13,115,60,0],[116,13,116,14,0],[117,17,117,57,0],[118,17,118,65,0],[119,17,119,18,0],[121,21,121,117,0],[122,21,122,39,0],[122,40,122,146,0],[123,21,123,130,0],[124,21,124,88,0],[125,21,126,107,0],[127,17,127,18,0],[128,13,128,14,0],[130,13,130,14,0],[132,17,133,103,0],[134,13,134,14,0],[136,13,136,39,0],[137,9,137,10,0],[144,9,144,10,0],[144,11,144,12,0],[151,9,151,10,0],[152,13,152,104,0],[153,13,153,14,0],[154,17,154,35,0],[155,13,155,14,0],[156,9,156,10,0],[163,9,163,10,0],[165,13,165,41,0],[166,17,166,24,0],[168,13,168,54,0],[172,13,172,42,0],[173,13,173,14,0],[174,17,174,68,0],[175,13,175,14,0],[177,13,177,14,0],[178,17,178,86,0],[179,17,179,18,0],[181,21,185,38,0],[185,38,185,86,0],[185,86,189,25,0],[189,25,189,26,0],[189,26,190,29,0],[190,29,193,31,0],[193,31,194,29,0],[194,29,194,36,0],[194,36,194,38,0],[194,38,194,43,0],[194,43,194,44,0],[194,44,194,46,0],[194,46,194,47,0],[194,47,194,69,0],[194,69,194,107,0],[194,107,194,108,0],[194,47,194,108,0],[194,108,195,29,0],[195,29,195,30,0],[195,30,196,33,0],[196,33,196,77,0],[196,77,197,29,0],[197,29,197,30,0],[197,30,198,29,0],[198,29,198,61,0],[198,61,199,25,0],[199,25,199,26,0],[199,26,199,28,0],[181,21,199,28,0],[200,17,200,18,0],[201,13,201,14,0],[203,9,203,10,0],[213,9,213,10,0],[214,13,214,46,0],[215,13,215,14,0],[217,17,217,111,0],[218,17,218,83,0],[221,17,221,67,0],[222,17,222,76,0],[223,17,223,24,0],[223,26,223,64,0],[223,65,223,67,0],[223,68,223,93,0],[224,17,224,18,0],[225,21,225,69,0],[226,21,226,98,0],[227,17,227,18,0],[230,17,231,106,0],[234,17,234,91,0],[235,17,235,54,0],[238,17,238,85,0],[239,17,239,103,0],[240,17,240,93,0],[241,17,241,35,0],[242,13,242,14,0],[243,13,243,29,0],[244,9,244,10,0],[247,9,247,10,0],[248,13,248,45,0],[249,13,249,14,0],[250,17,250,51,0],[251,21,251,105,0],[252,17,252,50,0],[253,21,253,104,0],[254,13,254,14,0],[256,13,256,25,0],[257,9,257,10,0],[265,9,265,10,0],[266,13,266,37,0],[267,9,267,10,0],[279,9,279,10,0],[280,13,280,44,0],[282,13,282,56,0],[283,13,283,34,0],[284,17,284,129,0],[286,13,286,79,0],[287,13,287,59,0],[290,13,290,58,0],[291,13,291,14,0],[293,17,293,18,0],[294,21,294,41,0],[295,21,295,38,0],[296,25,296,49,0],[297,17,297,18,0],[298,17,298,22,0],[298,23,298,24,0],[298,25,298,26,0],[299,13,299,14,0],[302,13,302,59,0],[303,13,303,14,0],[304,17,307,43,0],[307,43,307,61,0],[307,61,307,63,0],[304,17,307,63,0],[308,13,308,14,0],[309,13,309,39,0],[310,9,310,10,0],[321,9,321,10,0],[322,13,323,95,0],[324,13,324,28,0],[325,9,325,10,0]]);
+    </script>
+  </body>
+</html>

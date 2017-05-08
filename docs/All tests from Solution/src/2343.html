@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\UmbracoExamine\BaseUmbracoIndexer.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using System.Net;
+using System.Security;
+using System.Text;
+using System.Threading;
+using System.Web;
+using Examine.LuceneEngine.Config;
+using Examine.LuceneEngine.Providers;
+using Examine.Providers;
+using Lucene.Net.Analysis;
+using Lucene.Net.Documents;
+using Lucene.Net.Index;
+using Umbraco.Core;
+using umbraco.BasePages;
+using umbraco.BusinessLogic;
+using UmbracoExamine.DataServices;
+using Examine;
+using System.IO;
+using System.Xml.Linq;
+using Lucene.Net.Store;
+using UmbracoExamine.LocalStorage;
+
+namespace UmbracoExamine
+{
+
+    /// &lt;summary&gt;
+    /// An abstract provider containing the basic functionality to be able to query against
+    /// Umbraco data.
+    /// &lt;/summary&gt;
+    public abstract class BaseUmbracoIndexer : LuceneIndexer
+    {
+        #region Constructors
+
+        /// &lt;summary&gt;
+        /// Default constructor
+        /// &lt;/summary&gt;
+        protected BaseUmbracoIndexer()
+            : base()
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor to allow for creating an indexer at runtime
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;indexerData&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;indexPath&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dataService&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;analyzer&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;async&quot;&gt;&lt;/param&gt;
+        protected BaseUmbracoIndexer(IIndexCriteria indexerData, DirectoryInfo indexPath, IDataService dataService, Analyzer analyzer, bool async)
+            : base(indexerData, indexPath, analyzer, async)
+        {
+            DataService = dataService;
+        }
+
+		protected BaseUmbracoIndexer(IIndexCriteria indexerData, Lucene.Net.Store.Directory luceneDirectory, IDataService dataService, Analyzer analyzer, bool async)
+			: base(indexerData, luceneDirectory, analyzer, async)
+		{
+			DataService = dataService;
+		}
+
+        /// &lt;summary&gt;
+        /// Creates an NRT indexer
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;indexerData&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;writer&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;async&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dataService&quot;&gt;&lt;/param&gt;
+        protected BaseUmbracoIndexer(IIndexCriteria indexerData, IndexWriter writer, IDataService dataService, bool async) 
+            : base(indexerData, writer, async)
+        {
+            DataService = dataService;
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Used for unit tests
+        /// &lt;/summary&gt;
+        internal static bool? DisableInitializationCheck = null;
+        private readonly LocalTempStorageIndexer _localTempStorageIndexer = new LocalTempStorageIndexer();
+        private BaseLuceneSearcher _internalTempStorageSearcher = null;
+
+        #region Properties
+
+        public bool UseTempStorage
+        {
+            get { return _localTempStorageIndexer.LuceneDirectory != null; }
+        }
+
+        public string TempStorageLocation
+        {
+            get
+            {
+                if (UseTempStorage == false) return string.Empty;
+                return _localTempStorageIndexer.TempPath;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// If true, the IndexingActionHandler will be run to keep the default index up to date.
+        /// &lt;/summary&gt;
+        public bool EnableDefaultEventHandler { get; protected set; }
+
+        /// &lt;summary&gt;
+        /// Determines if the manager will call the indexing methods when content is saved or deleted as
+        /// opposed to cache being updated.
+        /// &lt;/summary&gt;
+        public bool SupportUnpublishedContent { get; protected internal set; }
+
+        /// &lt;summary&gt;
+        /// The data service used for retreiving and submitting data to the cms
+        /// &lt;/summary&gt;
+        public IDataService DataService { get; protected internal set; }
+
+        /// &lt;summary&gt;
+        /// the supported indexable types
+        /// &lt;/summary&gt;
+        protected abstract IEnumerable&lt;string&gt; SupportedTypes { get; }
+
+        #endregion
+
+        #region Initialize
+
+
+        /// &lt;summary&gt;
+        /// Setup the properties for the indexer from the provider settings
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;name&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;config&quot;&gt;&lt;/param&gt;
+        public override void Initialize(string name, System.Collections.Specialized.NameValueCollection config)
+        {
+
+            if (config[&quot;dataService&quot;] != null &amp;&amp; !string.IsNullOrEmpty(config[&quot;dataService&quot;]))
+            {
+                //this should be a fully qualified type
+                var serviceType = Type.GetType(config[&quot;dataService&quot;]);
+                DataService = (IDataService)Activator.CreateInstance(serviceType);
+            }
+            else if (DataService == null)
+            {
+                //By default, we will be using the UmbracoDataService
+                //generally this would only need to be set differently for unit testing
+                DataService = new UmbracoDataService();
+            }
+
+            DataService.LogService.LogLevel = LoggingLevel.Normal;
+
+            if (config[&quot;logLevel&quot;] != null &amp;&amp; !string.IsNullOrEmpty(config[&quot;logLevel&quot;]))
+            {
+                try
+                {
+                    var logLevel = (LoggingLevel)Enum.Parse(typeof(LoggingLevel), config[&quot;logLevel&quot;]);
+                    DataService.LogService.LogLevel = logLevel;
+                }
+                catch (ArgumentException)
+                {                    
+                    //FAILED
+                    DataService.LogService.LogLevel = LoggingLevel.Normal;
+                }
+            }
+
+            DataService.LogService.ProviderName = name;
+
+            EnableDefaultEventHandler = true; //set to true by default
+            bool enabled;
+            if (bool.TryParse(config[&quot;enableDefaultEventHandler&quot;], out enabled))
+            {
+                EnableDefaultEventHandler = enabled;
+            }         
+
+            DataService.LogService.AddVerboseLog(-1, string.Format(&quot;{0} indexer initializing&quot;, name));               
+
+            base.Initialize(name, config);
+
+            //NOTES: useTempStorage is obsolete, tempStorageDirectory is obsolete, both have been superceded by Examine Core&#39;s IDirectoryFactory
+            //       tempStorageDirectory never actually got finished in Umbraco Core but accidentally got shipped (it&#39;s only enabled on the searcher
+            //       and not the indexer). So this whole block is just legacy
+
+            //detect if a dir factory has been specified, if so then useTempStorage will not be used (deprecated)
+            if (config[&quot;directoryFactory&quot;] == null &amp;&amp; config[&quot;useTempStorage&quot;] != null)
+            {
+                var fsDir = base.GetLuceneDirectory() as FSDirectory;
+                if (fsDir != null)
+                {
+                    //Use the temp storage directory which will store the index in the local/codegen folder, this is useful
+                    // for websites that are running from a remove file server and file IO latency becomes an issue
+                    var attemptUseTempStorage = config[&quot;useTempStorage&quot;].TryConvertTo&lt;LocalStorageType&gt;();
+                    if (attemptUseTempStorage)
+                    {
+
+                        var indexSet = IndexSets.Instance.Sets[IndexSetName];
+                        var configuredPath = indexSet.IndexPath;
+
+                        _localTempStorageIndexer.Initialize(config, configuredPath, fsDir, IndexingAnalyzer, attemptUseTempStorage.Result);
+                    }
+                }
+               
+            }
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Used to aquire the internal searcher
+        /// &lt;/summary&gt;
+        private readonly object _internalSearcherLocker = new object();
+
+        protected override BaseSearchProvider InternalSearcher
+        {
+            get
+            {
+                //if temp local storage is configured use that, otherwise return the default
+                if (UseTempStorage)
+                {
+                    if (_internalTempStorageSearcher == null)
+                    {
+                        lock (_internalSearcherLocker)
+                        {
+                            if (_internalTempStorageSearcher == null)
+                            {
+                                _internalTempStorageSearcher = new LuceneSearcher(GetIndexWriter(), IndexingAnalyzer);
+                            }
+                        }
+                    }
+                    return _internalTempStorageSearcher;
+                }
+
+                return base.InternalSearcher;
+            }
+        }
+        
+        public override Lucene.Net.Store.Directory GetLuceneDirectory()
+        {
+            //if temp local storage is configured use that, otherwise return the default
+            if (UseTempStorage)
+            {
+                return _localTempStorageIndexer.LuceneDirectory;
+            }
+
+            return base.GetLuceneDirectory();
+
+        }
+
+        protected override IndexWriter CreateIndexWriter()
+        {
+            //if temp local storage is configured use that, otherwise return the default
+            if (UseTempStorage)
+            {
+                var directory = GetLuceneDirectory();
+                return new IndexWriter(GetLuceneDirectory(), IndexingAnalyzer,
+                    DeletePolicyTracker.Current.GetPolicy(directory),
+                    IndexWriter.MaxFieldLength.UNLIMITED);
+            }
+
+            return base.CreateIndexWriter();
+        }
+
+        ///// &lt;summary&gt;
+        ///// Override to check if we can actually initialize.
+        ///// &lt;/summary&gt;
+        ///// &lt;returns&gt;&lt;/returns&gt;
+        ///// &lt;remarks&gt;
+        ///// This check is required since the base examine lib will try to check this method on app startup. If the app
+        ///// is not ready then we need to deal with it otherwise the base class will throw exceptions since we&#39;ve bypassed initialization.
+        ///// &lt;/remarks&gt;
+        //public override bool IndexExists()
+        //{
+        //    return base.IndexExists();
+        //}
+
+        /// &lt;summary&gt;
+        /// override to check if we can actually initialize. 
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This check is required since the base examine lib will try to rebuild on startup
+        /// &lt;/remarks&gt;
+        public override void RebuildIndex()
+        {
+            if (CanInitialize())
+            {
+                base.RebuildIndex();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// override to check if we can actually initialize. 
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This check is required since the base examine lib will try to rebuild on startup
+        /// &lt;/remarks&gt;
+        public override void IndexAll(string type)
+        {
+            if (CanInitialize())
+            {
+                base.IndexAll(type);
+            }
+        }
+
+        public override void ReIndexNode(XElement node, string type)
+        {
+            if (CanInitialize())
+            {
+                if (!SupportedTypes.Contains(type))
+                    return;
+
+                base.ReIndexNode(node, type);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// override to check if we can actually initialize. 
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This check is required since the base examine lib will try to rebuild on startup
+        /// &lt;/remarks&gt;
+        public override void DeleteFromIndex(string nodeId)
+        {
+            if (CanInitialize())
+            {
+                base.DeleteFromIndex(nodeId);
+            }            
+        }
+
+        #region Protected
+
+        /// &lt;summary&gt;
+        /// Returns true if the Umbraco application is in a state that we can initialize the examine indexes
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected bool CanInitialize()
+        {
+            //check the DisableInitializationCheck and ensure that it is not set to true
+            if (!DisableInitializationCheck.HasValue || !DisableInitializationCheck.Value)
+            {
+                //We need to check if we actually can initialize, if not then don&#39;t continue
+                if (ApplicationContext.Current == null
+                    || !ApplicationContext.Current.IsConfigured
+                    || !ApplicationContext.Current.DatabaseContext.IsDatabaseConfigured)
+                {
+                    return false;
+                }    
+            }
+            
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Ensures that the node being indexed is of a correct type and is a descendent of the parent id specified.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;node&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected override bool ValidateDocument(XElement node)
+        {
+            //check if this document is a descendent of the parent
+            if (IndexerData.ParentNodeId.HasValue &amp;&amp; IndexerData.ParentNodeId.Value &gt; 0)
+                if (!((string)node.Attribute(&quot;path&quot;)).Contains(&quot;,&quot; + IndexerData.ParentNodeId.Value.ToString() + &quot;,&quot;))
+                    return false;
+
+            return base.ValidateDocument(node);
+        }
+
+        /// &lt;summary&gt;
+        /// Reindexes all supported types
+        /// &lt;/summary&gt;
+        protected override void PerformIndexRebuild()
+        {
+            foreach (var t in SupportedTypes)
+            {
+                IndexAll(t);
+            }
+        }
+        
+        /// &lt;summary&gt;
+        /// Builds an xpath statement to query against Umbraco data for the index type specified, then
+        /// initiates the re-indexing of the data matched.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        protected override void PerformIndexAll(string type)
+        {
+            //NOTE: the logic below is NOT used, this method is overridden
+            // and we query directly against the umbraco service layer.
+            // This is here for backwards compat only.
+
+            if (SupportedTypes.Contains(type) == false)
+                return;
+
+            var xPath = &quot;//*[(number(@id) &gt; 0 and (@isDoc or @nodeTypeAlias)){0}]&quot;; //we&#39;ll add more filters to this below if needed
+
+            var sb = new StringBuilder();
+
+            //create the xpath statement to match node type aliases if specified
+            if (IndexerData.IncludeNodeTypes.Any())
+            {
+                sb.Append(&quot;(&quot;);
+                foreach (var field in IndexerData.IncludeNodeTypes)
+                {
+                    //this can be used across both schemas
+                    const string nodeTypeAlias = &quot;(@nodeTypeAlias=&#39;{0}&#39; or (count(@nodeTypeAlias)=0 and name()=&#39;{0}&#39;))&quot;;
+
+                    sb.Append(string.Format(nodeTypeAlias, field));
+                    sb.Append(&quot; or &quot;);
+                }
+                sb.Remove(sb.Length - 4, 4); //remove last &quot; or &quot;
+                sb.Append(&quot;)&quot;);
+            }
+
+            //create the xpath statement to match all children of the current node.
+            if (IndexerData.ParentNodeId.HasValue &amp;&amp; IndexerData.ParentNodeId.Value &gt; 0)
+            {
+                if (sb.Length &gt; 0)
+                    sb.Append(&quot; and &quot;);
+                sb.Append(&quot;(&quot;);
+                sb.Append(&quot;contains(@path, &#39;,&quot; + IndexerData.ParentNodeId.Value + &quot;,&#39;)&quot;); //if the path contains comma - id - comma then the nodes must be a child
+                sb.Append(&quot;)&quot;);
+            }
+
+            //create the full xpath statement to match the appropriate nodes. If there is a filter
+            //then apply it, otherwise just select all nodes.
+            var filter = sb.ToString();
+            xPath = string.Format(xPath, filter.Length &gt; 0 ? &quot; and &quot; + filter : &quot;&quot;);
+
+            //raise the event and set the xpath statement to the value returned
+            var args = new IndexingNodesEventArgs(IndexerData, xPath, type);
+            OnNodesIndexing(args);
+            if (args.Cancel)
+            {
+                return;
+            }
+
+            xPath = args.XPath;
+
+            DataService.LogService.AddVerboseLog(-1, string.Format(&quot;({0}) PerformIndexAll with XPATH: {1}&quot;, this.Name, xPath));
+
+            AddNodesToIndex(xPath, type);
+        }
+
+        [Obsolete(&quot;This method is not be used, it will be removed in future versions&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        protected virtual XDocument GetXDocument(string xPath, string type)
+        {
+            //TODO: We need to get rid of this! This does not get called by our code
+
+            if (type == IndexTypes.Content)
+            {
+                if (this.SupportUnpublishedContent)
+                {
+                    return DataService.ContentService.GetLatestContentByXPath(xPath);
+                }
+                else
+                {
+                    return DataService.ContentService.GetPublishedContentByXPath(xPath);
+                }
+            }
+            else if (type == IndexTypes.Media)
+            {
+                return DataService.MediaService.GetLatestMediaByXpath(xPath);
+            }
+            return null;
+        }
+        #endregion
+
+        
+        [Obsolete(&quot;This method is not be used, it will be removed in future versions&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        private void AddNodesToIndex(string xPath, string type)
+        {
+            // Get all the nodes of nodeTypeAlias == nodeTypeAlias
+            XDocument xDoc = GetXDocument(xPath, type);
+            if (xDoc != null)
+            {
+                var rootNode = xDoc.Root;
+                if (rootNode != null)
+                {
+                    //the result will either be a single doc with an id as the root, or it will
+                    // be multiple docs with a &lt;nodes&gt; wrapper, we need to check for this
+                    if (rootNode.HasAttributes)
+                    {
+                        AddNodesToIndex(new[] {rootNode}, type);
+                    }
+                    else
+                    {
+                        AddNodesToIndex(rootNode.Elements(), type);
+                    }
+                }
+            }
+
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[41,15,41,21,0],[42,9,42,10,0],[43,9,43,10,0],[54,15,54,60,0],[55,9,55,10,0],[56,13,56,39,0],[57,9,57,10,0],[60,6,60,57,0],[61,3,61,4,0],[62,4,62,30,0],[63,3,63,4,0],[73,15,73,47,1],[74,9,74,10,1],[75,13,75,39,1],[76,9,76,10,1],[83,9,83,65,1],[84,9,84,107,1],[84,9,84,107,0],[84,9,84,107,0],[84,9,84,107,0],[85,9,85,72,0],[85,9,85,72,0],[85,9,85,72,1],[85,9,85,72,0],[91,17,91,18,1],[91,19,91,75,1],[91,76,91,77,1],[97,13,97,14,0],[98,17,98,45,0],[98,46,98,66,0],[99,17,99,58,0],[100,13,100,14,0],[106,49,106,53,0],[106,54,106,68,0],[112,49,112,53,1],[112,54,112,77,1],[117,43,117,47,1],[117,48,117,71,1],[135,9,135,10,0],[137,13,137,95,0],[138,13,138,14,0],[140,17,140,71,0],[141,17,141,83,0],[142,13,142,14,0],[143,18,143,42,0],[144,13,144,14,0],[147,17,147,56,0],[148,13,148,14,0],[150,13,150,67,0],[152,13,152,89,0],[153,13,153,14,0],[155,17,155,18,0],[156,21,156,103,0],[157,21,157,64,0],[158,17,158,18,0],[159,17,159,42,0],[160,17,160,18,0],[162,21,162,75,0],[163,17,163,18,0],[164,13,164,14,0],[166,13,166,56,0],[168,13,168,46,0],[170,13,170,81,0],[171,13,171,14,0],[172,17,172,53,0],[173,13,173,14,0],[175,13,175,103,0],[177,13,177,43,0],[184,13,184,88,0],[185,13,185,14,0],[186,17,186,70,0],[187,17,187,35,0],[188,17,188,18,0],[191,21,191,107,0],[192,21,192,47,0],[193,21,193,22,0],[195,25,195,78,0],[196,25,196,65,0],[198,25,198,140,0],[199,21,199,22,0],[200,17,200,18,0],[202,13,202,14,0],[203,9,203,10,0],[210,9,210,72,0],[210,9,210,72,1],[210,9,210,72,0],[210,9,210,72,0],[215,13,215,14,1],[217,17,217,36,1],[218,17,218,18,0],[219,21,219,62,0],[220,21,220,22,0],[221,25,221,55,0],[222,25,222,26,0],[223,29,223,70,0],[224,29,224,30,0],[225,33,225,119,0],[226,29,226,30,0],[227,25,227,26,0],[228,21,228,22,0],[229,21,229,57,0],[232,17,232,46,1],[233,13,233,14,1],[237,9,237,10,1],[239,13,239,32,1],[240,13,240,14,0],[241,17,241,65,0],[244,13,244,46,1],[246,9,246,10,1],[249,9,249,10,0],[251,13,251,32,0],[252,13,252,14,0],[253,17,253,54,0],[254,17,256,59,0],[259,13,259,45,0],[260,9,260,10,0],[282,9,282,10,1],[283,13,283,33,1],[284,13,284,14,1],[285,17,285,37,1],[286,13,286,14,1],[287,9,287,10,1],[296,9,296,10,1],[297,13,297,33,1],[298,13,298,14,1],[299,17,299,37,1],[300,13,300,14,1],[301,9,301,10,1],[304,9,304,10,1],[305,13,305,33,1],[306,13,306,14,1],[307,17,307,52,1],[308,21,308,28,0],[310,17,310,46,1],[311,13,311,14,1],[312,9,312,10,1],[321,9,321,10,1],[322,13,322,33,1],[323,13,323,14,1],[324,17,324,46,1],[325,13,325,14,1],[326,9,326,10,1],[335,9,335,10,1],[337,13,337,91,1],[338,13,338,14,0],[340,17,342,89,0],[343,17,343,18,0],[344,21,344,34,0],[346,13,346,14,0],[348,13,348,25,1],[349,9,349,10,1],[357,9,357,10,1],[359,13,359,89,1],[360,17,360,119,1],[361,21,361,34,1],[363,13,363,48,1],[364,9,364,10,1],[370,9,370,10,1],[371,13,371,20,1],[371,22,371,27,1],[371,28,371,30,1],[371,31,371,45,1],[372,13,372,14,1],[373,17,373,29,1],[374,13,374,14,1],[375,9,375,10,1],[383,9,383,10,0],[388,13,388,56,0],[389,17,389,24,0],[391,13,391,84,0],[393,13,393,42,0],[396,13,396,52,0],[397,13,397,14,0],[398,17,398,32,0],[399,17,399,24,0],[399,26,399,35,0],[399,36,399,38,0],[399,39,399,67,0],[400,17,400,18,0],[404,21,404,68,0],[405,21,405,39,0],[406,17,406,18,0],[407,17,407,45,0],[408,17,408,32,0],[409,13,409,14,0],[412,13,412,89,0],[413,13,413,14,0],[414,17,414,35,0],[415,21,415,40,0],[416,17,416,32,0],[417,17,417,90,0],[418,17,418,32,0],[419,13,419,14,0],[423,13,423,40,0],[424,13,424,85,0],[427,13,427,77,0],[428,13,428,35,0],[429,13,429,29,0],[430,13,430,14,0],[431,17,431,24,0],[434,13,434,32,0],[436,13,436,128,0],[438,13,438,42,0],[439,9,439,10,0],[444,9,444,10,0],[447,13,447,44,0],[448,13,448,14,0],[449,17,449,52,0],[450,17,450,18,0],[451,21,451,86,0],[454,17,454,18,0],[455,21,455,89,0],[458,18,458,47,0],[459,13,459,14,0],[460,17,460,78,0],[462,13,462,25,0],[463,9,463,10,0],[470,9,470,10,0],[472,13,472,56,0],[473,13,473,30,0],[474,13,474,14,0],[475,17,475,42,0],[476,17,476,38,0],[477,17,477,18,0],[480,21,480,48,0],[481,21,481,22,0],[482,25,482,65,0],[483,21,483,22,0],[485,21,485,22,0],[486,25,486,68,0],[487,21,487,22,0],[488,17,488,18,0],[489,13,489,14,0],[491,9,491,10,0]]);
+    </script>
+  </body>
+</html>

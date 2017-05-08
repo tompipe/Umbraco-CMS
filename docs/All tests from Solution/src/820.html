@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\WebApi\Binders\ContentItemBaseBinder.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Formatting;
+using System.Text;
+using System.Threading.Tasks;
+using System.Web;
+using System.Web.Http;
+using System.Web.Http.Controllers;
+using System.Web.Http.ModelBinding.Binders;
+using System.Web.Http.Validation;
+using System.Web.ModelBinding;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Serialization;
+using Umbraco.Core;
+using Umbraco.Core.IO;
+using Umbraco.Core.Models;
+using Umbraco.Web.Editors;
+using Umbraco.Web.Models.ContentEditing;
+using Umbraco.Web.Security;
+using Umbraco.Web.WebApi.Filters;
+using IModelBinder = System.Web.Http.ModelBinding.IModelBinder;
+using ModelBindingContext = System.Web.Http.ModelBinding.ModelBindingContext;
+using ModelMetadata = System.Web.Http.Metadata.ModelMetadata;
+using ModelMetadataProvider = System.Web.Http.Metadata.ModelMetadataProvider;
+using MutableObjectModelBinder = System.Web.Http.ModelBinding.Binders.MutableObjectModelBinder;
+using Task = System.Threading.Tasks.Task;
+
+namespace Umbraco.Web.WebApi.Binders
+{
+    /// &lt;summary&gt;
+    /// Binds the content model to the controller action for the posted multi-part Post
+    /// &lt;/summary&gt;
+    internal abstract class ContentItemBaseBinder&lt;TPersisted, TModelSave&gt; : IModelBinder
+        where TPersisted : class, IContentBase
+        where TModelSave : ContentBaseItemSave&lt;TPersisted&gt;
+    {
+        protected ApplicationContext ApplicationContext { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;applicationContext&quot;&gt;&lt;/param&gt;
+        internal ContentItemBaseBinder(ApplicationContext applicationContext)
+        {
+            ApplicationContext = applicationContext;
+        }
+
+        public bool BindModel(HttpActionContext actionContext, ModelBindingContext bindingContext)
+        {
+            //NOTE: Validation is done in the filter
+            if (actionContext.Request.Content.IsMimeMultipartContent() == false)
+            {
+                throw new HttpResponseException(HttpStatusCode.UnsupportedMediaType);
+            }
+
+            var root = IOHelper.MapPath(&quot;~/App_Data/TEMP/FileUploads&quot;);
+            //ensure it exists
+            Directory.CreateDirectory(root);
+            var provider = new MultipartFormDataStreamProvider(root);
+
+            var task = Task.Run(() =&gt; GetModelAsync(actionContext, bindingContext, provider))
+                           .ContinueWith(x =&gt;
+                               {
+                                   if (x.IsFaulted &amp;&amp; x.Exception != null)
+                                   {
+                                       throw x.Exception;
+                                   }
+
+                                   //now that everything is binded, validate the properties
+                                   var contentItemValidator = GetValidationHelper();
+                                   contentItemValidator.ValidateItem(actionContext, x.Result);
+
+                                   bindingContext.Model = x.Result;
+                               });
+
+            task.Wait();
+
+            return bindingContext.Model != null;
+        }
+
+        protected virtual ContentItemValidationHelper&lt;TPersisted, TModelSave&gt; GetValidationHelper()
+        {
+            return new ContentItemValidationHelper&lt;TPersisted, TModelSave&gt;();
+        }
+
+        /// &lt;summary&gt;
+        /// Builds the model from the request contents
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;actionContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;bindingContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;provider&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private async Task&lt;TModelSave&gt; GetModelAsync(HttpActionContext actionContext, ModelBindingContext bindingContext, MultipartFormDataStreamProvider provider)
+        {
+            var request = actionContext.Request;
+
+            //IMPORTANT!!! We need to ensure the umbraco context here because this is running in an async thread
+            var httpContext = (HttpContextBase) request.Properties[&quot;MS_HttpContext&quot;];
+            UmbracoContext.EnsureContext(
+                httpContext, 
+                ApplicationContext.Current,
+                new WebSecurity(httpContext, ApplicationContext.Current));
+
+            var content = request.Content;
+
+            var result = await content.ReadAsMultipartAsync(provider);
+
+            if (result.FormData[&quot;contentItem&quot;] == null)
+            {
+                var response = actionContext.Request.CreateResponse(HttpStatusCode.BadRequest);
+                response.ReasonPhrase = &quot;The request was not formatted correctly and is missing the &#39;contentItem&#39; parameter&quot;;
+                throw new HttpResponseException(response);
+            }
+
+            //get the string json from the request
+            var contentItem = result.FormData[&quot;contentItem&quot;];
+
+            //deserialize into our model
+            var model = JsonConvert.DeserializeObject&lt;TModelSave&gt;(contentItem);
+            
+            //get the default body validator and validate the object
+            var bodyValidator = actionContext.ControllerContext.Configuration.Services.GetBodyModelValidator();
+            var metadataProvider = actionContext.ControllerContext.Configuration.Services.GetModelMetadataProvider();
+            //all validation errors will not contain a prefix
+            bodyValidator.Validate(model, typeof(TModelSave), metadataProvider, actionContext, &quot;&quot;);
+
+            //get the files
+            foreach (var file in result.FileData)
+            {
+                //The name that has been assigned in JS has 2 parts and the second part indicates the property id 
+                // for which the file belongs.
+                var parts = file.Headers.ContentDisposition.Name.Trim(new char[] { &#39;\&quot;&#39; }).Split(&#39;_&#39;);
+                if (parts.Length != 2)
+                {
+                    var response = actionContext.Request.CreateResponse(HttpStatusCode.BadRequest);
+                    response.ReasonPhrase = &quot;The request was not formatted correctly the file name&#39;s must be underscore delimited&quot;;
+                    throw new HttpResponseException(response);
+                }
+                var propAlias = parts[1];
+             
+                var fileName = file.Headers.ContentDisposition.FileName.Trim(new char[] {&#39;\&quot;&#39;});
+
+                model.UploadedFiles.Add(new ContentItemFile
+                    {
+                        TempFilePath = file.LocalFileName,
+                        PropertyAlias = propAlias,
+                        FileName = fileName
+                    });
+            }
+
+            if (ContentControllerBase.IsCreatingAction(model.Action))
+            {
+                //we are creating new content                          
+                model.PersistedContent = CreateNew(model);
+            }
+            else
+            {
+                //finally, let&#39;s lookup the real content item and create the DTO item
+                model.PersistedContent = GetExisting(model);                
+            }
+            
+            //create the dto from the persisted model
+            if (model.PersistedContent != null)
+            {
+                model.ContentDto = MapFromPersisted(model);  
+            }
+            if (model.ContentDto != null)
+            {
+                //now map all of the saved values to the dto
+                MapPropertyValuesFromSaved(model, model.ContentDto);    
+            }
+
+            model.Name = model.Name.Trim();
+
+            return model;
+        }
+
+        /// &lt;summary&gt;
+        /// we will now assign all of the values in the &#39;save&#39; model to the DTO object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;saveModel&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dto&quot;&gt;&lt;/param&gt;
+        private static void MapPropertyValuesFromSaved(TModelSave saveModel, ContentItemDto&lt;TPersisted&gt; dto)
+        {
+            //NOTE: Don&#39;t convert this to linq, this is much quicker
+            foreach (var p in saveModel.Properties)
+            {
+                foreach (var propertyDto in dto.Properties)
+                {
+                    if (propertyDto.Alias != p.Alias) continue;
+                    propertyDto.Value = p.Value;                        
+                    break;
+                }
+            }
+        }
+
+        protected abstract TPersisted GetExisting(TModelSave model);
+        protected abstract TPersisted CreateNew(TModelSave model);
+        protected abstract ContentItemDto&lt;TPersisted&gt; MapFromPersisted(TModelSave model);
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[41,59,41,63,0],[41,64,41,76,0],[47,9,47,78,0],[48,9,48,10,0],[49,13,49,53,0],[50,9,50,10,0],[53,9,53,10,0],[55,13,55,81,0],[56,13,56,14,0],[57,17,57,86,0],[60,13,60,72,0],[62,13,62,45,0],[63,13,63,70,0],[65,13,65,39,0],[65,39,65,93,0],[65,93,67,32,0],[67,32,67,33,0],[67,33,68,36,0],[68,36,68,75,0],[68,75,69,36,0],[69,36,69,37,0],[69,37,70,40,0],[70,40,70,58,0],[70,58,74,36,0],[74,36,74,85,0],[74,85,75,36,0],[75,36,75,95,0],[75,95,77,36,0],[77,36,77,68,0],[77,68,78,32,0],[78,32,78,33,0],[78,33,78,35,0],[65,13,78,35,0],[80,13,80,25,0],[82,13,82,49,0],[83,9,83,10,0],[86,9,86,10,0],[87,13,87,78,0],[88,9,88,10,0],[98,9,98,10,0],[99,13,99,49,0],[102,13,102,86,0],[103,13,106,75,0],[108,13,108,43,0],[110,13,110,71,0],[112,13,112,56,0],[113,13,113,14,0],[114,17,114,96,0],[115,17,115,126,0],[116,17,116,59,0],[120,13,120,62,0],[123,13,123,80,0],[126,13,126,112,0],[127,13,127,118,0],[129,13,129,100,0],[132,13,132,20,0],[132,22,132,30,0],[132,31,132,33,0],[132,34,132,49,0],[133,13,133,14,0],[136,17,136,103,0],[137,17,137,39,0],[138,17,138,18,0],[139,21,139,100,0],[140,21,140,132,0],[141,21,141,63,0],[143,17,143,42,0],[145,17,145,97,0],[147,17,152,24,0],[153,13,153,14,0],[155,13,155,70,0],[156,13,156,14,0],[158,17,158,59,0],[159,13,159,14,0],[161,13,161,14,0],[163,17,163,61,0],[164,13,164,14,0],[167,13,167,48,0],[168,13,168,14,0],[169,17,169,60,0],[170,13,170,14,0],[171,13,171,42,0],[172,13,172,14,0],[174,17,174,69,0],[175,13,175,14,0],[177,13,177,44,0],[179,13,179,26,0],[180,9,180,10,0],[188,9,188,10,0],[190,13,190,20,0],[190,22,190,27,0],[190,28,190,30,0],[190,31,190,51,0],[191,13,191,14,0],[192,17,192,24,0],[192,26,192,41,0],[192,42,192,44,0],[192,45,192,59,0],[193,17,193,18,0],[194,21,194,54,0],[194,55,194,64,0],[195,21,195,49,0],[196,21,196,27,0],[198,13,198,14,0],[199,9,199,10,0]]);
+    </script>
+  </body>
+</html>

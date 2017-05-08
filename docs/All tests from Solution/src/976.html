@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\PropertyEditors\ImageCropperPropertyValueEditor.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using Newtonsoft.Json.Linq;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Media;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Editors;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Core.PropertyEditors.ValueConverters;
+using Umbraco.Core.Services;
+using Umbraco.Web.Models.ContentEditing;
+
+namespace Umbraco.Web.PropertyEditors
+{
+    internal class ImageCropperPropertyValueEditor : PropertyValueEditorWrapper
+    {
+        public ImageCropperPropertyValueEditor(PropertyValueEditor wrapped) : base(wrapped)
+        {
+
+        }
+
+        /// &lt;summary&gt;
+        /// This is called to merge in the prevalue crops with the value that is saved - similar to the property value converter for the front-end
+        /// &lt;/summary&gt;
+           
+        public override object ConvertDbToEditor(Property property, PropertyType propertyType, IDataTypeService dataTypeService)
+        {
+            var val = base.ConvertDbToEditor(property, propertyType, dataTypeService);
+
+            var json = val as JObject;
+            if (json != null)
+            {
+                ImageCropperValueConverter.MergePreValues(json, dataTypeService, propertyType.DataTypeDefinitionId);
+                return json;
+            }
+
+            return val;
+        }
+
+        /// &lt;summary&gt;
+        /// Overrides the deserialize value so that we can save the file accordingly
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;editorValue&quot;&gt;
+        /// This is value passed in from the editor. We normally don&#39;t care what the editorValue.Value is set to because
+        /// we are more interested in the files collection associated with it, however we do care about the value if we 
+        /// are clearing files. By default the editorValue.Value will just be set to the name of the file (but again, we
+        /// just ignore this and deal with the file collection in editorValue.AdditionalData.ContainsKey(&quot;files&quot;) )
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;currentValue&quot;&gt;
+        /// The current value persisted for this property. This will allow us to determine if we want to create a new
+        /// file path or use the existing file path.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override object ConvertEditorToDb(ContentPropertyData editorValue, object currentValue)
+        {
+
+
+            string oldFile = string.Empty;
+            string newFile = string.Empty;
+            JObject newJson = null;
+            JObject oldJson = null;
+
+            //get the old src path
+            if (currentValue != null &amp;&amp; string.IsNullOrEmpty(currentValue.ToString()) == false)
+            {
+                try
+                {
+                    oldJson = JObject.Parse(currentValue.ToString());
+                }
+                catch (Exception ex)
+                {
+                    //for some reason the value is invalid so continue as if there was no value there
+                    LogHelper.WarnWithException&lt;ImageCropperPropertyValueEditor&gt;(&quot;Could not parse current db value to a JObject&quot;, ex);
+                }
+
+                if (oldJson != null &amp;&amp; oldJson[&quot;src&quot;] != null)
+                {
+                    oldFile = oldJson[&quot;src&quot;].Value&lt;string&gt;();
+                }
+            }
+
+            //get the new src path
+            if (editorValue.Value != null)
+            {
+                newJson = editorValue.Value as JObject;
+                if (newJson != null &amp;&amp; newJson[&quot;src&quot;] != null)
+                {
+                    newFile = newJson[&quot;src&quot;].Value&lt;string&gt;();
+                }
+            }
+
+            //compare old and new src path
+            //if not alike, that means we have a new file, or delete the current one... 
+            if (string.IsNullOrEmpty(newFile) || editorValue.AdditionalData.ContainsKey(&quot;files&quot;))
+            {
+                var fs = FileSystemProviderManager.Current.GetFileSystemProvider&lt;MediaFileSystem&gt;();
+
+                //if we have an existing file, delete it
+                if (string.IsNullOrEmpty(oldFile) == false)
+                    fs.DeleteFile(fs.GetRelativePath(oldFile), true);
+                else
+                    oldFile = string.Empty;
+
+                //if we have a new file, add it to the media folder and set .src
+
+                if (editorValue.AdditionalData.ContainsKey(&quot;files&quot;))
+                {
+                    var files = editorValue.AdditionalData[&quot;files&quot;] as IEnumerable&lt;ContentItemFile&gt;;
+                    if (files != null &amp;&amp; files.Any())
+                    {
+                        var file = files.First();
+
+                        if (UploadFileTypeValidator.ValidateFileExtension(file.FileName))
+                        {
+                            //create name and folder number
+                            var name = IOHelper.SafeFileName(file.FileName.Substring(file.FileName.LastIndexOf(IOHelper.DirSepChar) + 1, file.FileName.Length - file.FileName.LastIndexOf(IOHelper.DirSepChar) - 1).ToLower());
+
+                            //try to reuse the folder number from the current file
+                            var subfolder = UmbracoConfig.For.UmbracoSettings().Content.UploadAllowDirectories
+                                                ? oldFile.Replace(fs.GetUrl(&quot;/&quot;), &quot;&quot;).Split(&#39;/&#39;)[0]
+                                                : oldFile.Substring(oldFile.LastIndexOf(&quot;/&quot;, StringComparison.Ordinal) + 1).Split(&#39;-&#39;)[0];
+
+                            //if we dont find one, create a new one
+                            int subfolderId;
+                            var numberedFolder = int.TryParse(subfolder, out subfolderId)
+                                                     ? subfolderId.ToString(CultureInfo.InvariantCulture)
+                                                     : MediaSubfolderCounter.Current.Increment().ToString(CultureInfo.InvariantCulture);
+
+                            //set a file name or full path
+                            var fileName = UmbracoConfig.For.UmbracoSettings().Content.UploadAllowDirectories
+                                               ? Path.Combine(numberedFolder, name)
+                                               : numberedFolder + &quot;-&quot; + name;
+
+                            //save file and assign to the json
+                            using (var fileStream = System.IO.File.OpenRead(file.TempFilePath))
+                            {
+                                var umbracoFile = UmbracoMediaFile.Save(fileStream, fileName);
+                                newJson[&quot;src&quot;] = umbracoFile.Url;
+
+                                return newJson.ToString();
+                            }
+                        }
+                    }
+                }
+            }
+
+            //incase we submit nothing back
+            if (editorValue.Value == null)
+                return null;
+
+            return editorValue.Value.ToString();
+        }
+        
+        
+
+        public override string ConvertDbToString(Property property, PropertyType propertyType, Core.Services.IDataTypeService dataTypeService)
+        {
+            if(property.Value == null || string.IsNullOrEmpty(property.Value.ToString()))
+               return null;
+
+            //if we dont have a json structure, we will get it from the property type
+            var val = property.Value.ToString();
+            if (val.DetectIsJson())
+                return val;
+
+            var config = dataTypeService.GetPreValuesByDataTypeId(propertyType.DataTypeDefinitionId).FirstOrDefault();
+            var crops = !string.IsNullOrEmpty(config) ? config : &quot;[]&quot;;
+            var newVal = &quot;{src: &#39;&quot; + val + &quot;&#39;, crops: &quot; + crops + &quot;}&quot;; 
+            return newVal;
+        }
+    }
+
+        
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[26,79,26,92,1],[27,9,27,10,1],[29,9,29,10,1],[36,9,36,10,0],[37,13,37,87,0],[39,13,39,39,0],[40,13,40,30,0],[41,13,41,14,0],[42,17,42,117,0],[43,17,43,29,0],[46,13,46,24,0],[47,9,47,10,0],[64,9,64,10,0],[67,13,67,43,0],[68,13,68,43,0],[69,13,69,36,0],[70,13,70,36,0],[73,13,73,96,0],[74,13,74,14,0],[76,17,76,18,0],[77,21,77,70,0],[78,17,78,18,0],[79,17,79,37,0],[80,17,80,18,0],[82,21,82,135,0],[83,17,83,18,0],[85,17,85,63,0],[86,17,86,18,0],[87,21,87,62,0],[88,17,88,18,0],[89,13,89,14,0],[92,13,92,43,0],[93,13,93,14,0],[94,17,94,56,0],[95,17,95,63,0],[96,17,96,18,0],[97,21,97,62,0],[98,17,98,18,0],[99,13,99,14,0],[103,13,103,98,0],[104,13,104,14,0],[105,17,105,101,0],[108,17,108,60,0],[109,21,109,70,0],[111,21,111,44,0],[115,17,115,69,0],[116,17,116,18,0],[117,21,117,101,0],[118,21,118,54,0],[119,21,119,22,0],[120,25,120,50,0],[122,25,122,90,0],[123,25,123,26,0],[125,29,125,224,0],[128,29,130,139,0],[134,29,136,137,0],[139,29,141,78,0],[144,36,144,95,0],[145,29,145,30,0],[146,33,146,95,0],[147,33,147,66,0],[149,33,149,59,0],[152,21,152,22,0],[153,17,153,18,0],[154,13,154,14,0],[157,13,157,43,0],[158,17,158,29,0],[160,13,160,49,0],[161,9,161,10,0],[166,9,166,10,1],[167,13,167,90,1],[168,16,168,28,0],[171,13,171,49,1],[172,13,172,36,1],[173,17,173,28,0],[175,13,175,119,1],[176,13,176,71,1],[177,13,177,71,1],[178,13,178,27,1],[179,9,179,10,1]]);
+    </script>
+  </body>
+</html>

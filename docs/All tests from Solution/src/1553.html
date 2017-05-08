@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\IO\IOHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Reflection;
+using System.IO;
+using System.Configuration;
+using System.Web;
+using System.Text.RegularExpressions;
+using System.Web.Hosting;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Core.IO
+{
+	public static class IOHelper
+    {
+        private static string _rootDir = &quot;&quot;;
+
+        // static compiled regex for faster performance
+        private readonly static Regex ResolveUrlPattern = new Regex(&quot;(=[\&quot;\&#39;]?)(\\W?\\~(?:.(?![\&quot;\&#39;]?\\s+(?:\\S+)=|[&gt;\&quot;\&#39;]))+.)[\&quot;\&#39;]?&quot;, RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+
+        public static char DirSepChar
+        {
+            get
+            {
+                return Path.DirectorySeparatorChar;
+            }
+        }
+
+        //helper to try and match the old path to a new virtual one
+        public static string FindFile(string virtualPath)
+        {
+            string retval = virtualPath;
+
+            if (virtualPath.StartsWith(&quot;~&quot;))
+                retval = virtualPath.Replace(&quot;~&quot;, SystemDirectories.Root);
+
+            if (virtualPath.StartsWith(&quot;/&quot;) &amp;&amp; virtualPath.StartsWith(SystemDirectories.Root) == false)
+                retval = SystemDirectories.Root + &quot;/&quot; + virtualPath.TrimStart(&#39;/&#39;);
+
+            return retval;
+        }
+
+        //Replaces tildes with the root dir
+        public static string ResolveUrl(string virtualPath)
+        {
+             if (virtualPath.StartsWith(&quot;~&quot;))
+                return virtualPath.Replace(&quot;~&quot;, SystemDirectories.Root).Replace(&quot;//&quot;, &quot;/&quot;);
+            else if (Uri.IsWellFormedUriString(virtualPath, UriKind.Absolute))
+                return virtualPath;
+            else
+                return VirtualPathUtility.ToAbsolute(virtualPath, SystemDirectories.Root);
+        }
+
+        public static Attempt&lt;string&gt; TryResolveUrl(string virtualPath)
+        {
+            try
+            {
+                if (virtualPath.StartsWith(&quot;~&quot;))
+                    return Attempt.Succeed(virtualPath.Replace(&quot;~&quot;, SystemDirectories.Root).Replace(&quot;//&quot;, &quot;/&quot;));
+                if (Uri.IsWellFormedUriString(virtualPath, UriKind.Absolute))
+                    return Attempt.Succeed(virtualPath);
+                return Attempt.Succeed(VirtualPathUtility.ToAbsolute(virtualPath, SystemDirectories.Root));
+            }
+            catch (Exception ex)
+            {
+                return Attempt.Fail(virtualPath, ex);
+            }
+        }
+
+	    [Obsolete(&quot;Use Umbraco.Web.Templates.TemplateUtilities.ResolveUrlsFromTextString instead, this method on this class will be removed in future versions&quot;)]
+        internal static string ResolveUrlsFromTextString(string text)
+        {
+            if (UmbracoConfig.For.UmbracoSettings().Content.ResolveUrlsFromTextString)
+            {				
+				using (DisposableTimer.DebugDuration(typeof(IOHelper), &quot;ResolveUrlsFromTextString starting&quot;, &quot;ResolveUrlsFromTextString complete&quot;))
+				{
+					// find all relative urls (ie. urls that contain ~)
+					var tags = ResolveUrlPattern.Matches(text);
+					
+					foreach (Match tag in tags)
+					{						
+						string url = &quot;&quot;;
+						if (tag.Groups[1].Success)
+							url = tag.Groups[1].Value;
+
+						if (String.IsNullOrEmpty(url) == false)
+						{
+							string resolvedUrl = (url.Substring(0, 1) == &quot;/&quot;) ? ResolveUrl(url.Substring(1)) : ResolveUrl(url);
+							text = text.Replace(url, resolvedUrl);
+						}
+					}
+				}
+            }
+            return text;
+        }
+
+        public static string MapPath(string path, bool useHttpContext)
+        {
+            // Check if the path is already mapped
+            if ((path.Length &gt;= 2 &amp;&amp; path[1] == Path.VolumeSeparatorChar)
+                || path.StartsWith(@&quot;\\&quot;)) //UNC Paths start with &quot;\\&quot;. If the site is running off a network drive mapped paths will look like &quot;\\Whatever\Boo\Bar&quot;
+            {
+                return path;
+            }
+			// Check that we even have an HttpContext! otherwise things will fail anyways
+			// http://umbraco.codeplex.com/workitem/30946
+
+            if (useHttpContext &amp;&amp; HttpContext.Current != null)
+            {
+                //string retval;
+                if (String.IsNullOrEmpty(path) == false &amp;&amp; (path.StartsWith(&quot;~&quot;) || path.StartsWith(SystemDirectories.Root)))
+                    return HostingEnvironment.MapPath(path);
+                else
+                    return HostingEnvironment.MapPath(&quot;~/&quot; + path.TrimStart(&#39;/&#39;));
+            }
+
+        	var root = GetRootDirectorySafe();
+        	var newPath = path.TrimStart(&#39;~&#39;, &#39;/&#39;).Replace(&#39;/&#39;, IOHelper.DirSepChar);
+        	var retval = root + IOHelper.DirSepChar.ToString(CultureInfo.InvariantCulture) + newPath;
+
+        	return retval;
+        }
+
+        public static string MapPath(string path)
+        {
+            return MapPath(path, true);
+        }
+
+        //use a tilde character instead of the complete path
+		internal static string ReturnPath(string settingsKey, string standardPath, bool useTilde)
+        {
+            string retval = ConfigurationManager.AppSettings[settingsKey];
+
+            if (String.IsNullOrEmpty(retval))
+                retval = standardPath;
+
+            return retval.TrimEnd(&#39;/&#39;);
+        }
+
+        internal static string ReturnPath(string settingsKey, string standardPath)
+        {
+            return ReturnPath(settingsKey, standardPath, false);
+
+        }
+
+        /// &lt;summary&gt;
+        /// Verifies that the current filepath matches a directory where the user is allowed to edit a file.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;filePath&quot;&gt;The filepath to validate.&lt;/param&gt;
+        /// &lt;param name=&quot;validDir&quot;&gt;The valid directory.&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether the filepath is valid.&lt;/returns&gt;
+        internal static bool VerifyEditPath(string filePath, string validDir)
+        {
+            return VerifyEditPath(filePath, new[] { validDir });
+        }
+
+        /// &lt;summary&gt;
+        /// Validates that the current filepath matches a directory where the user is allowed to edit a file.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;filePath&quot;&gt;The filepath to validate.&lt;/param&gt;
+        /// &lt;param name=&quot;validDir&quot;&gt;The valid directory.&lt;/param&gt;
+        /// &lt;returns&gt;True, if the filepath is valid, else an exception is thrown.&lt;/returns&gt;
+        /// &lt;exception cref=&quot;FileSecurityException&quot;&gt;The filepath is invalid.&lt;/exception&gt;
+        internal static bool ValidateEditPath(string filePath, string validDir)
+        {
+            if (VerifyEditPath(filePath, validDir) == false)
+                throw new FileSecurityException(String.Format(&quot;The filepath &#39;{0}&#39; is not within an allowed directory for this type of files&quot;, filePath.Replace(MapPath(SystemDirectories.Root), &quot;&quot;)));
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Verifies that the current filepath matches one of several directories where the user is allowed to edit a file.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;filePath&quot;&gt;The filepath to validate.&lt;/param&gt;
+        /// &lt;param name=&quot;validDirs&quot;&gt;The valid directories.&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether the filepath is valid.&lt;/returns&gt;
+        internal static bool VerifyEditPath(string filePath, IEnumerable&lt;string&gt; validDirs)
+        {
+            // this is called from ScriptRepository, PartialViewRepository, etc.
+            // filePath is the fullPath (rooted, filesystem path, can be trusted)
+            // validDirs are virtual paths (eg ~/Views)
+            //
+            // except that for templates, filePath actually is a virtual path
+
+            //TODO
+            // what&#39;s below is dirty, there are too many ways to get the root dir, etc.
+            // not going to fix everything today
+
+            var mappedRoot = MapPath(SystemDirectories.Root);
+            if (filePath.StartsWith(mappedRoot) == false)
+                filePath = MapPath(filePath);
+
+            // yes we can (see above)
+            //// don&#39;t trust what we get, it may contain relative segments
+            //filePath = Path.GetFullPath(filePath);
+
+            foreach (var dir in validDirs)
+            {
+                var validDir = dir;
+                if (validDir.StartsWith(mappedRoot) == false)
+                    validDir = MapPath(validDir);
+
+                if (PathStartsWith(filePath, validDir, Path.DirectorySeparatorChar))
+                    return true;
+            }
+
+            return false;
+        }
+
+        /// &lt;summary&gt;
+        /// Validates that the current filepath matches one of several directories where the user is allowed to edit a file.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;filePath&quot;&gt;The filepath to validate.&lt;/param&gt;
+        /// &lt;param name=&quot;validDirs&quot;&gt;The valid directories.&lt;/param&gt;
+        /// &lt;returns&gt;True, if the filepath is valid, else an exception is thrown.&lt;/returns&gt;
+        /// &lt;exception cref=&quot;FileSecurityException&quot;&gt;The filepath is invalid.&lt;/exception&gt;
+        internal static bool ValidateEditPath(string filePath, IEnumerable&lt;string&gt; validDirs)
+        {
+            if (VerifyEditPath(filePath, validDirs) == false)
+           throw new FileSecurityException(String.Format(&quot;The filepath &#39;{0}&#39; is not within an allowed directory for this type of files&quot;, filePath.Replace(MapPath(SystemDirectories.Root), &quot;&quot;)));
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Verifies that the current filepath has one of several authorized extensions.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;filePath&quot;&gt;The filepath to validate.&lt;/param&gt;
+        /// &lt;param name=&quot;validFileExtensions&quot;&gt;The valid extensions.&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether the filepath is valid.&lt;/returns&gt;
+        internal static bool VerifyFileExtension(string filePath, List&lt;string&gt; validFileExtensions)
+        {
+            var ext = Path.GetExtension(filePath);
+            return ext != null &amp;&amp; validFileExtensions.Contains(ext.TrimStart(&#39;.&#39;));
+        }
+
+        /// &lt;summary&gt;
+        /// Validates that the current filepath has one of several authorized extensions.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;filePath&quot;&gt;The filepath to validate.&lt;/param&gt;
+        /// &lt;param name=&quot;validFileExtensions&quot;&gt;The valid extensions.&lt;/param&gt;
+        /// &lt;returns&gt;True, if the filepath is valid, else an exception is thrown.&lt;/returns&gt;
+        /// &lt;exception cref=&quot;FileSecurityException&quot;&gt;The filepath is invalid.&lt;/exception&gt;
+        internal static bool ValidateFileExtension(string filePath, List&lt;string&gt; validFileExtensions)
+        {
+            if (VerifyFileExtension(filePath, validFileExtensions) == false)
+                throw new FileSecurityException(String.Format(&quot;The extension for the current file &#39;{0}&#39; is not of an allowed type for this editor. This is typically controlled from either the installed MacroEngines or based on configuration in /config/umbracoSettings.config&quot;, filePath.Replace(MapPath(SystemDirectories.Root), &quot;&quot;)));
+            return true;
+        }
+
+        public static bool PathStartsWith(string path, string root, char separator)
+        {
+            // either it is identical to root,
+            // or it is root + separator + anything
+
+            if (path.StartsWith(root, StringComparison.OrdinalIgnoreCase) == false) return false;
+            if (path.Length == root.Length) return true;
+            if (path.Length &lt; root.Length) return false;
+            return path[root.Length] == separator;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the path to the root of the application, by getting the path to where the assembly where this
+        /// method is included is present, then traversing until it&#39;s past the /bin directory. Ie. this makes it work
+        /// even if the assembly is in a /bin/debug or /bin/release folder
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static string GetRootDirectorySafe()
+        {
+            if (String.IsNullOrEmpty(_rootDir) == false)
+            {
+                return _rootDir;
+            }
+
+			var codeBase = Assembly.GetExecutingAssembly().CodeBase;
+			var uri = new Uri(codeBase);
+			var path = uri.LocalPath;
+        	var baseDirectory = Path.GetDirectoryName(path);
+            if (String.IsNullOrEmpty(baseDirectory))
+                throw new Exception(&quot;No root directory could be resolved. Please ensure that your Umbraco solution is correctly configured.&quot;);
+
+            _rootDir = baseDirectory.Contains(&quot;bin&quot;)
+                           ? baseDirectory.Substring(0, baseDirectory.LastIndexOf(&quot;bin&quot;, StringComparison.OrdinalIgnoreCase) - 1)
+                           : baseDirectory;
+
+            return _rootDir;
+        }
+
+        internal static string GetRootDirectoryBinFolder()
+        {
+            string binFolder = String.Empty;
+            if (String.IsNullOrEmpty(_rootDir))
+            {
+                binFolder = Assembly.GetExecutingAssembly().GetAssemblyFile().Directory.FullName;
+                return binFolder;
+            }
+
+            binFolder = Path.Combine(GetRootDirectorySafe(), &quot;bin&quot;);
+
+#if DEBUG
+            var debugFolder = Path.Combine(binFolder, &quot;debug&quot;);
+            if (Directory.Exists(debugFolder))
+                return debugFolder;
+#endif   
+            var releaseFolder = Path.Combine(binFolder, &quot;release&quot;);
+            if (Directory.Exists(releaseFolder))
+                return releaseFolder;
+
+            if (Directory.Exists(binFolder))
+                return binFolder;
+
+            return _rootDir;
+        }
+
+        /// &lt;summary&gt;
+        /// Allows you to overwrite RootDirectory, which would otherwise be resolved
+        /// automatically upon application start.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;The supplied path should be the absolute path to the root of the umbraco site.&lt;/remarks&gt;
+        /// &lt;param name=&quot;rootPath&quot;&gt;&lt;/param&gt;
+        internal static void SetRootDirectory(string rootPath)
+	    {
+            _rootDir = rootPath;
+	    }
+
+        /// &lt;summary&gt;
+        /// Check to see if filename passed has any special chars in it and strips them to create a safe filename.  Used to overcome an issue when Umbraco is used in IE in an intranet environment.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;filePath&quot;&gt;The filename passed to the file handler from the upload field.&lt;/param&gt;
+        /// &lt;returns&gt;A safe filename without any path specific chars.&lt;/returns&gt;
+        internal static string SafeFileName(string filePath)
+        {
+            // use string extensions
+            return filePath.ToSafeFileName();
+        }
+
+	    public static void EnsurePathExists(string path)
+	    {
+	        var absolutePath = IOHelper.MapPath(path);
+	        if (Directory.Exists(absolutePath) == false)
+	            Directory.CreateDirectory(absolutePath);
+	    }
+
+	    public static void EnsureFileExists(string path, string contents)
+	    {
+	        var absolutePath = IOHelper.MapPath(path);
+	        if (File.Exists(absolutePath) == false)
+	        {
+                using (var writer = File.CreateText(absolutePath))
+                {
+                    writer.Write(contents);
+                }
+	        }
+	            
+	    }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[17,9,17,45,1],[20,9,20,226,1],[25,13,25,14,1],[26,17,26,52,1],[27,13,27,14,1],[32,9,32,10,0],[33,13,33,41,0],[35,13,35,45,0],[36,17,36,75,0],[38,13,38,104,0],[39,17,39,84,0],[41,13,41,27,0],[42,9,42,10,0],[46,9,46,10,1],[47,14,47,46,1],[48,17,48,92,1],[49,18,49,79,1],[50,17,50,36,0],[52,17,52,91,1],[53,9,53,10,1],[56,9,56,10,1],[58,13,58,14,1],[59,17,59,49,1],[60,21,60,113,1],[61,17,61,78,1],[62,21,62,57,0],[63,17,63,108,1],[65,13,65,33,1],[66,13,66,14,1],[67,17,67,54,1],[69,9,69,10,1],[73,9,73,10,0],[74,13,74,87,0],[75,13,75,14,0],[76,5,76,136,0],[77,5,77,6,0],[79,6,79,49,0],[81,6,81,13,0],[81,15,81,24,0],[81,25,81,27,0],[81,28,81,32,0],[82,6,82,7,0],[83,7,83,23,0],[84,7,84,33,0],[85,8,85,34,0],[87,7,87,46,0],[88,7,88,8,0],[89,8,89,107,0],[90,8,90,46,0],[91,7,91,8,0],[92,6,92,7,0],[93,5,93,6,0],[94,13,94,14,0],[95,13,95,25,0],[96,9,96,10,0],[99,9,99,10,1],[101,13,102,43,1],[103,13,103,14,0],[104,17,104,29,0],[109,13,109,63,1],[110,13,110,14,0],[112,17,112,126,0],[113,21,113,61,0],[115,21,115,83,0],[118,10,118,44,1],[119,10,119,83,1],[120,10,120,99,1],[122,10,122,24,1],[123,9,123,10,1],[126,9,126,10,1],[127,13,127,40,1],[128,9,128,10,1],[132,9,132,10,1],[133,13,133,75,1],[135,13,135,46,1],[136,17,136,39,1],[138,13,138,40,1],[139,9,139,10,1],[142,9,142,10,1],[143,13,143,65,1],[145,9,145,10,1],[154,9,154,10,1],[155,13,155,65,1],[156,9,156,10,1],[166,9,166,10,0],[167,13,167,61,0],[168,17,168,199,0],[169,13,169,25,0],[170,9,170,10,0],[179,9,179,10,1],[190,13,190,62,1],[191,13,191,58,1],[192,17,192,46,0],[198,13,198,20,1],[198,22,198,29,1],[198,30,198,32,1],[198,33,198,42,1],[199,13,199,14,1],[200,17,200,36,1],[201,17,201,62,1],[202,21,202,50,1],[204,17,204,85,1],[205,21,205,33,1],[206,13,206,14,0],[208,13,208,26,0],[209,9,209,10,1],[219,9,219,10,0],[220,13,220,62,0],[221,12,221,194,0],[222,13,222,25,0],[223,9,223,10,0],[232,9,232,10,1],[233,13,233,51,1],[234,13,234,84,1],[235,9,235,10,1],[245,9,245,10,0],[246,13,246,77,0],[247,17,247,334,0],[248,13,248,25,0],[249,9,249,10,0],[252,9,252,10,1],[256,13,256,84,1],[256,85,256,98,1],[257,13,257,44,1],[257,45,257,57,1],[258,13,258,43,1],[258,44,258,57,0],[259,13,259,51,1],[260,9,260,10,1],[269,9,269,10,1],[270,13,270,57,1],[271,13,271,14,1],[272,17,272,33,1],[275,4,275,60,1],[276,4,276,32,1],[277,4,277,29,1],[278,10,278,58,1],[279,13,279,53,1],[280,17,280,143,0],[282,13,284,44,1],[286,13,286,29,1],[287,9,287,10,1],[290,9,290,10,1],[291,13,291,45,1],[292,13,292,48,1],[293,13,293,14,0],[294,17,294,98,0],[295,17,295,34,0],[298,13,298,69,1],[301,13,301,64,1],[302,13,302,47,1],[303,17,303,36,1],[305,13,305,68,0],[306,13,306,49,0],[307,17,307,38,0],[309,13,309,45,0],[310,17,310,34,0],[312,13,312,29,0],[313,9,313,10,1],[322,6,322,7,0],[323,13,323,33,0],[324,6,324,7,0],[332,9,332,10,1],[334,13,334,46,1],[335,9,335,10,1],[338,6,338,7,0],[339,10,339,52,0],[340,10,340,54,0],[341,14,341,54,0],[342,6,342,7,0],[345,6,345,7,0],[346,10,346,52,0],[347,10,347,49,0],[348,10,348,11,0],[349,24,349,66,0],[350,17,350,18,0],[351,21,351,44,0],[352,17,352,18,0],[353,10,353,11,0],[355,6,355,7,0]]);
+    </script>
+  </body>
+</html>

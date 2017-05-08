@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\PluginManager.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Threading;
+using System.Web.Compilation;
+using System.Xml.Linq;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Persistence.Mappers;
+using Umbraco.Core.Persistence.Migrations;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Profiling;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Core.Cache;
+using umbraco.interfaces;
+using File = System.IO.File;
+
+namespace Umbraco.Core
+{
+    /// &lt;summary&gt;
+    /// Used to resolve all plugin types and cache them and is also used to instantiate plugin types
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// 
+    /// This class should be used to resolve all plugin types, the TypeFinder should not be used directly!
+    /// 
+    /// This class can expose extension methods to resolve custom plugins
+    /// 
+    /// Before this class resolves any plugins it checks if the hash has changed for the DLLs in the /bin folder, if it hasn&#39;t
+    /// it will use the cached resolved plugins that it has already found which means that no assembly scanning is necessary. This leads
+    /// to much faster startup times.
+    /// &lt;/remarks&gt;
+    public class PluginManager
+    {
+        /// &lt;summary&gt;
+        /// Creates a new PluginManager with an ApplicationContext instance which ensures that the plugin xml 
+        /// file is cached temporarily until app startup completes.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;detectChanges&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;serviceProvider&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;runtimeCache&quot;&gt;&lt;/param&gt;
+        internal PluginManager(IServiceProvider serviceProvider, IRuntimeCacheProvider runtimeCache, ProfilingLogger logger, bool detectChanges = true)
+        {
+            if (serviceProvider == null) throw new ArgumentNullException(&quot;serviceProvider&quot;);
+            if (runtimeCache == null) throw new ArgumentNullException(&quot;runtimeCache&quot;);
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+
+            _serviceProvider = serviceProvider;
+            _runtimeCache = runtimeCache;
+            _logger = logger;
+
+            _tempFolder = IOHelper.MapPath(&quot;~/App_Data/TEMP/PluginCache&quot;);
+            //create the folder if it doesn&#39;t exist
+            if (Directory.Exists(_tempFolder) == false)
+            {
+                Directory.CreateDirectory(_tempFolder);
+            }
+
+            var pluginListFile = GetPluginListFilePath();
+
+            //this is a check for legacy changes, before we didn&#39;t store the TypeResolutionKind in the file which was a mistake,
+            //so we need to detect if the old file is there without this attribute, if it is then we delete it
+            if (DetectLegacyPluginListFile())
+            {
+                File.Delete(pluginListFile);
+            }
+
+            if (detectChanges)
+            {
+                //first check if the cached hash is 0, if it is then we ne
+                //do the check if they&#39;ve changed
+                RequiresRescanning = (CachedAssembliesHash != CurrentAssembliesHash) || CachedAssembliesHash == 0;
+                //if they have changed, we need to write the new file
+                if (RequiresRescanning)
+                {
+                    //if the hash has changed, clear out the persisted list no matter what, this will force
+                    // rescanning of all plugin types including lazy ones.
+                    // http://issues.umbraco.org/issue/U4-4789
+                    File.Delete(pluginListFile);
+
+                    WriteCachePluginsHash();
+                }
+            }
+            else
+            {
+
+                //if the hash has changed, clear out the persisted list no matter what, this will force
+                // rescanning of all plugin types including lazy ones.
+                // http://issues.umbraco.org/issue/U4-4789
+                File.Delete(pluginListFile);
+
+                //always set to true if we&#39;re not detecting (generally only for testing)
+                RequiresRescanning = true;
+            }
+        }
+
+        private readonly IServiceProvider _serviceProvider;
+        private readonly IRuntimeCacheProvider _runtimeCache;
+        private readonly ProfilingLogger _logger;
+        private const string CacheKey = &quot;umbraco-plugins.list&quot;;
+        static PluginManager _resolver;
+        private readonly string _tempFolder;
+        private long _cachedAssembliesHash = -1;
+        private long _currentAssembliesHash = -1;
+        private static bool _initialized = false;
+        private static object _singletonLock = new object();
+
+        /// &lt;summary&gt;
+        /// We will ensure that no matter what, only one of these is created, this is to ensure that caching always takes place
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// The setter is generally only used for unit tests
+        /// &lt;/remarks&gt;
+        public static PluginManager Current
+        {
+            get
+            {
+                return LazyInitializer.EnsureInitialized(ref _resolver, ref _initialized, ref _singletonLock, () =&gt;
+                {
+                    if (ApplicationContext.Current == null)
+                    {
+                        var logger = LoggerResolver.HasCurrent ? LoggerResolver.Current.Logger : new DebugDiagnosticsLogger();
+                        var profiler = ProfilerResolver.HasCurrent ? ProfilerResolver.Current.Profiler : new LogProfiler(logger);
+                        return new PluginManager(
+                            new ActivatorServiceProvider(), 
+                            new NullCacheProvider(), 
+                            new ProfilingLogger(logger, profiler));
+                    }
+                    return new PluginManager(
+                        new ActivatorServiceProvider(), 
+                        ApplicationContext.Current.ApplicationCache.RuntimeCache, 
+                        ApplicationContext.Current.ProfilingLogger);
+                });
+            }
+            set
+            {
+                _initialized = true;
+                _resolver = value;
+            }
+        }
+
+        #region Hash checking methods
+
+
+        /// &lt;summary&gt;
+        /// Returns a bool if the assemblies in the /bin, app_code, global.asax, etc... have changed since they were last hashed.
+        /// &lt;/summary&gt;
+        internal bool RequiresRescanning { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Returns the currently cached hash value of the scanned assemblies in the /bin folder. Returns 0 
+        /// if no cache is found.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt; &lt;/value&gt;
+        internal long CachedAssembliesHash
+        {
+            get
+            {
+                if (_cachedAssembliesHash != -1)
+                    return _cachedAssembliesHash;
+
+                var filePath = GetPluginHashFilePath();
+                if (!File.Exists(filePath))
+                    return 0;
+                var hash = File.ReadAllText(filePath, Encoding.UTF8);
+                Int64 val;
+                if (Int64.TryParse(hash, out val))
+                {
+                    _cachedAssembliesHash = val;
+                    return _cachedAssembliesHash;
+                }
+                //it could not parse for some reason so we&#39;ll return 0.
+                return 0;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the current assemblies hash based on creating a hash from the assemblies in the /bin
+        /// &lt;/summary&gt;
+        /// &lt;value&gt; &lt;/value&gt;
+        internal long CurrentAssembliesHash
+        {
+            get
+            {
+                if (_currentAssembliesHash != -1)
+                    return _currentAssembliesHash;
+
+                _currentAssembliesHash = GetFileHash(
+                    new List&lt;Tuple&lt;FileSystemInfo, bool&gt;&gt;
+						{
+							//add the bin folder and everything in it
+							new Tuple&lt;FileSystemInfo, bool&gt;(new DirectoryInfo(IOHelper.MapPath(SystemDirectories.Bin)), false),
+							//add the app code folder and everything in it
+							new Tuple&lt;FileSystemInfo, bool&gt;(new DirectoryInfo(IOHelper.MapPath(&quot;~/App_Code&quot;)), false),
+							//add the global.asax (the app domain also monitors this, if it changes will do a full restart)
+							new Tuple&lt;FileSystemInfo, bool&gt;(new FileInfo(IOHelper.MapPath(&quot;~/global.asax&quot;)), false),
+
+                            //add the trees.config - use the contents to create the has since this gets resaved on every app startup!
+                            new Tuple&lt;FileSystemInfo, bool&gt;(new FileInfo(IOHelper.MapPath(SystemDirectories.Config + &quot;/trees.config&quot;)), true)
+						}, _logger
+                    );
+                return _currentAssembliesHash;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Writes the assembly hash file
+        /// &lt;/summary&gt;
+        private void WriteCachePluginsHash()
+        {
+            var filePath = GetPluginHashFilePath();
+            File.WriteAllText(filePath, CurrentAssembliesHash.ToString(), Encoding.UTF8);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a unique hash for the combination of FileInfo objects passed in
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;filesAndFolders&quot;&gt;
+        /// A collection of files and whether or not to use their file contents to determine the hash or the file&#39;s properties 
+        /// (true will make a hash based on it&#39;s contents)
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static long GetFileHash(IEnumerable&lt;Tuple&lt;FileSystemInfo, bool&gt;&gt; filesAndFolders, ProfilingLogger logger)
+        {
+            using (logger.TraceDuration&lt;PluginManager&gt;(&quot;Determining hash of code files on disk&quot;, &quot;Hash determined&quot;))
+            {
+                var hashCombiner = new HashCodeCombiner();
+
+                //get the file info&#39;s to check
+                var fileInfos = filesAndFolders.Where(x =&gt; x.Item2 == false).ToArray();
+                var fileContents = filesAndFolders.Except(fileInfos);
+                
+                //add each unique folder/file to the hash
+                foreach (var i in fileInfos.Select(x =&gt; x.Item1).DistinctBy(x =&gt; x.FullName))
+                {
+                    hashCombiner.AddFileSystemItem(i);
+                }
+
+                //add each unique file&#39;s contents to the hash
+                foreach (var i in fileContents.Select(x =&gt; x.Item1).DistinctBy(x =&gt; x.FullName))
+                {
+                    if (File.Exists(i.FullName))
+                    {
+                        var content = File.ReadAllText(i.FullName).Replace(&quot;\r\n&quot;, string.Empty).Replace(&quot;\n&quot;, string.Empty).Replace(&quot;\r&quot;, string.Empty);
+                        hashCombiner.AddCaseInsensitiveString(content);    
+                    }
+                    
+                }
+
+                return ConvertPluginsHashFromHex(hashCombiner.GetCombinedHashCode());
+            }
+        }
+
+        internal static long GetFileHash(IEnumerable&lt;FileSystemInfo&gt; filesAndFolders, ProfilingLogger logger)
+        {
+            using (logger.TraceDuration&lt;PluginManager&gt;(&quot;Determining hash of code files on disk&quot;, &quot;Hash determined&quot;))
+            {
+                var hashCombiner = new HashCodeCombiner();
+
+                //add each unique folder/file to the hash
+                foreach (var i in filesAndFolders.DistinctBy(x =&gt; x.FullName))
+                {
+                    hashCombiner.AddFileSystemItem(i);
+                }
+                return ConvertPluginsHashFromHex(hashCombiner.GetCombinedHashCode());
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Converts the hash value of current plugins to long from string
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;val&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static long ConvertPluginsHashFromHex(string val)
+        {
+            long outVal;
+            if (Int64.TryParse(val, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out outVal))
+            {
+                return outVal;
+            }
+            return 0;
+        }
+
+        /// &lt;summary&gt;
+        /// Attempts to resolve the list of plugin + assemblies found in the runtime for the base type &#39;T&#39; passed in.
+        /// If the cache file doesn&#39;t exist, fails to load, is corrupt or the type &#39;T&#39; element is not found then 
+        /// a false attempt is returned.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal Attempt&lt;IEnumerable&lt;string&gt;&gt; TryGetCachedPluginsFromFile&lt;T&gt;(TypeResolutionKind resolutionType)
+        {
+            var filePath = GetPluginListFilePath();
+            if (!File.Exists(filePath))
+                return Attempt&lt;IEnumerable&lt;string&gt;&gt;.Fail();
+
+            try
+            {
+                //we will load the xml document, if the app context exist, we will load it from the cache (which is only around for 5 minutes)
+                //while the app boots up, this should save some IO time on app startup when the app context is there (which is always unless in unit tests)
+                var xml = _runtimeCache.GetCacheItem&lt;XDocument&gt;(CacheKey,
+                    () =&gt; XDocument.Load(filePath),
+                    new TimeSpan(0, 0, 5, 0));
+
+                if (xml.Root == null)
+                    return Attempt&lt;IEnumerable&lt;string&gt;&gt;.Fail();
+
+                var typeElement = xml.Root.Elements()
+                    .SingleOrDefault(x =&gt;
+                                     x.Name.LocalName == &quot;baseType&quot;
+                                     &amp;&amp; ((string)x.Attribute(&quot;type&quot;)) == typeof(T).FullName
+                                     &amp;&amp; ((string)x.Attribute(&quot;resolutionType&quot;)) == resolutionType.ToString());
+
+                //return false but specify this exception type so we can detect it
+                if (typeElement == null)
+                    return Attempt&lt;IEnumerable&lt;string&gt;&gt;.Fail(new CachedPluginNotFoundInFileException());
+
+                //return success
+                return Attempt.Succeed(typeElement.Elements(&quot;add&quot;)
+                        .Select(x =&gt; (string)x.Attribute(&quot;type&quot;)));
+            }
+            catch (Exception ex)
+            {
+                //if the file is corrupted, etc... return false
+                return Attempt&lt;IEnumerable&lt;string&gt;&gt;.Fail(ex);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Removes cache files and internal cache as well
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Generally only used for resetting cache, for example during the install process
+        /// &lt;/remarks&gt;
+        public void ClearPluginCache()
+        {
+            var path = GetPluginListFilePath();
+            if (File.Exists(path))
+                File.Delete(path);
+            path = GetPluginHashFilePath();
+            if (File.Exists(path))
+                File.Delete(path);
+
+            _runtimeCache.ClearCacheItem(CacheKey);
+        }
+        
+        private string GetPluginListFilePath()
+        {
+            return Path.Combine(_tempFolder, string.Format(&quot;umbraco-plugins.{0}.list&quot;, NetworkHelper.FileSafeMachineName));
+        }
+
+        private string GetPluginHashFilePath()
+        {
+            return Path.Combine(_tempFolder, string.Format(&quot;umbraco-plugins.{0}.hash&quot;, NetworkHelper.FileSafeMachineName));
+        }
+
+        /// &lt;summary&gt;
+        /// This will return true if the plugin list file is a legacy one
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This method exists purely due to an error in 4.11. We were writing the plugin list file without the 
+        /// type resolution kind which will have caused some problems. Now we detect this legacy file and if it is detected
+        /// we remove it so it can be recreated properly.
+        /// &lt;/remarks&gt;
+        internal bool DetectLegacyPluginListFile()
+        {
+            var filePath = GetPluginListFilePath();
+            if (!File.Exists(filePath))
+                return false;
+
+            try
+            {
+                var xml = XDocument.Load(filePath);
+                if (xml.Root == null)
+                    return false;
+
+                var typeElement = xml.Root.Elements()
+                    .FirstOrDefault(x =&gt; x.Name.LocalName == &quot;baseType&quot;);
+
+                if (typeElement == null)
+                    return false;
+
+                //now check if the typeElement is missing the resolutionType attribute
+                return typeElement.Attributes().All(x =&gt; x.Name.LocalName != &quot;resolutionType&quot;);
+            }
+            catch (Exception)
+            {
+                //if the file is corrupted, etc... return true so it is removed
+                return true;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Adds/Updates the type list for the base type &#39;T&#39; in the cached file
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;typesFound&quot;&gt;&lt;/param&gt;
+        ///&lt;param name=&quot;resolutionType&quot;&gt; &lt;/param&gt;
+        ///&lt;remarks&gt;
+        /// THIS METHOD IS NOT THREAD SAFE
+        /// &lt;/remarks&gt;
+        /// &lt;example&gt;
+        /// &lt;![CDATA[
+        /// &lt;plugins&gt;
+        ///		&lt;baseType type=&quot;Test.Testing.Tester&quot;&gt;
+        ///			&lt;add type=&quot;My.Assembly.MyTester&quot; assembly=&quot;My.Assembly&quot; /&gt;
+        ///			&lt;add type=&quot;Your.Assembly.YourTester&quot; assembly=&quot;Your.Assembly&quot; /&gt;
+        ///		&lt;/baseType&gt;
+        /// &lt;/plugins&gt;
+        /// ]]&gt;
+        /// &lt;/example&gt;
+        internal void UpdateCachedPluginsFile&lt;T&gt;(IEnumerable&lt;Type&gt; typesFound, TypeResolutionKind resolutionType)
+        {
+            var filePath = GetPluginListFilePath();
+            XDocument xml;
+            try
+            {
+                xml = XDocument.Load(filePath);
+            }
+            catch
+            {
+                //if there&#39;s an exception loading then this is somehow corrupt, we&#39;ll just replace it.
+                File.Delete(filePath);
+                //create the document and the root
+                xml = new XDocument(new XElement(&quot;plugins&quot;));
+            }
+            if (xml.Root == null)
+            {
+                //if for some reason there is no root, create it
+                xml.Add(new XElement(&quot;plugins&quot;));
+            }
+            //find the type &#39;T&#39; element to add or update
+            var typeElement = xml.Root.Elements()
+                .SingleOrDefault(x =&gt;
+                                 x.Name.LocalName == &quot;baseType&quot;
+                                 &amp;&amp; ((string)x.Attribute(&quot;type&quot;)) == typeof(T).FullName
+                                 &amp;&amp; ((string)x.Attribute(&quot;resolutionType&quot;)) == resolutionType.ToString());
+
+            if (typeElement == null)
+            {
+                //create the type element
+                typeElement = new XElement(&quot;baseType&quot;,
+                    new XAttribute(&quot;type&quot;, typeof(T).FullName),
+                    new XAttribute(&quot;resolutionType&quot;, resolutionType.ToString()));
+                //then add it to the root
+                xml.Root.Add(typeElement);
+            }
+
+
+            //now we have the type element, we need to clear any previous types as children and add/update it with new ones
+            typeElement.ReplaceNodes(typesFound.Select(x =&gt; new XElement(&quot;add&quot;, new XAttribute(&quot;type&quot;, x.AssemblyQualifiedName))));
+            //save the xml file
+            xml.Save(filePath);
+        }
+
+        #endregion
+
+        private static readonly ReaderWriterLockSlim Locker = new ReaderWriterLockSlim();
+        private readonly HashSet&lt;TypeList&gt; _types = new HashSet&lt;TypeList&gt;();
+        private IEnumerable&lt;Assembly&gt; _assemblies;
+
+        /// &lt;summary&gt;
+        /// Returns all found property editors (based on the resolved Iparameter editors - this saves a scan)
+        /// &lt;/summary&gt;
+        internal IEnumerable&lt;Type&gt; ResolvePropertyEditors()
+        {
+            //return all proeprty editor types found except for the base property editor type
+            return ResolveTypes&lt;IParameterEditor&gt;()
+                .Where(x =&gt; x.IsType&lt;PropertyEditor&gt;())
+                .Except(new[] { typeof(PropertyEditor) });
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all found parameter editors (which includes property editors)
+        /// &lt;/summary&gt;
+        internal IEnumerable&lt;Type&gt; ResolveParameterEditors()
+        {
+            //return all paramter editor types found except for the base property editor type
+            return ResolveTypes&lt;IParameterEditor&gt;()
+                .Except(new[] { typeof(ParameterEditor), typeof(PropertyEditor) });
+        } 
+
+        /// &lt;summary&gt;
+        /// Returns all available IApplicationStartupHandler objects
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;Type&gt; ResolveApplicationStartupHandlers()
+        {
+            return ResolveTypes&lt;IApplicationStartupHandler&gt;();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all classes of type ICacheRefresher
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;Type&gt; ResolveCacheRefreshers()
+        {
+            return ResolveTypes&lt;ICacheRefresher&gt;();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all available IPropertyEditorValueConverter
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;Type&gt; ResolvePropertyEditorValueConverters()
+        {
+            return ResolveTypes&lt;IPropertyEditorValueConverter&gt;();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all available IDataType in application
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;Type&gt; ResolveDataTypes()
+        {
+            return ResolveTypes&lt;IDataType&gt;();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all available IMacroGuiRendering in application
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;Type&gt; ResolveMacroRenderings()
+        {
+            return ResolveTypes&lt;IMacroGuiRendering&gt;();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all available IPackageAction in application
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;Type&gt; ResolvePackageActions()
+        {
+            return ResolveTypes&lt;IPackageAction&gt;();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all available IAction in application
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;Type&gt; ResolveActions()
+        {
+            return ResolveTypes&lt;IAction&gt;();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns all mapper types that have a MapperFor attribute defined
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;Type&gt; ResolveAssignedMapperTypes()
+        {
+            return ResolveTypesWithAttribute&lt;BaseMapper, MapperForAttribute&gt;();
+        } 
+        
+        /// &lt;summary&gt;
+        /// Returns all SqlSyntaxProviders with the SqlSyntaxProviderAttribute
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;Type&gt; ResolveSqlSyntaxProviders()
+        {
+            return ResolveTypesWithAttribute&lt;ISqlSyntaxProvider, SqlSyntaxProviderAttribute&gt;();
+        }
+
+        /// &lt;summary&gt;
+        /// Gets/sets which assemblies to scan when type finding, generally used for unit testing, if not explicitly set
+        /// this will search all assemblies known to have plugins and exclude ones known to not have them.
+        /// &lt;/summary&gt;
+        internal IEnumerable&lt;Assembly&gt; AssembliesToScan
+        {
+            get { return _assemblies ?? (_assemblies = TypeFinder.GetAssembliesWithKnownExclusions()); }
+            set { _assemblies = value; }
+        }
+
+        /// &lt;summary&gt;
+        /// Used to resolve and create instances of the specified type based on the resolved/cached plugin types
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;throwException&quot;&gt;set to true if an exception is to be thrown if there is an error during instantiation&lt;/param&gt;
+        /// &lt;param name=&quot;cacheResult&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;specificAssemblies&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;T&gt; FindAndCreateInstances&lt;T&gt;(bool throwException = false, bool cacheResult = true, IEnumerable&lt;Assembly&gt; specificAssemblies = null)
+        {
+            var types = ResolveTypes&lt;T&gt;(cacheResult, specificAssemblies);
+            return CreateInstances&lt;T&gt;(types, throwException);
+        }
+
+        /// &lt;summary&gt;
+        /// Used to create instances of the specified type based on the resolved/cached plugin types
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;types&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;throwException&quot;&gt;set to true if an exception is to be thrown if there is an error during instantiation&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal IEnumerable&lt;T&gt; CreateInstances&lt;T&gt;(IEnumerable&lt;Type&gt; types, bool throwException = false)
+        {
+            return _serviceProvider.CreateInstances&lt;T&gt;(types, _logger.Logger, throwException);
+        }
+
+        /// &lt;summary&gt;
+        /// Used to create an instance of the specified type based on the resolved/cached plugin types
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;throwException&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal T CreateInstance&lt;T&gt;(Type type, bool throwException = false)
+        {
+            var instances = CreateInstances&lt;T&gt;(new[] { type }, throwException);
+            return instances.FirstOrDefault();
+        }
+
+        private IEnumerable&lt;Type&gt; ResolveTypes&lt;T&gt;(
+            Func&lt;IEnumerable&lt;Type&gt;&gt; finder,
+            TypeResolutionKind resolutionType,
+            bool cacheResult)
+        {
+            using (var readLock = new UpgradeableReadLock(Locker))
+            {
+                var typesFound = new List&lt;Type&gt;();
+
+                using (_logger.TraceDuration&lt;PluginManager&gt;(
+                    String.Format(&quot;Starting resolution types of {0}&quot;, typeof(T).FullName),
+                    String.Format(&quot;Completed resolution of types of {0}, found {1}&quot;, typeof(T).FullName, typesFound.Count)))
+                {
+                    //check if the TypeList already exists, if so return it, if not we&#39;ll create it
+                    var typeList = _types.SingleOrDefault(x =&gt; x.IsTypeList&lt;T&gt;(resolutionType));
+
+                    //need to put some logging here to try to figure out why this is happening: http://issues.umbraco.org/issue/U4-3505
+                    if (cacheResult &amp;&amp; typeList != null)
+                    {
+                        _logger.Logger.Debug&lt;PluginManager&gt;(&quot;Existing typeList found for {0} with resolution type {1}&quot;, () =&gt; typeof(T), () =&gt; resolutionType);
+                    }
+                    
+                    //if we&#39;re not caching the result then proceed, or if the type list doesn&#39;t exist then proceed
+                    if (cacheResult == false || typeList == null)
+                    {
+                        //upgrade to a write lock since we&#39;re adding to the collection
+                        readLock.UpgradeToWriteLock();
+
+                        typeList = new TypeList&lt;T&gt;(resolutionType);
+
+                        //we first need to look into our cache file (this has nothing to do with the &#39;cacheResult&#39; parameter which caches in memory).
+                        //if assemblies have not changed and the cache file actually exists, then proceed to try to lookup by the cache file.
+                        if (RequiresRescanning == false &amp;&amp; File.Exists(GetPluginListFilePath()))
+                        {
+                            var fileCacheResult = TryGetCachedPluginsFromFile&lt;T&gt;(resolutionType);
+
+                            //here we need to identify if the CachedPluginNotFoundInFile was the exception, if it was then we need to re-scan
+                            //in some cases the plugin will not have been scanned for on application startup, but the assemblies haven&#39;t changed
+                            //so in this instance there will never be a result.
+                            if (fileCacheResult.Exception != null &amp;&amp; fileCacheResult.Exception is CachedPluginNotFoundInFileException)
+                            {
+                                _logger.Logger.Debug&lt;PluginManager&gt;(&quot;Tried to find typelist for type {0} and resolution {1} in file cache but the type was not found so loading types by assembly scan &quot;, () =&gt; typeof(T), () =&gt; resolutionType);
+
+                                //we don&#39;t have a cache for this so proceed to look them up by scanning
+                                LoadViaScanningAndUpdateCacheFile&lt;T&gt;(typeList, resolutionType, finder);
+                            }
+                            else
+                            {
+                                if (fileCacheResult.Success)
+                                {
+                                    var successfullyLoadedFromCache = true;
+                                    //we have a previous cache for this so we don&#39;t need to scan we just load what has been found in the file
+                                    foreach (var t in fileCacheResult.Result)
+                                    {
+                                        try
+                                        {
+                                            //we use the build manager to ensure we get all types loaded, this is slightly slower than
+                                            //Type.GetType but if the types in the assembly aren&#39;t loaded yet then we have problems with that.
+                                            var type = BuildManager.GetType(t, true);
+                                            typeList.AddType(type);
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            //if there are any exceptions loading types, we have to exist, this should never happen so 
+                                            //we will need to revert to scanning for types.
+                                            successfullyLoadedFromCache = false;
+                                            _logger.Logger.Error&lt;PluginManager&gt;(&quot;Could not load a cached plugin type: &quot; + t + &quot; now reverting to re-scanning assemblies for the base type: &quot; + typeof(T).FullName, ex);
+                                            break;
+                                        }
+                                    }
+                                    if (successfullyLoadedFromCache == false)
+                                    {
+                                        //we need to manually load by scanning if loading from the file was not successful.
+                                        LoadViaScanningAndUpdateCacheFile&lt;T&gt;(typeList, resolutionType, finder);
+                                    }
+                                    else
+                                    {
+                                        _logger.Logger.Debug&lt;PluginManager&gt;(&quot;Loaded plugin types {0} with resolution {1} from persisted cache&quot;, () =&gt; typeof(T), () =&gt; resolutionType);
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            _logger.Logger.Debug&lt;PluginManager&gt;(&quot;Assembly changes detected, loading types {0} for resolution {1} by assembly scan&quot;, () =&gt; typeof(T), () =&gt; resolutionType);
+
+                            //we don&#39;t have a cache for this so proceed to look them up by scanning
+                            LoadViaScanningAndUpdateCacheFile&lt;T&gt;(typeList, resolutionType, finder);
+                        }
+
+                        //only add the cache if we are to cache the results
+                        if (cacheResult)
+                        {
+                            //add the type list to the collection
+                            var added = _types.Add(typeList);
+
+                            _logger.Logger.Debug&lt;PluginManager&gt;(&quot;Caching of typelist for type {0} and resolution {1} was successful = {2}&quot;, () =&gt; typeof(T), () =&gt; resolutionType, () =&gt; added);
+
+                        }
+                    }
+                    typesFound = typeList.GetTypes().ToList();
+                }
+
+                return typesFound;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This method invokes the finder which scans the assemblies for the types and then loads the result into the type finder.
+        /// Once the results are loaded, we update the cached type xml file
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;typeList&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;resolutionKind&quot;&gt; &lt;/param&gt;
+        /// &lt;param name=&quot;finder&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// THIS METHODS IS NOT THREAD SAFE
+        /// &lt;/remarks&gt;
+        private void LoadViaScanningAndUpdateCacheFile&lt;T&gt;(TypeList typeList, TypeResolutionKind resolutionKind, Func&lt;IEnumerable&lt;Type&gt;&gt; finder)
+        {
+            //we don&#39;t have a cache for this so proceed to look them up by scanning
+            foreach (var t in finder())
+            {
+                typeList.AddType(t);
+            }
+            UpdateCachedPluginsFile&lt;T&gt;(typeList.GetTypes(), resolutionKind);
+        }
+
+        #region Public Methods
+        /// &lt;summary&gt;
+        /// Generic method to find the specified type and cache the result
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;Type&gt; ResolveTypes&lt;T&gt;(bool cacheResult = true, IEnumerable&lt;Assembly&gt; specificAssemblies = null)
+        {
+            return ResolveTypes&lt;T&gt;(
+                () =&gt; TypeFinder.FindClassesOfType&lt;T&gt;(specificAssemblies ?? AssembliesToScan),
+                TypeResolutionKind.FindAllTypes,
+                cacheResult);
+        }
+
+        /// &lt;summary&gt;
+        /// Generic method to find the specified type that has an attribute and cache the result
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;typeparam name=&quot;TAttribute&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;Type&gt; ResolveTypesWithAttribute&lt;T, TAttribute&gt;(bool cacheResult = true, IEnumerable&lt;Assembly&gt; specificAssemblies = null)
+            where TAttribute : Attribute
+        {
+            return ResolveTypes&lt;T&gt;(
+                () =&gt; TypeFinder.FindClassesOfTypeWithAttribute&lt;T, TAttribute&gt;(specificAssemblies ?? AssembliesToScan),
+                TypeResolutionKind.FindTypesWithAttribute,
+                cacheResult);
+        }
+
+        /// &lt;summary&gt;
+        /// Generic method to find any type that has the specified attribute
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TAttribute&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;Type&gt; ResolveAttributedTypes&lt;TAttribute&gt;(bool cacheResult = true, IEnumerable&lt;Assembly&gt; specificAssemblies = null)
+            where TAttribute : Attribute
+        {
+            return ResolveTypes&lt;TAttribute&gt;(
+                () =&gt; TypeFinder.FindClassesWithAttribute&lt;TAttribute&gt;(specificAssemblies ?? AssembliesToScan),
+                TypeResolutionKind.FindAttributedTypes,
+                cacheResult);
+        } 
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Used for unit tests
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal HashSet&lt;TypeList&gt; GetTypeLists()
+        {
+            return _types;
+        }
+
+
+
+        #region Private classes/Enums
+
+        /// &lt;summary&gt;
+        /// The type of resolution being invoked
+        /// &lt;/summary&gt;
+        internal enum TypeResolutionKind
+        {
+            FindAllTypes,
+            FindAttributedTypes,
+            FindTypesWithAttribute
+        }
+
+        internal abstract class TypeList
+        {
+            public abstract void AddType(Type t);
+            public abstract bool IsTypeList&lt;TLookup&gt;(TypeResolutionKind resolutionType);
+            public abstract IEnumerable&lt;Type&gt; GetTypes();
+        }
+
+        internal class TypeList&lt;T&gt; : TypeList
+        {
+            private readonly TypeResolutionKind _resolutionType;
+
+            public TypeList(TypeResolutionKind resolutionType)
+            {
+                _resolutionType = resolutionType;
+            }
+
+            private readonly List&lt;Type&gt; _types = new List&lt;Type&gt;();
+
+            public override void AddType(Type t)
+            {
+                //if the type is an attribute type we won&#39;t do the type check because typeof&lt;T&gt; is going to be the 
+                //attribute type whereas the &#39;t&#39; type is the object type found with the attribute.
+                if (_resolutionType == TypeResolutionKind.FindAttributedTypes || t.IsType&lt;T&gt;())
+                {
+                    _types.Add(t);
+                }
+            }
+
+            /// &lt;summary&gt;
+            /// Returns true if the current TypeList is of the same lookup type
+            /// &lt;/summary&gt;
+            /// &lt;typeparam name=&quot;TLookup&quot;&gt;&lt;/typeparam&gt;
+            /// &lt;param name=&quot;resolutionType&quot;&gt;&lt;/param&gt;
+            /// &lt;returns&gt;&lt;/returns&gt;
+            public override bool IsTypeList&lt;TLookup&gt;(TypeResolutionKind resolutionType)
+            {
+                return _resolutionType == resolutionType &amp;&amp; (typeof(T)) == typeof(TLookup);
+            }
+
+            public override IEnumerable&lt;Type&gt; GetTypes()
+            {
+                return _types;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This class is used simply to determine that a plugin was not found in the cache plugin list with the specified
+        /// TypeResolutionKind.
+        /// &lt;/summary&gt;
+        internal class CachedPluginNotFoundInFileException : Exception
+        {
+
+        }
+
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[49,9,49,152,1],[50,9,50,10,1],[51,13,51,41,1],[51,42,51,93,0],[52,13,52,38,1],[52,39,52,87,0],[53,13,53,32,1],[53,33,53,75,0],[55,13,55,48,1],[56,13,56,42,1],[57,13,57,30,1],[59,13,59,75,1],[61,13,61,56,1],[62,13,62,14,1],[63,17,63,56,1],[64,13,64,14,1],[66,13,66,58,1],[70,13,70,46,1],[71,13,71,14,0],[72,17,72,45,0],[73,13,73,14,0],[75,13,75,31,1],[76,13,76,14,1],[79,17,79,115,1],[81,17,81,40,1],[82,17,82,18,1],[86,21,86,49,1],[88,21,88,45,1],[89,17,89,18,1],[90,13,90,14,1],[92,13,92,14,1],[97,17,97,45,1],[100,17,100,43,1],[101,13,101,14,1],[102,9,102,10,1],[110,9,110,49,1],[111,9,111,50,1],[112,9,112,50,1],[113,9,113,61,1],[124,13,124,14,1],[125,17,126,17,1],[126,17,126,18,0],[126,18,127,21,1],[127,21,127,60,0],[127,60,128,21,1],[128,21,128,22,0],[128,22,129,25,1],[129,25,129,127,0],[129,127,130,25,1],[130,25,130,130,0],[130,130,131,25,1],[131,25,134,68,0],[134,68,136,21,1],[136,21,139,69,0],[139,69,140,17,1],[140,17,140,18,0],[140,18,140,20,1],[125,17,140,20,1],[141,13,141,14,1],[143,13,143,14,1],[144,17,144,37,1],[145,17,145,35,1],[146,13,146,14,1],[155,44,155,48,1],[155,49,155,61,1],[165,13,165,14,1],[166,17,166,49,1],[167,21,167,50,1],[169,17,169,56,1],[170,17,170,44,1],[171,21,171,30,1],[172,17,172,70,1],[174,17,174,51,1],[175,17,175,18,1],[176,21,176,49,1],[177,21,177,50,1],[180,17,180,26,0],[181,13,181,14,1],[191,13,191,14,1],[192,17,192,50,1],[193,21,193,51,1],[195,17,208,23,1],[209,17,209,47,1],[210,13,210,14,1],[217,9,217,10,1],[218,13,218,52,1],[219,13,219,90,1],[220,9,220,10,1],[231,9,231,10,1],[232,13,232,117,1],[233,13,233,14,1],[234,17,234,59,1],[237,17,237,60,1],[237,60,237,76,1],[237,76,237,88,1],[237,17,237,88,1],[238,17,238,70,1],[241,17,241,24,1],[241,26,241,31,1],[241,32,241,34,1],[241,35,241,57,1],[241,57,241,64,1],[241,64,241,82,1],[241,82,241,92,1],[241,92,241,93,1],[241,35,241,93,1],[242,17,242,18,1],[243,21,243,55,1],[244,17,244,18,1],[247,17,247,24,1],[247,26,247,31,1],[247,32,247,34,1],[247,35,247,60,1],[247,60,247,67,1],[247,67,247,85,1],[247,85,247,95,1],[247,95,247,96,1],[247,35,247,96,1],[248,17,248,18,1],[249,21,249,49,1],[250,21,250,22,0],[251,25,251,154,0],[252,25,252,72,0],[253,21,253,22,0],[255,17,255,18,1],[257,17,257,86,1],[259,9,259,10,1],[262,9,262,10,1],[263,13,263,117,1],[264,13,264,14,1],[265,17,265,59,1],[268,17,268,24,1],[268,26,268,31,1],[268,32,268,34,1],[268,35,268,67,1],[268,67,268,77,1],[268,77,268,78,1],[268,35,268,78,1],[269,17,269,18,1],[270,21,270,55,1],[271,17,271,18,1],[272,17,272,86,1],[274,9,274,10,1],[282,9,282,10,1],[284,13,284,111,1],[285,13,285,14,1],[286,17,286,31,1],[288,13,288,22,0],[289,9,289,10,1],[299,9,299,10,1],[300,13,300,52,1],[301,13,301,40,1],[302,17,302,60,0],[305,13,305,14,1],[308,17,309,27,1],[309,27,309,51,1],[309,51,310,47,1],[308,17,310,47,1],[312,17,312,38,1],[313,21,313,64,0],[315,17,317,38,1],[317,38,319,109,1],[319,109,319,111,1],[315,17,319,111,1],[322,17,322,41,1],[323,21,323,105,1],[326,17,327,38,1],[327,38,327,65,1],[327,65,327,68,1],[326,17,327,68,1],[329,13,329,33,0],[330,13,330,14,0],[332,17,332,62,0],[334,9,334,10,1],[343,9,343,10,0],[344,13,344,48,0],[345,13,345,35,0],[346,17,346,35,0],[347,13,347,44,0],[348,13,348,35,0],[349,17,349,35,0],[351,13,351,52,0],[352,9,352,10,0],[355,9,355,10,1],[356,13,356,124,1],[357,9,357,10,1],[360,9,360,10,1],[361,13,361,124,1],[362,9,362,10,1],[374,9,374,10,1],[375,13,375,52,1],[376,13,376,40,1],[377,17,377,30,1],[380,13,380,14,1],[381,17,381,52,1],[382,17,382,38,1],[383,21,383,34,0],[385,17,386,42,1],[386,42,386,72,1],[386,72,386,74,1],[385,17,386,74,1],[388,17,388,41,1],[389,21,389,34,0],[392,17,392,58,1],[392,58,392,94,1],[392,94,392,96,1],[392,17,392,96,1],[394,13,394,30,0],[395,13,395,14,0],[397,17,397,29,0],[399,9,399,10,1],[421,9,421,10,1],[422,13,422,52,1],[425,13,425,14,1],[426,17,426,48,1],[427,13,427,14,1],[428,13,428,18,1],[429,13,429,14,1],[431,17,431,39,1],[433,17,433,62,1],[434,13,434,14,1],[435,13,435,34,1],[436,13,436,14,0],[438,17,438,50,0],[439,13,439,14,0],[441,13,443,34,1],[443,34,445,105,1],[445,105,445,107,1],[441,13,445,107,1],[447,13,447,37,1],[448,13,448,14,1],[450,17,452,82,1],[454,17,454,43,1],[455,13,455,14,1],[459,13,459,61,1],[459,61,459,129,1],[459,129,459,132,1],[459,13,459,132,1],[461,13,461,32,1],[462,9,462,10,1],[466,9,466,90,1],[467,9,467,77,1],[474,9,474,10,1],[476,13,477,29,1],[477,29,477,55,1],[477,55,478,59,1],[476,13,478,59,1],[479,9,479,10,1],[485,9,485,10,0],[487,13,488,84,0],[489,9,489,10,0],[496,9,496,10,0],[497,13,497,63,0],[498,9,498,10,0],[505,9,505,10,0],[506,13,506,52,0],[507,9,507,10,0],[514,9,514,10,1],[515,13,515,66,1],[516,9,516,10,1],[523,9,523,10,1],[524,13,524,46,1],[525,9,525,10,1],[532,9,532,10,1],[533,13,533,55,1],[534,9,534,10,1],[541,9,541,10,1],[542,13,542,51,1],[543,9,543,10,1],[550,9,550,10,1],[551,13,551,44,1],[552,9,552,10,1],[559,9,559,10,1],[560,13,560,80,1],[561,9,561,10,1],[568,9,568,10,0],[569,13,569,96,0],[570,9,570,10,0],[578,17,578,18,1],[578,19,578,103,1],[578,104,578,105,1],[579,17,579,18,1],[579,19,579,39,1],[579,40,579,41,1],[591,9,591,10,1],[592,13,592,74,1],[593,13,593,62,1],[594,9,594,10,1],[604,9,604,10,1],[605,13,605,95,1],[606,9,606,10,1],[616,9,616,10,0],[617,13,617,80,0],[618,13,618,47,0],[619,9,619,10,0],[625,9,625,10,1],[626,20,626,66,1],[627,13,627,14,1],[628,17,628,51,1],[630,17,632,125,1],[633,17,633,18,1],[635,21,635,64,1],[635,64,635,95,1],[635,95,635,97,1],[635,21,635,97,1],[638,21,638,57,1],[639,21,639,22,1],[640,25,640,127,1],[640,127,640,136,0],[640,136,640,144,1],[640,144,640,158,0],[640,158,640,160,1],[640,25,640,160,1],[641,21,641,22,1],[644,21,644,66,1],[645,21,645,22,1],[647,25,647,55,1],[649,25,649,68,1],[653,25,653,97,1],[654,25,654,26,1],[655,29,655,98,1],[660,29,660,135,1],[661,29,661,30,1],[662,33,662,209,1],[662,209,662,218,0],[662,218,662,226,1],[662,226,662,240,0],[662,240,662,242,1],[662,33,662,242,1],[665,33,665,104,1],[666,29,666,30,1],[668,29,668,30,1],[669,33,669,61,1],[670,33,670,34,1],[671,37,671,76,1],[673,37,673,44,1],[673,46,673,51,1],[673,52,673,54,1],[673,55,673,77,1],[674,37,674,38,1],[676,41,676,42,1],[679,45,679,86,1],[680,45,680,68,1],[681,41,681,42,1],[682,41,682,61,0],[683,41,683,42,0],[686,45,686,81,0],[687,45,687,216,0],[688,45,688,51,0],[690,37,690,38,1],[691,37,691,78,1],[692,37,692,38,0],[694,41,694,112,0],[695,37,695,38,0],[697,37,697,38,1],[698,41,698,151,1],[698,151,698,160,0],[698,160,698,168,1],[698,168,698,182,0],[698,182,698,184,1],[698,41,698,184,1],[699,37,699,38,1],[700,33,700,34,1],[701,29,701,30,1],[702,25,702,26,1],[704,25,704,26,1],[705,29,705,155,1],[705,155,705,164,0],[705,164,705,172,1],[705,172,705,186,0],[705,186,705,188,1],[705,29,705,188,1],[708,29,708,100,1],[709,25,709,26,1],[712,25,712,41,1],[713,25,713,26,1],[715,29,715,62,1],[717,29,717,147,1],[717,147,717,156,0],[717,156,717,164,1],[717,164,717,178,0],[717,178,717,186,1],[717,186,717,191,0],[717,191,717,193,1],[717,29,717,193,1],[719,25,719,26,1],[720,21,720,22,1],[721,21,721,63,1],[722,17,722,18,1],[724,17,724,35,1],[726,9,726,10,1],[739,9,739,10,1],[741,13,741,20,1],[741,22,741,27,1],[741,28,741,30,1],[741,31,741,39,1],[742,13,742,14,1],[743,17,743,37,1],[744,13,744,14,1],[745,13,745,77,1],[746,9,746,10,1],[755,9,755,10,1],[756,13,757,23,1],[757,23,757,94,1],[757,94,759,30,1],[756,13,759,30,1],[760,9,760,10,1],[770,9,770,10,1],[771,13,772,23,1],[772,23,772,119,1],[772,119,774,30,1],[771,13,774,30,1],[775,9,775,10,1],[784,9,784,10,1],[785,13,786,23,1],[786,23,786,110,1],[786,110,788,30,1],[785,13,788,30,1],[789,9,789,10,1],[797,9,797,10,1],[798,13,798,27,1],[799,9,799,10,1],[826,13,826,63,1],[827,13,827,14,1],[828,17,828,50,1],[829,13,829,14,1],[831,13,831,67,1],[834,13,834,14,1],[837,17,837,96,1],[838,17,838,18,1],[839,21,839,35,1],[840,17,840,18,1],[841,13,841,14,1],[850,13,850,14,1],[851,17,851,92,1],[852,13,852,14,1],[855,13,855,14,1],[856,17,856,31,1],[857,13,857,14,1]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Editors\EntityController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Net;
+using System.Text;
+using System.Web.Http;
+using AutoMapper;
+using Umbraco.Core;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Web.Models.ContentEditing;
+using Umbraco.Web.Mvc;
+using System.Linq;
+using Umbraco.Core.Models;
+using Constants = Umbraco.Core.Constants;
+using Examine;
+using Umbraco.Web.Dynamics;
+using System.Text.RegularExpressions;
+using Umbraco.Core.Xml;
+
+namespace Umbraco.Web.Editors
+{
+    /// &lt;summary&gt;
+    /// The API controller used for getting entity objects, basic name, icon, id representation of umbraco objects that are based on CMSNode
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// Some objects such as macros are not based on CMSNode
+    /// &lt;/remarks&gt;
+    [EntityControllerConfiguration]
+    [PluginController(&quot;UmbracoApi&quot;)]
+    public class EntityController : UmbracoAuthorizedJsonController
+    {
+        /// &lt;summary&gt;
+        /// Returns an Umbraco alias given a string
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;value&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;camelCase&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public dynamic GetSafeAlias(string value, bool camelCase = true)
+        {
+            var returnValue = (string.IsNullOrWhiteSpace(value)) ? string.Empty : value.ToSafeAlias(camelCase);
+            dynamic returnObj = new System.Dynamic.ExpandoObject();
+            returnObj.alias = returnValue;
+            returnObj.original = value;
+            returnObj.camelCase = camelCase;
+
+            return returnObj;
+        }
+
+        /// &lt;summary&gt;
+        /// Searches for results based on the entity type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;query&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;searchFrom&quot;&gt;
+        /// A starting point for the search, generally a node id, but for members this is a member type alias
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        [HttpGet]
+        public IEnumerable&lt;EntityBasic&gt; Search(string query, UmbracoEntityTypes type, string searchFrom = null)
+        {
+            //TODO: Should we restrict search results based on what app the user has access to?
+            // - Theoretically you shouldn&#39;t be able to see member data if you don&#39;t have access to members right?
+
+            if (string.IsNullOrEmpty(query))
+                return Enumerable.Empty&lt;EntityBasic&gt;();
+
+            return ExamineSearch(query, type, searchFrom);
+        }
+
+        /// &lt;summary&gt;
+        /// Searches for all content that the user is allowed to see (based on their allowed sections)
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;query&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Even though a normal entity search will allow any user to search on a entity type that they may not have access to edit, we need
+        /// to filter these results to the sections they are allowed to edit since this search function is explicitly for the global search 
+        /// so if we showed entities that they weren&#39;t allowed to edit they would get errors when clicking on the result.
+        /// 
+        /// The reason a user is allowed to search individual entity types that they are not allowed to edit is because those search
+        /// methods might be used in things like pickers in the content editor.
+        /// &lt;/remarks&gt;
+        [HttpGet]
+        public IEnumerable&lt;EntityTypeSearchResult&gt; SearchAll(string query)
+        {
+            if (string.IsNullOrEmpty(query))
+                return Enumerable.Empty&lt;EntityTypeSearchResult&gt;();
+
+            var allowedSections = Security.CurrentUser.AllowedSections.ToArray();
+
+            var result = new List&lt;EntityTypeSearchResult&gt;();
+
+            if (allowedSections.InvariantContains(Constants.Applications.Content))
+            {
+                result.Add(new EntityTypeSearchResult
+                    {
+                        Results = ExamineSearch(query, UmbracoEntityTypes.Document),
+                        EntityType = UmbracoEntityTypes.Document.ToString()
+                    });
+            }
+            if (allowedSections.InvariantContains(Constants.Applications.Media))
+            {
+                result.Add(new EntityTypeSearchResult
+                {
+                    Results = ExamineSearch(query, UmbracoEntityTypes.Media),
+                    EntityType = UmbracoEntityTypes.Media.ToString()
+                });
+            }
+            if (allowedSections.InvariantContains(Constants.Applications.Members))
+            {
+                result.Add(new EntityTypeSearchResult
+                {
+                    Results = ExamineSearch(query, UmbracoEntityTypes.Member),
+                    EntityType = UmbracoEntityTypes.Member.ToString()
+                });
+
+            }
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the path for a given node ID
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;int&gt; GetPath(int id, UmbracoEntityTypes type)
+        {
+            var foundContent = GetResultForId(id, type);
+
+            return foundContent.Path.Split(new[] {&#39;,&#39;}, StringSplitOptions.RemoveEmptyEntries).Select(int.Parse);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an entity by it&#39;s unique id if the entity supports that
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public EntityBasic GetByKey(Guid id, UmbracoEntityTypes type)
+        {
+            return GetResultForKey(id, type);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an entity by a xpath query
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;query&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;nodeContextId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public EntityBasic GetByQuery(string query, int nodeContextId, UmbracoEntityTypes type)
+        {
+            //TODO: Rename this!!! It&#39;s a bit misleading, it should be GetByXPath
+
+          
+            if (type != UmbracoEntityTypes.Document)
+                throw new ArgumentException(&quot;Get by query is only compatible with enitities of type Document&quot;);
+
+
+            var q = ParseXPathQuery(query, nodeContextId);
+            var node = Umbraco.TypedContentSingleAtXPath(q);
+
+            if (node == null)
+                return null;
+
+            return GetById(node.Id, type);
+        }
+
+        //PP: wip in progress on the query parser
+        private string ParseXPathQuery(string query, int id)
+        {
+            return UmbracoXPathPathSyntaxParser.ParseXPathQuery(
+                xpathExpression: query,
+                nodeContextId: id,
+                getPath: nodeid =&gt;
+                {
+                    var ent = Services.EntityService.Get(nodeid);
+                    return ent.Path.Split(&#39;,&#39;).Reverse();
+                },
+                publishedContentExists: i =&gt; Umbraco.TypedContent(i) != null);
+        }
+        
+        public EntityBasic GetById(int id, UmbracoEntityTypes type)
+        {
+            return GetResultForId(id, type);
+        }
+
+        public IEnumerable&lt;EntityBasic&gt; GetByIds([FromUri]int[] ids, UmbracoEntityTypes type)
+        {
+            if (ids == null)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+            return GetResultForIds(ids, type);
+        }
+
+        public IEnumerable&lt;EntityBasic&gt; GetByKeys([FromUri]Guid[] ids, UmbracoEntityTypes type)
+        {
+            if (ids == null)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+            return GetResultForKeys(ids, type);
+        }
+
+        public IEnumerable&lt;EntityBasic&gt; GetChildren(int id, UmbracoEntityTypes type)
+        {
+            return GetResultForChildren(id, type);
+        }
+
+        /// &lt;summary&gt;
+        /// Get paged descendant entities by id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;pageNumber&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;orderDirection&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;filter&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;EntityBasic&gt; GetAncestors(int id, UmbracoEntityTypes type)
+        {
+            return GetResultForAncestors(id, type);
+        }
+
+        public IEnumerable&lt;EntityBasic&gt; GetAll(UmbracoEntityTypes type, string postFilter, [FromUri]IDictionary&lt;string, object&gt; postFilterParams)
+        {
+            return GetResultForAll(type, postFilter, postFilterParams);
+        }
+
+        /// &lt;summary&gt;
+        /// Searches for results based on the entity type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;query&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;entityType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;searchFrom&quot;&gt;
+        /// A starting point for the search, generally a node id, but for members this is a member type alias
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IEnumerable&lt;EntityBasic&gt; ExamineSearch(string query, UmbracoEntityTypes entityType, string searchFrom = null)
+        {
+            var sb = new StringBuilder();
+
+            string type;
+            var searcher = Constants.Examine.InternalSearcher;            
+            var fields = new[] { &quot;id&quot;, &quot;__NodeId&quot; };
+            
+            //TODO: WE should really just allow passing in a lucene raw query
+            switch (entityType)
+            {
+                case UmbracoEntityTypes.Member:
+                    searcher = Constants.Examine.InternalMemberSearcher;
+                    type = &quot;member&quot;;
+                    fields = new[] { &quot;id&quot;, &quot;__NodeId&quot;, &quot;email&quot;, &quot;loginName&quot;};
+                    if (searchFrom != null &amp;&amp; searchFrom != Constants.Conventions.MemberTypes.AllMembersListId &amp;&amp; searchFrom.Trim() != &quot;-1&quot;)
+                    {
+                        sb.Append(&quot;+__NodeTypeAlias:&quot;);
+                        sb.Append(searchFrom);
+                        sb.Append(&quot; &quot;);
+                    }
+                    break;
+                case UmbracoEntityTypes.Media:
+                    type = &quot;media&quot;;
+
+                    var mediaSearchFrom = int.MinValue;
+
+                    if (Security.CurrentUser.StartMediaId &gt; 0 ||
+                        //if searchFrom is specified and it is greater than 0
+                        (searchFrom != null &amp;&amp; int.TryParse(searchFrom, out mediaSearchFrom) &amp;&amp; mediaSearchFrom &gt; 0))
+                    {
+                        sb.Append(&quot;+__Path: \\-1*\\,&quot;);
+                        sb.Append(mediaSearchFrom &gt; 0
+                            ? mediaSearchFrom.ToString(CultureInfo.InvariantCulture)
+                            : Security.CurrentUser.StartMediaId.ToString(CultureInfo.InvariantCulture));
+                        sb.Append(&quot;\\,* &quot;);
+                    }
+                    break;
+                case UmbracoEntityTypes.Document:
+                    type = &quot;content&quot;;
+
+                    var contentSearchFrom = int.MinValue;
+
+                    if (Security.CurrentUser.StartContentId &gt; 0 || 
+                        //if searchFrom is specified and it is greater than 0
+                        (searchFrom != null &amp;&amp; int.TryParse(searchFrom, out contentSearchFrom) &amp;&amp; contentSearchFrom &gt; 0))
+                    {
+                        sb.Append(&quot;+__Path: \\-1*\\,&quot;);
+                        sb.Append(contentSearchFrom &gt; 0
+                            ? contentSearchFrom.ToString(CultureInfo.InvariantCulture)
+                            : Security.CurrentUser.StartContentId.ToString(CultureInfo.InvariantCulture));
+                        sb.Append(&quot;\\,* &quot;);
+                    }
+                    break;
+                default:
+                    throw new NotSupportedException(&quot;The &quot; + typeof(EntityController) + &quot; currently does not support searching against object type &quot; + entityType);                    
+            }
+
+            var internalSearcher = ExamineManager.Instance.SearchProviderCollection[searcher];
+
+            //build a lucene query:
+            // the __nodeName will be boosted 10x without wildcards
+            // then __nodeName will be matched normally with wildcards
+            // the rest will be normal without wildcards
+            
+            
+            //check if text is surrounded by single or double quotes, if so, then exact match
+            var surroundedByQuotes = Regex.IsMatch(query, &quot;^\&quot;.*?\&quot;$&quot;)
+                                     || Regex.IsMatch(query, &quot;^\&#39;.*?\&#39;$&quot;);
+            
+            if (surroundedByQuotes)
+            {
+                //strip quotes, escape string, the replace again
+                query = query.Trim(new[] { &#39;\&quot;&#39;, &#39;\&#39;&#39; });
+
+                query = Lucene.Net.QueryParsers.QueryParser.Escape(query);
+
+                if (query.IsNullOrWhiteSpace())
+                {
+                    return new List&lt;EntityBasic&gt;();
+                }
+
+                //add back the surrounding quotes
+                query = string.Format(&quot;{0}{1}{0}&quot;, &quot;\&quot;&quot;, query);
+
+                //node name exactly boost x 10
+                sb.Append(&quot;+(__nodeName: (&quot;);
+                sb.Append(query.ToLower());
+                sb.Append(&quot;)^10.0 &quot;);
+
+                foreach (var f in fields)
+                {
+                    //additional fields normally
+                    sb.Append(f);
+                    sb.Append(&quot;: (&quot;);
+                    sb.Append(query);
+                    sb.Append(&quot;) &quot;);
+                }
+            }
+            else
+            {
+                if (query.Trim(new[] { &#39;\&quot;&#39;, &#39;\&#39;&#39; }).IsNullOrWhiteSpace())
+                {
+                    return new List&lt;EntityBasic&gt;();
+                }
+                
+                query = Lucene.Net.QueryParsers.QueryParser.Escape(query);
+
+                var querywords = query.Split(new[] { &#39; &#39; }, StringSplitOptions.RemoveEmptyEntries);
+
+                //node name exactly boost x 10
+                sb.Append(&quot;+(__nodeName:&quot;);
+                sb.Append(&quot;\&quot;&quot;);
+                sb.Append(query.ToLower());
+                sb.Append(&quot;\&quot;&quot;);
+                sb.Append(&quot;^10.0 &quot;);
+
+                //node name normally with wildcards
+                sb.Append(&quot; __nodeName:&quot;);
+                sb.Append(&quot;(&quot;);
+                foreach (var w in querywords)
+                {
+                    sb.Append(w.ToLower());
+                    sb.Append(&quot;* &quot;);
+                }
+                sb.Append(&quot;) &quot;);
+
+
+                foreach (var f in fields)
+                {
+                    //additional fields normally
+                    sb.Append(f);
+                    sb.Append(&quot;:&quot;);
+                    sb.Append(&quot;(&quot;);
+                    foreach (var w in querywords)
+                    {
+                        sb.Append(w.ToLower());
+                        sb.Append(&quot;* &quot;);
+                    }
+                    sb.Append(&quot;)&quot;);
+                    sb.Append(&quot; &quot;);
+                }
+            }
+
+            //must match index type
+            sb.Append(&quot;) +__IndexType:&quot;);
+            sb.Append(type);
+
+            
+            var raw = internalSearcher.CreateSearchCriteria().RawQuery(sb.ToString());
+            
+            //limit results to 200 to avoid huge over processing (CPU)
+            var result = internalSearcher.Search(raw, 200);
+
+            switch (entityType)
+            {
+                case UmbracoEntityTypes.Member:
+                    return MemberFromSearchResults(result);
+                case UmbracoEntityTypes.Media:
+                    return MediaFromSearchResults(result);                    
+                case UmbracoEntityTypes.Document:
+                    return ContentFromSearchResults(result);
+                default:
+                    throw new NotSupportedException(&quot;The &quot; + typeof(EntityController) + &quot; currently does not support searching against object type &quot; + entityType);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a collection of entities for media based on search results
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;results&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IEnumerable&lt;EntityBasic&gt; MemberFromSearchResults(ISearchResults results)
+        {
+            var mapped = Mapper.Map&lt;IEnumerable&lt;EntityBasic&gt;&gt;(results).ToArray();
+            //add additional data
+            foreach (var m in mapped)
+            {
+                //if no icon could be mapped, it will be set to document, so change it to picture
+                if (m.Icon == &quot;icon-document&quot;)
+                {
+                    m.Icon = &quot;icon-user&quot;;
+                }
+
+                var searchResult = results.First(x =&gt; x.Id.ToInvariantString() == m.Id.ToString());
+                if (searchResult.Fields.ContainsKey(&quot;email&quot;) &amp;&amp; searchResult.Fields[&quot;email&quot;] != null)
+                {
+                    m.AdditionalData[&quot;Email&quot;] = results.First(x =&gt; x.Id.ToInvariantString() == m.Id.ToString()).Fields[&quot;email&quot;];    
+                }
+                if (searchResult.Fields.ContainsKey(&quot;__key&quot;) &amp;&amp; searchResult.Fields[&quot;__key&quot;] != null)
+                {
+                    Guid key;
+                    if (Guid.TryParse(searchResult.Fields[&quot;__key&quot;], out key))
+                    {
+                        m.Key = key;
+                    }
+                }
+            }
+            return mapped;
+        } 
+
+        /// &lt;summary&gt;
+        /// Returns a collection of entities for media based on search results
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;results&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IEnumerable&lt;EntityBasic&gt; MediaFromSearchResults(ISearchResults results)
+        {
+            var mapped = Mapper.Map&lt;IEnumerable&lt;EntityBasic&gt;&gt;(results).ToArray();
+            //add additional data
+            foreach (var m in mapped)
+            {
+                //if no icon could be mapped, it will be set to document, so change it to picture
+                if (m.Icon == &quot;icon-document&quot;)
+                {
+                    m.Icon = &quot;icon-picture&quot;;                     
+                }
+            }
+            return mapped;
+        } 
+
+        /// &lt;summary&gt;
+        /// Returns a collection of entities for content based on search results
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;results&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IEnumerable&lt;EntityBasic&gt; ContentFromSearchResults(ISearchResults results)
+        {
+            var mapped = Mapper.Map&lt;ISearchResults, IEnumerable&lt;EntityBasic&gt;&gt;(results).ToArray();
+            //add additional data
+            foreach (var m in mapped)
+            {
+                var intId = m.Id.TryConvertTo&lt;int&gt;();
+                if (intId.Success)
+                {
+                    m.AdditionalData[&quot;Url&quot;] = Umbraco.NiceUrl(intId.Result);
+                }
+            }
+            return mapped;
+        } 
+
+        private IEnumerable&lt;EntityBasic&gt; GetResultForChildren(int id, UmbracoEntityTypes entityType)
+        {
+            var objectType = ConvertToObjectType(entityType);
+            if (objectType.HasValue)
+            {
+                //TODO: Need to check for Object types that support hierarchic here, some might not.
+
+                return Services.EntityService.GetChildren(id, objectType.Value)
+                    .WhereNotNull()
+                    .Select(Mapper.Map&lt;EntityBasic&gt;);
+            }
+            //now we need to convert the unknown ones
+            switch (entityType)
+            {
+                case UmbracoEntityTypes.Domain:
+                case UmbracoEntityTypes.Language:
+                case UmbracoEntityTypes.User:
+                case UmbracoEntityTypes.Macro:
+                default:
+                    throw new NotSupportedException(&quot;The &quot; + typeof(EntityController) + &quot; does not currently support data for the type &quot; + entityType);
+            }
+        }
+
+        private IEnumerable&lt;EntityBasic&gt; GetResultForAncestors(int id, UmbracoEntityTypes entityType)
+        {
+            var objectType = ConvertToObjectType(entityType);
+            if (objectType.HasValue)
+            {
+                //TODO: Need to check for Object types that support hierarchic here, some might not.
+
+                var ids = Services.EntityService.Get(id).Path.Split(&#39;,&#39;).Select(int.Parse).Distinct().ToArray();
+
+                return Services.EntityService.GetAll(objectType.Value, ids)
+                    .WhereNotNull()
+                    .OrderBy(x =&gt; x.Level)
+                    .Select(Mapper.Map&lt;EntityBasic&gt;);
+            }
+            //now we need to convert the unknown ones
+            switch (entityType)
+            {
+                case UmbracoEntityTypes.PropertyType:
+                case UmbracoEntityTypes.PropertyGroup:
+                case UmbracoEntityTypes.Domain:
+                case UmbracoEntityTypes.Language:
+                case UmbracoEntityTypes.User:
+                case UmbracoEntityTypes.Macro:
+                default:
+                    throw new NotSupportedException(&quot;The &quot; + typeof(EntityController) + &quot; does not currently support data for the type &quot; + entityType);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the result for the entity list based on the type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entityType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;postFilter&quot;&gt;A string where filter that will filter the results dynamically with linq - optional&lt;/param&gt;
+        /// &lt;param name=&quot;postFilterParams&quot;&gt;the parameters to fill in the string where filter - optional&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IEnumerable&lt;EntityBasic&gt; GetResultForAll(UmbracoEntityTypes entityType, string postFilter = null, IDictionary&lt;string, object&gt; postFilterParams = null)
+        {
+            var objectType = ConvertToObjectType(entityType);
+            if (objectType.HasValue)
+            {
+                //TODO: Should we order this by something ?
+                var entities = Services.EntityService.GetAll(objectType.Value).WhereNotNull().Select(Mapper.Map&lt;EntityBasic&gt;);
+                return ExecutePostFilter(entities, postFilter, postFilterParams);                
+            }
+            //now we need to convert the unknown ones
+            switch (entityType)
+            {
+                case UmbracoEntityTypes.Template:
+                    var templates = Services.FileService.GetTemplates();
+                    var filteredTemplates = ExecutePostFilter(templates, postFilter, postFilterParams);
+                    return filteredTemplates.Select(Mapper.Map&lt;EntityBasic&gt;);
+
+                case UmbracoEntityTypes.Macro:                    
+                    //Get all macros from the macro service
+                    var macros = Services.MacroService.GetAll().WhereNotNull().OrderBy(x =&gt; x.Name);
+                    var filteredMacros = ExecutePostFilter(macros, postFilter, postFilterParams);
+                    return filteredMacros.Select(Mapper.Map&lt;EntityBasic&gt;);
+
+                case UmbracoEntityTypes.PropertyType:
+
+                    //get all document types, then combine all property types into one list
+                    var propertyTypes = Services.ContentTypeService.GetAllContentTypes().Cast&lt;IContentTypeComposition&gt;()
+                                                .Concat(Services.ContentTypeService.GetAllMediaTypes())
+                                                .ToArray()
+                                                .SelectMany(x =&gt; x.PropertyTypes)
+                                                .DistinctBy(composition =&gt; composition.Alias);
+                    var filteredPropertyTypes = ExecutePostFilter(propertyTypes, postFilter, postFilterParams);
+                    return Mapper.Map&lt;IEnumerable&lt;PropertyType&gt;, IEnumerable&lt;EntityBasic&gt;&gt;(filteredPropertyTypes);
+
+                case UmbracoEntityTypes.PropertyGroup:
+
+                    //get all document types, then combine all property types into one list
+                    var propertyGroups = Services.ContentTypeService.GetAllContentTypes().Cast&lt;IContentTypeComposition&gt;()
+                                                .Concat(Services.ContentTypeService.GetAllMediaTypes())
+                                                .ToArray()
+                                                .SelectMany(x =&gt; x.PropertyGroups)
+                                                .DistinctBy(composition =&gt; composition.Name);
+                    var filteredpropertyGroups = ExecutePostFilter(propertyGroups, postFilter, postFilterParams);
+                    return Mapper.Map&lt;IEnumerable&lt;PropertyGroup&gt;, IEnumerable&lt;EntityBasic&gt;&gt;(filteredpropertyGroups);
+
+                case UmbracoEntityTypes.User:
+
+                    int total;
+                    var users = Services.UserService.GetAll(0, int.MaxValue, out total);
+                    var filteredUsers = ExecutePostFilter(users, postFilter, postFilterParams);
+                    return Mapper.Map&lt;IEnumerable&lt;IUser&gt;, IEnumerable&lt;EntityBasic&gt;&gt;(filteredUsers);
+
+                case UmbracoEntityTypes.Domain:
+
+                case UmbracoEntityTypes.Language:
+
+                default:
+                    throw new NotSupportedException(&quot;The &quot; + typeof(EntityController) + &quot; does not currently support data for the type &quot; + entityType);
+            }
+        }
+
+        private IEnumerable&lt;EntityBasic&gt; GetResultForKeys(IEnumerable&lt;Guid&gt; keys, UmbracoEntityTypes entityType)
+        {
+            var keysArray = keys.ToArray();
+            if (keysArray.Any() == false) return Enumerable.Empty&lt;EntityBasic&gt;();
+
+            var objectType = ConvertToObjectType(entityType);
+            if (objectType.HasValue)
+            {
+                var entities = Services.EntityService.GetAll(objectType.Value, keysArray)
+                    .WhereNotNull()
+                    .Select(Mapper.Map&lt;EntityBasic&gt;);
+
+                // entities are in &quot;some&quot; order, put them back in order
+                var xref = entities.ToDictionary(x =&gt; x.Key);
+                var result = keysArray.Select(x =&gt; xref.ContainsKey(x) ? xref[x] : null).Where(x =&gt; x != null);
+
+                return result;
+            }
+            //now we need to convert the unknown ones
+            switch (entityType)
+            {
+                case UmbracoEntityTypes.PropertyType:
+                case UmbracoEntityTypes.PropertyGroup:
+                case UmbracoEntityTypes.Domain:
+                case UmbracoEntityTypes.Language:
+                case UmbracoEntityTypes.User:
+                case UmbracoEntityTypes.Macro:
+                default:
+                    throw new NotSupportedException(&quot;The &quot; + typeof(EntityController) + &quot; does not currently support data for the type &quot; + entityType);
+            }
+        }
+
+        private IEnumerable&lt;EntityBasic&gt; GetResultForIds(IEnumerable&lt;int&gt; ids, UmbracoEntityTypes entityType)
+        {
+            var idsArray = ids.ToArray();
+            if (idsArray.Any() == false) return Enumerable.Empty&lt;EntityBasic&gt;();
+
+            var objectType = ConvertToObjectType(entityType);
+            if (objectType.HasValue)
+            {
+                var entities = Services.EntityService.GetAll(objectType.Value, idsArray)
+                    .WhereNotNull()
+                    .Select(Mapper.Map&lt;EntityBasic&gt;);
+
+                // entities are in &quot;some&quot; order, put them back in order
+                var xref = entities.ToDictionary(x =&gt; x.Id);
+                var result = idsArray.Select(x =&gt; xref.ContainsKey(x) ? xref[x] : null).Where(x =&gt; x != null);
+
+                return result;
+            }
+            //now we need to convert the unknown ones
+            switch (entityType)
+            {
+                case UmbracoEntityTypes.PropertyType:
+                case UmbracoEntityTypes.PropertyGroup:
+                case UmbracoEntityTypes.Domain:
+                case UmbracoEntityTypes.Language:
+                case UmbracoEntityTypes.User:
+                case UmbracoEntityTypes.Macro:
+                default:
+                    throw new NotSupportedException(&quot;The &quot; + typeof(EntityController) + &quot; does not currently support data for the type &quot; + entityType);
+            }
+        }
+
+        private EntityBasic GetResultForKey(Guid key, UmbracoEntityTypes entityType)
+        {
+            var objectType = ConvertToObjectType(entityType);
+            if (objectType.HasValue)
+            {
+                var found = Services.EntityService.GetByKey(key, objectType.Value);
+                if (found == null)
+                {
+                    throw new HttpResponseException(HttpStatusCode.NotFound);
+                }
+                return Mapper.Map&lt;EntityBasic&gt;(found);
+            }
+            //now we need to convert the unknown ones
+            switch (entityType)
+            {
+                case UmbracoEntityTypes.PropertyType:
+
+                case UmbracoEntityTypes.PropertyGroup:
+
+                case UmbracoEntityTypes.Domain:
+
+                case UmbracoEntityTypes.Language:
+
+                case UmbracoEntityTypes.User:
+
+                case UmbracoEntityTypes.Macro:
+
+                default:
+                    throw new NotSupportedException(&quot;The &quot; + typeof(EntityController) + &quot; does not currently support data for the type &quot; + entityType);
+            }
+        }
+
+        private EntityBasic GetResultForId(int id, UmbracoEntityTypes entityType)
+        {
+            var objectType = ConvertToObjectType(entityType);
+            if (objectType.HasValue)
+            {
+                var found = Services.EntityService.Get(id, objectType.Value);
+                if (found == null)
+                {
+                    throw new HttpResponseException(HttpStatusCode.NotFound);
+                }
+                return Mapper.Map&lt;EntityBasic&gt;(found);
+            }                
+            //now we need to convert the unknown ones
+            switch (entityType)
+            {
+                case UmbracoEntityTypes.PropertyType:
+                    
+                case UmbracoEntityTypes.PropertyGroup:
+
+                case UmbracoEntityTypes.Domain:
+                    
+                case UmbracoEntityTypes.Language:
+                    
+                case UmbracoEntityTypes.User:
+                    
+                case UmbracoEntityTypes.Macro:
+                    
+                default:
+                    throw new NotSupportedException(&quot;The &quot; + typeof(EntityController) + &quot; does not currently support data for the type &quot; + entityType);
+            }
+        }
+
+        private static UmbracoObjectTypes? ConvertToObjectType(UmbracoEntityTypes entityType)
+        {
+            switch (entityType)
+            {
+                case UmbracoEntityTypes.Document:
+                    return UmbracoObjectTypes.Document;
+                case UmbracoEntityTypes.Media:
+                    return UmbracoObjectTypes.Media;
+                case UmbracoEntityTypes.MemberType:
+                    return UmbracoObjectTypes.MediaType;
+                case UmbracoEntityTypes.MemberGroup:
+                    return UmbracoObjectTypes.MemberGroup;
+                case UmbracoEntityTypes.ContentItem:
+                    return UmbracoObjectTypes.ContentItem;
+                case UmbracoEntityTypes.MediaType:
+                    return UmbracoObjectTypes.MediaType;
+                case UmbracoEntityTypes.DocumentType:
+                    return UmbracoObjectTypes.DocumentType;
+                case UmbracoEntityTypes.Stylesheet:
+                    return UmbracoObjectTypes.Stylesheet;
+                case UmbracoEntityTypes.Member:
+                    return UmbracoObjectTypes.Member;
+                case UmbracoEntityTypes.DataType:
+                    return UmbracoObjectTypes.DataType;
+                default:
+                    //There is no UmbracoEntity conversion (things like Macros, Users, etc...)
+                    return null;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Executes the post filter against a collection of objects
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;entities&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;postFilter&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;postFilterParams&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IEnumerable&lt;T&gt; ExecutePostFilter&lt;T&gt;(IEnumerable&lt;T&gt; entities, string postFilter, IDictionary&lt;string, object&gt; postFilterParams)
+        {
+            //if a post filter is assigned then try to execute it
+            if (postFilter.IsNullOrWhiteSpace() == false)
+            {
+                return postFilterParams == null
+                               ? entities.AsQueryable().Where(postFilter).ToArray()
+                               : entities.AsQueryable().Where(postFilter, postFilterParams).ToArray();
+
+            }
+            return entities;
+        } 
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[39,9,39,10,0],[40,13,40,112,0],[41,13,41,68,0],[42,13,42,43,0],[43,13,43,40,0],[44,13,44,45,0],[46,13,46,30,0],[47,9,47,10,0],[60,9,60,10,0],[64,13,64,45,0],[65,17,65,56,0],[67,13,67,59,0],[68,9,68,10,0],[85,9,85,10,0],[86,13,86,45,0],[87,17,87,67,0],[89,13,89,82,0],[91,13,91,61,0],[93,13,93,83,0],[94,13,94,14,0],[95,17,99,24,0],[100,13,100,14,0],[101,13,101,81,0],[102,13,102,14,0],[103,17,107,20,0],[108,13,108,14,0],[109,13,109,83,0],[110,13,110,14,0],[111,17,115,20,0],[117,13,117,14,0],[118,13,118,27,0],[119,9,119,10,0],[128,9,128,10,0],[129,13,129,57,0],[131,13,131,114,0],[132,9,132,10,0],[141,9,141,10,0],[142,13,142,46,0],[143,9,143,10,0],[153,9,153,10,0],[157,13,157,53,0],[158,17,158,112,0],[161,13,161,59,0],[162,13,162,61,0],[164,13,164,30,0],[165,17,165,29,0],[167,13,167,43,0],[168,9,168,10,0],[172,9,172,10,0],[173,13,177,17,0],[177,17,177,18,0],[177,18,178,21,0],[178,21,178,66,0],[178,66,179,21,0],[179,21,179,58,0],[179,58,180,17,0],[180,17,180,18,0],[180,18,181,46,0],[181,46,181,77,0],[181,77,181,79,0],[173,13,181,79,0],[182,9,182,10,0],[185,9,185,10,0],[186,13,186,45,0],[187,9,187,10,0],[190,9,190,10,0],[191,13,191,29,0],[192,13,192,14,0],[193,17,193,74,0],[195,13,195,47,0],[196,9,196,10,0],[199,9,199,10,0],[200,13,200,29,0],[201,13,201,14,0],[202,17,202,74,0],[204,13,204,48,0],[205,9,205,10,0],[208,9,208,10,0],[209,13,209,51,0],[210,9,210,10,0],[224,9,224,10,0],[225,13,225,52,0],[226,9,226,10,0],[229,9,229,10,0],[230,13,230,72,0],[231,9,231,10,0],[243,9,243,10,0],[244,13,244,42,0],[247,13,247,63,0],[248,13,248,53,0],[251,13,251,32,0],[254,21,254,73,0],[255,21,255,37,0],[256,21,256,78,0],[257,21,257,141,0],[258,21,258,22,0],[259,25,259,56,0],[260,25,260,47,0],[261,25,261,40,0],[262,21,262,22,0],[263,21,263,27,0],[265,21,265,36,0],[267,21,267,56,0],[269,21,271,118,0],[272,21,272,22,0],[273,25,273,56,0],[274,25,276,105,0],[277,25,277,44,0],[278,21,278,22,0],[279,21,279,27,0],[281,21,281,38,0],[283,21,283,58,0],[285,21,287,122,0],[288,21,288,22,0],[289,25,289,56,0],[290,25,292,107,0],[293,25,293,44,0],[294,21,294,22,0],[295,21,295,27,0],[297,21,297,164,0],[300,13,300,95,0],[309,13,310,75,0],[312,13,312,36,0],[313,13,313,14,0],[315,17,315,58,0],[317,17,317,75,0],[319,17,319,48,0],[320,17,320,18,0],[321,21,321,52,0],[325,17,325,65,0],[328,17,328,46,0],[329,17,329,44,0],[330,17,330,38,0],[332,17,332,24,0],[332,26,332,31,0],[332,32,332,34,0],[332,35,332,41,0],[333,17,333,18,0],[335,21,335,34,0],[336,21,336,38,0],[337,21,337,38,0],[338,21,338,37,0],[339,17,339,18,0],[340,13,340,14,0],[342,13,342,14,0],[343,17,343,75,0],[344,17,344,18,0],[345,21,345,52,0],[348,17,348,75,0],[350,17,350,100,0],[353,17,353,44,0],[354,17,354,33,0],[355,17,355,44,0],[356,17,356,33,0],[357,17,357,37,0],[360,17,360,43,0],[361,17,361,32,0],[362,17,362,24,0],[362,26,362,31,0],[362,32,362,34,0],[362,35,362,45,0],[363,17,363,18,0],[364,21,364,44,0],[365,21,365,37,0],[366,17,366,18,0],[367,17,367,33,0],[370,17,370,24,0],[370,26,370,31,0],[370,32,370,34,0],[370,35,370,41,0],[371,17,371,18,0],[373,21,373,34,0],[374,21,374,36,0],[375,21,375,36,0],[376,21,376,28,0],[376,30,376,35,0],[376,36,376,38,0],[376,39,376,49,0],[377,21,377,22,0],[378,25,378,48,0],[379,25,379,41,0],[380,21,380,22,0],[381,21,381,36,0],[382,21,382,36,0],[383,17,383,18,0],[384,13,384,14,0],[387,13,387,42,0],[388,13,388,29,0],[391,13,391,87,0],[394,13,394,60,0],[396,13,396,32,0],[399,21,399,60,0],[401,21,401,59,0],[403,21,403,61,0],[405,21,405,164,0],[407,9,407,10,0],[415,9,415,10,0],[416,13,416,82,0],[418,13,418,20,0],[418,22,418,27,0],[418,28,418,30,0],[418,31,418,37,0],[419,13,419,14,0],[421,17,421,47,0],[422,17,422,18,0],[423,21,423,42,0],[424,17,424,18,0],[426,17,426,55,0],[426,55,426,98,0],[426,98,426,100,0],[426,17,426,100,0],[427,17,427,102,0],[428,17,428,18,0],[429,21,429,68,0],[429,68,429,111,0],[429,111,429,129,0],[429,21,429,129,0],[430,17,430,18,0],[431,17,431,102,0],[432,17,432,18,0],[434,21,434,78,0],[435,21,435,22,0],[436,25,436,37,0],[437,21,437,22,0],[438,17,438,18,0],[439,13,439,14,0],[440,13,440,27,0],[441,9,441,10,0],[449,9,449,10,0],[450,13,450,82,0],[452,13,452,20,0],[452,22,452,27,0],[452,28,452,30,0],[452,31,452,37,0],[453,13,453,14,0],[455,17,455,47,0],[456,17,456,18,0],[457,21,457,45,0],[458,17,458,18,0],[459,13,459,14,0],[460,13,460,27,0],[461,9,461,10,0],[469,9,469,10,0],[470,13,470,98,0],[472,13,472,20,0],[472,22,472,27,0],[472,28,472,30,0],[472,31,472,37,0],[473,13,473,14,0],[474,17,474,54,0],[475,17,475,35,0],[476,17,476,18,0],[477,21,477,77,0],[478,17,478,18,0],[479,13,479,14,0],[480,13,480,27,0],[481,9,481,10,0],[484,9,484,10,0],[485,13,485,62,0],[486,13,486,37,0],[487,13,487,14,0],[490,17,492,54,0],[495,13,495,32,0],[502,21,502,152,0],[504,9,504,10,0],[507,9,507,10,0],[508,13,508,62,0],[509,13,509,37,0],[510,13,510,14,0],[513,17,513,113,0],[515,17,517,35,0],[517,35,517,42,0],[517,42,518,54,0],[515,17,518,54,0],[521,13,521,32,0],[530,21,530,152,0],[532,9,532,10,0],[542,9,542,10,0],[543,13,543,62,0],[544,13,544,37,0],[545,13,545,14,0],[547,17,547,127,0],[548,17,548,82,0],[551,13,551,32,0],[554,21,554,73,0],[555,21,555,104,0],[556,21,556,78,0],[560,21,560,93,0],[560,93,560,99,0],[560,99,560,101,0],[560,21,560,101,0],[561,21,561,98,0],[562,21,562,75,0],[567,21,570,66,0],[570,66,570,81,0],[570,81,571,76,0],[571,76,571,93,0],[571,93,571,95,0],[567,21,571,95,0],[572,21,572,112,0],[573,21,573,115,0],[578,21,581,66,0],[581,66,581,82,0],[581,82,582,76,0],[582,76,582,92,0],[582,92,582,94,0],[578,21,582,94,0],[583,21,583,114,0],[584,21,584,117,0],[589,21,589,89,0],[590,21,590,96,0],[591,21,591,100,0],[598,21,598,152,0],[600,9,600,10,0],[603,9,603,10,0],[604,13,604,44,0],[605,13,605,42,0],[605,43,605,82,0],[607,13,607,62,0],[608,13,608,37,0],[609,13,609,14,0],[610,17,612,54,0],[615,17,615,55,0],[615,55,615,60,0],[615,60,615,62,0],[615,17,615,62,0],[616,17,616,52,0],[616,52,616,88,0],[616,88,616,101,0],[616,101,616,110,0],[616,110,616,112,0],[616,17,616,112,0],[618,17,618,31,0],[621,13,621,32,0],[630,21,630,152,0],[632,9,632,10,0],[635,9,635,10,0],[636,13,636,42,0],[637,13,637,41,0],[637,42,637,81,0],[639,13,639,62,0],[640,13,640,37,0],[641,13,641,14,0],[642,17,644,54,0],[647,17,647,55,0],[647,55,647,59,0],[647,59,647,61,0],[647,17,647,61,0],[648,17,648,51,0],[648,51,648,87,0],[648,87,648,100,0],[648,100,648,109,0],[648,109,648,111,0],[648,17,648,111,0],[650,17,650,31,0],[653,13,653,32,0],[662,21,662,152,0],[664,9,664,10,0],[667,9,667,10,0],[668,13,668,62,0],[669,13,669,37,0],[670,13,670,14,0],[671,17,671,84,0],[672,17,672,35,0],[673,17,673,18,0],[674,21,674,78,0],[676,17,676,55,0],[679,13,679,32,0],[694,21,694,152,0],[696,9,696,10,0],[699,9,699,10,0],[700,13,700,62,0],[701,13,701,37,0],[702,13,702,14,0],[703,17,703,78,0],[704,17,704,35,0],[705,17,705,18,0],[706,21,706,78,0],[708,17,708,55,0],[711,13,711,32,0],[726,21,726,152,0],[728,9,728,10,0],[731,9,731,10,0],[732,13,732,32,0],[735,21,735,56,0],[737,21,737,53,0],[739,21,739,57,0],[741,21,741,59,0],[743,21,743,59,0],[745,21,745,57,0],[747,21,747,60,0],[749,21,749,58,0],[751,21,751,54,0],[753,21,753,56,0],[756,21,756,33,0],[758,9,758,10,0],[769,9,769,10,0],[771,13,771,58,0],[772,13,772,14,0],[773,17,775,103,0],[778,13,778,29,0],[779,9,779,10,0]]);
+    </script>
+  </body>
+</html>

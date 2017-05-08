@@ -1,0 +1,849 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Configuration\GlobalSettings.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Linq;
+using System.Web;
+using System.Web.Configuration;
+using System.Web.Hosting;
+using System.Web.Routing;
+using System.Web.Security;
+using System.Xml;
+using System.Xml.Linq;
+using System.Xml.XPath;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Security;
+
+namespace Umbraco.Core.Configuration
+{
+    //NOTE: Do not expose this class ever until we cleanup all configuration including removal of static classes, etc...
+    // we have this two tasks logged:
+    // http://issues.umbraco.org/issue/U4-58
+    // http://issues.umbraco.org/issue/U4-115	
+
+    //TODO:  Replace checking for if the app settings exist and returning an empty string, instead return the defaults!
+
+    /// &lt;summary&gt;
+    /// The GlobalSettings Class contains general settings information for the entire Umbraco instance based on information from  web.config appsettings 
+    /// &lt;/summary&gt;
+    internal class GlobalSettings
+    {
+
+        #region Private static fields
+
+        private static Version _version;
+        private static readonly object Locker = new object();
+        //make this volatile so that we can ensure thread safety with a double check lock
+    	private static volatile string _reservedUrlsCache;
+        private static string _reservedPathsCache;
+        private static HashSet&lt;string&gt; _reservedList = new HashSet&lt;string&gt;();
+        private static string _reservedPaths;
+        private static string _reservedUrls;
+        //ensure the built on (non-changeable) reserved paths are there at all times
+        private const string StaticReservedPaths = &quot;~/app_plugins/,~/install/,&quot;;
+        private const string StaticReservedUrls = &quot;~/config/splashes/booting.aspx,~/config/splashes/noNodes.aspx,~/VSEnterpriseHelper.axd,&quot;;
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Used in unit testing to reset all config items that were set with property setters (i.e. did not come from config)
+        /// &lt;/summary&gt;
+        private static void ResetInternal()
+        {
+            _reservedUrlsCache = null;
+            _reservedPaths = null;
+            _reservedUrls = null;
+        }
+
+        /// &lt;summary&gt;
+        /// Resets settings that were set programmatically, to their initial values.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;To be used in unit tests.&lt;/remarks&gt;
+        internal static void Reset()
+        {
+            ResetInternal();
+        }
+
+    	/// &lt;summary&gt;
+        /// Gets the reserved urls from web.config.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The reserved urls.&lt;/value&gt;
+        public static string ReservedUrls
+        {
+            get
+            {                
+                if (_reservedUrls == null)
+                {
+                    var urls = ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoReservedUrls&quot;)
+                                   ? ConfigurationManager.AppSettings[&quot;umbracoReservedUrls&quot;]
+                                   : string.Empty;
+
+                    //ensure the built on (non-changeable) reserved paths are there at all times
+                    _reservedUrls = StaticReservedUrls + urls;    
+                }
+                return _reservedUrls;
+            }
+            internal set { _reservedUrls = value; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the reserved paths from web.config
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The reserved paths.&lt;/value&gt;
+        public static string ReservedPaths
+        {
+            get
+            {
+                if (_reservedPaths == null)
+                {
+                    var reservedPaths = StaticReservedPaths;
+                    //always add the umbraco path to the list
+                    if (ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoPath&quot;)
+                        &amp;&amp; !ConfigurationManager.AppSettings[&quot;umbracoPath&quot;].IsNullOrWhiteSpace())
+                    {
+                        reservedPaths += ConfigurationManager.AppSettings[&quot;umbracoPath&quot;].EnsureEndsWith(&#39;,&#39;);
+                    }
+
+                    var allPaths = ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoReservedPaths&quot;)
+                                    ? ConfigurationManager.AppSettings[&quot;umbracoReservedPaths&quot;]
+                                    : string.Empty;
+
+                    _reservedPaths = reservedPaths + allPaths;
+                }
+                return _reservedPaths;
+            }
+            internal set { _reservedPaths = value; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the name of the content XML file.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The content XML.&lt;/value&gt;
+        /// &lt;remarks&gt;
+        /// Defaults to ~/App_Data/umbraco.config
+        /// &lt;/remarks&gt;
+        public static string ContentXmlFile
+        {
+            get
+            {
+                return ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoContentXML&quot;)
+                    ? ConfigurationManager.AppSettings[&quot;umbracoContentXML&quot;]
+                    : &quot;~/App_Data/umbraco.config&quot;;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the path to the storage directory (/data by default).
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The storage directory.&lt;/value&gt;
+        public static string StorageDirectory
+        {
+            get
+            {
+                return ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoStorageDirectory&quot;)
+                    ? ConfigurationManager.AppSettings[&quot;umbracoStorageDirectory&quot;]
+                    : &quot;~/App_Data&quot;;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the path to umbraco&#39;s root directory (/umbraco by default).
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The path.&lt;/value&gt;
+        public static string Path
+        {
+            get
+            {
+                return ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoPath&quot;)
+                    ? IOHelper.ResolveUrl(ConfigurationManager.AppSettings[&quot;umbracoPath&quot;])
+                    : string.Empty;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This returns the string of the MVC Area route.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// THIS IS TEMPORARY AND SHOULD BE REMOVED WHEN WE MIGRATE/UPDATE THE CONFIG SETTINGS TO BE A REAL CONFIG SECTION
+        /// AND SHOULD PROBABLY BE HANDLED IN A MORE ROBUST WAY.
+        /// 
+        /// This will return the MVC area that we will route all custom routes through like surface controllers, etc...
+        /// We will use the &#39;Path&#39; (default ~/umbraco) to create it but since it cannot contain &#39;/&#39; and people may specify a path of ~/asdf/asdf/admin
+        /// we will convert the &#39;/&#39; to &#39;-&#39; and use that as the path. its a bit lame but will work.
+		/// 
+        /// We also make sure that the virtual directory (SystemDirectories.Root) is stripped off first, otherwise we&#39;d end up with something
+        /// like &quot;MyVirtualDirectory-Umbraco&quot; instead of just &quot;Umbraco&quot;.
+        /// &lt;/remarks&gt;
+        public static string UmbracoMvcArea
+        {
+            get
+            {
+                if (Path.IsNullOrWhiteSpace())
+                {
+                    throw new InvalidOperationException(&quot;Cannot create an MVC Area path without the umbracoPath specified&quot;);
+                }
+                var path = Path;
+                if (path.StartsWith(SystemDirectories.Root)) // beware of TrimStart, see U4-2518
+                    path = path.Substring(SystemDirectories.Root.Length);
+			    return path.TrimStart(&#39;~&#39;).TrimStart(&#39;/&#39;).Replace(&#39;/&#39;, &#39;-&#39;).Trim().ToLower();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the path to umbraco&#39;s client directory (/umbraco_client by default).
+        /// This is a relative path to the Umbraco Path as it always must exist beside the &#39;umbraco&#39;
+        /// folder since the CSS paths to images depend on it.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The path.&lt;/value&gt;
+        public static string ClientPath
+        {
+            get
+            {
+                return Path + &quot;/../umbraco_client&quot;;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the database connection string
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The database connection string.&lt;/value&gt;
+        [Obsolete(&quot;Use System.Configuration.ConfigurationManager.ConnectionStrings[\&quot;umbracoDbDSN\&quot;] instead&quot;)]
+        public static string DbDsn
+        {
+            get
+            {
+                var settings = ConfigurationManager.ConnectionStrings[UmbracoConnectionName];
+                var connectionString = string.Empty;
+
+                if (settings != null)
+                {
+                    connectionString = settings.ConnectionString;
+
+                    // The SqlCe connectionString is formatted slightly differently, so we need to update it
+                    if (settings.ProviderName.Contains(&quot;SqlServerCe&quot;))
+                        connectionString = string.Format(&quot;datalayer=SQLCE4Umbraco.SqlCEHelper,SQLCE4Umbraco;{0}&quot;, connectionString);
+                }
+
+                return connectionString;
+            }
+            set
+            {
+                if (DbDsn != value)
+                {
+                    if (value.ToLower().Contains(&quot;SQLCE4Umbraco.SqlCEHelper&quot;.ToLower()))
+                    {
+                        ApplicationContext.Current.DatabaseContext.ConfigureEmbeddedDatabaseConnection();
+                    }
+                    else
+                    {
+                        ApplicationContext.Current.DatabaseContext.ConfigureDatabaseConnection(value);
+                    } 
+                }
+            }
+        }
+
+        //TODO: Move these to constants!
+        public const string UmbracoConnectionName = &quot;umbracoDbDSN&quot;;
+        public const string UmbracoMigrationName = &quot;Umbraco&quot;;
+
+        /// &lt;summary&gt;
+        /// Gets or sets the configuration status. This will return the version number of the currently installed umbraco instance.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The configuration status.&lt;/value&gt;
+        public static string ConfigurationStatus
+        {
+            get
+            {
+                return ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoConfigurationStatus&quot;)
+                    ? ConfigurationManager.AppSettings[&quot;umbracoConfigurationStatus&quot;]
+                    : string.Empty;
+            }
+            set
+            {
+                SaveSetting(&quot;umbracoConfigurationStatus&quot;, value);
+            }
+        }
+        
+        /// &lt;summary&gt;
+        /// Gets or sets the Umbraco members membership providers&#39; useLegacyEncoding state. This will return a boolean
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The useLegacyEncoding status.&lt;/value&gt;
+        public static bool UmbracoMembershipProviderLegacyEncoding
+        {
+            get
+            {
+                return IsConfiguredMembershipProviderUsingLegacyEncoding(Constants.Conventions.Member.UmbracoMemberProviderName);
+            }
+            set
+            {
+                SetMembershipProvidersLegacyEncoding(Constants.Conventions.Member.UmbracoMemberProviderName, value);
+            }
+        }
+        
+        /// &lt;summary&gt;
+        /// Gets or sets the Umbraco users membership providers&#39; useLegacyEncoding state. This will return a boolean
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The useLegacyEncoding status.&lt;/value&gt;
+        public static bool UmbracoUsersMembershipProviderLegacyEncoding
+        {
+            get
+            {
+                return IsConfiguredMembershipProviderUsingLegacyEncoding(UmbracoConfig.For.UmbracoSettings().Providers.DefaultBackOfficeUserProvider);
+            }
+            set
+            {
+                SetMembershipProvidersLegacyEncoding(UmbracoConfig.For.UmbracoSettings().Providers.DefaultBackOfficeUserProvider, value);
+            }
+        }
+		
+        /// &lt;summary&gt;
+        /// Saves a setting into the configuration file.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;key&quot;&gt;Key of the setting to be saved.&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;Value of the setting to be saved.&lt;/param&gt;
+        internal static void SaveSetting(string key, string value)
+        {
+            var fileName = IOHelper.MapPath(string.Format(&quot;{0}/web.config&quot;, SystemDirectories.Root));
+            var xml = XDocument.Load(fileName, LoadOptions.PreserveWhitespace);
+
+            var appSettings = xml.Root.DescendantsAndSelf(&quot;appSettings&quot;).Single();
+
+            // Update appSetting if it exists, or else create a new appSetting for the given key and value
+            var setting = appSettings.Descendants(&quot;add&quot;).FirstOrDefault(s =&gt; s.Attribute(&quot;key&quot;).Value == key);
+            if (setting == null)
+                appSettings.Add(new XElement(&quot;add&quot;, new XAttribute(&quot;key&quot;, key), new XAttribute(&quot;value&quot;, value)));
+            else
+                setting.Attribute(&quot;value&quot;).Value = value;
+
+            xml.Save(fileName, SaveOptions.DisableFormatting);
+            ConfigurationManager.RefreshSection(&quot;appSettings&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Removes a setting from the configuration file.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;key&quot;&gt;Key of the setting to be removed.&lt;/param&gt;
+        internal static void RemoveSetting(string key)
+        {
+            var fileName = IOHelper.MapPath(string.Format(&quot;{0}/web.config&quot;, SystemDirectories.Root));
+            var xml = XDocument.Load(fileName, LoadOptions.PreserveWhitespace);
+
+            var appSettings = xml.Root.DescendantsAndSelf(&quot;appSettings&quot;).Single();
+            var setting = appSettings.Descendants(&quot;add&quot;).FirstOrDefault(s =&gt; s.Attribute(&quot;key&quot;).Value == key);
+
+            if (setting != null)
+            {
+                setting.Remove();
+                xml.Save(fileName, SaveOptions.DisableFormatting);
+                ConfigurationManager.RefreshSection(&quot;appSettings&quot;);
+            }        
+        }
+
+        private static void SetMembershipProvidersLegacyEncoding(string providerName, bool useLegacyEncoding)
+        {
+            //check if this can even be configured.
+            var membershipProvider = Membership.Providers[providerName] as MembershipProviderBase;
+            if (membershipProvider == null)
+            {
+                return;
+            }
+            if (membershipProvider.GetType().Namespace == &quot;umbraco.providers.members&quot;)
+            {
+                //its the legacy one, this cannot be changed
+                return;
+            }
+
+            var webConfigFilename = IOHelper.MapPath(string.Format(&quot;{0}/web.config&quot;, SystemDirectories.Root));
+            var webConfigXml = XDocument.Load(webConfigFilename, LoadOptions.PreserveWhitespace);
+
+            var membershipConfigs = webConfigXml.XPathSelectElements(&quot;configuration/system.web/membership/providers/add&quot;).ToList();
+
+            if (membershipConfigs.Any() == false) 
+                return;
+
+            var provider = membershipConfigs.SingleOrDefault(c =&gt; c.Attribute(&quot;name&quot;) != null &amp;&amp; c.Attribute(&quot;name&quot;).Value == providerName);
+
+            if (provider == null) 
+                return;
+
+            provider.SetAttributeValue(&quot;useLegacyEncoding&quot;, useLegacyEncoding);
+            
+            webConfigXml.Save(webConfigFilename, SaveOptions.DisableFormatting);
+        }
+
+        private static bool IsConfiguredMembershipProviderUsingLegacyEncoding(string providerName)
+        {
+            //check if this can even be configured.
+            var membershipProvider = Membership.Providers[providerName] as MembershipProviderBase;
+            if (membershipProvider == null)
+            {
+                return false;
+            }
+
+            return membershipProvider.UseLegacyEncoding;            
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the full path to root.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The fullpath to root.&lt;/value&gt;
+        public static string FullpathToRoot
+        {
+            get { return IOHelper.GetRootDirectorySafe(); }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether umbraco is running in [debug mode].
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;&lt;c&gt;true&lt;/c&gt; if [debug mode]; otherwise, &lt;c&gt;false&lt;/c&gt;.&lt;/value&gt;
+        public static bool DebugMode
+        {
+            get
+            {
+                try
+                {
+                    if (HttpContext.Current != null)
+                    {
+                        return HttpContext.Current.IsDebuggingEnabled;
+                    }
+                    //go and get it from config directly
+                    var section = ConfigurationManager.GetSection(&quot;system.web/compilation&quot;) as CompilationSection;
+                    return section != null &amp;&amp; section.Debug;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether the current version of umbraco is configured.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;&lt;c&gt;true&lt;/c&gt; if configured; otherwise, &lt;c&gt;false&lt;/c&gt;.&lt;/value&gt;
+        [Obsolete(&quot;Do not use this, it is no longer in use and will be removed from the codebase in future versions&quot;)]
+        internal static bool Configured
+        {
+            get
+            {
+                try
+                {
+                    string configStatus = ConfigurationStatus;
+                    string currentVersion = UmbracoVersion.GetSemanticVersion().ToSemanticString();
+
+
+                    if (currentVersion != configStatus)
+                    {
+                        LogHelper.Debug&lt;GlobalSettings&gt;(&quot;CurrentVersion different from configStatus: &#39;&quot; + currentVersion + &quot;&#39;,&#39;&quot; + configStatus + &quot;&#39;&quot;);
+                    }
+
+
+                    return (configStatus == currentVersion);
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the time out in minutes.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The time out in minutes.&lt;/value&gt;
+        public static int TimeOutInMinutes
+        {
+            get
+            {
+                try
+                {
+                    return int.Parse(ConfigurationManager.AppSettings[&quot;umbracoTimeOutInMinutes&quot;]);
+                }
+                catch
+                {
+                    return 20;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether umbraco uses directory urls.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;&lt;c&gt;true&lt;/c&gt; if umbraco uses directory urls; otherwise, &lt;c&gt;false&lt;/c&gt;.&lt;/value&gt;
+        public static bool UseDirectoryUrls
+        {
+            get
+            {
+                try
+                {
+                    return bool.Parse(ConfigurationManager.AppSettings[&quot;umbracoUseDirectoryUrls&quot;]);
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a string value to determine if umbraco should skip version-checking.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The version check period in days (0 = never).&lt;/value&gt;
+        public static int VersionCheckPeriod
+        {
+            get
+            {
+                try
+                {
+                    return int.Parse(ConfigurationManager.AppSettings[&quot;umbracoVersionCheckPeriod&quot;]);
+                }
+                catch
+                {
+                    return 7;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a string value to determine if umbraco should disbable xslt extensions
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;&lt;c&gt;&quot;true&quot;&lt;/c&gt; if version xslt extensions are disabled, otherwise, &lt;c&gt;&quot;false&quot;&lt;/c&gt;&lt;/value&gt;
+        [Obsolete(&quot;This is no longer used and will be removed from the codebase in future releases&quot;)]
+        public static string DisableXsltExtensions
+        {
+            get
+            {
+                return ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoDisableXsltExtensions&quot;)
+                    ? ConfigurationManager.AppSettings[&quot;umbracoDisableXsltExtensions&quot;]
+                    : &quot;false&quot;;
+            }
+        }
+
+        internal static bool ContentCacheXmlStoredInCodeGen
+        {
+            get { return ContentCacheXmlStorageLocation == ContentXmlStorage.AspNetTemp; }
+        }
+
+        internal static ContentXmlStorage ContentCacheXmlStorageLocation
+        {
+            get
+            {
+                if (ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoContentXMLStorage&quot;))
+                {
+                    return Enum&lt;ContentXmlStorage&gt;.Parse(ConfigurationManager.AppSettings[&quot;umbracoContentXMLStorage&quot;]);
+                }
+                if (ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoContentXMLUseLocalTemp&quot;))
+                {
+                    return bool.Parse(ConfigurationManager.AppSettings[&quot;umbracoContentXMLUseLocalTemp&quot;]) 
+                        ? ContentXmlStorage.AspNetTemp 
+                        : ContentXmlStorage.Default;
+                }
+                return ContentXmlStorage.Default;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a string value to determine if umbraco should use Xhtml editing mode in the wysiwyg editor
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;&lt;c&gt;&quot;true&quot;&lt;/c&gt; if Xhtml mode is enable, otherwise, &lt;c&gt;&quot;false&quot;&lt;/c&gt;&lt;/value&gt;
+        [Obsolete(&quot;This is no longer used and will be removed from the codebase in future releases&quot;)]
+        public static string EditXhtmlMode
+        {
+            get { return &quot;true&quot;; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the default UI language.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The default UI language.&lt;/value&gt;
+        public static string DefaultUILanguage
+        {
+            get
+            {
+                return ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoDefaultUILanguage&quot;)
+                    ? ConfigurationManager.AppSettings[&quot;umbracoDefaultUILanguage&quot;]
+                    : string.Empty;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the profile URL.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The profile URL.&lt;/value&gt;
+        public static string ProfileUrl
+        {
+            get
+            {
+                //the default will be &#39;profiler&#39;
+                return ConfigurationManager.AppSettings.ContainsKey(&quot;umbracoProfileUrl&quot;)
+                    ? ConfigurationManager.AppSettings[&quot;umbracoProfileUrl&quot;]
+                    : &quot;profiler&quot;;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether umbraco should hide top level nodes from generated urls.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;
+        /// 	&lt;c&gt;true&lt;/c&gt; if umbraco hides top level nodes from urls; otherwise, &lt;c&gt;false&lt;/c&gt;.
+        /// &lt;/value&gt;
+        public static bool HideTopLevelNodeFromPath
+        {
+            get
+            {
+                try
+                {
+                    return bool.Parse(ConfigurationManager.AppSettings[&quot;umbracoHideTopLevelNodeFromPath&quot;]);
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the current version.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The current version.&lt;/value&gt;
+        [Obsolete(&quot;Use Umbraco.Core.Configuration.UmbracoVersion.Current instead&quot;, false)]
+        public static string CurrentVersion
+        {
+            get { return UmbracoVersion.GetSemanticVersion().ToSemanticString(); }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the major version number.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The major version number.&lt;/value&gt;
+        [Obsolete(&quot;Use Umbraco.Core.Configuration.UmbracoVersion.Current instead&quot;, false)]
+        public static int VersionMajor
+        {
+            get
+            {
+                return UmbracoVersion.Current.Major;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the minor version number.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The minor version number.&lt;/value&gt;
+        [Obsolete(&quot;Use Umbraco.Core.Configuration.UmbracoVersion.Current instead&quot;, false)]
+        public static int VersionMinor
+        {
+            get
+            {
+                return UmbracoVersion.Current.Minor;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the patch version number.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The patch version number.&lt;/value&gt;
+        [Obsolete(&quot;Use Umbraco.Core.Configuration.UmbracoVersion.Current instead&quot;, false)]
+        public static int VersionPatch
+        {
+            get
+            {
+                return UmbracoVersion.Current.Build;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the version comment (like beta or RC).
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The version comment.&lt;/value&gt;
+        [Obsolete(&quot;Use Umbraco.Core.Configuration.UmbracoVersion.Current instead&quot;, false)]
+        public static string VersionComment
+        {
+            get
+            {
+                return Umbraco.Core.Configuration.UmbracoVersion.CurrentComment;
+            }
+        }
+
+
+        /// &lt;summary&gt;
+        /// Requests the is in umbraco application directory structure.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;context&quot;&gt;The context.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static bool RequestIsInUmbracoApplication(HttpContext context)
+        {
+            return context.Request.Path.ToLower().IndexOf(IOHelper.ResolveUrl(SystemDirectories.Umbraco).ToLower()) &gt; -1;
+        }
+
+        public static bool RequestIsInUmbracoApplication(HttpContextBase context)
+        {
+            return context.Request.Path.ToLower().IndexOf(IOHelper.ResolveUrl(SystemDirectories.Umbraco).ToLower()) &gt; -1;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether umbraco should force a secure (https) connection to the backoffice.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;&lt;c&gt;true&lt;/c&gt; if [use SSL]; otherwise, &lt;c&gt;false&lt;/c&gt;.&lt;/value&gt;
+        public static bool UseSSL
+        {
+            get
+            {
+                try
+                {
+                    return bool.Parse(ConfigurationManager.AppSettings[&quot;umbracoUseSSL&quot;]);
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the umbraco license.
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The license.&lt;/value&gt;
+        public static string License
+        {
+            get
+            {
+                string license =
+                    &quot;&lt;A href=\&quot;http://umbraco.org/redir/license\&quot; target=\&quot;_blank\&quot;&gt;the open source license MIT&lt;/A&gt;. The umbraco UI is freeware licensed under the umbraco license.&quot;;
+
+                var versionDoc = new XmlDocument();
+                var versionReader = new XmlTextReader(IOHelper.MapPath(SystemDirectories.Umbraco + &quot;/version.xml&quot;));
+                versionDoc.Load(versionReader);
+                versionReader.Close();
+
+                // check for license
+                try
+                {
+                    string licenseUrl =
+                        versionDoc.SelectSingleNode(&quot;/version/licensing/licenseUrl&quot;).FirstChild.Value;
+                    string licenseValidation =
+                        versionDoc.SelectSingleNode(&quot;/version/licensing/licenseValidation&quot;).FirstChild.Value;
+                    string licensedTo =
+                        versionDoc.SelectSingleNode(&quot;/version/licensing/licensedTo&quot;).FirstChild.Value;
+
+                    if (licensedTo != &quot;&quot; &amp;&amp; licenseUrl != &quot;&quot;)
+                    {
+                        license = &quot;umbraco Commercial License&lt;br/&gt;&lt;b&gt;Registered to:&lt;/b&gt;&lt;br/&gt;&quot; +
+                                  licensedTo.Replace(&quot;\n&quot;, &quot;&lt;br/&gt;&quot;) + &quot;&lt;br/&gt;&lt;b&gt;For use with domain:&lt;/b&gt;&lt;br/&gt;&quot; +
+                                  licenseUrl;
+                    }
+                }
+                catch
+                {
+                }
+
+                return license;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Determines whether the current request is reserved based on the route table and 
+        /// whether the specified URL is reserved or is inside a reserved path.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;url&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;routes&quot;&gt;The route collection to lookup the request in&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static bool IsReservedPathOrUrl(string url, HttpContextBase httpContext, RouteCollection routes)
+        {
+            if (httpContext == null) throw new ArgumentNullException(&quot;httpContext&quot;);
+            if (routes == null) throw new ArgumentNullException(&quot;routes&quot;);
+
+            //check if the current request matches a route, if so then it is reserved.
+            var route = routes.GetRouteData(httpContext);
+            if (route != null)
+                return true;
+
+            //continue with the standard ignore routine
+            return IsReservedPathOrUrl(url);
+        }
+
+        /// &lt;summary&gt;
+        /// Determines whether the specified URL is reserved or is inside a reserved path.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;url&quot;&gt;The URL to check.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// 	&lt;c&gt;true&lt;/c&gt; if the specified URL is reserved; otherwise, &lt;c&gt;false&lt;/c&gt;.
+        /// &lt;/returns&gt;
+        public static bool IsReservedPathOrUrl(string url)
+        {
+            if (_reservedUrlsCache == null)
+            {
+                lock (Locker)
+                {
+                    if (_reservedUrlsCache == null)
+                    {
+                        // store references to strings to determine changes
+                        _reservedPathsCache = GlobalSettings.ReservedPaths;
+                        _reservedUrlsCache = GlobalSettings.ReservedUrls;
+                        
+                        // add URLs and paths to a new list
+                        var newReservedList = new HashSet&lt;string&gt;();
+                        foreach (var reservedUrlTrimmed in _reservedUrlsCache
+                            .Split(new[] {&quot;,&quot;}, StringSplitOptions.RemoveEmptyEntries)
+                            .Select(x =&gt; x.Trim().ToLowerInvariant())
+                            .Where(x =&gt; x.IsNullOrWhiteSpace() == false)
+                            .Select(reservedUrl =&gt; IOHelper.ResolveUrl(reservedUrl).Trim().EnsureStartsWith(&quot;/&quot;))
+                            .Where(reservedUrlTrimmed =&gt; reservedUrlTrimmed.IsNullOrWhiteSpace() == false))
+                        {
+                            newReservedList.Add(reservedUrlTrimmed);
+                        }
+
+                        foreach (var reservedPathTrimmed in _reservedPathsCache
+                            .Split(new[] {&quot;,&quot;}, StringSplitOptions.RemoveEmptyEntries)
+                            .Select(x =&gt; x.Trim().ToLowerInvariant())
+                            .Where(x =&gt; x.IsNullOrWhiteSpace() == false)
+                            .Select(reservedPath =&gt; IOHelper.ResolveUrl(reservedPath).Trim().EnsureStartsWith(&quot;/&quot;).EnsureEndsWith(&quot;/&quot;))
+                            .Where(reservedPathTrimmed =&gt; reservedPathTrimmed.IsNullOrWhiteSpace() == false))
+                        {
+                            newReservedList.Add(reservedPathTrimmed);
+                        }
+
+                        // use the new list from now on
+                        _reservedList = newReservedList;
+                    }
+                }
+            }
+
+            //The url should be cleaned up before checking:
+            // * If it doesn&#39;t contain an &#39;.&#39; in the path then we assume it is a path based URL, if that is the case we should add an trailing &#39;/&#39; because all of our reservedPaths use a trailing &#39;/&#39;
+            // * We shouldn&#39;t be comparing the query at all
+            var pathPart = url.Split(new[] {&#39;?&#39;}, StringSplitOptions.RemoveEmptyEntries)[0].ToLowerInvariant();
+            if (pathPart.Contains(&quot;.&quot;) == false)
+            {
+                pathPart = pathPart.EnsureEndsWith(&#39;/&#39;);
+            }
+
+            // return true if url starts with an element of the reserved list
+            return _reservedList.Any(x =&gt; pathPart.InvariantStartsWith(x));
+        }
+
+      
+
+    }
+
+
+
+
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[35,9,35,62,1],[39,9,39,78,1],[52,9,52,10,1],[53,13,53,39,1],[54,13,54,35,1],[55,13,55,34,1],[56,9,56,10,1],[63,9,63,10,1],[64,13,64,29,1],[65,9,65,10,1],[74,13,74,14,1],[75,17,75,43,1],[76,17,76,18,1],[77,21,79,51,1],[82,21,82,63,1],[83,17,83,18,1],[84,17,84,38,1],[85,13,85,14,1],[86,26,86,27,1],[86,28,86,50,1],[86,51,86,52,1],[96,13,96,14,1],[97,17,97,44,1],[98,17,98,18,1],[99,21,99,61,1],[101,21,102,98,1],[103,21,103,22,1],[104,25,104,110,1],[105,21,105,22,1],[107,21,109,52,1],[111,21,111,63,1],[112,17,112,18,1],[113,17,113,39,1],[114,13,114,14,1],[115,26,115,27,1],[115,28,115,51,1],[115,52,115,53,1],[128,13,128,14,0],[129,17,131,51,0],[132,13,132,14,0],[142,13,142,14,0],[143,17,145,36,0],[146,13,146,14,0],[156,13,156,14,1],[157,17,159,36,1],[160,13,160,14,1],[180,13,180,14,1],[181,17,181,47,1],[182,17,182,18,0],[183,21,183,125,0],[185,17,185,33,1],[186,17,186,61,1],[187,21,187,74,1],[188,8,188,85,1],[189,13,189,14,1],[201,13,201,14,0],[202,17,202,52,0],[203,13,203,14,0],[214,13,214,14,0],[215,17,215,94,0],[216,17,216,53,0],[218,17,218,38,0],[219,17,219,18,0],[220,21,220,66,0],[223,21,223,71,0],[224,25,224,133,0],[225,17,225,18,0],[227,17,227,41,0],[228,13,228,14,0],[230,13,230,14,0],[231,17,231,36,0],[232,17,232,18,0],[233,21,233,89,0],[234,21,234,22,0],[235,25,235,106,0],[236,21,236,22,0],[238,21,238,22,0],[239,25,239,103,0],[240,21,240,22,0],[241,17,241,18,0],[242,13,242,14,0],[256,13,256,14,0],[257,17,259,36,0],[260,13,260,14,0],[262,13,262,14,0],[263,17,263,66,0],[264,13,264,14,0],[274,13,274,14,0],[275,17,275,130,0],[276,13,276,14,0],[278,13,278,14,0],[279,17,279,117,0],[280,13,280,14,0],[290,13,290,14,0],[291,17,291,151,0],[292,13,292,14,0],[294,13,294,14,0],[295,17,295,138,0],[296,13,296,14,0],[305,9,305,10,0],[306,13,306,102,0],[307,13,307,80,0],[309,13,309,83,0],[312,13,312,78,0],[312,78,312,109,0],[312,109,312,111,0],[312,13,312,111,0],[313,13,313,33,0],[314,17,314,114,0],[316,17,316,58,0],[318,13,318,63,0],[319,13,319,64,0],[320,9,320,10,0],[327,9,327,10,0],[328,13,328,102,0],[329,13,329,80,0],[331,13,331,83,0],[332,13,332,78,0],[332,78,332,109,0],[332,109,332,111,0],[332,13,332,111,0],[334,13,334,33,0],[335,13,335,14,0],[336,17,336,34,0],[337,17,337,67,0],[338,17,338,68,0],[339,13,339,14,0],[340,9,340,10,0],[343,9,343,10,0],[345,13,345,99,0],[346,13,346,44,0],[347,13,347,14,0],[348,17,348,24,0],[350,13,350,87,0],[351,13,351,14,0],[353,17,353,24,0],[356,13,356,111,0],[357,13,357,98,0],[359,13,359,132,0],[361,13,361,50,0],[362,17,362,24,0],[364,13,364,67,0],[364,67,364,139,0],[364,139,364,141,0],[364,13,364,141,0],[366,13,366,34,0],[367,17,367,24,0],[369,13,369,80,0],[371,13,371,81,0],[372,9,372,10,0],[375,9,375,10,0],[377,13,377,99,0],[378,13,378,44,0],[379,13,379,14,0],[380,17,380,30,0],[383,13,383,57,0],[384,9,384,10,0],[392,17,392,18,1],[392,19,392,58,1],[392,59,392,60,1],[402,13,402,14,1],[404,17,404,18,1],[405,21,405,53,1],[406,21,406,22,0],[407,25,407,71,0],[410,21,410,115,1],[411,21,411,61,1],[413,17,413,22,0],[414,17,414,18,0],[415,21,415,34,0],[417,13,417,14,1],[428,13,428,14,0],[430,17,430,18,0],[431,21,431,63,0],[432,21,432,100,0],[435,21,435,56,0],[436,21,436,22,0],[437,25,437,152,0],[438,21,438,22,0],[441,21,441,61,0],[443,17,443,22,0],[444,17,444,18,0],[445,21,445,34,0],[447,13,447,14,0],[457,13,457,14,0],[459,17,459,18,0],[460,21,460,99,0],[462,17,462,22,0],[463,17,463,18,0],[464,21,464,31,0],[466,13,466,14,0],[476,13,476,14,1],[478,17,478,18,1],[479,21,479,100,1],[481,17,481,22,0],[482,17,482,18,0],[483,21,483,34,0],[485,13,485,14,1],[495,13,495,14,0],[497,17,497,18,0],[498,21,498,101,0],[500,17,500,22,0],[501,17,501,18,0],[502,21,502,30,0],[504,13,504,14,0],[515,13,515,14,0],[516,17,518,31,0],[519,13,519,14,0],[524,17,524,18,0],[524,19,524,89,0],[524,90,524,91,0],[530,13,530,14,0],[531,17,531,94,0],[532,17,532,18,0],[533,21,533,120,0],[535,17,535,99,0],[536,17,536,18,0],[537,21,539,53,0],[541,17,541,50,0],[542,13,542,14,0],[552,17,552,18,0],[552,19,552,33,0],[552,34,552,35,0],[562,13,562,14,1],[563,17,565,36,1],[566,13,566,14,1],[576,13,576,14,0],[578,17,580,34,0],[581,13,581,14,0],[593,13,593,14,1],[595,17,595,18,1],[596,21,596,108,1],[598,17,598,22,0],[599,17,599,18,0],[600,21,600,34,0],[602,13,602,14,1],[612,17,612,18,0],[612,19,612,81,0],[612,82,612,83,0],[623,13,623,14,0],[624,17,624,53,0],[625,13,625,14,0],[636,13,636,14,0],[637,17,637,53,0],[638,13,638,14,0],[649,13,649,14,0],[650,17,650,53,0],[651,13,651,14,0],[662,13,662,14,0],[663,17,663,81,0],[664,13,664,14,0],[674,9,674,10,0],[675,13,675,122,0],[676,9,676,10,0],[679,9,679,10,0],[680,13,680,122,0],[681,9,681,10,0],[690,13,690,14,1],[692,17,692,18,1],[693,21,693,90,1],[695,17,695,22,0],[696,17,696,18,0],[697,21,697,34,0],[699,13,699,14,1],[709,13,709,14,0],[710,17,711,182,0],[713,17,713,52,0],[714,17,714,117,0],[715,17,715,48,0],[716,17,716,39,0],[720,17,720,18,0],[721,21,722,103,0],[723,21,724,110,0],[725,21,726,103,0],[728,21,728,62,0],[729,21,729,22,0],[730,25,732,46,0],[733,21,733,22,0],[734,17,734,18,0],[735,17,735,22,0],[736,17,736,18,0],[737,17,737,18,0],[739,17,739,32,0],[740,13,740,14,0],[752,9,752,10,1],[753,13,753,37,1],[753,38,753,85,0],[754,13,754,32,1],[754,33,754,75,0],[757,13,757,58,1],[758,13,758,31,1],[759,17,759,29,1],[762,13,762,45,1],[763,9,763,10,1],[773,9,773,10,1],[774,13,774,44,1],[775,13,775,14,1],[776,17,776,30,1],[777,17,777,18,1],[778,21,778,52,1],[779,21,779,22,1],[781,25,781,76,1],[782,25,782,74,1],[785,25,785,69,1],[786,25,786,32,1],[786,34,786,56,1],[786,57,786,59,1],[786,60,788,42,1],[788,42,788,69,1],[788,69,789,41,1],[789,41,789,72,1],[789,72,790,52,1],[790,52,790,113,1],[790,113,791,58,1],[791,58,791,106,1],[791,106,791,107,1],[786,60,791,107,1],[792,25,792,26,1],[793,29,793,69,1],[794,25,794,26,1],[796,25,796,32,1],[796,34,796,57,1],[796,58,796,60,1],[796,61,798,42,1],[798,42,798,69,1],[798,69,799,41,1],[799,41,799,72,1],[799,72,800,53,1],[800,53,800,135,1],[800,135,801,59,1],[801,59,801,108,1],[801,108,801,109,1],[796,61,801,109,1],[802,25,802,26,1],[803,29,803,70,1],[804,25,804,26,1],[807,25,807,57,1],[808,21,808,22,1],[809,17,809,18,1],[810,13,810,14,1],[815,13,815,112,1],[816,13,816,49,1],[817,13,817,14,1],[818,17,818,57,1],[819,13,819,14,1],[822,13,822,43,1],[822,43,822,74,1],[822,74,822,76,1],[822,13,822,76,1],[823,9,823,10,1]]);
+    </script>
+  </body>
+</html>

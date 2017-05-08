@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\HealthCheck\Checks\DataIntegrity\XmlDataIntegrityHealthCheck.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using Umbraco.Core;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Web.HealthCheck.Checks.DataIntegrity
+{
+    /// &lt;summary&gt;
+    /// This moves the functionality from the XmlIntegrity check dashboard into a health check
+    /// &lt;/summary&gt;
+    [HealthCheck(
+        &quot;D999EB2B-64C2-400F-B50C-334D41F8589A&quot;,
+        &quot;XML Data Integrity&quot;,
+        Description = &quot;This checks the data integrity for the xml structures for content, media and members that are stored in the cmsContentXml table. This does not check the data integrity of the xml cache file, only the xml structures stored in the database used to create the xml cache file.&quot;,
+        Group = &quot;Data Integrity&quot;)]
+    public class XmlDataIntegrityHealthCheck : HealthCheck
+    {
+        private readonly ILocalizedTextService _textService;
+
+        private const string CheckContentXmlTableAction = &quot;checkContentXmlTable&quot;;
+        private const string CheckMediaXmlTableAction = &quot;checkMediaXmlTable&quot;;
+        private const string CheckMembersXmlTableAction = &quot;checkMembersXmlTable&quot;;
+
+        public XmlDataIntegrityHealthCheck(HealthCheckContext healthCheckContext) : base(healthCheckContext)
+        {
+            _sqlSyntax = HealthCheckContext.ApplicationContext.DatabaseContext.SqlSyntax;
+            _services = HealthCheckContext.ApplicationContext.Services;
+            _database = HealthCheckContext.ApplicationContext.DatabaseContext.Database;
+            _textService = healthCheckContext.ApplicationContext.Services.TextService;
+        }
+
+        private readonly ISqlSyntaxProvider _sqlSyntax;
+        private readonly ServiceContext _services;
+        private readonly UmbracoDatabase _database;
+
+        /// &lt;summary&gt;
+        /// Get the status for this health check
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override IEnumerable&lt;HealthCheckStatus&gt; GetStatus()
+        {
+            //return the statuses
+            return new[] { CheckContent(), CheckMedia(), CheckMembers() };
+        }
+
+        /// &lt;summary&gt;
+        /// Executes the action and returns it&#39;s status
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;action&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override HealthCheckStatus ExecuteAction(HealthCheckAction action)
+        {
+            switch (action.Alias)
+            {
+                case CheckContentXmlTableAction:
+                    _services.ContentService.RebuildXmlStructures();
+                    return CheckContent();
+                case CheckMediaXmlTableAction:
+                    _services.MediaService.RebuildXmlStructures();
+                    return CheckMedia();
+                case CheckMembersXmlTableAction:
+                    _services.MemberService.RebuildXmlStructures();
+                    return CheckMembers();
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+        }
+
+        private HealthCheckStatus CheckMembers()
+        {
+            var total = _services.MemberService.Count();
+            var memberObjectType = Guid.Parse(Constants.ObjectTypes.Member);
+            var subQuery = new Sql()
+                .Select(&quot;Count(*)&quot;)
+                .From&lt;ContentXmlDto&gt;(_sqlSyntax)
+                .InnerJoin&lt;NodeDto&gt;(_sqlSyntax)
+                .On&lt;ContentXmlDto, NodeDto&gt;(_sqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(dto =&gt; dto.NodeObjectType == memberObjectType);
+            var totalXml = _database.ExecuteScalar&lt;int&gt;(subQuery);
+
+            var actions = new List&lt;HealthCheckAction&gt;();
+            if (totalXml != total)
+                actions.Add(new HealthCheckAction(CheckMembersXmlTableAction, Id));
+            
+            return new HealthCheckStatus(_textService.Localize(&quot;healthcheck/xmlDataIntegrityCheckMembers&quot;, new[] { totalXml.ToString(), total.ToString(), (total - totalXml).ToString() }))
+            {
+                ResultType = totalXml == total ? StatusResultType.Success : StatusResultType.Error,
+                Actions = actions
+            };
+        }
+
+        /// &lt;summary&gt;
+        /// Checks the cmsContentXml table to see if the number of entries for media matches the number of media entities
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Further to just counting the data integrity, this also checks if the XML stored in the cmsContentXml table contains the correct
+        /// GUID identifier. In older versions of Umbraco, the GUID is not persisted to the content cache, that will cause problems in newer
+        /// versions of Umbraco, so the xml table would need a rebuild.
+        /// &lt;/remarks&gt;
+        private HealthCheckStatus CheckMedia()
+        {
+            var total = _services.MediaService.CountNotTrashed();
+            var mediaObjectType = Guid.Parse(Constants.ObjectTypes.Media);
+
+            //count entries
+            var countTotalSubQuery = new Sql()
+                .Select(&quot;Count(*)&quot;)
+                .From&lt;ContentXmlDto&gt;(_sqlSyntax)
+                .InnerJoin&lt;NodeDto&gt;(_sqlSyntax)
+                .On&lt;ContentXmlDto, NodeDto&gt;(_sqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(dto =&gt; dto.NodeObjectType == mediaObjectType);
+            var totalXml = _database.ExecuteScalar&lt;int&gt;(countTotalSubQuery);
+
+            //count invalid entries
+            var countNonGuidQuery = new Sql()
+                .Select(&quot;Count(*)&quot;)
+                .From&lt;ContentXmlDto&gt;(_sqlSyntax)
+                .InnerJoin&lt;NodeDto&gt;(_sqlSyntax)
+                .On&lt;ContentXmlDto, NodeDto&gt;(_sqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(dto =&gt; dto.NodeObjectType == mediaObjectType)
+                .Where(string.Format(&quot;{0}.{1} NOT LIKE &#39;% key=\&quot;%&#39;&quot;, _sqlSyntax.GetQuotedTableName(&quot;cmsContentXml&quot;), _sqlSyntax.GetQuotedColumnName(&quot;xml&quot;)));
+            var totalNonGuidXml = _database.ExecuteScalar&lt;int&gt;(countNonGuidQuery);
+
+            var hasError = false;
+            var actions = new List&lt;HealthCheckAction&gt;();
+            if (totalXml != total || totalNonGuidXml &gt; 0)
+            {
+                //if the counts don&#39;t match
+                actions.Add(new HealthCheckAction(CheckMediaXmlTableAction, Id));
+                hasError = true;
+            }         
+
+            return new HealthCheckStatus(_textService.Localize(&quot;healthcheck/xmlDataIntegrityCheckMedia&quot;,
+                new[] { totalXml.ToString(), total.ToString(), totalNonGuidXml.ToString() }))
+            {
+                ResultType = hasError == false
+                    ? StatusResultType.Success
+                    : StatusResultType.Error,
+                Actions = actions
+            };
+        }
+
+        /// &lt;summary&gt;
+        /// Checks the cmsContentXml table to see if the number of entries for content matches the number of published content entities
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Further to just counting the data integrity, this also checks if the XML stored in the cmsContentXml table contains the correct
+        /// GUID identifier. In older versions of Umbraco, the GUID is not persisted to the content cache, that will cause problems in newer
+        /// versions of Umbraco, so the xml table would need a rebuild.
+        /// &lt;/remarks&gt;
+        private HealthCheckStatus CheckContent()
+        {
+            var total = _services.ContentService.CountPublished();
+            var documentObjectType = Guid.Parse(Constants.ObjectTypes.Document);
+
+            //count entires
+            var countTotalSubQuery = new Sql()
+                .Select(string.Format(&quot;DISTINCT {0}.{1}&quot;, _sqlSyntax.GetQuotedTableName(&quot;cmsContentXml&quot;), _sqlSyntax.GetQuotedColumnName(&quot;nodeId&quot;)))
+                .From&lt;ContentXmlDto&gt;(_sqlSyntax)
+                .InnerJoin&lt;DocumentDto&gt;(_sqlSyntax)
+                .On&lt;DocumentDto, ContentXmlDto&gt;(_sqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId);
+            var totalXml = _database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM (&quot; + countTotalSubQuery.SQL + &quot;) as tmp&quot;);
+            
+            //count invalid entries
+            var countNonGuidQuery = new Sql()
+                .Select(&quot;Count(*)&quot;)
+                .From&lt;ContentXmlDto&gt;(_sqlSyntax)
+                .InnerJoin&lt;NodeDto&gt;(_sqlSyntax)
+                .On&lt;ContentXmlDto, NodeDto&gt;(_sqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .Where&lt;NodeDto&gt;(dto =&gt; dto.NodeObjectType == documentObjectType)
+                .Where(string.Format(&quot;{0}.{1} NOT LIKE &#39;% key=\&quot;%&#39;&quot;, _sqlSyntax.GetQuotedTableName(&quot;cmsContentXml&quot;), _sqlSyntax.GetQuotedColumnName(&quot;xml&quot;)));
+            var totalNonGuidXml = _database.ExecuteScalar&lt;int&gt;(countNonGuidQuery);
+
+            var hasError = false;
+            var actions = new List&lt;HealthCheckAction&gt;();
+            if (totalXml != total || totalNonGuidXml &gt; 0)
+            {
+                //if the counts don&#39;t match
+                actions.Add(new HealthCheckAction(CheckContentXmlTableAction, Id));
+                hasError = true;
+            }            
+
+            return new HealthCheckStatus(_textService.Localize(&quot;healthcheck/xmlDataIntegrityCheckContent&quot;, 
+                new[] { totalXml.ToString(), total.ToString(), totalNonGuidXml.ToString() }))
+            {
+                ResultType = hasError == false
+                    ? StatusResultType.Success 
+                    : StatusResultType.Error,
+                Actions = actions
+            };
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[27,85,27,109,0],[28,9,28,10,0],[29,13,29,90,0],[30,13,30,72,0],[31,13,31,88,0],[32,13,32,87,0],[33,9,33,10,0],[44,9,44,10,0],[46,13,46,75,0],[47,9,47,10,0],[55,9,55,10,0],[56,13,56,34,0],[59,21,59,69,0],[60,21,60,43,0],[62,21,62,67,0],[63,21,63,41,0],[65,21,65,68,0],[66,21,66,43,0],[68,21,68,61,0],[70,9,70,10,0],[73,9,73,10,0],[74,13,74,57,0],[75,13,75,77,0],[76,13,81,80,0],[82,13,82,67,0],[84,13,84,57,0],[85,13,85,35,0],[86,17,86,84,0],[88,13,92,15,0],[93,9,93,10,0],[105,9,105,10,0],[106,13,106,66,0],[107,13,107,75,0],[110,13,115,79,0],[116,13,116,77,0],[119,13,125,158,0],[126,13,126,83,0],[128,13,128,34,0],[129,13,129,57,0],[130,13,130,58,0],[131,13,131,14,0],[133,17,133,82,0],[134,17,134,33,0],[135,13,135,14,0],[137,13,144,15,0],[145,9,145,10,0],[157,9,157,10,0],[158,13,158,67,0],[159,13,159,81,0],[162,13,166,105,0],[167,13,167,121,0],[170,13,176,158,0],[177,13,177,83,0],[179,13,179,34,0],[180,13,180,57,0],[181,13,181,58,0],[182,13,182,14,0],[184,17,184,84,0],[185,17,185,33,0],[186,13,186,14,0],[188,13,195,15,0],[196,9,196,10,0]]);
+    </script>
+  </body>
+</html>

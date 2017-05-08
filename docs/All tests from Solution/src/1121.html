@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Install\InstallHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Configuration;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Web;
+using System.Web.Script.Serialization;
+using System.Web.UI;
+using umbraco.BusinessLogic;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Persistence;
+using Umbraco.Web.Install.InstallSteps;
+using Umbraco.Web.Install.Models;
+
+
+namespace Umbraco.Web.Install
+{
+    internal class InstallHelper
+    {
+        private readonly UmbracoContext _umbContext;
+        private InstallationType? _installationType;
+
+        internal InstallHelper(UmbracoContext umbContext)
+        {
+            _umbContext = umbContext;
+        }
+
+
+        /// &lt;summary&gt;
+        /// Get the installer steps
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// The step order returned here is how they will appear on the front-end if they have views assigned
+        /// &lt;/remarks&gt;
+        public IEnumerable&lt;InstallSetupStep&gt; GetAllSteps()
+        {
+            return new List&lt;InstallSetupStep&gt;
+            {
+                new NewInstallStep(_umbContext.HttpContext, _umbContext.Application),
+                new UpgradeStep(),
+                new FilePermissionsStep(),
+                new MajorVersion7UpgradeReport(_umbContext.Application),
+                new Version73FileCleanup(_umbContext.HttpContext, _umbContext.Application.ProfilingLogger.Logger),
+                new DatabaseConfigureStep(_umbContext.Application),
+                new DatabaseInstallStep(_umbContext.Application),
+                new DatabaseUpgradeStep(_umbContext.Application),
+                new StarterKitDownloadStep(_umbContext.Application),
+                new StarterKitInstallStep(_umbContext.Application, _umbContext.HttpContext),
+                new StarterKitCleanupStep(_umbContext.Application),
+                new SetUmbracoVersionStep(_umbContext.Application, _umbContext.HttpContext),
+            };
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the steps that are used only for the current installation type
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IEnumerable&lt;InstallSetupStep&gt; GetStepsForCurrentInstallType()
+        {
+            return GetAllSteps().Where(x =&gt; x.InstallTypeTarget.HasFlag(GetInstallationType()));
+        }
+
+        public InstallationType GetInstallationType()
+        {
+            return _installationType ?? (_installationType = IsBrandNewInstall ? InstallationType.NewInstall : InstallationType.Upgrade).Value;
+        }
+
+        internal void DeleteLegacyInstaller()
+        {
+            if (Directory.Exists(IOHelper.MapPath(SystemDirectories.Install)))
+            {
+                if (Directory.Exists(IOHelper.MapPath(&quot;~/app_data/temp/install_backup&quot;)))
+                {
+                    //this means the backup already exists with files but there&#39;s no files in it, so we&#39;ll delete the backup and re-run it
+                    if (Directory.GetFiles(IOHelper.MapPath(&quot;~/app_data/temp/install_backup&quot;)).Any() == false)
+                    {
+                        Directory.Delete(IOHelper.MapPath(&quot;~/app_data/temp/install_backup&quot;), true);
+                        Directory.Move(IOHelper.MapPath(SystemDirectories.Install), IOHelper.MapPath(&quot;~/app_data/temp/install_backup&quot;));
+                    }
+                }
+                else
+                {
+                    Directory.Move(IOHelper.MapPath(SystemDirectories.Install), IOHelper.MapPath(&quot;~/app_data/temp/install_backup&quot;));
+                }
+            }
+
+            if (Directory.Exists(IOHelper.MapPath(&quot;~/Areas/UmbracoInstall&quot;)))
+            {
+                Directory.Delete(IOHelper.MapPath(&quot;~/Areas/UmbracoInstall&quot;), true);
+            }
+        }
+
+        internal void InstallStatus(bool isCompleted, string errorMsg)
+        {
+            try
+            {
+                string userAgent = _umbContext.HttpContext.Request.UserAgent;
+
+                // Check for current install Id
+                var installId = Guid.NewGuid();
+                var installCookie = new StateHelper.Cookies.Cookie(&quot;umb_installId&quot;, 1);
+                if (string.IsNullOrEmpty(installCookie.GetValue()) == false)
+                {
+                    if (Guid.TryParse(installCookie.GetValue(), out installId))
+                    {
+                        // check that it&#39;s a valid Guid
+                        if (installId == Guid.Empty)
+                            installId = Guid.NewGuid();
+                    }
+                }
+                installCookie.SetValue(installId.ToString());
+
+                string dbProvider = string.Empty;
+                if (IsBrandNewInstall == false)
+                    dbProvider = ApplicationContext.Current.DatabaseContext.DatabaseProvider.ToString();
+
+                org.umbraco.update.CheckForUpgrade check = new org.umbraco.update.CheckForUpgrade();
+                check.Install(installId,
+                    IsBrandNewInstall == false,
+                    isCompleted,
+                    DateTime.Now,
+                    UmbracoVersion.Current.Major,
+                    UmbracoVersion.Current.Minor,
+                    UmbracoVersion.Current.Build,
+                    UmbracoVersion.CurrentComment,
+                    errorMsg,
+                    userAgent,
+                    dbProvider);
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Error&lt;InstallHelper&gt;(&quot;An error occurred in InstallStatus trying to check upgrades&quot;, ex);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if this is a brand new install meaning that there is no configured version and there is no configured database connection
+        /// &lt;/summary&gt;
+        private bool IsBrandNewInstall
+        {
+            get
+            {
+                var databaseSettings = ConfigurationManager.ConnectionStrings[GlobalSettings.UmbracoConnectionName];
+                if (GlobalSettings.ConfigurationStatus.IsNullOrWhiteSpace()
+                    &amp;&amp; _umbContext.Application.DatabaseContext.IsConnectionStringConfigured(databaseSettings) == false)
+                {
+                    //no version or conn string configured, must be a brand new install
+                    return true;
+                }
+
+                //now we have to check if this is really a new install, the db might be configured and might contain data
+
+                if (_umbContext.Application.DatabaseContext.IsConnectionStringConfigured(databaseSettings) == false
+                    || _umbContext.Application.DatabaseContext.IsDatabaseConfigured == false)
+                {
+                    return true;
+                }
+
+                //check if we have the default user configured already
+                var result = _umbContext.Application.DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                    &quot;SELECT COUNT(*) FROM umbracoUser WHERE id=0 AND userPassword=&#39;default&#39;&quot;);
+                if (result == 1)
+                {
+                    //the user has not been configured
+                    //this is always true on UaaS, need to check if there&#39;s multiple users too
+                    var usersResult = _umbContext.Application.DatabaseContext.Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM umbracoUser&quot;);
+                    return usersResult == 1;
+                }
+
+                //                //check if there are any content types configured, if there isn&#39;t then we will consider this a new install
+                //                result = _umbContext.Application.DatabaseContext.Database.ExecuteScalar&lt;int&gt;(
+                //                    @&quot;SELECT COUNT(*) FROM cmsContentType 
+                //                        INNER JOIN umbracoNode ON cmsContentType.nodeId = umbracoNode.id
+                //                        WHERE umbracoNode.nodeObjectType = @contentType&quot;, new {contentType = Constants.ObjectTypes.DocumentType});
+                //                if (result == 0)
+                //                {
+                //                    //no content types have been created
+                //                    return true;
+                //                }
+
+                return false;
+            }
+        }
+
+        internal IEnumerable&lt;Package&gt; GetStarterKits()
+        {
+            var packages = new List&lt;Package&gt;();
+
+            try
+            {
+                var requestUri = string.Format(&quot;http://our.umbraco.org/webapi/StarterKit/Get/?umbracoVersion={0}&quot;,
+                    UmbracoVersion.Current);
+
+                using (var request = new HttpRequestMessage(HttpMethod.Get, requestUri))
+                using (var httpClient = new HttpClient())
+                using (var response = httpClient.SendAsync(request).Result)
+                {
+                    packages = response.Content.ReadAsAsync&lt;IEnumerable&lt;Package&gt;&gt;().Result.ToList();
+                }
+            }
+            catch (AggregateException ex)
+            {
+                LogHelper.Error&lt;InstallHelper&gt;(&quot;Could not download list of available starter kits&quot;, ex);
+            }
+
+            return packages;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[28,9,28,58,0],[29,9,29,10,0],[30,13,30,38,0],[31,9,31,10,0],[42,9,42,10,0],[43,13,57,15,0],[58,9,58,10,0],[65,9,65,10,0],[66,13,66,45,0],[66,45,66,95,0],[66,95,66,97,0],[66,13,66,97,0],[67,9,67,10,0],[70,9,70,10,0],[71,13,71,144,0],[72,9,72,10,0],[75,9,75,10,0],[76,13,76,79,0],[77,13,77,14,0],[78,17,78,90,0],[79,17,79,18,0],[81,21,81,111,0],[82,21,82,22,0],[83,25,83,100,0],[84,25,84,137,0],[85,21,85,22,0],[86,17,86,18,0],[88,17,88,18,0],[89,21,89,133,0],[90,17,90,18,0],[91,13,91,14,0],[93,13,93,78,0],[94,13,94,14,0],[95,17,95,84,0],[96,13,96,14,0],[97,9,97,10,0],[100,9,100,10,0],[102,13,102,14,0],[103,17,103,78,0],[106,17,106,48,0],[107,17,107,88,0],[108,17,108,77,0],[109,17,109,18,0],[110,21,110,80,0],[111,21,111,22,0],[113,25,113,53,0],[114,29,114,56,0],[115,21,115,22,0],[116,17,116,18,0],[117,17,117,62,0],[119,17,119,50,0],[120,17,120,48,0],[121,21,121,105,0],[123,17,123,101,0],[124,17,134,33,0],[135,13,135,14,0],[136,13,136,33,0],[137,13,137,14,0],[138,17,138,115,0],[139,13,139,14,0],[140,9,140,10,0],[148,13,148,14,0],[149,17,149,117,0],[150,17,151,120,0],[152,17,152,18,0],[154,21,154,33,0],[159,17,160,94,0],[161,17,161,18,0],[162,21,162,33,0],[166,17,167,95,0],[168,17,168,33,0],[169,17,169,18,0],[172,21,172,143,0],[173,21,173,45,0],[187,17,187,30,0],[188,13,188,14,0],[192,9,192,10,0],[193,13,193,48,0],[196,13,196,14,0],[197,17,198,45,0],[200,24,200,88,0],[201,24,201,57,0],[202,24,202,75,0],[203,17,203,18,0],[204,21,204,101,0],[205,17,205,18,0],[206,13,206,14,0],[207,13,207,42,0],[208,13,208,14,0],[209,17,209,105,0],[210,13,210,14,0],[212,13,212,29,0],[213,9,213,10,0]]);
+    </script>
+  </body>
+</html>

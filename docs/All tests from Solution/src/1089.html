@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Mvc\RenderModelBinder.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Web;
+using System.Web.Mvc;
+using Umbraco.Core;
+using Umbraco.Core.Models;
+using Umbraco.Web.Models;
+
+namespace Umbraco.Web.Mvc
+{
+    /// &lt;summary&gt;
+    /// Allows for Model Binding any IPublishedContent or IRenderModel
+    /// &lt;/summary&gt;
+	public class RenderModelBinder : DefaultModelBinder, IModelBinder, IModelBinderProvider
+    {
+		/// &lt;summary&gt;
+		/// Binds the model to a value by using the specified controller context and binding context.
+		/// &lt;/summary&gt;
+		/// &lt;returns&gt;
+		/// The bound value.
+		/// &lt;/returns&gt;
+		/// &lt;param name=&quot;controllerContext&quot;&gt;The controller context.&lt;/param&gt;&lt;param name=&quot;bindingContext&quot;&gt;The binding context.&lt;/param&gt;
+		public override object BindModel(ControllerContext controllerContext, ModelBindingContext bindingContext)
+		{
+            object model;
+            if (controllerContext.RouteData.DataTokens.TryGetValue(Core.Constants.Web.UmbracoDataToken, out model) == false)
+                return null;
+
+            //This model binder deals with IRenderModel and IPublishedContent by extracting the model from the route&#39;s
+            // datatokens. This data token is set in 2 places: RenderRouteHandler, UmbracoVirtualNodeRouteHandler
+            // and both always set the model to an instance of `RenderModel`. So if this isn&#39;t an instance of IRenderModel then
+            // we need to let the DefaultModelBinder deal with the logic.
+            var renderModel = model as IRenderModel;
+            if (renderModel == null)
+            {
+                model = base.BindModel(controllerContext, bindingContext);
+                if (model == null) return null;
+            }
+
+            //if for any reason the model is not either IRenderModel or IPublishedContent, then we return since those are the only
+            // types this binder is dealing with.
+		    if ((model is IRenderModel) == false &amp;&amp; (model is IPublishedContent) == false) return null;
+
+		    //default culture
+		    var culture = CultureInfo.CurrentCulture;
+
+		    var umbracoContext = controllerContext.GetUmbracoContext()
+		                         ?? UmbracoContext.Current;
+
+		    if (umbracoContext != null &amp;&amp; umbracoContext.PublishedContentRequest != null)
+		    {
+		        culture = umbracoContext.PublishedContentRequest.Culture;
+		    }
+
+		    return BindModel(model, bindingContext.ModelType, culture);
+		}
+
+        // source is the model that we have
+        // modelType is the type of the model that we need to bind to
+        // culture is the CultureInfo that we have, used by RenderModel
+        //
+        // create a model object of the modelType by mapping:
+        // { RenderModel, RenderModel&lt;TContent&gt;, IPublishedContent }
+        // to
+        // { RenderModel, RenderModel&lt;TContent&gt;, IPublishedContent }
+        //
+        public static object BindModel(object source, Type modelType, CultureInfo culture)
+        {
+            // null model, return
+            if (source == null) return null;
+
+            // if types already match, return
+            var sourceType = source.GetType();
+            if (sourceType.Inherits(modelType)) // includes ==
+                return source;
+
+            // try to grab the content
+            var sourceContent = source as IPublishedContent; // check if what we have is an IPublishedContent
+            if (sourceContent == null &amp;&amp; sourceType.Implements&lt;IRenderModel&gt;())
+            {
+                // else check if it&#39;s an IRenderModel, and get the content
+                sourceContent = ((IRenderModel)source).Content;
+            }
+            if (sourceContent == null)
+            {
+                // else check if we can convert it to a content
+                var attempt1 = source.TryConvertTo&lt;IPublishedContent&gt;();
+                if (attempt1.Success) sourceContent = attempt1.Result;
+            }
+
+            // if we have a content
+            if (sourceContent != null)
+            {
+                // try to grab the culture
+                // using supplied culture by default
+                var sourceRenderModel = source as RenderModel;
+                if (sourceRenderModel != null)
+                    culture = sourceRenderModel.CurrentCulture;
+
+                // if model is IPublishedContent, check content type and return
+                if (modelType.Implements&lt;IPublishedContent&gt;())
+                {
+                    if ((sourceContent.GetType().Inherits(modelType)) == false)
+                        ThrowModelBindingException(true, false, sourceContent.GetType(), modelType);
+                    return sourceContent;
+                }
+
+                // if model is RenderModel, create and return
+                if (modelType == typeof(RenderModel))
+                {
+                    return new RenderModel(sourceContent, culture);
+                }
+
+                // if model is RenderModel&lt;TContent&gt;, check content type, then create and return
+                if (modelType.IsGenericType &amp;&amp; modelType.GetGenericTypeDefinition() == typeof(RenderModel&lt;&gt;))
+                {
+                    var targetContentType = modelType.GetGenericArguments()[0];
+                    if ((sourceContent.GetType().Inherits(targetContentType)) == false)
+                        ThrowModelBindingException(true, true, sourceContent.GetType(), targetContentType);
+                    return Activator.CreateInstance(modelType, sourceContent, culture);
+                }
+            }
+
+            // last chance : try to convert
+            var attempt2 = source.TryConvertTo(modelType);
+            if (attempt2.Success) return attempt2.Result;
+
+            // fail
+            ThrowModelBindingException(false, false, sourceType, modelType);
+            return null;
+        }
+
+	    private static void ThrowModelBindingException(bool sourceContent, bool modelContent, Type sourceType, Type modelType)
+	    {
+	        var msg = new StringBuilder();
+
+	        msg.Append(&quot;Cannot bind source&quot;);
+	        if (sourceContent) msg.Append(&quot; content&quot;);
+	        msg.Append(&quot; type &quot;);
+	        msg.Append(sourceType.FullName);
+	        msg.Append(&quot; to model&quot;);
+	        if (modelContent) msg.Append(&quot; content&quot;);
+	        msg.Append(&quot; type &quot;);
+            msg.Append(modelType.FullName);
+            msg.Append(&quot;.&quot;);
+
+            // compare FullName for the time being because when upgrading ModelsBuilder,
+            // Umbraco does not know about the new attribute type - later on, can compare
+            // on type directly (ie after v7.4.2).
+	        var sourceAttr = sourceType.Assembly.CustomAttributes.FirstOrDefault(x =&gt;
+                x.AttributeType.FullName == &quot;Umbraco.ModelsBuilder.PureLiveAssemblyAttribute&quot;);
+	        var modelAttr = modelType.Assembly.CustomAttributes.FirstOrDefault(x =&gt;
+                x.AttributeType.FullName == &quot;Umbraco.ModelsBuilder.PureLiveAssemblyAttribute&quot;);
+
+            // bah.. names are App_Web_all.generated.cs.8f9494c4.jjuvxz55 so they ARE different, fuck!
+            // we cannot compare purely on type.FullName &#39;cos we might be trying to map Sub to Main = fails!
+            if (sourceAttr != null &amp;&amp; modelAttr != null
+                &amp;&amp; sourceType.Assembly.GetName().Version.Revision != modelType.Assembly.GetName().Version.Revision)
+	        {
+	            msg.Append(&quot; Types come from two PureLive assemblies with different versions,&quot;);
+                msg.Append(&quot; this usually indicates that the application is in an unstable state.&quot;);
+                msg.Append(&quot; The application is restarting now, reload the page and it should work.&quot;);
+                var context = HttpContext.Current;
+                if (context == null)
+                    AppDomain.Unload(AppDomain.CurrentDomain);
+                else
+                    ApplicationContext.Current.RestartApplicationPool(new HttpContextWrapper(context));
+            }
+
+	        throw new ModelBindingException(msg.ToString());
+	    }
+
+        public IModelBinder GetBinder(Type modelType)
+        {
+            // can bind to RenderModel (exact type match)
+            // You might be tempted to change this to IRenderModel but do not change this: http://issues.umbraco.org/issue/U4-8216
+            if (modelType == typeof(RenderModel)) return this;
+
+            // can bind to RenderModel&lt;TContent&gt; (exact generic type match)
+            if (modelType.IsGenericType &amp;&amp; modelType.GetGenericTypeDefinition() == typeof(RenderModel&lt;&gt;)) return this;
+
+            // can bind to TContent where TContent : IPublishedContent (any IPublishedContent implementation)
+            if (typeof(IPublishedContent).IsAssignableFrom(modelType)) return this;
+            return null;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[26,3,26,4,1],[28,13,28,125,1],[29,17,29,29,1],[35,13,35,53,1],[36,13,36,37,1],[37,13,37,14,1],[38,17,38,75,1],[39,17,39,35,1],[39,36,39,48,1],[40,13,40,14,1],[44,7,44,85,1],[44,86,44,98,0],[47,7,47,48,1],[49,7,50,54,1],[52,7,52,84,1],[53,7,53,8,0],[54,11,54,68,0],[55,7,55,8,0],[57,7,57,66,1],[58,3,58,4,1],[70,9,70,10,1],[72,13,72,32,1],[72,33,72,45,1],[75,13,75,47,1],[76,13,76,48,1],[77,17,77,31,1],[80,13,80,61,1],[81,13,81,80,1],[82,13,82,14,1],[84,17,84,64,1],[85,13,85,14,1],[86,13,86,39,1],[87,13,87,14,0],[89,17,89,73,0],[90,17,90,38,0],[90,39,90,71,0],[91,13,91,14,0],[94,13,94,39,1],[95,13,95,14,1],[98,17,98,63,1],[99,17,99,47,1],[100,21,100,64,1],[103,17,103,63,1],[104,17,104,18,1],[105,21,105,80,1],[106,25,106,101,1],[107,21,107,42,1],[111,17,111,54,1],[112,17,112,18,1],[113,21,113,68,1],[117,17,117,110,1],[118,17,118,18,1],[119,21,119,80,1],[120,21,120,88,1],[121,25,121,108,1],[122,21,122,88,1],[124,13,124,14,0],[127,13,127,59,0],[128,13,128,34,0],[128,35,128,58,0],[131,13,131,77,0],[132,13,132,25,0],[133,9,133,10,1],[136,6,136,7,1],[137,10,137,40,1],[139,10,139,43,1],[140,10,140,28,1],[140,29,140,52,1],[141,10,141,31,1],[142,10,142,42,1],[143,10,143,34,1],[144,10,144,27,1],[144,28,144,51,1],[145,10,145,31,1],[146,13,146,44,1],[147,13,147,29,1],[152,10,153,17,1],[153,17,153,94,1],[153,94,153,96,1],[152,10,153,96,1],[154,10,155,17,1],[155,17,155,94,1],[155,94,155,96,1],[154,10,155,96,1],[159,13,160,116,1],[161,10,161,11,0],[162,14,162,94,0],[163,17,163,101,0],[164,17,164,103,0],[165,17,165,51,0],[166,17,166,37,0],[167,21,167,63,0],[169,21,169,104,0],[170,13,170,14,0],[172,10,172,58,1],[176,9,176,10,1],[179,13,179,50,1],[179,51,179,63,1],[182,13,182,106,1],[182,107,182,119,1],[185,13,185,71,1],[185,72,185,84,1],[186,13,186,25,1],[187,9,187,10,1]]);
+    </script>
+  </body>
+</html>

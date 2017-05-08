@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\IO\UmbracoMediaFile.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using System.Web;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Media;
+
+namespace Umbraco.Core.IO
+{
+    public class UmbracoMediaFile
+    {
+        private readonly MediaFileSystem _fs;
+
+        #region Constructors
+
+        public UmbracoMediaFile()
+        {
+            _fs = FileSystemProviderManager.Current.GetFileSystemProvider&lt;MediaFileSystem&gt;();
+        }
+
+        public UmbracoMediaFile(string path)
+        {
+            _fs = FileSystemProviderManager.Current.GetFileSystemProvider&lt;MediaFileSystem&gt;();
+
+            Path = path;
+
+            Initialize();
+        }
+
+        #endregion
+
+        #region Static Methods
+
+        //MB: Do we really need all these overloads? looking through the code, only one of them is actually used
+
+        public static UmbracoMediaFile Save(HttpPostedFile file, string path)
+        {
+            return Save(file.InputStream, path);
+        }
+
+        public static UmbracoMediaFile Save(HttpPostedFileBase file, string path)
+        {
+            return Save(file.InputStream, path);
+        }
+
+        public static UmbracoMediaFile Save(Stream inputStream, string path)
+        {
+            var fs = FileSystemProviderManager.Current.GetFileSystemProvider&lt;MediaFileSystem&gt;();
+            fs.AddFile(path, inputStream);
+
+            return new UmbracoMediaFile(path);
+        }
+
+        public static UmbracoMediaFile Save(byte[] file, string relativePath)
+        {
+            return Save(new MemoryStream(file), relativePath);
+        }
+
+        public static UmbracoMediaFile Save(HttpPostedFile file)
+        {
+            var tempDir = System.IO.Path.Combine(&quot;uploads&quot;, Guid.NewGuid().ToString());
+            return Save(file, tempDir);
+        }
+
+        //filebase overload...
+        public static UmbracoMediaFile Save(HttpPostedFileBase file)
+        {
+            var tempDir = System.IO.Path.Combine(&quot;uploads&quot;, Guid.NewGuid().ToString());
+            return Save(file, tempDir);
+        }
+
+        #endregion
+
+        private long? _length;
+        private Size? _size;
+
+        /// &lt;summary&gt;
+        /// Initialized values that don&#39;t require opening the file.
+        /// &lt;/summary&gt;
+        private void Initialize()
+        {
+            Filename = _fs.GetFileName(Path);
+            Extension = string.IsNullOrEmpty(_fs.GetExtension(Path)) == false
+                ? _fs.GetExtension(Path).Substring(1).ToLowerInvariant()
+                : &quot;&quot;;
+            Url = _fs.GetUrl(Path);
+            Exists = _fs.FileExists(Path);
+            if (Exists == false)
+            {
+                LogHelper.Warn&lt;UmbracoMediaFile&gt;(&quot;The media file doesn&#39;t exist: &quot; + Path);
+            }
+        }
+
+        public bool Exists { get; private set; }
+
+        public string Filename { get; private set; }
+
+        public string Extension { get; private set; }
+
+        public string Path { get; private set; }
+
+        public string Url { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Get the length of the file in bytes
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// We are lazy loading this, don&#39;t go opening the file on ctor like we were doing.
+        /// &lt;/remarks&gt;
+        public long Length
+        {
+            get
+            {
+                if (_length == null)
+                {
+                    if (Exists)
+                    {
+                        _length = _fs.GetSize(Path);
+                    }
+                    else
+                    {
+                        _length = -1;
+                    }
+                }
+                return _length.Value;
+            }
+        }
+
+        public bool SupportsResizing
+        {
+            get
+            {
+                return UmbracoConfig.For.UmbracoSettings().Content.ImageFileTypes.InvariantContains(Extension);
+            }
+        }
+
+        public string GetFriendlyName()
+        {
+            return Filename.SplitPascalCasing().ToFirstUpperInvariant();
+        }
+
+        public Size GetDimensions()
+        {
+            if (_size == null)
+            {
+                if (_fs.FileExists(Path))
+                {
+                    EnsureFileSupportsResizing();
+
+                    using (var fs = _fs.OpenFile(Path))
+                    {
+                        _size = ImageHelper.GetDimensions(fs);
+                    }
+                }
+                else
+                {
+                    _size = new Size(-1, -1);
+                }
+            }
+            return _size.Value;
+        }
+
+        public string Resize(int width, int height)
+        {
+            if (Exists)
+            {
+                EnsureFileSupportsResizing();
+
+                var fileNameThumb = DoResize(width, height, -1, string.Empty);
+
+                return _fs.GetUrl(fileNameThumb);
+            }
+            return string.Empty;
+        }
+
+        public string Resize(int maxWidthHeight, string fileNameAddition)
+        {
+            if (Exists)
+            {
+                EnsureFileSupportsResizing();
+
+                var fileNameThumb = DoResize(-1, -1, maxWidthHeight, fileNameAddition);
+
+                return _fs.GetUrl(fileNameThumb);
+            }
+            return string.Empty;
+        }
+
+        private string DoResize(int width, int height, int maxWidthHeight, string fileNameAddition)
+        {
+            using (var fs = _fs.OpenFile(Path))
+            {
+                using (var image = Image.FromStream(fs))
+                {
+                    var fileNameThumb = string.IsNullOrWhiteSpace(fileNameAddition)
+                        ? string.Format(&quot;{0}_UMBRACOSYSTHUMBNAIL.&quot; + Extension, Path.Substring(0, Path.LastIndexOf(&quot;.&quot;, StringComparison.Ordinal)))
+                        : string.Format(&quot;{0}_{1}.&quot; + Extension, Path.Substring(0, Path.LastIndexOf(&quot;.&quot;, StringComparison.Ordinal)), fileNameAddition);
+
+                    var thumbnail = maxWidthHeight == -1
+                        ? ImageHelper.GenerateThumbnail(image, width, height, fileNameThumb, Extension, _fs)
+                        : ImageHelper.GenerateThumbnail(image, maxWidthHeight, fileNameThumb, Extension, _fs);
+
+                    return thumbnail.FileName;
+                }
+            }
+        }
+
+        private void EnsureFileSupportsResizing()
+        {
+            if (SupportsResizing == false)
+                throw new InvalidOperationException(string.Format(&quot;The file {0} is not an image, so can&#39;t get dimensions&quot;, Filename));
+        }
+
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,9,22,34,0],[23,9,23,10,0],[24,13,24,94,0],[25,9,25,10,0],[27,9,27,45,0],[28,9,28,10,0],[29,13,29,94,0],[31,13,31,25,0],[33,13,33,26,0],[34,9,34,10,0],[43,9,43,10,0],[44,13,44,49,0],[45,9,45,10,0],[48,9,48,10,0],[49,13,49,49,0],[50,9,50,10,0],[53,9,53,10,0],[54,13,54,97,0],[55,13,55,43,0],[57,13,57,47,0],[58,9,58,10,0],[61,9,61,10,0],[62,13,62,63,0],[63,9,63,10,0],[66,9,66,10,0],[67,13,67,88,0],[68,13,68,40,0],[69,9,69,10,0],[73,9,73,10,0],[74,13,74,88,0],[75,13,75,40,0],[76,9,76,10,0],[87,9,87,10,0],[88,13,88,46,0],[89,13,91,22,0],[92,13,92,36,0],[93,13,93,43,0],[94,13,94,33,0],[95,13,95,14,0],[96,17,96,91,0],[97,13,97,14,0],[98,9,98,10,0],[100,30,100,34,0],[100,35,100,47,0],[102,34,102,38,0],[102,39,102,51,0],[104,35,104,39,0],[104,40,104,52,0],[106,30,106,34,0],[106,35,106,47,0],[108,29,108,33,0],[108,34,108,46,0],[119,13,119,14,0],[120,17,120,37,0],[121,17,121,18,0],[122,21,122,32,0],[123,21,123,22,0],[124,25,124,53,0],[125,21,125,22,0],[127,21,127,22,0],[128,25,128,38,0],[129,21,129,22,0],[130,17,130,18,0],[131,17,131,38,0],[132,13,132,14,0],[138,13,138,14,0],[139,17,139,112,0],[140,13,140,14,0],[144,9,144,10,0],[145,13,145,73,0],[146,9,146,10,0],[149,9,149,10,0],[150,13,150,31,0],[151,13,151,14,0],[152,17,152,42,0],[153,17,153,18,0],[154,21,154,50,0],[156,28,156,55,0],[157,21,157,22,0],[158,25,158,63,0],[159,21,159,22,0],[160,17,160,18,0],[162,17,162,18,0],[163,21,163,46,0],[164,17,164,18,0],[165,13,165,14,0],[166,13,166,32,0],[167,9,167,10,0],[170,9,170,10,0],[171,13,171,24,0],[172,13,172,14,0],[173,17,173,46,0],[175,17,175,79,0],[177,17,177,50,0],[179,13,179,33,0],[180,9,180,10,0],[183,9,183,10,0],[184,13,184,24,0],[185,13,185,14,0],[186,17,186,46,0],[188,17,188,88,0],[190,17,190,50,0],[192,13,192,33,0],[193,9,193,10,0],[196,9,196,10,0],[197,20,197,47,0],[198,13,198,14,0],[199,24,199,56,0],[200,17,200,18,0],[201,21,203,151,0],[205,21,207,111,0],[209,21,209,47,0],[212,9,212,10,0],[215,9,215,10,0],[216,13,216,43,0],[217,17,217,135,0],[218,9,218,10,0]]);
+    </script>
+  </body>
+</html>

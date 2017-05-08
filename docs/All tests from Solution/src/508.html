@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\controls\Tree\TreeControl.ascx.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Web;
+using System.Web.UI;
+using System.Web.UI.WebControls;
+using System.Web.Script.Serialization;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Web.Trees;
+using Umbraco.Web.UI.Controls;
+using umbraco.interfaces;
+using System.Text.RegularExpressions;
+using umbraco.BusinessLogic.Actions;
+using umbraco.businesslogic.Utils;
+using System.Text;
+using umbraco.cms.presentation.Trees;
+using umbraco.BasePages;
+using System.Web.Services;
+using System.Drawing;
+using System.Linq;
+using Umbraco.Core;
+
+namespace umbraco.controls.Tree
+{
+
+    /// &lt;summary&gt;
+    /// The Umbraco tree control.
+    /// &lt;remarks&gt;If this control doesn&#39;t exist on an UmbracoEnsuredPage it will not work.&lt;/remarks&gt;
+    /// &lt;/summary&gt;
+    public partial class TreeControl : UmbracoUserControl, ITreeService
+    {
+
+        /// &lt;summary&gt;
+        /// Set the defaults
+        /// &lt;/summary&gt;
+        public TreeControl()
+        {
+            Width = Unit.Empty;
+            Height = Unit.Empty;
+            BackColor = Color.Empty;
+            CssClass = &quot;&quot;;
+            ManualInitialization = false;
+        }
+
+        protected override void OnInit(EventArgs e)
+        {
+            base.OnInit(e);
+            EnableViewState = false;
+        }
+
+        public enum TreeMode
+        {
+            Standard, Checkbox, InheritedCheckBox
+        }
+
+        /// &lt;summary&gt;
+        /// If there is not application or tree specified in a query string then this is the application to load.
+        /// &lt;/summary&gt;
+        private const string DEFAULT_APP = Constants.Applications.Content;
+
+        private List&lt;BaseTree&gt; m_ActiveTrees = new List&lt;BaseTree&gt;();
+        private List&lt;BaseTree&gt; m_AllAppTrees = new List&lt;BaseTree&gt;();
+        private List&lt;ApplicationTree&gt; m_ActiveTreeDefs = null;
+        private TreeMode m_TreeType = TreeMode.Standard;
+        private bool m_IsInit = false;
+        private TreeService m_TreeService = new TreeService();
+        private string m_SelectedNodePath;
+
+        #region Public Properties
+
+        #region Style Properties
+        public string CssClass { get; set; }
+        public Unit Height { get; set; }
+        public Unit Width { get; set; }
+        public Color BackColor { get; set; }
+        #endregion
+
+        #region TreeService parameters.
+        public string FunctionToCall
+        {
+            get { return m_TreeService.FunctionToCall; }
+            set
+            {
+                m_TreeService.FunctionToCall = value;
+            }
+        }
+
+        public string NodeKey
+        {
+            get { return m_TreeService.NodeKey; }
+            set
+            {
+                m_TreeService.NodeKey = value;
+            }
+        }
+
+        public int StartNodeID
+        {
+            get { return m_TreeService.StartNodeID; }
+            set
+            {
+                m_TreeService.StartNodeID = value;
+            }
+        }
+
+        public string SelectedNodePath
+        {
+            get { return m_SelectedNodePath; }
+            set
+            {
+                m_SelectedNodePath = value;
+            }
+        }
+
+        public string TreeType
+        {
+            get { return m_TreeService.TreeType; }
+            set
+            {
+                m_TreeService.TreeType = value;
+            }
+        }
+
+        public bool ShowContextMenu
+        {
+            get { return m_TreeService.ShowContextMenu; }
+            set
+            {
+                m_TreeService.ShowContextMenu = value;
+            }
+        }
+
+        public bool IsDialog
+        {
+            get { return m_TreeService.IsDialog; }
+            set
+            {
+                m_TreeService.IsDialog = value;
+            }
+        }
+
+        public TreeDialogModes DialogMode
+        {
+            get { return m_TreeService.DialogMode; }
+            set
+            {
+                m_TreeService.DialogMode = value;
+            }
+        }
+
+
+        public string App
+        {
+            get
+            {
+                return GetCurrentApp();
+            }
+            set
+            {
+                m_TreeService.App = value;
+            }
+        }
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Allows for checkboxes to be used with the tree. Default is standard.
+        /// &lt;/summary&gt;
+        public TreeMode Mode
+        {
+            get
+            {
+                return m_TreeType;
+            }
+            set
+            {
+                m_TreeType = value;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the required JavaScript as a string for the current application
+        /// &lt;/summary&gt;
+        public string JSCurrApp
+        {
+            get
+            {
+                StringBuilder javascript = new StringBuilder();
+                foreach (BaseTree bTree in m_AllAppTrees)
+                    bTree.RenderJS(ref javascript);
+                return javascript.ToString();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// By default this is false. If set to true, then the code in the client side of the tree will force calling rebuildTree
+        /// to be called explicitly for the tree to render
+        /// &lt;/summary&gt;
+        public bool ManualInitialization { get; set; }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Can be set explicitly which will override what is in query strings or what has been set by properties.
+        /// Useful for rendering out a tree dynamically with an instance of anoterh TreeService.
+        /// By using this method, it will undo any of the tree service public properties that may be set
+        /// on this object.
+        /// &lt;/summary&gt;
+        public void SetTreeService(TreeService srv)
+        {
+            m_TreeService = srv;
+            Initialize();
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes the control and looks up the tree structures that are required to be rendered.
+        /// Properties of the control (or SetTreeService) need to be set before pre render or calling
+        /// GetJSONContextMenu or GetJSONNode
+        /// &lt;/summary&gt;
+        protected void Initialize()
+        {
+            //use the query strings if the TreeParams isn&#39;t explicitly set
+            if (m_TreeService == null)
+            {
+                m_TreeService = TreeRequestParams.FromQueryStrings().CreateTreeService();
+            }
+            m_TreeService.App = GetCurrentApp();
+
+            // Validate permissions
+            if (!BasePages.BasePage.ValidateUserContextID(BasePages.BasePage.umbracoUserContextID))
+                return;
+            UmbracoEnsuredPage page = new UmbracoEnsuredPage();
+            if (!page.ValidateUserApp(GetCurrentApp()))
+                throw new ArgumentException(&quot;The current user doesn&#39;t have access to this application. Please contact the system administrator.&quot;);
+
+            //find all tree definitions that have the current application alias that are ACTIVE.
+            //if an explicit tree has been requested, then only load that tree in.
+            //m_ActiveTreeDefs = TreeDefinitionCollection.Instance.FindActiveTrees(GetCurrentApp());
+
+            m_ActiveTreeDefs = Services.ApplicationTreeService.GetApplicationTrees(GetCurrentApp(), true).ToList();
+            
+            if (!string.IsNullOrEmpty(this.TreeType))
+            {
+                m_ActiveTreeDefs = m_ActiveTreeDefs
+                    .Where(x =&gt; x.Alias == this.TreeType)
+                    .ToList(); //this will only return 1
+            }
+
+            //find all tree defs that exists for the current application regardless of if they are active
+            var appTreeDefs = Services.ApplicationTreeService.GetApplicationTrees(GetCurrentApp()).ToList();
+
+            //Create the BaseTree&#39;s based on the tree definitions found
+            foreach (var treeDef in appTreeDefs)
+            {
+                //create the tree and initialize it
+                var bTree = LegacyTreeDataConverter.GetLegacyTreeForLegacyServices(treeDef);
+                //BaseTree bTree = treeDef.CreateInstance();
+                bTree.SetTreeParameters(m_TreeService);
+
+                //store the created tree
+                m_AllAppTrees.Add(bTree);
+                if (treeDef.Initialize)
+                    m_ActiveTrees.Add(bTree);
+            }
+
+            m_IsInit = true;
+        }
+
+        /// &lt;summary&gt;
+        /// This calls the databind method to bind the data binding syntax on the front-end.
+        /// &lt;remarks&gt;
+        /// Databinding was used instead of inline tags in case the tree properties needed to be set
+        /// by other classes at runtime
+        /// &lt;/remarks&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// This will initialize the control so all TreeService properties need to be set before hand
+        /// &lt;/remarks&gt;
+        protected override void OnPreRender(EventArgs e)
+        {
+            base.OnPreRender(e);
+
+            if (!m_IsInit)
+                Initialize();
+
+            //Render out the JavaScript associated with all of the trees for the application
+            RenderTreeJS();
+
+            //apply the styles
+            if (Width != Unit.Empty)
+                TreeContainer.Style.Add(HtmlTextWriterStyle.Width, Width.ToString());
+            if (Height != Unit.Empty)
+                TreeContainer.Style.Add(HtmlTextWriterStyle.Height, Height.ToString());
+            if (BackColor != Color.Empty)
+                TreeContainer.Style.Add(HtmlTextWriterStyle.BackgroundColor, ColorTranslator.ToHtml(BackColor));
+            if (CssClass != &quot;&quot;)
+            {
+                TreeContainer.Attributes.Add(&quot;class&quot;, CssClass);
+            }
+            else
+            {
+                //add the default class
+                TreeContainer.Attributes.Add(&quot;class&quot;, &quot;treeContainer&quot;);
+            }
+
+
+            DataBind();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the JSON markup for the full context menu
+        /// &lt;/summary&gt;
+        public string GetJSONContextMenu()
+        {
+            if (ShowContextMenu)
+            {
+                JTreeContextMenu menu = new JTreeContextMenu();
+                return menu.RenderJSONMenu();
+            }
+            else
+            {
+                return &quot;{}&quot;;
+            }
+
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a string with javascript proxy methods for IActions that are using old javascript
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public string GetLegacyIActionJavascript()
+        {
+            return LegacyTreeJavascript.GetLegacyIActionJavascript();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the JSON markup for one node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;treeAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;nodeId&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This will initialize the control so all TreeService properties need to be set before hand
+        /// &lt;/remarks&gt;
+        public string GetJSONNode(string nodeId)
+        {
+            if (!m_IsInit)
+                Initialize();
+
+            if (string.IsNullOrEmpty(m_TreeService.TreeType))
+            {
+                throw new ArgumentException(&quot;The TreeType is not set on the tree service&quot;);
+            }
+
+            BaseTree tree = m_ActiveTrees.Find(
+                delegate(BaseTree t)
+                {
+                    return (t.TreeAlias == m_TreeService.TreeType);
+                }
+            );
+            return tree.GetSerializedNodeData(nodeId);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the JSON markup for the first node in the tree
+        /// &lt;/summary&gt;
+
+        public string GetJSONInitNode()
+        {
+            if (!m_IsInit)
+                Initialize();
+
+            //if there is only one tree to render, we don&#39;t want to have a node to hold sub trees, we just want the
+            //stand alone tree, so we&#39;ll just add a TreeType to the TreeService and ensure that the right method gets loaded in tree.aspx
+            if (m_ActiveTrees.Count == 1)
+            {
+                m_TreeService.TreeType = m_ActiveTreeDefs[0].Alias;
+
+                //convert the menu to a string
+                //string initActions = (TreeSvc.ShowContextMenu ? Action.ToString(m_ActiveTrees[0].RootNodeActions) : &quot;&quot;);
+
+                //Since there&#39;s only 1 tree, render out the tree&#39;s RootNode properties
+                XmlTree xTree = new XmlTree();
+                xTree.Add(m_ActiveTrees[0].RootNode);
+                return xTree.ToString();
+            }
+            else
+            {
+
+                //If there is more than 1 tree for the application than render out a 
+                //container node labelled with the current application.
+                XmlTree xTree = new XmlTree();
+                XmlTreeNode xNode = XmlTreeNode.CreateRoot(new NullTree(GetCurrentApp()));
+                xNode.Text = ui.Text(&quot;sections&quot;, GetCurrentApp(), UmbracoEnsuredPage.CurrentUser);
+                xNode.Source = m_TreeService.GetServiceUrl();
+                xNode.Action = &quot;javascript:&quot; + ClientTools.Scripts.OpenDashboard(GetCurrentApp());
+                xNode.NodeType = m_TreeService.App.ToLower();
+                xNode.NodeID = &quot;-1&quot;;
+                xNode.Icon = &quot;.sprTreeFolder&quot;;
+                xTree.Add(xNode);
+                return xTree.ToString();
+            }
+        }
+
+        private void RenderTreeJS()
+        {
+            Page.ClientScript.RegisterClientScriptBlock(this.GetType(), &quot;Trees_&quot; + GetCurrentApp(), JSCurrApp, true);
+        }
+
+        /// &lt;summary&gt;
+        /// Return the current application alias. If neither the TreeType of Application is specified
+        /// than return the default application. If the Application is null but there is a TreeType then
+        /// find the application that the tree type is associated with.
+        /// &lt;/summary&gt;
+        private string GetCurrentApp()
+        {
+            //if theres an treetype specified but no application
+            if (string.IsNullOrEmpty(m_TreeService.App) &amp;&amp;
+                !string.IsNullOrEmpty(m_TreeService.TreeType))
+            {
+                TreeDefinition treeDef = TreeDefinitionCollection.Instance.FindTree(m_TreeService.TreeType);
+                if (treeDef != null)
+                    return treeDef.App.alias;
+            }
+            else if (!string.IsNullOrEmpty(m_TreeService.App))
+                return m_TreeService.App;
+
+            //if everything is null then return the default app
+            return DEFAULT_APP;
+        }
+
+        /// &lt;summary&gt;
+        /// CssInclude2 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.CssInclude CssInclude2;
+
+        /// &lt;summary&gt;
+        /// CssInclude3 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.CssInclude CssInclude3;
+
+        /// &lt;summary&gt;
+        /// CssInclude1 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.CssInclude CssInclude1;
+
+        /// &lt;summary&gt;
+        /// JsInclude1 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude1;
+
+        /// &lt;summary&gt;
+        /// JsInclude2 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude2;
+
+        /// &lt;summary&gt;
+        /// JsInclude3 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude3;
+
+        /// &lt;summary&gt;
+        /// JsInclude4 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude4;
+
+        /// &lt;summary&gt;
+        /// JsInclude5 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude5;
+
+        /// &lt;summary&gt;
+        /// JsInclude6 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude6;
+
+        /// &lt;summary&gt;
+        /// JsInclude8 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude8;
+
+        /// &lt;summary&gt;
+        /// JsInclude11 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude11;
+
+        /// &lt;summary&gt;
+        /// JsInclude7 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude7;
+
+        /// &lt;summary&gt;
+        /// JsInclude12 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude12;
+
+        /// &lt;summary&gt;
+        /// JsInclude9 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude9;
+
+        /// &lt;summary&gt;
+        /// JsInclude10 control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::ClientDependency.Core.Controls.JsInclude JsInclude10;
+
+        /// &lt;summary&gt;
+        /// TreeContainer control.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Auto-generated field.
+        /// To modify move field declaration from designer file to code-behind file.
+        /// &lt;/remarks&gt;
+        protected global::System.Web.UI.HtmlControls.HtmlGenericControl TreeContainer;
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[36,9,36,29,0],[37,9,37,10,0],[38,13,38,32,0],[39,13,39,33,0],[40,13,40,37,0],[41,13,41,27,0],[42,13,42,42,0],[43,9,43,10,0],[46,9,46,10,0],[47,13,47,28,0],[48,13,48,37,0],[49,9,49,10,0],[61,9,61,69,0],[62,9,62,69,0],[63,9,63,63,0],[64,9,64,57,0],[65,9,65,39,0],[66,9,66,63,0],[72,34,72,38,0],[72,39,72,43,0],[73,30,73,34,0],[73,35,73,39,0],[74,29,74,33,0],[74,34,74,38,0],[75,34,75,38,0],[75,39,75,43,0],[81,17,81,18,0],[81,19,81,55,0],[81,56,81,57,0],[83,13,83,14,0],[84,17,84,54,0],[85,13,85,14,0],[90,17,90,18,0],[90,19,90,48,0],[90,49,90,50,0],[92,13,92,14,0],[93,17,93,47,0],[94,13,94,14,0],[99,17,99,18,0],[99,19,99,52,0],[99,53,99,54,0],[101,13,101,14,0],[102,17,102,51,0],[103,13,103,14,0],[108,17,108,18,0],[108,19,108,45,0],[108,46,108,47,0],[110,13,110,14,0],[111,17,111,44,0],[112,13,112,14,0],[117,17,117,18,0],[117,19,117,49,0],[117,50,117,51,0],[119,13,119,14,0],[120,17,120,48,0],[121,13,121,14,0],[126,17,126,18,0],[126,19,126,56,0],[126,57,126,58,0],[128,13,128,14,0],[129,17,129,55,0],[130,13,130,14,0],[135,17,135,18,0],[135,19,135,49,0],[135,50,135,51,0],[137,13,137,14,0],[138,17,138,48,0],[139,13,139,14,0],[144,17,144,18,0],[144,19,144,51,0],[144,52,144,53,0],[146,13,146,14,0],[147,17,147,50,0],[148,13,148,14,0],[155,13,155,14,0],[156,17,156,40,0],[157,13,157,14,0],[159,13,159,14,0],[160,17,160,43,0],[161,13,161,14,0],[171,13,171,14,0],[172,17,172,35,0],[173,13,173,14,0],[175,13,175,14,0],[176,17,176,36,0],[177,13,177,14,0],[186,13,186,14,0],[187,17,187,64,0],[188,17,188,24,0],[188,26,188,40,0],[188,41,188,43,0],[188,44,188,57,0],[189,21,189,52,0],[190,17,190,46,0],[191,13,191,14,0],[198,44,198,48,0],[198,49,198,53,0],[209,9,209,10,0],[210,13,210,33,0],[211,13,211,26,0],[212,9,212,10,0],[220,9,220,10,0],[222,13,222,39,0],[223,13,223,14,0],[224,17,224,90,0],[225,13,225,14,0],[226,13,226,49,0],[229,13,229,100,0],[230,17,230,24,0],[231,13,231,64,0],[232,13,232,56,0],[233,17,233,147,0],[239,13,239,116,0],[241,13,241,54,0],[242,13,242,14,0],[243,17,244,33,0],[244,33,244,57,0],[244,57,245,31,0],[243,17,245,31,0],[246,13,246,14,0],[249,13,249,109,0],[252,13,252,20,0],[252,22,252,33,0],[252,34,252,36,0],[252,37,252,48,0],[253,13,253,14,0],[255,17,255,93,0],[257,17,257,56,0],[260,17,260,42,0],[261,17,261,40,0],[262,21,262,46,0],[263,13,263,14,0],[265,13,265,29,0],[266,9,266,10,0],[280,9,280,10,0],[281,13,281,33,0],[283,13,283,27,0],[284,17,284,30,0],[287,13,287,28,0],[290,13,290,37,0],[291,17,291,86,0],[292,13,292,38,0],[293,17,293,88,0],[294,13,294,42,0],[295,17,295,113,0],[296,13,296,32,0],[297,13,297,14,0],[298,17,298,65,0],[299,13,299,14,0],[301,13,301,14,0],[303,17,303,72,0],[304,13,304,14,0],[307,13,307,24,0],[308,9,308,10,0],[314,9,314,10,0],[315,13,315,33,0],[316,13,316,14,0],[317,17,317,64,0],[318,17,318,46,0],[321,13,321,14,0],[322,17,322,29,0],[325,9,325,10,0],[332,9,332,10,0],[333,13,333,70,0],[334,9,334,10,0],[346,9,346,10,0],[347,13,347,27,0],[348,17,348,30,0],[350,13,350,62,0],[351,13,351,14,0],[352,17,352,92,0],[355,13,357,17,0],[357,17,357,18,0],[357,18,358,21,0],[358,21,358,68,0],[358,68,359,17,0],[359,17,359,18,0],[359,18,360,15,0],[355,13,360,15,0],[361,13,361,55,0],[362,9,362,10,0],[369,9,369,10,0],[370,13,370,27,0],[371,17,371,30,0],[375,13,375,42,0],[376,13,376,14,0],[377,17,377,68,0],[383,17,383,47,0],[384,17,384,54,0],[385,17,385,41,0],[388,13,388,14,0],[392,17,392,47,0],[393,17,393,91,0],[394,17,394,99,0],[395,17,395,62,0],[396,17,396,99,0],[397,17,397,62,0],[398,17,398,37,0],[399,17,399,47,0],[400,17,400,34,0],[401,17,401,41,0],[403,9,403,10,0],[406,9,406,10,0],[407,13,407,118,0],[408,9,408,10,0],[416,9,416,10,0],[418,13,419,63,0],[420,13,420,14,0],[421,17,421,109,0],[422,17,422,37,0],[423,21,423,46,0],[424,13,424,14,0],[425,18,425,63,0],[426,17,426,42,0],[429,13,429,32,0],[430,9,430,10,0]]);
+    </script>
+  </body>
+</html>

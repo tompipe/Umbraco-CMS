@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Factories\ContentFactory.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Globalization;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Rdbms;
+
+namespace Umbraco.Core.Persistence.Factories
+{
+    internal class ContentFactory
+    {
+        private readonly IContentType _contentType;
+        private readonly Guid _nodeObjectTypeId;
+        private readonly int _id;
+        private int _primaryKey;
+
+        public ContentFactory(IContentType contentType, Guid nodeObjectTypeId, int id)
+        {
+            _contentType = contentType;
+            _nodeObjectTypeId = nodeObjectTypeId;
+            _id = id;
+        }
+
+        public ContentFactory(Guid nodeObjectTypeId, int id)
+        {
+            _nodeObjectTypeId = nodeObjectTypeId;
+            _id = id;
+        }
+
+        #region Implementation of IEntityFactory&lt;IContent,DocumentDto&gt;
+
+        /// &lt;summary&gt;
+        /// Builds a IContent item from the dto(s) and content type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dto&quot;&gt;
+        /// This DTO can contain all of the information to build an IContent item, however in cases where multiple entities are being built,
+        /// a separate &lt;see cref=&quot;DocumentPublishedReadOnlyDto&quot;/&gt; publishedDto entity will be supplied in place of the &lt;see cref=&quot;DocumentDto&quot;/&gt;&#39;s own 
+        /// ResultColumn DocumentPublishedReadOnlyDto
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;contentType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;publishedDto&quot;&gt;
+        /// When querying for multiple content items the main DTO will not contain the ResultColumn DocumentPublishedReadOnlyDto and a separate publishedDto instance will be supplied
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static IContent BuildEntity(DocumentDto dto, IContentType contentType, DocumentPublishedReadOnlyDto publishedDto = null)
+        {
+            var content = new Content(dto.Text, dto.ContentVersionDto.ContentDto.NodeDto.ParentId, contentType);
+
+            try
+            {
+                content.DisableChangeTracking();
+
+                content.Id = dto.NodeId;
+                content.Key = dto.ContentVersionDto.ContentDto.NodeDto.UniqueId;
+                content.Name = dto.Text;
+                content.NodeName = dto.ContentVersionDto.ContentDto.NodeDto.Text;
+                content.Path = dto.ContentVersionDto.ContentDto.NodeDto.Path;
+                content.CreatorId = dto.ContentVersionDto.ContentDto.NodeDto.UserId.Value;
+                content.WriterId = dto.WriterUserId;
+                content.Level = dto.ContentVersionDto.ContentDto.NodeDto.Level;
+                content.ParentId = dto.ContentVersionDto.ContentDto.NodeDto.ParentId;
+                content.SortOrder = dto.ContentVersionDto.ContentDto.NodeDto.SortOrder;
+                content.Trashed = dto.ContentVersionDto.ContentDto.NodeDto.Trashed;
+                content.Published = dto.Published;
+                content.CreateDate = dto.ContentVersionDto.ContentDto.NodeDto.CreateDate;
+                content.UpdateDate = dto.ContentVersionDto.VersionDate;
+                content.ExpireDate = dto.ExpiresDate.HasValue ? dto.ExpiresDate.Value : (DateTime?)null;
+                content.ReleaseDate = dto.ReleaseDate.HasValue ? dto.ReleaseDate.Value : (DateTime?)null;
+                content.Version = dto.ContentVersionDto.VersionId;
+
+                content.PublishedState = dto.Published ? PublishedState.Published : PublishedState.Unpublished;
+
+                //Check if the publishedDto has been supplied, if not the use the dto&#39;s own DocumentPublishedReadOnlyDto value
+                content.PublishedVersionGuid = publishedDto == null
+                    ? (dto.DocumentPublishedReadOnlyDto == null ? default(Guid) : dto.DocumentPublishedReadOnlyDto.VersionId)
+                    : publishedDto.VersionId;
+                content.PublishedDate = publishedDto == null
+                    ? (dto.DocumentPublishedReadOnlyDto == null ? default(DateTime) : dto.DocumentPublishedReadOnlyDto.VersionDate)
+                    : publishedDto.VersionDate;
+
+                //on initial construction we don&#39;t want to have dirty properties tracked
+                // http://issues.umbraco.org/issue/U4-1946
+                content.ResetDirtyProperties(false);
+                return content;
+            }
+            finally
+            {
+                content.EnableChangeTracking();
+            }
+
+        }
+
+        [Obsolete(&quot;Use the static BuildEntity instead so we don&#39;t have to allocate one of these objects everytime we want to map values&quot;)]
+        public IContent BuildEntity(DocumentDto dto)
+        {
+            return BuildEntity(dto, _contentType);
+        }
+
+        public DocumentDto BuildDto(IContent entity)
+        {
+            //NOTE Currently doesn&#39;t add Alias (legacy that eventually will go away)
+            var documentDto = new DocumentDto
+                                  {
+                                      Newest = true,
+                                      NodeId = entity.Id,
+                                      Published = entity.Published,
+                                      Text = entity.Name,
+                                      UpdateDate = entity.UpdateDate,
+                                      WriterUserId = entity.WriterId,
+                                      VersionId = entity.Version,
+                                      ExpiresDate = null,
+                                      ReleaseDate = null,
+                                      ContentVersionDto = BuildContentVersionDto(entity)
+                                  };
+
+            if (entity.Template != null &amp;&amp; entity.Template.Id &gt; 0)
+                documentDto.TemplateId = entity.Template.Id;
+
+            if (entity.ExpireDate.HasValue)
+                documentDto.ExpiresDate = entity.ExpireDate.Value;
+
+            if (entity.ReleaseDate.HasValue)
+                documentDto.ReleaseDate = entity.ReleaseDate.Value;
+
+            return documentDto;
+        }
+
+        #endregion
+
+        public void SetPrimaryKey(int primaryKey)
+        {
+            _primaryKey = primaryKey;
+        }
+
+        private ContentVersionDto BuildContentVersionDto(IContent entity)
+        {
+            //TODO: Change this once the Language property is public on IContent
+            var content = entity as Content;
+            var lang = content == null ? string.Empty : content.Language;
+
+            var contentVersionDto = new ContentVersionDto
+            {
+                NodeId = entity.Id,
+                VersionDate = entity.UpdateDate,
+                VersionId = entity.Version,
+                ContentDto = BuildContentDto(entity)
+            };
+            return contentVersionDto;
+        }
+
+        private ContentDto BuildContentDto(IContent entity)
+        {
+            var contentDto = new ContentDto
+            {
+                NodeId = entity.Id,
+                ContentTypeId = entity.ContentTypeId,
+                NodeDto = BuildNodeDto(entity)
+            };
+
+            if (_primaryKey &gt; 0)
+            {
+                contentDto.PrimaryKey = _primaryKey;
+            }
+
+            return contentDto;
+        }
+
+        private NodeDto BuildNodeDto(IContent entity)
+        {
+            //TODO: Change this once the Language property is public on IContent            
+            var nodeName = entity.Name;
+
+            var nodeDto = new NodeDto
+            {
+                CreateDate = entity.CreateDate,
+                NodeId = entity.Id,
+                Level = short.Parse(entity.Level.ToString(CultureInfo.InvariantCulture)),
+                NodeObjectType = _nodeObjectTypeId,
+                ParentId = entity.ParentId,
+                Path = entity.Path,
+                SortOrder = entity.SortOrder,
+                Text = nodeName,
+                Trashed = entity.Trashed,
+                UniqueId = entity.Key,
+                UserId = entity.CreatorId
+            };
+
+            return nodeDto;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[15,9,15,87,0],[16,9,16,10,0],[17,13,17,40,0],[18,13,18,50,0],[19,13,19,22,0],[20,9,20,10,0],[22,9,22,61,1],[23,9,23,10,1],[24,13,24,50,1],[25,13,25,22,1],[26,9,26,10,1],[44,9,44,10,1],[45,13,45,113,1],[48,13,48,14,1],[49,17,49,49,1],[51,17,51,41,1],[52,17,52,81,1],[53,17,53,41,1],[54,17,54,82,1],[55,17,55,78,1],[56,17,56,91,1],[57,17,57,53,1],[58,17,58,80,1],[59,17,59,86,1],[60,17,60,88,1],[61,17,61,84,1],[62,17,62,51,1],[63,17,63,90,1],[64,17,64,72,1],[65,17,65,105,1],[66,17,66,106,1],[67,17,67,67,1],[69,17,69,112,1],[72,17,74,46,1],[75,17,77,48,1],[81,17,81,53,1],[82,17,82,32,1],[85,13,85,14,1],[86,17,86,48,1],[87,13,87,14,1],[89,9,89,10,1],[93,9,93,10,0],[94,13,94,51,0],[95,9,95,10,0],[98,9,98,10,1],[100,13,112,37,1],[114,13,114,67,1],[115,17,115,61,1],[117,13,117,44,1],[118,17,118,67,1],[120,13,120,45,1],[121,17,121,68,1],[123,13,123,32,1],[124,9,124,10,1],[129,9,129,10,1],[130,13,130,38,1],[131,9,131,10,1],[134,9,134,10,1],[136,13,136,45,1],[137,13,137,74,1],[139,13,145,15,1],[146,13,146,38,1],[147,9,147,10,1],[150,9,150,10,1],[151,13,156,15,1],[158,13,158,33,1],[159,13,159,14,1],[160,17,160,53,1],[161,13,161,14,1],[163,13,163,31,1],[164,9,164,10,1],[167,9,167,10,1],[169,13,169,40,1],[171,13,184,15,1],[186,13,186,28,1],[187,9,187,10,1]]);
+    </script>
+  </body>
+</html>

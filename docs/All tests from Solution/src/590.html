@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\nodeFactory\UmbracoSiteMapProvider.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+#region namespace
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Web;
+using System.Web.Security;
+using System.Configuration;
+using Umbraco.Core.Logging;
+using umbraco.BusinessLogic;
+using System.Security.Cryptography;
+using System.Web.Util;
+using System.Collections.Specialized;
+using System.Configuration.Provider;
+using System.Collections;
+#endregion
+
+namespace umbraco.presentation.nodeFactory
+{
+    public sealed class UmbracoSiteMapProvider : StaticSiteMapProvider
+    {
+
+        private SiteMapNode _root;
+        private readonly Dictionary&lt;string, SiteMapNode&gt; _nodes = new Dictionary&lt;string, SiteMapNode&gt;(16);
+        private string _defaultDescriptionAlias = &quot;&quot;;
+        private bool _enableSecurityTrimming;
+
+        public override void Initialize(string name, NameValueCollection config)
+        {
+            if (config == null)
+                throw new ArgumentNullException(&quot;Config is null&quot;);
+
+            if (string.IsNullOrEmpty(name))
+                name = &quot;UmbracoSiteMapProvider&quot;;
+
+            if (string.IsNullOrEmpty(config[&quot;defaultDescriptionAlias&quot;]) == false)
+            {
+                _defaultDescriptionAlias = config[&quot;defaultDescriptionAlias&quot;];
+                config.Remove(&quot;defaultDescriptionAlias&quot;);
+            }
+            if (config[&quot;securityTrimmingEnabled&quot;] != null)
+            {
+                _enableSecurityTrimming = bool.Parse(config[&quot;securityTrimmingEnabled&quot;]);
+            }
+
+            base.Initialize(name, config);
+
+            // Throw an exception if unrecognized attributes remain
+            if (config.Count &gt; 0)
+            {
+                string attr = config.GetKey(0);
+                if (string.IsNullOrEmpty(attr) == false)
+                    throw new ProviderException
+                    (string.Format(&quot;Unrecognized attribute: {0}&quot;, attr));
+            }
+
+        }
+
+        public override SiteMapNode BuildSiteMap()
+        {
+            lock (this)
+            {
+                if (_root != null)
+                    return _root;
+
+                _root = CreateNode(&quot;-1&quot;, &quot;root&quot;, &quot;umbraco root&quot;, &quot;/&quot;, null);
+                try
+                {
+                    AddNode(_root, null);
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.Error&lt;UmbracoSiteMapProvider&gt;(&quot;Error adding to SiteMapProvider&quot;, ex);
+                }
+
+                LoadNodes(_root.Key, _root);
+            }
+
+            return _root;
+        }
+
+        public void UpdateNode(NodeFactory.Node node)
+        {
+            lock (this)
+            {
+                // validate sitemap
+                BuildSiteMap();
+
+                SiteMapNode n;
+                if (_nodes.ContainsKey(node.Id.ToString()) == false)
+                {
+                    n = CreateNode(node.Id.ToString(),
+                        node.Name,
+                        node.GetProperty(_defaultDescriptionAlias) != null ? node.GetProperty(_defaultDescriptionAlias).Value : &quot;&quot;,
+                        node.Url,
+                        FindRoles(node.Id, node.Path));
+                    string parentNode = node.Parent == null ? &quot;-1&quot; : node.Parent.Id.ToString();
+
+                    try
+                    {
+                        AddNode(n, _nodes[parentNode]);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogHelper.Error&lt;UmbracoSiteMapProvider&gt;(String.Format(&quot;Error adding node with url &#39;{0}&#39; and Id {1} to SiteMapProvider&quot;, node.Name, node.Id), ex);
+                    }
+                }
+                else
+                {
+                    n = _nodes[node.Id.ToString()];
+                    n.Url = node.Url;
+                    n.Description = node.GetProperty(_defaultDescriptionAlias) != null ? node.GetProperty(_defaultDescriptionAlias).Value : &quot;&quot;;
+                    n.Title = node.Name;
+                    n.Roles = FindRoles(node.Id, node.Path).Split(&quot;,&quot;.ToCharArray());
+                }
+            }
+        }
+
+        public void RemoveNode(int nodeId)
+        {
+            lock (this)
+            {
+                if (_nodes.ContainsKey(nodeId.ToString()))
+                    RemoveNode(_nodes[nodeId.ToString()]);
+            }
+        }
+
+        private void LoadNodes(string parentId, SiteMapNode parentNode)
+        {
+            lock (this)
+            {
+                NodeFactory.Node n = new NodeFactory.Node(int.Parse(parentId));
+                foreach (NodeFactory.Node child in n.Children)
+                {
+
+                    string roles = FindRoles(child.Id, child.Path);
+                    SiteMapNode childNode = CreateNode(
+                        child.Id.ToString(),
+                        child.Name,
+                        child.GetProperty(_defaultDescriptionAlias) != null ? child.GetProperty(_defaultDescriptionAlias).Value : &quot;&quot;,
+                        child.Url,
+                        roles);
+                    try
+                    {
+                        AddNode(childNode, parentNode);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogHelper.Error&lt;UmbracoSiteMapProvider&gt;(string.Format(&quot;Error adding node {0} to SiteMapProvider in loadNodes()&quot;, child.Id), ex);
+                    }
+                    LoadNodes(child.Id.ToString(), childNode);
+                }
+            }
+        }
+
+        private string FindRoles(int nodeId, string nodePath)
+        {
+            // check for roles
+            string roles = &quot;&quot;;
+            if (_enableSecurityTrimming &amp;&amp; !string.IsNullOrEmpty(nodePath) &amp;&amp; nodePath.Length &gt; 0)
+            {
+                string[] roleArray = cms.businesslogic.web.Access.GetAccessingMembershipRoles(nodeId, nodePath);
+                if (roleArray != null)
+                    roles = String.Join(&quot;,&quot;, roleArray);
+                else
+                    roles = &quot;*&quot;;
+            }
+            return roles;
+        }
+
+        protected override SiteMapNode GetRootNodeCore()
+        {
+            BuildSiteMap();
+            return _root;
+        }
+
+        public override bool IsAccessibleToUser(HttpContext context, SiteMapNode node)
+        {
+            if (!_enableSecurityTrimming)
+                return true;
+
+            if (node.Roles == null || node.Roles.Count == -1)
+                return true;
+
+            if (node.Roles[0].ToString() == &quot;*&quot;)
+                return true;
+
+            foreach (string role in node.Roles)
+                if (context.User.IsInRole(role))
+                    return true;
+
+            return false;
+        }
+
+        private SiteMapNode CreateNode(string id, string name, string description, string url, string roles)
+        {
+            lock (this)
+            {
+                if (_nodes.ContainsKey(id))
+                    throw new ProviderException(String.Format(&quot;A node with id &#39;{0}&#39; already exists&quot;, id));
+                // Get title, URL, description, and roles from the DataReader
+
+                // If roles were specified, turn the list into a string array
+                string[] rolelist = null;
+                if (!String.IsNullOrEmpty(roles))
+                    rolelist = roles.Split(new char[] { &#39;,&#39;, &#39;;&#39; }, 512);
+
+                // Create a SiteMapNode
+                SiteMapNode node = new SiteMapNode(this, id, url, name, description, rolelist, null, null, null);
+
+                _nodes.Add(id, node);
+
+                // Return the node
+                return node;
+            }
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[23,9,23,107,0],[24,9,24,54,0],[28,9,28,10,0],[29,13,29,32,0],[30,17,30,67,0],[32,13,32,44,0],[33,17,33,49,0],[35,13,35,82,0],[36,13,36,14,0],[37,17,37,78,0],[38,17,38,58,0],[39,13,39,14,0],[40,13,40,59,0],[41,13,41,14,0],[42,17,42,89,0],[43,13,43,14,0],[45,13,45,43,0],[48,13,48,34,0],[49,13,49,14,0],[50,17,50,48,0],[51,17,51,57,0],[52,21,53,74,0],[54,13,54,14,0],[56,9,56,10,0],[59,9,59,10,0],[60,13,60,24,0],[61,13,61,14,0],[62,17,62,35,0],[63,21,63,34,0],[65,17,65,77,0],[67,17,67,18,0],[68,21,68,42,0],[69,17,69,18,0],[70,17,70,37,0],[71,17,71,18,0],[72,21,72,100,0],[73,17,73,18,0],[75,17,75,45,0],[76,13,76,14,0],[78,13,78,26,0],[79,9,79,10,0],[82,9,82,10,0],[83,13,83,24,0],[84,13,84,14,0],[86,17,86,32,0],[89,17,89,69,0],[90,17,90,18,0],[91,21,95,56,0],[96,21,96,96,0],[99,21,99,22,0],[100,25,100,56,0],[101,21,101,22,0],[102,21,102,41,0],[103,21,103,22,0],[104,25,104,170,0],[105,21,105,22,0],[106,17,106,18,0],[108,17,108,18,0],[109,21,109,52,0],[110,21,110,38,0],[111,21,111,144,0],[112,21,112,41,0],[113,21,113,86,0],[114,17,114,18,0],[115,13,115,14,0],[116,9,116,10,0],[119,9,119,10,0],[120,13,120,24,0],[121,13,121,14,0],[122,17,122,59,0],[123,21,123,59,0],[124,13,124,14,0],[125,9,125,10,0],[128,9,128,10,0],[129,13,129,24,0],[130,13,130,14,0],[131,17,131,80,0],[132,17,132,24,0],[132,26,132,48,0],[132,49,132,51,0],[132,52,132,62,0],[133,17,133,18,0],[135,21,135,68,0],[136,21,141,32,0],[143,21,143,22,0],[144,25,144,56,0],[145,21,145,22,0],[146,21,146,41,0],[147,21,147,22,0],[148,25,148,153,0],[149,21,149,22,0],[150,21,150,63,0],[151,17,151,18,0],[152,13,152,14,0],[153,9,153,10,0],[156,9,156,10,0],[158,13,158,31,0],[159,13,159,99,0],[160,13,160,14,0],[161,17,161,113,0],[162,17,162,39,0],[163,21,163,57,0],[165,21,165,33,0],[166,13,166,14,0],[167,13,167,26,0],[168,9,168,10,0],[171,9,171,10,0],[172,13,172,28,0],[173,13,173,26,0],[174,9,174,10,0],[177,9,177,10,0],[178,13,178,42,0],[179,17,179,29,0],[181,13,181,62,0],[182,17,182,29,0],[184,13,184,49,0],[185,17,185,29,0],[187,13,187,20,0],[187,22,187,33,0],[187,34,187,36,0],[187,37,187,47,0],[188,17,188,49,0],[189,21,189,33,0],[191,13,191,26,0],[192,9,192,10,0],[195,9,195,10,0],[196,13,196,24,0],[197,13,197,14,0],[198,17,198,44,0],[199,21,199,107,0],[203,17,203,42,0],[204,17,204,50,0],[205,21,205,74,0],[208,17,208,114,0],[210,17,210,38,0],[213,17,213,29,0],[215,9,215,10,0]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\DataTypeService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using Umbraco.Core.Auditing;
+using Umbraco.Core.Events;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.PropertyEditors;
+using umbraco.interfaces;
+using Umbraco.Core.Exceptions;
+
+namespace Umbraco.Core.Services
+{
+    /// &lt;summary&gt;
+    /// Represents the DataType Service, which is an easy access to operations involving &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;
+    /// &lt;/summary&gt;
+    public class DataTypeService : RepositoryService, IDataTypeService
+    {
+
+        public DataTypeService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory, ILogger logger, IEventMessagesFactory eventMessagesFactory)
+            : base(provider, repositoryFactory, logger, eventMessagesFactory)
+        {
+        }
+
+        #region Containers
+
+        public Attempt&lt;OperationStatus&lt;EntityContainer, OperationStatusType&gt;&gt; CreateContainer(int parentId, string name, int userId = 0)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repo = RepositoryFactory.CreateEntityContainerRepository(uow, Constants.ObjectTypes.DataTypeContainerGuid))
+            {
+                try
+                {
+                    var container = new EntityContainer(Constants.ObjectTypes.DataTypeGuid)
+                    {
+                        Name = name,
+                        ParentId = parentId,
+                        CreatorId = userId
+                    };
+
+                    if (SavingContainer.IsRaisedEventCancelled(
+                        new SaveEventArgs&lt;EntityContainer&gt;(container, evtMsgs),
+                        this))
+                    {
+                        return Attempt.Fail(new OperationStatus&lt;EntityContainer, OperationStatusType&gt;(container, OperationStatusType.FailedCancelledByEvent, evtMsgs));
+                    }
+
+                    repo.AddOrUpdate(container);
+                    uow.Commit();
+
+                    SavedContainer.RaiseEvent(new SaveEventArgs&lt;EntityContainer&gt;(container, evtMsgs), this);
+                    //TODO: Audit trail ?
+
+                    return Attempt.Succeed(new OperationStatus&lt;EntityContainer, OperationStatusType&gt;(container, OperationStatusType.Success, evtMsgs));
+                }
+                catch (Exception ex)
+                {
+                    return Attempt.Fail(new OperationStatus&lt;EntityContainer, OperationStatusType&gt;(null, OperationStatusType.FailedExceptionThrown, evtMsgs), ex);
+                }
+            }
+        }
+
+        public EntityContainer GetContainer(int containerId)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repo = RepositoryFactory.CreateEntityContainerRepository(uow, Constants.ObjectTypes.DataTypeContainerGuid))
+            {
+                var container = repo.Get(containerId);
+                return container;
+            }
+        }
+
+        public EntityContainer GetContainer(Guid containerId)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repo = RepositoryFactory.CreateEntityContainerRepository(uow, Constants.ObjectTypes.DataTypeContainerGuid))
+            {
+                var container = repo.Get(containerId);
+                return container;
+            }
+        }
+
+        public IEnumerable&lt;EntityContainer&gt; GetContainers(string name, int level)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repo = RepositoryFactory.CreateEntityContainerRepository(uow, Constants.ObjectTypes.DataTypeContainerGuid))
+            {
+                return repo.Get(name, level);
+            }
+        }
+
+        public IEnumerable&lt;EntityContainer&gt; GetContainers(IDataTypeDefinition dataTypeDefinition)
+        {
+            var ancestorIds = dataTypeDefinition.Path.Split(new[] { &#39;,&#39; }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(x =&gt;
+                {
+                    var asInt = x.TryConvertTo&lt;int&gt;();
+                    if (asInt) return asInt.Result;
+                    return int.MinValue;
+                })
+                .Where(x =&gt; x != int.MinValue &amp;&amp; x != dataTypeDefinition.Id)
+                .ToArray();
+
+            return GetContainers(ancestorIds);
+        }
+
+        public IEnumerable&lt;EntityContainer&gt; GetContainers(int[] containerIds)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repo = RepositoryFactory.CreateEntityContainerRepository(uow, Constants.ObjectTypes.DataTypeContainerGuid))
+            {
+                return repo.GetAll(containerIds);
+            }
+        }
+
+        public Attempt&lt;OperationStatus&gt; SaveContainer(EntityContainer container, int userId = 0)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+
+            if (container.ContainedObjectType != Constants.ObjectTypes.DataTypeGuid)
+            {
+                var ex = new InvalidOperationException(&quot;Not a &quot; + Constants.ObjectTypes.DataTypeGuid + &quot; container.&quot;);
+                return OperationStatus.Exception(evtMsgs, ex);
+            }
+
+            if (container.HasIdentity &amp;&amp; container.IsPropertyDirty(&quot;ParentId&quot;))
+            {
+                var ex = new InvalidOperationException(&quot;Cannot save a container with a modified parent, move the container instead.&quot;);
+                return OperationStatus.Exception(evtMsgs, ex);
+            }
+
+            if (SavingContainer.IsRaisedEventCancelled(
+                        new SaveEventArgs&lt;EntityContainer&gt;(container, evtMsgs),
+                        this))
+            {
+                return OperationStatus.Cancelled(evtMsgs);
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repo = RepositoryFactory.CreateEntityContainerRepository(uow, Constants.ObjectTypes.DataTypeContainerGuid))
+            {
+                repo.AddOrUpdate(container);
+                uow.Commit();
+            }
+
+            SavedContainer.RaiseEvent(new SaveEventArgs&lt;EntityContainer&gt;(container, evtMsgs), this);
+
+            //TODO: Audit trail ?
+
+            return OperationStatus.Success(evtMsgs);
+        }
+
+        public Attempt&lt;OperationStatus&gt; DeleteContainer(int containerId, int userId = 0)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repo = RepositoryFactory.CreateEntityContainerRepository(uow, Constants.ObjectTypes.DataTypeContainerGuid))
+            {
+                var container = repo.Get(containerId);
+                if (container == null) return OperationStatus.NoOperation(evtMsgs);
+
+                if (DeletingContainer.IsRaisedEventCancelled(
+                        new DeleteEventArgs&lt;EntityContainer&gt;(container, evtMsgs),
+                        this))
+                {
+                    return Attempt.Fail(new OperationStatus(OperationStatusType.FailedCancelledByEvent, evtMsgs));
+                }
+
+                repo.Delete(container);
+                uow.Commit();
+
+                DeletedContainer.RaiseEvent(new DeleteEventArgs&lt;EntityContainer&gt;(container, evtMsgs), this);
+
+                return OperationStatus.Success(evtMsgs);
+                //TODO: Audit trail ?
+            }
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Gets a &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; by its Name
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;name&quot;&gt;Name of the &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;&lt;/returns&gt;
+        public IDataTypeDefinition GetDataTypeDefinitionByName(string name)
+        {
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetByQuery(new Query&lt;IDataTypeDefinition&gt;().Where(x =&gt; x.Name == name)).FirstOrDefault();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; by its Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;&lt;/returns&gt;
+        public IDataTypeDefinition GetDataTypeDefinitionById(int id)
+        {
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.Get(id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; by its unique guid Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Unique guid Id of the DataType&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;&lt;/returns&gt;
+        public IDataTypeDefinition GetDataTypeDefinitionById(Guid id)
+        {
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IDataTypeDefinition&gt;.Builder.Where(x =&gt; x.Key == id);
+                var definitions = repository.GetByQuery(query);
+
+                return definitions.FirstOrDefault();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; by its control Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the DataType control&lt;/param&gt;
+        /// &lt;returns&gt;Collection of &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; objects with a matching contorl id&lt;/returns&gt;
+        [Obsolete(&quot;Property editor&#39;s are defined by a string alias from version 7 onwards, use the overload GetDataTypeDefinitionByPropertyEditorAlias instead&quot;)]
+        public IEnumerable&lt;IDataTypeDefinition&gt; GetDataTypeDefinitionByControlId(Guid id)
+        {
+            var alias = LegacyPropertyEditorIdToAliasConverter.GetAliasFromLegacyId(id, true);
+            return GetDataTypeDefinitionByPropertyEditorAlias(alias);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; by its control Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;propertyEditorAlias&quot;&gt;Alias of the property editor&lt;/param&gt;
+        /// &lt;returns&gt;Collection of &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; objects with a matching contorl id&lt;/returns&gt;
+        public IEnumerable&lt;IDataTypeDefinition&gt; GetDataTypeDefinitionByPropertyEditorAlias(string propertyEditorAlias)
+        {
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IDataTypeDefinition&gt;.Builder.Where(x =&gt; x.PropertyEditorAlias == propertyEditorAlias);
+                var definitions = repository.GetByQuery(query);
+
+                return definitions;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; objects or those with the ids passed in
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ids&quot;&gt;Optional array of Ids&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IDataTypeDefinition&gt; GetAllDataTypeDefinitions(params int[] ids)
+        {
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetAll(ids);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all prevalues for an &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; to retrieve prevalues from&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of string values&lt;/returns&gt;
+        public IEnumerable&lt;string&gt; GetPreValuesByDataTypeId(int id)
+        {
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(UowProvider.GetUnitOfWork()))
+            {
+                var collection = repository.GetPreValuesCollectionByDataTypeId(id);
+                //now convert the collection to a string list
+                var list = collection.FormatAsDictionary()
+                    .Select(x =&gt; x.Value.Value)
+                    .ToList();
+                return list;
+            }
+        }
+        
+        /// &lt;summary&gt;
+        /// Returns the PreValueCollection for the specified data type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public PreValueCollection GetPreValuesCollectionByDataTypeId(int id)
+        {
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetPreValuesCollectionByDataTypeId(id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a specific PreValue by its Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the PreValue to retrieve the value from&lt;/param&gt;
+        /// &lt;returns&gt;PreValue as a string&lt;/returns&gt;
+        public string GetPreValueAsString(int id)
+        {
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetPreValueAsString(id);
+            }
+        }
+
+        public Attempt&lt;OperationStatus&lt;MoveOperationStatusType&gt;&gt; Move(IDataTypeDefinition toMove, int parentId)
+        {
+            var evtMsgs = EventMessagesFactory.Get();
+
+            if (Moving.IsRaisedEventCancelled(
+                  new MoveEventArgs&lt;IDataTypeDefinition&gt;(evtMsgs, new MoveEventInfo&lt;IDataTypeDefinition&gt;(toMove, toMove.Path, parentId)),
+                  this))
+            {
+                return Attempt.Fail(
+                    new OperationStatus&lt;MoveOperationStatusType&gt;(
+                        MoveOperationStatusType.FailedCancelledByEvent, evtMsgs));
+            }
+
+            var moveInfo = new List&lt;MoveEventInfo&lt;IDataTypeDefinition&gt;&gt;();
+            var uow = UowProvider.GetUnitOfWork();
+            using (var containerRepository = RepositoryFactory.CreateEntityContainerRepository(uow, Constants.ObjectTypes.DataTypeContainerGuid))
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(uow))
+            {
+                try
+                {
+                    EntityContainer container = null;
+                    if (parentId &gt; 0)
+                    {
+                        container = containerRepository.Get(parentId);
+                        if (container == null)
+                            throw new DataOperationException&lt;MoveOperationStatusType&gt;(MoveOperationStatusType.FailedParentNotFound);
+                    }
+                    moveInfo.AddRange(repository.Move(toMove, container));
+                }
+                catch (DataOperationException&lt;MoveOperationStatusType&gt; ex)
+                {
+                    return Attempt.Fail(
+                        new OperationStatus&lt;MoveOperationStatusType&gt;(ex.Operation, evtMsgs));
+                }
+                uow.Commit();
+            }
+
+            Moved.RaiseEvent(new MoveEventArgs&lt;IDataTypeDefinition&gt;(false, evtMsgs, moveInfo.ToArray()), this);
+
+            return Attempt.Succeed(
+                new OperationStatus&lt;MoveOperationStatusType&gt;(MoveOperationStatusType.Success, evtMsgs));
+        }
+
+        /// &lt;summary&gt;
+        /// Saves an &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dataTypeDefinition&quot;&gt;&lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Id of the user issueing the save&lt;/param&gt;
+        public void Save(IDataTypeDefinition dataTypeDefinition, int userId = 0)
+        {
+            if (Saving.IsRaisedEventCancelled(new SaveEventArgs&lt;IDataTypeDefinition&gt;(dataTypeDefinition), this)) 
+                return;
+
+            if (string.IsNullOrWhiteSpace(dataTypeDefinition.Name))
+            {
+                throw new ArgumentException(&quot;Cannot save datatype with empty name.&quot;);
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(uow))
+            {
+                dataTypeDefinition.CreatorId = userId;
+                repository.AddOrUpdate(dataTypeDefinition);
+                uow.Commit();
+
+                Saved.RaiseEvent(new SaveEventArgs&lt;IDataTypeDefinition&gt;(dataTypeDefinition, false), this);
+            }
+
+            Audit(AuditType.Save, string.Format(&quot;Save DataTypeDefinition performed by user&quot;), userId, dataTypeDefinition.Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a collection of &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dataTypeDefinitions&quot;&gt;&lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Id of the user issueing the save&lt;/param&gt;
+        public void Save(IEnumerable&lt;IDataTypeDefinition&gt; dataTypeDefinitions, int userId = 0)
+        {
+            Save(dataTypeDefinitions, userId, true);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a collection of &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dataTypeDefinitions&quot;&gt;&lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Id of the user issueing the save&lt;/param&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;Boolean indicating whether or not to raise events&lt;/param&gt;
+        public void Save(IEnumerable&lt;IDataTypeDefinition&gt; dataTypeDefinitions, int userId, bool raiseEvents)
+        {
+            if (raiseEvents)
+            {
+                if (Saving.IsRaisedEventCancelled(new SaveEventArgs&lt;IDataTypeDefinition&gt;(dataTypeDefinitions), this))
+                    return;
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(uow))
+            {
+                foreach (var dataTypeDefinition in dataTypeDefinitions)
+                {
+                    dataTypeDefinition.CreatorId = userId;
+                    repository.AddOrUpdate(dataTypeDefinition);
+                }
+                uow.Commit();
+
+                if (raiseEvents)
+                    Saved.RaiseEvent(new SaveEventArgs&lt;IDataTypeDefinition&gt;(dataTypeDefinitions, false), this);
+            }
+
+            Audit(AuditType.Save, string.Format(&quot;Save DataTypeDefinition performed by user&quot;), userId, -1);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a list of PreValues for a given DataTypeDefinition
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dataTypeId&quot;&gt;Id of the DataTypeDefinition to save PreValues for&lt;/param&gt;
+        /// &lt;param name=&quot;values&quot;&gt;List of string values to save&lt;/param&gt;
+        [Obsolete(&quot;This should no longer be used, use the alternative SavePreValues or SaveDataTypeAndPreValues methods instead. This will only insert pre-values without keys&quot;)]
+        public void SavePreValues(int dataTypeId, IEnumerable&lt;string&gt; values)
+        {
+            //TODO: Should we raise an event here since we are really saving values for the data type?
+
+            using (var uow = UowProvider.GetUnitOfWork())
+            {
+                using (var transaction = uow.Database.GetTransaction())
+                {
+                    var sortOrderObj =
+                    uow.Database.ExecuteScalar&lt;object&gt;(
+                        &quot;SELECT max(sortorder) FROM cmsDataTypePreValues WHERE datatypeNodeId = @DataTypeId&quot;, new { DataTypeId = dataTypeId });
+                    int sortOrder;
+                    if (sortOrderObj == null || int.TryParse(sortOrderObj.ToString(), out sortOrder) == false)
+                    {
+                        sortOrder = 1;
+                    }
+
+                    foreach (var value in values)
+                    {
+                        var dto = new DataTypePreValueDto { DataTypeNodeId = dataTypeId, Value = value, SortOrder = sortOrder };
+                        uow.Database.Insert(dto);
+                        sortOrder++;
+                    }
+
+                    transaction.Complete();
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Saves/updates the pre-values
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dataTypeId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;values&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// We need to actually look up each pre-value and maintain it&#39;s id if possible - this is because of silly property editors
+        /// like &#39;dropdown list publishing keys&#39;
+        /// &lt;/remarks&gt;
+        public void SavePreValues(int dataTypeId, IDictionary&lt;string, PreValue&gt; values)
+        {
+            var dtd = this.GetDataTypeDefinitionById(dataTypeId);
+            if (dtd == null)
+            {
+                throw new InvalidOperationException(&quot;No data type found for id &quot; + dataTypeId);
+            }
+            SavePreValues(dtd, values);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves/updates the pre-values
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dataTypeDefinition&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;values&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// We need to actually look up each pre-value and maintain it&#39;s id if possible - this is because of silly property editors
+        /// like &#39;dropdown list publishing keys&#39;
+        /// &lt;/remarks&gt;
+        public void SavePreValues(IDataTypeDefinition dataTypeDefinition, IDictionary&lt;string, PreValue&gt; values)
+        {
+            //TODO: Should we raise an event here since we are really saving values for the data type?
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(uow))
+            {
+                repository.AddOrUpdatePreValues(dataTypeDefinition, values);
+                uow.Commit();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This will save a data type and it&#39;s pre-values in one transaction
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dataTypeDefinition&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;values&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;&lt;/param&gt;
+        public void SaveDataTypeAndPreValues(IDataTypeDefinition dataTypeDefinition, IDictionary&lt;string, PreValue&gt; values, int userId = 0)
+        {
+            if (Saving.IsRaisedEventCancelled(new SaveEventArgs&lt;IDataTypeDefinition&gt;(dataTypeDefinition), this))
+                return;
+
+            // if preValues contain the data type, override the data type definition accordingly
+            if (values != null &amp;&amp; values.ContainsKey(Constants.PropertyEditors.PreValueKeys.DataValueType))
+                dataTypeDefinition.DatabaseType = PropertyValueEditor.GetDatabaseType(values[Constants.PropertyEditors.PreValueKeys.DataValueType].Value);
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(uow))
+            {
+                dataTypeDefinition.CreatorId = userId;
+
+                //add/update the dtd
+                repository.AddOrUpdate(dataTypeDefinition);
+
+                //add/update the prevalues
+                repository.AddOrUpdatePreValues(dataTypeDefinition, values);
+
+                uow.Commit();
+
+                Saved.RaiseEvent(new SaveEventArgs&lt;IDataTypeDefinition&gt;(dataTypeDefinition, false), this);
+            }
+            
+            Audit(AuditType.Save, string.Format(&quot;Save DataTypeDefinition performed by user&quot;), userId, dataTypeDefinition.Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes an &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Please note that deleting a &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; will remove
+        /// all the &lt;see cref=&quot;PropertyType&quot;/&gt; data that references this &lt;see cref=&quot;IDataTypeDefinition&quot;/&gt;.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;dataTypeDefinition&quot;&gt;&lt;see cref=&quot;IDataTypeDefinition&quot;/&gt; to delete&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the user issueing the deletion&lt;/param&gt;
+        public void Delete(IDataTypeDefinition dataTypeDefinition, int userId = 0)
+        {            
+	        if (Deleting.IsRaisedEventCancelled(new DeleteEventArgs&lt;IDataTypeDefinition&gt;(dataTypeDefinition), this)) 
+				return;
+	        
+			var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateDataTypeDefinitionRepository(uow))
+	        {
+                repository.Delete(dataTypeDefinition);
+
+		        uow.Commit();
+
+		        Deleted.RaiseEvent(new DeleteEventArgs&lt;IDataTypeDefinition&gt;(dataTypeDefinition, false), this); 		        
+	        }
+
+	        Audit(AuditType.Delete, string.Format(&quot;Delete DataTypeDefinition performed by user&quot;), userId, dataTypeDefinition.Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the &lt;see cref=&quot;IDataType&quot;/&gt; specified by it&#39;s unique ID
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the DataType, which corresponds to the Guid Id of the control&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IDataType&quot;/&gt; object&lt;/returns&gt;
+        [Obsolete(&quot;IDataType is obsolete and is no longer used, it will be removed from the codebase in future versions&quot;)]
+        public IDataType GetDataTypeById(Guid id)
+        {
+            return DataTypesResolver.Current.GetById(id);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a complete list of all registered &lt;see cref=&quot;IDataType&quot;/&gt;&#39;s
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;IDataType&quot;/&gt; objects&lt;/returns&gt;
+        [Obsolete(&quot;IDataType is obsolete and is no longer used, it will be removed from the codebase in future versions&quot;)]
+        public IEnumerable&lt;IDataType&gt; GetAllDataTypes()
+        {
+            return DataTypesResolver.Current.DataTypes;
+        }
+
+        private void Audit(AuditType type, string message, int userId, int objectId)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var auditRepo = RepositoryFactory.CreateAuditRepository(uow))
+            {
+                auditRepo.AddOrUpdate(new AuditItem(objectId, message, type, userId));
+                uow.Commit();
+            }
+        }
+
+        #region Event Handlers
+
+        public static event TypedEventHandler&lt;IDataTypeService, SaveEventArgs&lt;EntityContainer&gt;&gt; SavingContainer;
+        public static event TypedEventHandler&lt;IDataTypeService, SaveEventArgs&lt;EntityContainer&gt;&gt; SavedContainer;
+        public static event TypedEventHandler&lt;IDataTypeService, DeleteEventArgs&lt;EntityContainer&gt;&gt; DeletingContainer;
+        public static event TypedEventHandler&lt;IDataTypeService, DeleteEventArgs&lt;EntityContainer&gt;&gt; DeletedContainer;
+
+        /// &lt;summary&gt;
+        /// Occurs before Delete
+        /// &lt;/summary&gt;
+		public static event TypedEventHandler&lt;IDataTypeService, DeleteEventArgs&lt;IDataTypeDefinition&gt;&gt; Deleting;
+
+        /// &lt;summary&gt;
+        /// Occurs after Delete
+        /// &lt;/summary&gt;
+		public static event TypedEventHandler&lt;IDataTypeService, DeleteEventArgs&lt;IDataTypeDefinition&gt;&gt; Deleted;
+
+        /// &lt;summary&gt;
+        /// Occurs before Save
+        /// &lt;/summary&gt;
+		public static event TypedEventHandler&lt;IDataTypeService, SaveEventArgs&lt;IDataTypeDefinition&gt;&gt; Saving;
+
+        /// &lt;summary&gt;
+        /// Occurs after Save
+        /// &lt;/summary&gt;
+		public static event TypedEventHandler&lt;IDataTypeService, SaveEventArgs&lt;IDataTypeDefinition&gt;&gt; Saved;
+
+        /// &lt;summary&gt;
+        /// Occurs before Move
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IDataTypeService, MoveEventArgs&lt;IDataTypeDefinition&gt;&gt; Moving;
+
+        /// &lt;summary&gt;
+        /// Occurs after Move
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IDataTypeService, MoveEventArgs&lt;IDataTypeDefinition&gt;&gt; Moved;
+        #endregion
+
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[26,15,26,78,1],[27,9,27,10,1],[28,9,28,10,1],[33,9,33,10,0],[34,13,34,54,0],[35,13,35,51,0],[36,20,36,130,0],[37,13,37,14,0],[39,17,39,18,0],[40,21,45,23,0],[47,21,49,31,0],[50,21,50,22,0],[51,25,51,168,0],[54,21,54,49,0],[55,21,55,34,0],[57,21,57,109,0],[60,21,60,152,0],[62,17,62,37,0],[63,17,63,18,0],[64,21,64,162,0],[67,9,67,10,0],[70,9,70,10,0],[71,13,71,51,0],[72,20,72,130,0],[73,13,73,14,0],[74,17,74,55,0],[75,17,75,34,0],[77,9,77,10,0],[80,9,80,10,0],[81,13,81,51,0],[82,20,82,130,0],[83,13,83,14,0],[84,17,84,55,0],[85,17,85,34,0],[87,9,87,10,0],[90,9,90,10,0],[91,13,91,51,0],[92,20,92,130,0],[93,13,93,14,0],[94,17,94,46,0],[96,9,96,10,0],[99,9,99,10,0],[100,13,102,17,0],[102,17,102,18,0],[102,18,103,21,0],[103,21,103,55,0],[103,55,104,21,0],[104,21,104,31,0],[104,31,104,32,0],[104,32,104,52,0],[104,52,105,21,0],[105,21,105,41,0],[105,41,106,17,0],[106,17,106,18,0],[106,18,107,29,0],[107,29,107,76,0],[107,76,108,28,0],[100,13,108,28,0],[110,13,110,47,0],[111,9,111,10,0],[114,9,114,10,0],[115,13,115,51,0],[116,20,116,130,0],[117,13,117,14,0],[118,17,118,50,0],[120,9,120,10,0],[123,9,123,10,0],[124,13,124,54,0],[126,13,126,85,0],[127,13,127,14,0],[128,17,128,119,0],[129,17,129,63,0],[132,13,132,80,0],[133,13,133,14,0],[134,17,134,135,0],[135,17,135,63,0],[138,13,140,31,0],[141,13,141,14,0],[142,17,142,59,0],[145,13,145,51,0],[146,20,146,130,0],[147,13,147,14,0],[148,17,148,45,0],[149,17,149,30,0],[150,13,150,14,0],[152,13,152,101,0],[156,13,156,53,0],[157,9,157,10,0],[160,9,160,10,0],[161,13,161,54,0],[162,13,162,51,0],[163,20,163,130,0],[164,13,164,14,0],[165,17,165,55,0],[166,17,166,39,0],[166,40,166,84,0],[168,17,170,31,0],[171,17,171,18,0],[172,21,172,115,0],[175,17,175,40,0],[176,17,176,30,0],[178,17,178,109,0],[180,17,180,57,0],[183,9,183,10,0],[193,9,193,10,1],[194,20,194,118,1],[195,13,195,14,1],[196,17,196,124,1],[198,9,198,10,1],[206,9,206,10,1],[207,20,207,118,1],[208,13,208,14,1],[209,17,209,43,1],[211,9,211,10,1],[219,9,219,10,1],[220,20,220,118,1],[221,13,221,14,1],[222,17,222,88,1],[223,17,223,64,1],[225,17,225,53,1],[227,9,227,10,1],[236,9,236,10,1],[237,13,237,95,1],[238,13,238,70,1],[239,9,239,10,1],[247,9,247,10,1],[248,20,248,118,1],[249,13,249,14,1],[250,17,250,121,1],[251,17,251,64,1],[253,17,253,36,1],[255,9,255,10,1],[263,9,263,10,0],[264,20,264,118,0],[265,13,265,14,0],[266,17,266,47,0],[268,9,268,10,0],[276,9,276,10,1],[277,20,277,118,1],[278,13,278,14,1],[279,17,279,84,1],[281,17,282,34,1],[282,34,282,47,0],[282,47,283,31,1],[281,17,283,31,1],[284,17,284,29,1],[286,9,286,10,1],[294,9,294,10,1],[295,20,295,118,1],[296,13,296,14,1],[297,17,297,74,1],[299,9,299,10,1],[307,9,307,10,0],[308,20,308,118,0],[309,13,309,14,0],[310,17,310,59,0],[312,9,312,10,0],[315,9,315,10,0],[316,13,316,54,0],[318,13,320,25,0],[321,13,321,14,0],[322,17,324,83,0],[327,13,327,75,0],[328,13,328,51,0],[329,20,329,145,0],[330,20,330,94,0],[331,13,331,14,0],[333,17,333,18,0],[334,21,334,54,0],[335,21,335,38,0],[336,21,336,22,0],[337,25,337,71,0],[338,25,338,47,0],[339,29,339,133,0],[340,21,340,22,0],[341,21,341,75,0],[342,17,342,18,0],[343,17,343,75,0],[344,17,344,18,0],[345,21,346,94,0],[348,17,348,30,0],[349,13,349,14,0],[351,13,351,112,0],[353,13,354,105,0],[355,9,355,10,0],[363,9,363,10,1],[364,13,364,113,1],[365,17,365,24,0],[367,13,367,68,1],[368,13,368,14,1],[369,17,369,86,1],[372,13,372,51,1],[373,20,373,94,1],[374,13,374,14,1],[375,17,375,55,1],[376,17,376,60,1],[377,17,377,30,1],[379,17,379,107,1],[380,13,380,14,1],[382,13,382,126,1],[383,9,383,10,1],[391,9,391,10,0],[392,13,392,53,0],[393,9,393,10,0],[402,9,402,10,1],[403,13,403,29,1],[404,13,404,14,1],[405,17,405,118,1],[406,21,406,28,0],[407,13,407,14,1],[409,13,409,51,1],[410,20,410,94,1],[411,13,411,14,1],[412,17,412,24,1],[412,26,412,48,1],[412,49,412,51,1],[412,52,412,71,1],[413,17,413,18,1],[414,21,414,59,1],[415,21,415,64,1],[416,17,416,18,1],[417,17,417,30,1],[419,17,419,33,1],[420,21,420,112,1],[421,13,421,14,1],[423,13,423,107,1],[424,9,424,10,1],[433,9,433,10,1],[436,20,436,57,1],[437,13,437,14,1],[438,24,438,71,1],[439,17,439,18,1],[440,21,442,144,1],[444,21,444,111,1],[445,21,445,22,1],[446,25,446,39,1],[447,21,447,22,1],[449,21,449,28,1],[449,30,449,39,1],[449,40,449,42,1],[449,43,449,49,1],[450,21,450,22,1],[451,25,451,129,1],[452,25,452,50,1],[453,25,453,37,1],[454,21,454,22,1],[456,21,456,44,1],[457,17,457,18,1],[458,13,458,14,1],[459,9,459,10,1],[471,9,471,10,1],[472,13,472,66,1],[473,13,473,29,1],[474,13,474,14,0],[475,17,475,96,0],[477,13,477,40,1],[478,9,478,10,1],[490,9,490,10,1],[493,13,493,51,1],[494,20,494,94,1],[495,13,495,14,1],[496,17,496,77,1],[497,17,497,30,1],[498,13,498,14,1],[499,9,499,10,1],[508,9,508,10,1],[509,13,509,113,1],[510,17,510,24,0],[513,13,513,108,1],[514,17,514,155,0],[516,13,516,51,1],[517,20,517,94,1],[518,13,518,14,1],[519,17,519,55,1],[522,17,522,60,1],[525,17,525,77,1],[527,17,527,30,1],[529,17,529,107,1],[530,13,530,14,1],[532,13,532,126,1],[533,9,533,10,1],[545,9,545,10,1],[546,10,546,114,1],[547,5,547,12,0],[549,4,549,42,1],[550,20,550,94,1],[551,10,551,11,1],[552,17,552,55,1],[554,11,554,24,1],[556,11,556,105,1],[557,10,557,11,1],[559,10,559,127,1],[560,9,560,10,1],[569,9,569,10,0],[570,13,570,58,0],[571,9,571,10,0],[579,9,579,10,0],[580,13,580,56,0],[581,9,581,10,0],[584,9,584,10,1],[585,13,585,51,1],[586,20,586,80,1],[587,13,587,14,1],[588,17,588,87,1],[589,17,589,30,1],[590,13,590,14,1],[591,9,591,10,1]]);
+    </script>
+  </body>
+</html>

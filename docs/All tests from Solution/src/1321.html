@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Editors\DashboardController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System.Collections.Generic;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Web.Models.ContentEditing;
+using Umbraco.Web.Mvc;
+using System.Linq;
+using Umbraco.Core.IO;
+using Newtonsoft.Json.Linq;
+using System.Threading.Tasks;
+using System.Net.Http;
+using System.Web.Http;
+using System;
+using System.Net;
+using System.Text;
+using Umbraco.Core.Cache;
+using Umbraco.Web.WebApi;
+using Umbraco.Web.WebApi.Filters;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Web.Editors
+{
+  
+    //we need to fire up the controller like this to enable loading of remote css directly from this controller
+    [PluginController(&quot;UmbracoApi&quot;)]
+    [ValidationFilter]
+    [AngularJsonOnlyConfiguration]
+    [IsBackOffice]
+    [WebApi.UmbracoAuthorize]
+    public class DashboardController : UmbracoApiController
+    {
+        //we have baseurl as a param to make previewing easier, so we can test with a dev domain from client side
+        [ValidateAngularAntiForgeryToken]
+        public async Task&lt;JObject&gt; GetRemoteDashboardContent(string section, string baseUrl = &quot;https://dashboard.umbraco.org/&quot;)
+        {
+            var context = UmbracoContext.Current;
+            if (context == null)
+                throw new HttpResponseException(HttpStatusCode.InternalServerError);
+
+            var user = Security.CurrentUser;
+            var userType = user.UserType.Alias;
+            var allowedSections = string.Join(&quot;,&quot;, user.AllowedSections);
+            var language = user.Language;
+            var version = UmbracoVersion.GetSemanticVersion().ToSemanticString();
+
+            var url = string.Format(baseUrl + &quot;{0}?section={0}&amp;type={1}&amp;allowed={2}&amp;lang={3}&amp;version={4}&quot;, section, userType, allowedSections, language, version);
+            var key = &quot;umbraco-dynamic-dashboard-&quot; + userType + language + allowedSections.Replace(&quot;,&quot;, &quot;-&quot;) + section;
+
+            var content = ApplicationContext.ApplicationCache.RuntimeCache.GetCacheItem&lt;JObject&gt;(key);
+            var result = new JObject();
+            if (content != null)
+            {
+                result = content;
+            }
+            else
+            {
+                //content is null, go get it
+                try
+                {
+                    using (var web = new HttpClient())
+                    {
+                        //fetch dashboard json and parse to JObject
+                        var json = await web.GetStringAsync(url);
+                        content = JObject.Parse(json);
+                        result = content;
+                    }
+
+                    ApplicationContext.ApplicationCache.RuntimeCache.InsertCacheItem&lt;JObject&gt;(key, () =&gt; result, new TimeSpan(0, 30, 0));
+                }
+                catch (HttpRequestException ex)
+                {
+                    LogHelper.Debug&lt;DashboardController&gt;(string.Format(&quot;Error getting dashboard content from &#39;{0}&#39;: {1}\n{2}&quot;, url, ex.Message, ex.InnerException));
+
+                    //it&#39;s still new JObject() - we return it like this to avoid error codes which triggers UI warnings
+                    ApplicationContext.ApplicationCache.RuntimeCache.InsertCacheItem&lt;JObject&gt;(key, () =&gt; result, new TimeSpan(0, 5, 0));
+                }
+            }
+
+            return result;
+        }
+
+        public async Task&lt;HttpResponseMessage&gt; GetRemoteDashboardCss(string section, string baseUrl = &quot;https://dashboard.umbraco.org/&quot;)
+        {
+            var url = string.Format(baseUrl + &quot;css/dashboard.css?section={0}&quot;, section);
+            var key = &quot;umbraco-dynamic-dashboard-css-&quot; + section;
+
+            var content = ApplicationContext.ApplicationCache.RuntimeCache.GetCacheItem&lt;string&gt;(key);
+            var result = string.Empty;
+
+            if (content != null)
+            {
+                result = content;
+            }
+            else
+            {
+                //content is null, go get it
+                try
+                {
+                    using (var web = new HttpClient())
+                    {
+                        //fetch remote css
+                        content = await web.GetStringAsync(url);
+
+                        //can&#39;t use content directly, modified closure problem
+                        result = content;
+
+                        //save server content for 30 mins
+                        ApplicationContext.ApplicationCache.RuntimeCache.InsertCacheItem&lt;string&gt;(key, () =&gt; result, new TimeSpan(0, 30, 0));
+                    }
+                }
+                catch (HttpRequestException ex)
+                {
+                    LogHelper.Debug&lt;DashboardController&gt;(string.Format(&quot;Error getting dashboard CSS from &#39;{0}&#39;: {1}\n{2}&quot;, url, ex.Message, ex.InnerException));
+
+                    //it&#39;s still string.Empty - we return it like this to avoid error codes which triggers UI warnings
+                    ApplicationContext.ApplicationCache.RuntimeCache.InsertCacheItem&lt;string&gt;(key, () =&gt; result, new TimeSpan(0, 5, 0));
+                }
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(result, Encoding.UTF8, &quot;text/css&quot;)
+            };
+        }
+        
+        [ValidateAngularAntiForgeryToken]
+        public IEnumerable&lt;Tab&lt;DashboardControl&gt;&gt; GetDashboard(string section)
+        {
+            var tabs = new List&lt;Tab&lt;DashboardControl&gt;&gt;();
+            var i = 1;
+
+            // The dashboard config can contain more than one area inserted by a package.
+            foreach( var dashboardSection in UmbracoConfig.For.DashboardSettings().Sections.Where(x =&gt; x.Areas.Contains(section)))
+            {
+                //we need to validate access to this section
+                if (DashboardSecurity.AuthorizeAccess(dashboardSection, Security.CurrentUser, Services.SectionService) == false)
+                    continue;
+
+                //User is authorized
+                foreach (var tab in dashboardSection.Tabs)
+                {
+                    //we need to validate access to this tab
+                    if (DashboardSecurity.AuthorizeAccess(tab, Security.CurrentUser, Services.SectionService) == false)
+                        continue;
+
+                    var dashboardControls = new List&lt;DashboardControl&gt;();
+
+                    foreach (var control in tab.Controls)
+                    {
+                        if (DashboardSecurity.AuthorizeAccess(control, Security.CurrentUser, Services.SectionService) == false)
+                            continue;
+
+                        var dashboardControl = new DashboardControl();
+                        var controlPath = control.ControlPath.Trim();
+                        dashboardControl.Path = IOHelper.FindFile(controlPath);
+                        if (controlPath.ToLowerInvariant().EndsWith(&quot;.ascx&quot;.ToLowerInvariant()))
+                            dashboardControl.ServerSide = true;
+
+                        dashboardControls.Add(dashboardControl);
+                    }
+
+                    tabs.Add(new Tab&lt;DashboardControl&gt;
+                    {
+                        Id = i,
+                        Alias = tab.Caption.ToSafeAlias(),
+                        IsActive = i == 1,
+                        Label = tab.Caption,
+                        Properties = dashboardControls
+                    });
+
+                    i++;
+                }
+            }
+
+            //In case there are no tabs or a user doesn&#39;t have access the empty tabs list is returned
+            return tabs;
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[34,9,34,10,0],[35,13,35,50,0],[36,13,36,33,0],[37,17,37,85,0],[39,13,39,45,0],[40,13,40,48,0],[41,13,41,74,0],[42,13,42,42,0],[43,13,43,82,0],[45,13,45,163,0],[46,13,46,120,0],[48,13,48,103,0],[49,13,49,40,0],[50,13,50,33,0],[51,13,51,14,0],[52,17,52,34,0],[53,13,53,14,0],[55,13,55,14,0],[58,17,58,18,0],[59,28,59,54,0],[60,21,60,22,0],[62,25,62,66,0],[63,25,63,55,0],[64,25,64,42,0],[65,21,65,22,0],[67,21,67,106,0],[67,106,67,112,0],[67,112,67,138,0],[67,21,67,138,0],[68,17,68,18,0],[69,17,69,48,0],[70,17,70,18,0],[71,21,71,165,0],[74,21,74,106,0],[74,106,74,112,0],[74,112,74,137,0],[74,21,74,137,0],[75,17,75,18,0],[76,13,76,14,0],[78,13,78,27,0],[79,9,79,10,0],[82,9,82,10,0],[83,13,83,89,0],[84,13,84,66,0],[86,13,86,102,0],[87,13,87,39,0],[89,13,89,33,0],[90,13,90,14,0],[91,17,91,34,0],[92,13,92,14,0],[94,13,94,14,0],[97,17,97,18,0],[98,28,98,54,0],[99,21,99,22,0],[101,25,101,65,0],[104,25,104,42,0],[107,25,107,109,0],[107,109,107,115,0],[107,115,107,141,0],[107,25,107,141,0],[108,21,108,22,0],[109,17,109,18,0],[110,17,110,48,0],[111,17,111,18,0],[112,21,112,161,0],[115,21,115,105,0],[115,105,115,111,0],[115,111,115,136,0],[115,21,115,136,0],[116,17,116,18,0],[117,13,117,14,0],[119,13,122,15,0],[123,9,123,10,0],[127,9,127,10,0],[128,13,128,58,0],[129,13,129,23,0],[132,13,132,20,0],[132,22,132,42,0],[132,43,132,45,0],[132,46,132,104,0],[132,104,132,129,0],[132,129,132,130,0],[132,46,132,130,0],[133,13,133,14,0],[135,17,135,129,0],[136,21,136,30,0],[139,17,139,24,0],[139,26,139,33,0],[139,34,139,36,0],[139,37,139,58,0],[140,17,140,18,0],[142,21,142,120,0],[143,25,143,34,0],[145,21,145,74,0],[147,21,147,28,0],[147,30,147,41,0],[147,42,147,44,0],[147,45,147,57,0],[148,21,148,22,0],[149,25,149,128,0],[150,29,150,38,0],[152,25,152,71,0],[153,25,153,70,0],[154,25,154,80,0],[155,25,155,97,0],[156,29,156,64,0],[158,25,158,65,0],[159,21,159,22,0],[161,21,168,24,0],[170,21,170,25,0],[171,17,171,18,0],[172,13,172,14,0],[175,13,175,25,0],[176,9,176,10,0]]);
+    </script>
+  </body>
+</html>

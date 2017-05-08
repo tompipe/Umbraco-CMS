@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\DatabaseContext.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Configuration;
+using System.Data.SqlServerCe;
+using System.IO;
+using System.Linq;
+using System.Web;
+using System.Web.Configuration;
+using System.Xml.Linq;
+using Semver;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Migrations;
+using Umbraco.Core.Persistence.Migrations.Initial;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Core
+{
+    /// &lt;summary&gt;
+    /// The Umbraco Database context
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// One per AppDomain, represents the Umbraco database
+    /// &lt;/remarks&gt;
+    public class DatabaseContext
+    {
+        private readonly IDatabaseFactory _factory;
+        private readonly ILogger _logger;
+        private readonly SqlSyntaxProviders _syntaxProviders;
+        private bool _configured;
+        private readonly object _locker = new object();
+        private string _connectionString;
+        private string _providerName;
+        private DatabaseSchemaResult _result;
+        private DateTime? _connectionLastChecked = null;
+
+        /// &lt;summary&gt;
+        /// The number of minutes to throttle the checks to CanConnect
+        /// &lt;/summary&gt;
+        private const int ConnectionCheckMinutes = 1;
+
+        [Obsolete(&quot;Use the constructor specifying all dependencies instead&quot;)]
+        public DatabaseContext(IDatabaseFactory factory)
+            : this(factory, LoggerResolver.Current.Logger, new SqlSyntaxProviders(new ISqlSyntaxProvider[]
+            {
+                new MySqlSyntaxProvider(LoggerResolver.Current.Logger),
+                new SqlCeSyntaxProvider(), 
+                new SqlServerSyntaxProvider()
+            }))
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Default constructor
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;factory&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;syntaxProviders&quot;&gt;&lt;/param&gt;
+        public DatabaseContext(IDatabaseFactory factory, ILogger logger, SqlSyntaxProviders syntaxProviders)
+        {
+            if (factory == null) throw new ArgumentNullException(&quot;factory&quot;);
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            if (syntaxProviders == null) throw new ArgumentNullException(&quot;syntaxProviders&quot;);
+
+            _factory = factory;
+            _logger = logger;
+            _syntaxProviders = syntaxProviders;
+        }
+
+        /// &lt;summary&gt;
+        /// Create a configured DatabaseContext
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;factory&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;logger&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;sqlSyntax&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;providerName&quot;&gt;&lt;/param&gt;
+        public DatabaseContext(IDatabaseFactory factory, ILogger logger, ISqlSyntaxProvider sqlSyntax, string providerName)
+        {
+            _providerName = providerName;
+            SqlSyntax = sqlSyntax;
+            SqlSyntaxContext.SqlSyntaxProvider = SqlSyntax;
+            _factory = factory;
+            _logger = logger;
+            _configured = true;
+        }
+
+        public ISqlSyntaxProvider SqlSyntax { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Gets the &lt;see cref=&quot;Database&quot;/&gt; object for doing CRUD operations
+        /// against custom tables that resides in the Umbraco database.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This should not be used for CRUD operations or queries against the
+        /// standard Umbraco tables! Use the Public services for that.
+        /// &lt;/remarks&gt;
+        public virtual UmbracoDatabase Database
+        {
+            get { return _factory.CreateDatabase(); }
+        }
+
+        /// &lt;summary&gt;
+        /// Boolean indicating whether the database has been configured
+        /// &lt;/summary&gt;
+        public virtual bool IsDatabaseConfigured
+        {
+            get { return _configured; }
+        }
+
+        /// &lt;summary&gt;
+        /// Determines if the db can be connected to
+        /// &lt;/summary&gt;
+        public virtual bool CanConnect
+        {
+            get
+            {
+                if (IsDatabaseConfigured == false)
+                    return false;
+
+                //Don&#39;t check again if the timeout period hasn&#39;t elapsed
+                //this ensures we don&#39;t keep checking the connection too many times in a row like during startup.
+                //Do check if the _connectionLastChecked is null which means we&#39;re just initializing or it could 
+                //not connect last time it was checked.
+                if ((_connectionLastChecked.HasValue &amp;&amp; (DateTime.Now - _connectionLastChecked.Value).TotalMinutes &gt; ConnectionCheckMinutes)
+                    || _connectionLastChecked.HasValue == false)
+                {
+                    var canConnect = DbConnectionExtensions.IsConnectionAvailable(ConnectionString, DatabaseProvider);
+                    LogHelper.Info&lt;DatabaseContext&gt;(&quot;CanConnect = &quot; + canConnect);
+
+                    _connectionLastChecked = canConnect == false ? null : (DateTime?) DateTime.Now;
+                    return canConnect;
+                }
+
+                return _connectionLastChecked.HasValue;
+            }
+        }
+
+
+        /// &lt;summary&gt;
+        /// Gets the configured umbraco db connection string.
+        /// &lt;/summary&gt;
+        public virtual string ConnectionString
+        {
+            get { return _connectionString; }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the name of the dataprovider from the connectionstring setting in config
+        /// &lt;/summary&gt;
+        internal string ProviderName
+        {
+            get
+            {
+                if (string.IsNullOrEmpty(_providerName) == false)
+                    return _providerName;
+
+                _providerName = Constants.DatabaseProviders.SqlServer;
+                if (ConfigurationManager.ConnectionStrings[GlobalSettings.UmbracoConnectionName] != null)
+                {
+                    if (string.IsNullOrEmpty(ConfigurationManager.ConnectionStrings[GlobalSettings.UmbracoConnectionName].ProviderName) == false)
+                        _providerName = ConfigurationManager.ConnectionStrings[GlobalSettings.UmbracoConnectionName].ProviderName;
+                }
+                else
+                {
+                    throw new InvalidOperationException(&quot;Can&#39;t find a connection string with the name &#39;&quot; + GlobalSettings.UmbracoConnectionName + &quot;&#39;&quot;);
+                }
+                return _providerName;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the Type of DatabaseProvider used
+        /// &lt;/summary&gt;
+        public virtual DatabaseProviders DatabaseProvider
+        {
+            get
+            {
+                string dbtype = Database.Connection == null ? ProviderName : Database.Connection.GetType().Name;
+
+                if (dbtype.StartsWith(&quot;MySql&quot;)) return DatabaseProviders.MySql;
+                if (dbtype.StartsWith(&quot;SqlCe&quot;) || dbtype.Contains(&quot;SqlServerCe&quot;)) return DatabaseProviders.SqlServerCE;
+                if (dbtype.StartsWith(&quot;Npgsql&quot;)) return DatabaseProviders.PostgreSQL;
+                if (dbtype.StartsWith(&quot;Oracle&quot;) || dbtype.Contains(&quot;OracleClient&quot;)) return DatabaseProviders.Oracle;
+                if (dbtype.StartsWith(&quot;SQLite&quot;)) return DatabaseProviders.SQLite;
+                if (dbtype.Contains(&quot;Azure&quot;)) return DatabaseProviders.SqlAzure;
+
+                return DatabaseProviders.SqlServer;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Configure a ConnectionString for the embedded database.
+        /// &lt;/summary&gt;
+        public void ConfigureEmbeddedDatabaseConnection()
+        {
+            const string providerName = Constants.DatabaseProviders.SqlCe;
+
+            var connectionString = GetEmbeddedDatabaseConnectionString();
+            SaveConnectionString(connectionString, providerName);
+
+            var path = Path.Combine(GlobalSettings.FullpathToRoot, &quot;App_Data&quot;, &quot;Umbraco.sdf&quot;);
+            if (File.Exists(path) == false)
+            {
+                using (var engine = new SqlCeEngine(connectionString))
+                {
+                    engine.CreateDatabase();
+                }
+            }
+
+            Initialize(providerName);
+        }
+
+        public string GetEmbeddedDatabaseConnectionString()
+        {
+            return @&quot;Data Source=|DataDirectory|\Umbraco.sdf;Flush Interval=1;&quot;;
+        }
+
+        /// &lt;summary&gt;
+        /// Configure a ConnectionString that has been entered manually.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Please note that we currently assume that the &#39;System.Data.SqlClient&#39; provider can be used.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;connectionString&quot;&gt;&lt;/param&gt;
+        public void ConfigureDatabaseConnection(string connectionString)
+        {
+            var provider = DbConnectionExtensions.DetectProviderFromConnectionString(connectionString);
+            var databaseProvider = provider.ToString();
+            var providerName = Constants.DatabaseProviders.SqlServer;
+            if (databaseProvider.ToLower().Contains(&quot;mysql&quot;))
+            {
+                providerName = Constants.DatabaseProviders.MySql;
+            }
+            SaveConnectionString(connectionString, providerName);
+            Initialize(string.Empty);
+        }
+
+        /// &lt;summary&gt;
+        /// Configures a ConnectionString for the Umbraco database based on the passed in properties from the installer.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;server&quot;&gt;Name or address of the database server&lt;/param&gt;
+        /// &lt;param name=&quot;databaseName&quot;&gt;Name of the database&lt;/param&gt;
+        /// &lt;param name=&quot;user&quot;&gt;Database Username&lt;/param&gt;
+        /// &lt;param name=&quot;password&quot;&gt;Database Password&lt;/param&gt;
+        /// &lt;param name=&quot;databaseProvider&quot;&gt;Type of the provider to be used (Sql, Sql Azure, Sql Ce, MySql)&lt;/param&gt;
+        public void ConfigureDatabaseConnection(string server, string databaseName, string user, string password, string databaseProvider)
+        {            
+            string providerName;
+            var connectionString = GetDatabaseConnectionString(server, databaseName, user, password, databaseProvider, out providerName);
+
+            SaveConnectionString(connectionString, providerName);
+            Initialize(providerName);
+        }
+        
+        public string GetDatabaseConnectionString(string server, string databaseName, string user, string password, string databaseProvider, out string providerName)
+        {
+            providerName = Constants.DatabaseProviders.SqlServer;
+            if (databaseProvider.ToLower().Contains(&quot;mysql&quot;))
+            {
+                providerName = Constants.DatabaseProviders.MySql;
+                return string.Format(&quot;Server={0}; Database={1};Uid={2};Pwd={3}&quot;, server, databaseName, user, password);
+            }
+            if (databaseProvider.ToLower().Contains(&quot;azure&quot;))
+            {
+                return BuildAzureConnectionString(server, databaseName, user, password);
+            }
+            return string.Format(&quot;server={0};database={1};user id={2};password={3}&quot;, server, databaseName, user, password);
+        }
+
+        /// &lt;summary&gt;
+        /// Configures a ConnectionString for the Umbraco database that uses Microsoft SQL Server integrated security.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;server&quot;&gt;Name or address of the database server&lt;/param&gt;
+        /// &lt;param name=&quot;databaseName&quot;&gt;Name of the database&lt;/param&gt;
+        public void ConfigureIntegratedSecurityDatabaseConnection(string server, string databaseName)
+        {
+            const string providerName = Constants.DatabaseProviders.SqlServer;
+            var connectionString = GetIntegratedSecurityDatabaseConnectionString(server, databaseName);
+            SaveConnectionString(connectionString, providerName);
+            Initialize(providerName);
+        }
+
+        public string GetIntegratedSecurityDatabaseConnectionString(string server, string databaseName)
+        {
+            return String.Format(&quot;Server={0};Database={1};Integrated Security=true&quot;, server, databaseName);            
+        }
+
+        internal string BuildAzureConnectionString(string server, string databaseName, string user, string password)
+        {
+            if (server.Contains(&quot;.&quot;) &amp;&amp; ServerStartsWithTcp(server) == false)
+                server = string.Format(&quot;tcp:{0}&quot;, server);
+            
+            if (server.Contains(&quot;.&quot;) == false &amp;&amp; ServerStartsWithTcp(server))
+            {
+                string serverName = server.Contains(&quot;,&quot;) 
+                                        ? server.Substring(0, server.IndexOf(&quot;,&quot;, StringComparison.Ordinal)) 
+                                        : server;
+
+                var portAddition = string.Empty;
+
+                if (server.Contains(&quot;,&quot;))
+                    portAddition = server.Substring(server.IndexOf(&quot;,&quot;, StringComparison.Ordinal));
+
+                server = string.Format(&quot;{0}.database.windows.net{1}&quot;, serverName, portAddition);
+            }
+            
+            if (ServerStartsWithTcp(server) == false)
+                server = string.Format(&quot;tcp:{0}.database.windows.net&quot;, server);
+            
+            if (server.Contains(&quot;,&quot;) == false)
+                server = string.Format(&quot;{0},1433&quot;, server);
+
+            if (user.Contains(&quot;@&quot;) == false)
+            {
+                var userDomain = server;
+
+                if (ServerStartsWithTcp(server))
+                    userDomain = userDomain.Substring(userDomain.IndexOf(&quot;:&quot;, StringComparison.Ordinal) + 1);
+
+                if (userDomain.Contains(&quot;.&quot;))
+                    userDomain = userDomain.Substring(0, userDomain.IndexOf(&quot;.&quot;, StringComparison.Ordinal));
+
+                user = string.Format(&quot;{0}@{1}&quot;, user, userDomain);
+            }
+
+            return string.Format(&quot;Server={0};Database={1};User ID={2};Password={3}&quot;, server, databaseName, user, password);
+        }
+
+        private static bool ServerStartsWithTcp(string server)
+        {
+            return server.ToLower().StartsWith(&quot;tcp:&quot;.ToLower());
+        }
+
+        /// &lt;summary&gt;
+        /// Saves the connection string as a proper .net ConnectionString and the legacy AppSettings key/value.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Saves the ConnectionString in the very nasty &#39;medium trust&#39;-supportive way.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;connectionString&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;providerName&quot;&gt;&lt;/param&gt;
+        private void SaveConnectionString(string connectionString, string providerName)
+        {
+            //Set the connection string for the new datalayer
+            var connectionStringSettings = string.IsNullOrEmpty(providerName)
+                                      ? new ConnectionStringSettings(GlobalSettings.UmbracoConnectionName,
+                                                                     connectionString)
+                                      : new ConnectionStringSettings(GlobalSettings.UmbracoConnectionName,
+                                                                     connectionString, providerName);
+
+            _connectionString = connectionString;
+            _providerName = providerName;
+            
+            var fileName = IOHelper.MapPath(string.Format(&quot;{0}/web.config&quot;, SystemDirectories.Root));
+            var xml = XDocument.Load(fileName, LoadOptions.PreserveWhitespace);
+            var connectionstrings = xml.Root.DescendantsAndSelf(&quot;connectionStrings&quot;).Single();
+
+            // Update connectionString if it exists, or else create a new appSetting for the given key and value
+            var setting = connectionstrings.Descendants(&quot;add&quot;).FirstOrDefault(s =&gt; s.Attribute(&quot;name&quot;).Value == GlobalSettings.UmbracoConnectionName);
+            if (setting == null)
+                connectionstrings.Add(new XElement(&quot;add&quot;,
+                    new XAttribute(&quot;name&quot;, GlobalSettings.UmbracoConnectionName),
+                    new XAttribute(&quot;connectionString&quot;, connectionStringSettings),
+                    new XAttribute(&quot;providerName&quot;, providerName)));
+            else
+            {
+                setting.Attribute(&quot;connectionString&quot;).Value = connectionString;
+                setting.Attribute(&quot;providerName&quot;).Value = providerName;
+            }
+
+            xml.Save(fileName, SaveOptions.DisableFormatting);
+
+            _logger.Info&lt;DatabaseContext&gt;(&quot;Configured a new ConnectionString using the &#39;&quot; + providerName + &quot;&#39; provider.&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Internal method to initialize the database configuration.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// If an Umbraco connectionstring exists the database can be configured on app startup,
+        /// but if its a new install the entry doesn&#39;t exist and the db cannot be configured.
+        /// So for new installs the Initialize() method should be called after the connectionstring
+        /// has been added to the web.config.
+        /// &lt;/remarks&gt;
+        internal void Initialize()
+        {
+            var databaseSettings = ConfigurationManager.ConnectionStrings[GlobalSettings.UmbracoConnectionName];
+            if (databaseSettings != null &amp;&amp; string.IsNullOrWhiteSpace(databaseSettings.ConnectionString) == false &amp;&amp; string.IsNullOrWhiteSpace(databaseSettings.ProviderName) == false)
+            {
+                var providerName = Constants.DatabaseProviders.SqlServer;
+                string connString = null;
+                if (!string.IsNullOrEmpty(ConfigurationManager.ConnectionStrings[GlobalSettings.UmbracoConnectionName].ProviderName))
+                {
+                    providerName = ConfigurationManager.ConnectionStrings[GlobalSettings.UmbracoConnectionName].ProviderName;
+                    connString = ConfigurationManager.ConnectionStrings[GlobalSettings.UmbracoConnectionName].ConnectionString;
+                }
+                Initialize(providerName, connString);
+                
+            }
+            else if (ConfigurationManager.AppSettings.ContainsKey(GlobalSettings.UmbracoConnectionName) &amp;&amp; string.IsNullOrEmpty(ConfigurationManager.AppSettings[GlobalSettings.UmbracoConnectionName]) == false)
+            {
+                //A valid connectionstring does not exist, but the legacy appSettings key was found, so we&#39;ll reconfigure the conn.string.
+                var legacyConnString = ConfigurationManager.AppSettings[GlobalSettings.UmbracoConnectionName];
+                if (legacyConnString.ToLowerInvariant().Contains(&quot;sqlce4umbraco&quot;))
+                {
+                    ConfigureEmbeddedDatabaseConnection();
+                }
+                else if (legacyConnString.ToLowerInvariant().Contains(&quot;tcp:&quot;))
+                {
+                    //Must be sql azure
+                    SaveConnectionString(legacyConnString, Constants.DatabaseProviders.SqlServer);
+                    Initialize(Constants.DatabaseProviders.SqlServer);
+                }
+                else if (legacyConnString.ToLowerInvariant().Contains(&quot;datalayer=mysql&quot;))
+                {
+                    //Must be MySql
+
+                    //Need to strip the datalayer part off
+                    var connectionStringWithoutDatalayer = string.Empty;
+                    foreach (var variable in legacyConnString.Split(&#39;;&#39;).Where(x =&gt; x.ToLowerInvariant().StartsWith(&quot;datalayer&quot;) == false))
+                        connectionStringWithoutDatalayer = string.Format(&quot;{0}{1};&quot;, connectionStringWithoutDatalayer, variable);
+
+                    SaveConnectionString(connectionStringWithoutDatalayer, Constants.DatabaseProviders.MySql);
+                    Initialize(Constants.DatabaseProviders.MySql);
+                }
+                else
+                {
+                    //Must be sql
+                    SaveConnectionString(legacyConnString, Constants.DatabaseProviders.SqlServer);
+                    Initialize(Constants.DatabaseProviders.SqlServer);
+                }
+
+                //Remove the legacy connection string, so we don&#39;t end up in a loop if something goes wrong.
+                GlobalSettings.RemoveSetting(GlobalSettings.UmbracoConnectionName);
+                
+            }
+            else
+            {
+                _configured = false;
+            }
+        }
+
+        internal void Initialize(string providerName)
+        {
+            //only configure once!
+            if (_configured == true) return;
+
+            _providerName = providerName;
+
+            try
+            {
+                if (_syntaxProviders != null)
+                {
+                    SqlSyntax = _syntaxProviders.GetByProviderNameOrDefault(providerName);    
+                }
+                else if (SqlSyntax == null)
+                {
+                    throw new InvalidOperationException(&quot;No &quot; + typeof(ISqlSyntaxProvider) + &quot; specified or no &quot; + typeof(SqlSyntaxProviders) + &quot; instance specified&quot;);
+                }
+                
+                SqlSyntaxContext.SqlSyntaxProvider = SqlSyntax;
+                
+                _configured = true;
+            }
+            catch (Exception e)
+            {
+                _configured = false;
+
+                _logger.Info&lt;DatabaseContext&gt;(&quot;Initialization of the DatabaseContext failed with following error: &quot; + e.Message);
+                _logger.Info&lt;DatabaseContext&gt;(e.StackTrace);
+            }
+        }
+
+        internal void Initialize(string providerName, string connectionString)
+        {
+            _connectionString = connectionString;
+            Initialize(providerName);
+        }
+
+        internal DatabaseSchemaResult ValidateDatabaseSchema()
+        {
+            if (_configured == false || (string.IsNullOrEmpty(_connectionString) || string.IsNullOrEmpty(ProviderName)))
+                return new DatabaseSchemaResult();
+
+            if (_result == null)
+            {
+
+                if (SystemUtilities.GetCurrentTrustLevel() != AspNetHostingPermissionLevel.Unrestricted
+                    &amp;&amp; ProviderName == Constants.DatabaseProviders.MySql)
+                {
+                    throw new InvalidOperationException(&quot;Cannot use MySql in Medium Trust configuration&quot;);
+                }
+
+                var database = new UmbracoDatabase(_connectionString, ProviderName, _logger);
+                var dbSchema = new DatabaseSchemaCreation(database, _logger, SqlSyntax);
+                _result = dbSchema.ValidateSchema();
+            }
+            return _result;
+        }
+
+        internal Result CreateDatabaseSchemaAndData(ApplicationContext applicationContext)
+        {   
+            try
+            {
+                var readyForInstall = CheckReadyForInstall();
+                if (readyForInstall.Success == false)
+                {
+                    return readyForInstall.Result;
+                }
+
+                _logger.Info&lt;DatabaseContext&gt;(&quot;Database configuration status: Started&quot;);
+
+                string message;
+
+                var database = new UmbracoDatabase(_connectionString, ProviderName, _logger);
+
+                // If MySQL, we&#39;re going to ensure that database calls are maintaining proper casing as to remove the necessity for checks
+                // for case insensitive queries. In an ideal situation (which is what we&#39;re striving for), all calls would be case sensitive.
+
+                /*                
+                var supportsCaseInsensitiveQueries = SqlSyntax.SupportsCaseInsensitiveQueries(database);
+                if (supportsCaseInsensitiveQueries  == false)
+                {
+                    message = &quot;&lt;p&gt;&amp;nbsp;&lt;/p&gt;&lt;p&gt;The database you&#39;re trying to use does not support case insensitive queries. &lt;br /&gt;We currently do not support these types of databases.&lt;/p&gt;&quot; +
+                              &quot;&lt;p&gt;You can fix this by changing the following setting in your my.ini file in your MySQL installation directory:&lt;/p&gt;&quot; +
+                              &quot;&lt;pre&gt;lower_case_table_names=1&lt;/pre&gt;&lt;br /&gt;&quot; +
+                              &quot;&lt;p&gt;Note: Make sure to check with your hosting provider if they support case insensitive queries as well.&lt;/p&gt;&quot; +
+                              &quot;&lt;p&gt;For more technical information on case sensitivity in MySQL, have a look at &quot; +
+                              &quot;&lt;a href=&#39;http://dev.mysql.com/doc/refman/5.0/en/identifier-case-sensitivity.html&#39;&gt;the documentation on the subject&lt;/a&gt;&lt;/p&gt;&quot;;
+
+                    return new Result { Message = message, Success = false, Percentage = &quot;15&quot; };
+                }
+                */
+
+                message = GetResultMessageForMySql();
+
+                var schemaResult = ValidateDatabaseSchema();
+                
+                var installedSchemaVersion = schemaResult.DetermineInstalledVersion();
+                
+                //If Configuration Status is empty and the determined version is &quot;empty&quot; its a new install - otherwise upgrade the existing
+                if (string.IsNullOrEmpty(GlobalSettings.ConfigurationStatus) &amp;&amp; installedSchemaVersion.Equals(new Version(0, 0, 0)))
+                {
+                    var helper = new DatabaseSchemaHelper(database, _logger, SqlSyntax);
+                    helper.CreateDatabaseSchema(true, applicationContext);
+
+                    message = message + &quot;&lt;p&gt;Installation completed!&lt;/p&gt;&quot;;
+
+                    //now that everything is done, we need to determine the version of SQL server that is executing
+                    _logger.Info&lt;DatabaseContext&gt;(&quot;Database configuration status: &quot; + message);
+                    return new Result { Message = message, Success = true, Percentage = &quot;100&quot; };
+                }
+
+                //we need to do an upgrade so return a new status message and it will need to be done during the next step
+                _logger.Info&lt;DatabaseContext&gt;(&quot;Database requires upgrade&quot;);
+                message = &quot;&lt;p&gt;Upgrading database, this may take some time...&lt;/p&gt;&quot;;
+                return new Result
+                    {
+                        RequiresUpgrade = true, 
+                        Message = message, 
+                        Success = true, 
+                        Percentage = &quot;30&quot;
+                    };
+            }
+            catch (Exception ex)
+            {
+                return HandleInstallException(ex);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This assumes all of the previous checks are done!
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal Result UpgradeSchemaAndData(IMigrationEntryService migrationEntryService)
+        {
+            try
+            {
+
+                var readyForInstall = CheckReadyForInstall();
+                if (readyForInstall.Success == false)
+                {
+                    return readyForInstall.Result;
+                }
+
+                _logger.Info&lt;DatabaseContext&gt;(&quot;Database upgrade started&quot;);
+
+                var database = new UmbracoDatabase(_connectionString, ProviderName, _logger);
+                //var supportsCaseInsensitiveQueries = SqlSyntax.SupportsCaseInsensitiveQueries(database);                
+
+                var message = GetResultMessageForMySql();
+
+                var schemaResult = ValidateDatabaseSchema();
+
+                var installedSchemaVersion = new SemVersion(schemaResult.DetermineInstalledVersion());
+
+                var installedMigrationVersion = schemaResult.DetermineInstalledVersionByMigrations(migrationEntryService);    
+                
+                var targetVersion = UmbracoVersion.Current;
+                
+                //In some cases - like upgrading from 7.2.6 -&gt; 7.3, there will be no migration information in the database and therefore it will
+                // return a version of 0.0.0 and we don&#39;t necessarily want to run all migrations from 0 -&gt; 7.3, so we&#39;ll just ensure that the 
+                // migrations are run for the target version
+                if (installedMigrationVersion == new SemVersion(new Version(0, 0, 0)) &amp;&amp; installedSchemaVersion &gt; new SemVersion(new Version(0, 0, 0)))
+                {
+                    //set the installedMigrationVersion to be one less than the target so the latest migrations are guaranteed to execute
+                    installedMigrationVersion = new SemVersion(targetVersion.SubtractRevision());
+                }
+                
+                //Figure out what our current installed version is. If the web.config doesn&#39;t have a version listed, then we&#39;ll use the minimum
+                // version detected between the schema installed and the migrations listed in the migration table. 
+                // If there is a version in the web.config, we&#39;ll take the minimum between the listed migration in the db and what
+                // is declared in the web.config.
+                
+                var currentInstalledVersion = string.IsNullOrEmpty(GlobalSettings.ConfigurationStatus)
+                    //Take the minimum version between the detected schema version and the installed migration version
+                    ? new[] {installedSchemaVersion, installedMigrationVersion}.Min()
+                    //Take the minimum version between the installed migration version and the version specified in the config
+                    : new[] { SemVersion.Parse(GlobalSettings.ConfigurationStatus), installedMigrationVersion }.Min();
+
+                //Ok, another edge case here. If the current version is a pre-release, 
+                // then we want to ensure all migrations for the current release are executed. 
+                if (currentInstalledVersion.Prerelease.IsNullOrWhiteSpace() == false)
+                {
+                    currentInstalledVersion  = new SemVersion(currentInstalledVersion.GetVersion().SubtractRevision());
+                }
+
+                //DO the upgrade!
+
+                var runner = new MigrationRunner(migrationEntryService, _logger, currentInstalledVersion, UmbracoVersion.GetSemanticVersion(), GlobalSettings.UmbracoMigrationName);
+
+                var upgraded = runner.Execute(database, true);
+
+                if (upgraded == false)
+                {
+                    throw new ApplicationException(&quot;Upgrading failed, either an error occurred during the upgrade process or an event canceled the upgrade process, see log for full details&quot;);
+                }
+
+                message = message + &quot;&lt;p&gt;Upgrade completed!&lt;/p&gt;&quot;;
+
+                //now that everything is done, we need to determine the version of SQL server that is executing
+
+                _logger.Info&lt;DatabaseContext&gt;(&quot;Database configuration status: &quot; + message);
+
+                return new Result { Message = message, Success = true, Percentage = &quot;100&quot; };
+            }
+            catch (Exception ex)
+            {
+                return HandleInstallException(ex);
+            }
+        }
+
+        private string GetResultMessageForMySql()
+        {
+            if (SqlSyntax.GetType() == typeof(MySqlSyntaxProvider))
+            {
+                return &quot;&lt;p&gt;&amp;nbsp;&lt;/p&gt;&lt;p&gt;Congratulations, the database step ran successfully!&lt;/p&gt;&quot; +
+                       &quot;&lt;p&gt;Note: You&#39;re using MySQL and the database instance you&#39;re connecting to seems to support case insensitive queries.&lt;/p&gt;&quot; +
+                       &quot;&lt;p&gt;However, your hosting provider may not support this option. Umbraco does not currently support MySQL installs that do not support case insensitive queries&lt;/p&gt;&quot; +
+                       &quot;&lt;p&gt;Make sure to check with your hosting provider if they support case insensitive queries as well.&lt;/p&gt;&quot; +
+                       &quot;&lt;p&gt;They can check this by looking for the following setting in the my.ini file in their MySQL installation directory:&lt;/p&gt;&quot; +
+                       &quot;&lt;pre&gt;lower_case_table_names=1&lt;/pre&gt;&lt;br /&gt;&quot; +
+                       &quot;&lt;p&gt;For more technical information on case sensitivity in MySQL, have a look at &quot; +
+                       &quot;&lt;a href=&#39;http://dev.mysql.com/doc/refman/5.0/en/identifier-case-sensitivity.html&#39;&gt;the documentation on the subject&lt;/a&gt;&lt;/p&gt;&quot;;
+            }
+            return string.Empty;
+        }
+
+        /*
+        private string GetResultMessageForMySql(bool? supportsCaseInsensitiveQueries)
+        {
+            if (supportsCaseInsensitiveQueries == null)
+            {
+                return &quot;&lt;p&gt;&amp;nbsp;&lt;/p&gt;&lt;p&gt;Warning! Could not check if your database type supports case insensitive queries. &lt;br /&gt;We currently do not support these databases that do not support case insensitive queries.&lt;/p&gt;&quot; +
+                          &quot;&lt;p&gt;You can check this by looking for the following setting in your my.ini file in your MySQL installation directory:&lt;/p&gt;&quot; +
+                          &quot;&lt;pre&gt;lower_case_table_names=1&lt;/pre&gt;&lt;br /&gt;&quot; +
+                          &quot;&lt;p&gt;Note: Make sure to check with your hosting provider if they support case insensitive queries as well.&lt;/p&gt;&quot; +
+                          &quot;&lt;p&gt;For more technical information on case sensitivity in MySQL, have a look at &quot; +
+                          &quot;&lt;a href=&#39;http://dev.mysql.com/doc/refman/5.0/en/identifier-case-sensitivity.html&#39;&gt;the documentation on the subject&lt;/a&gt;&lt;/p&gt;&quot;;
+            }
+            if (SqlSyntax.GetType() == typeof(MySqlSyntaxProvider))
+            {
+                return &quot;&lt;p&gt;&amp;nbsp;&lt;/p&gt;&lt;p&gt;Congratulations, the database step ran successfully!&lt;/p&gt;&quot; +
+                       &quot;&lt;p&gt;Note: You&#39;re using MySQL and the database instance you&#39;re connecting to seems to support case insensitive queries.&lt;/p&gt;&quot; +
+                       &quot;&lt;p&gt;However, your hosting provider may not support this option. Umbraco does not currently support MySQL installs that do not support case insensitive queries&lt;/p&gt;&quot; +
+                       &quot;&lt;p&gt;Make sure to check with your hosting provider if they support case insensitive queries as well.&lt;/p&gt;&quot; +
+                       &quot;&lt;p&gt;They can check this by looking for the following setting in the my.ini file in their MySQL installation directory:&lt;/p&gt;&quot; +
+                       &quot;&lt;pre&gt;lower_case_table_names=1&lt;/pre&gt;&lt;br /&gt;&quot; +
+                       &quot;&lt;p&gt;For more technical information on case sensitivity in MySQL, have a look at &quot; +
+                       &quot;&lt;a href=&#39;http://dev.mysql.com/doc/refman/5.0/en/identifier-case-sensitivity.html&#39;&gt;the documentation on the subject&lt;/a&gt;&lt;/p&gt;&quot;;
+            }
+            return string.Empty;
+        }*/
+
+        private Attempt&lt;Result&gt; CheckReadyForInstall()
+        {
+            if (SystemUtilities.GetCurrentTrustLevel() != AspNetHostingPermissionLevel.Unrestricted
+                    &amp;&amp; ProviderName == Constants.DatabaseProviders.MySql)
+            {
+                throw new InvalidOperationException(&quot;Cannot use MySql in Medium Trust configuration&quot;);
+            }
+
+            if (_configured == false || (string.IsNullOrEmpty(_connectionString) || string.IsNullOrEmpty(ProviderName)))
+            {
+                return Attempt.Fail(new Result
+                {
+                    Message =
+                        &quot;Database configuration is invalid. Please check that the entered database exists and that the provided username and password has write access to the database.&quot;,
+                    Success = false,
+                    Percentage = &quot;10&quot;
+                });
+            }
+            return Attempt&lt;Result&gt;.Succeed();
+        }
+
+        private Result HandleInstallException(Exception ex)
+        {
+            _logger.Error&lt;DatabaseContext&gt;(&quot;Database configuration failed&quot;, ex);
+
+            if (_result != null)
+            {
+                _logger.Info&lt;DatabaseContext&gt;(&quot;The database schema validation produced the following summary: \n&quot; + _result.GetSummary());
+            }
+
+            return new Result
+            {
+                Message =
+                    &quot;The database configuration failed with the following message: &quot; + ex.Message +
+                    &quot;\n Please check log file for additional information (can be found in &#39;/App_Data/Logs/UmbracoTraceLog.txt&#39;)&quot;,
+                Success = false,
+                Percentage = &quot;90&quot;
+            };
+        }
+
+        internal class Result
+        {
+            public bool RequiresUpgrade { get; set; }
+            public string Message { get; set; }
+            public bool Success { get; set; }
+            public string Percentage { get; set; }
+        }
+
+        internal bool IsConnectionStringConfigured(ConnectionStringSettings databaseSettings)
+        {
+            var dbIsSqlCe = false;
+            if (databaseSettings != null &amp;&amp; databaseSettings.ProviderName != null)
+                dbIsSqlCe = databaseSettings.ProviderName == Constants.DatabaseProviders.SqlCe;
+            var sqlCeDatabaseExists = false;
+            if (dbIsSqlCe)
+            {
+                var parts = databaseSettings.ConnectionString.Split(new[] { &#39;;&#39; }, StringSplitOptions.RemoveEmptyEntries);
+                var dataSourcePart = parts.FirstOrDefault(x =&gt; x.InvariantStartsWith(&quot;Data Source=&quot;));
+                if (dataSourcePart != null)
+                {
+                    var datasource = dataSourcePart.Replace(&quot;|DataDirectory|&quot;, AppDomain.CurrentDomain.GetData(&quot;DataDirectory&quot;).ToString());
+                    var filePath = datasource.Replace(&quot;Data Source=&quot;, string.Empty);
+                    sqlCeDatabaseExists = File.Exists(filePath);                    
+                }
+            }
+
+            // Either the connection details are not fully specified or it&#39;s a SQL CE database that doesn&#39;t exist yet
+            if (databaseSettings == null
+                || string.IsNullOrWhiteSpace(databaseSettings.ConnectionString) || string.IsNullOrWhiteSpace(databaseSettings.ProviderName)
+                || (dbIsSqlCe &amp;&amp; sqlCeDatabaseExists == false))
+            {
+                return false;
+            }
+
+            return true;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[33,9,33,56,1],[33,9,33,56,1],[37,9,37,57,1],[37,9,37,57,1],[46,15,51,16,0],[52,9,52,10,0],[53,9,53,10,0],[61,9,61,109,1],[62,9,62,10,1],[63,13,63,33,1],[63,34,63,77,0],[64,13,64,32,1],[64,33,64,75,0],[65,13,65,41,1],[65,42,65,93,0],[67,13,67,32,1],[68,13,68,30,1],[69,13,69,48,1],[70,9,70,10,1],[79,9,79,124,1],[80,9,80,10,1],[81,13,81,42,1],[82,13,82,35,1],[83,13,83,60,1],[84,13,84,32,1],[85,13,85,30,1],[86,13,86,32,1],[87,9,87,10,1],[89,47,89,51,1],[89,52,89,64,1],[101,17,101,18,1],[101,19,101,52,1],[101,53,101,54,1],[109,17,109,18,1],[109,19,109,38,1],[109,39,109,40,1],[118,13,118,14,1],[119,17,119,51,1],[120,21,120,34,0],[126,17,127,65,1],[128,17,128,18,1],[129,21,129,119,1],[130,21,130,83,1],[132,21,132,100,1],[133,21,133,39,1],[136,17,136,56,0],[137,13,137,14,1],[146,17,146,18,1],[146,19,146,44,1],[146,45,146,46,1],[155,13,155,14,1],[156,17,156,66,1],[157,21,157,42,1],[159,17,159,71,0],[160,17,160,106,0],[161,17,161,18,0],[162,21,162,146,0],[163,25,163,131,0],[164,17,164,18,0],[166,17,166,18,0],[167,21,167,152,0],[169,17,169,38,0],[170,13,170,14,1],[179,13,179,14,1],[180,17,180,113,1],[182,17,182,48,1],[182,49,182,80,0],[183,17,183,82,1],[183,83,183,120,1],[184,17,184,49,0],[184,50,184,86,0],[185,17,185,84,0],[185,85,185,117,0],[186,17,186,49,0],[186,50,186,82,0],[187,17,187,46,0],[187,47,187,81,0],[189,17,189,52,0],[190,13,190,14,1],[197,9,197,10,0],[200,13,200,74,0],[201,13,201,66,0],[203,13,203,95,0],[204,13,204,44,0],[205,13,205,14,0],[206,24,206,70,0],[207,17,207,18,0],[208,21,208,45,0],[209,17,209,18,0],[210,13,210,14,0],[212,13,212,38,0],[213,9,213,10,0],[216,9,216,10,0],[217,13,217,81,0],[218,9,218,10,0],[228,9,228,10,0],[229,13,229,104,0],[230,13,230,56,0],[231,13,231,70,0],[232,13,232,62,0],[233,13,233,14,0],[234,17,234,66,0],[235,13,235,14,0],[236,13,236,66,0],[237,13,237,38,0],[238,9,238,10,0],[249,9,249,10,0],[251,13,251,138,0],[253,13,253,66,0],[254,13,254,38,0],[255,9,255,10,0],[258,9,258,10,0],[259,13,259,66,0],[260,13,260,62,0],[261,13,261,14,0],[262,17,262,66,0],[263,17,263,120,0],[265,13,265,62,0],[266,13,266,14,0],[267,17,267,89,0],[269,13,269,124,0],[270,9,270,10,0],[278,9,278,10,0],[280,13,280,104,0],[281,13,281,66,0],[282,13,282,38,0],[283,9,283,10,0],[286,9,286,10,0],[287,13,287,108,0],[288,9,288,10,0],[291,9,291,10,1],[292,13,292,78,1],[293,17,293,59,0],[295,13,295,78,1],[296,13,296,14,1],[297,17,299,50,1],[301,17,301,49,1],[303,17,303,42,1],[304,21,304,100,1],[306,17,306,97,1],[307,13,307,14,1],[309,13,309,54,1],[310,17,310,80,1],[312,13,312,47,1],[313,17,313,60,1],[315,13,315,45,1],[316,13,316,14,1],[317,17,317,41,1],[319,17,319,49,1],[320,21,320,110,1],[322,17,322,46,1],[323,21,323,109,1],[325,17,325,67,1],[326,13,326,14,1],[328,13,328,124,1],[329,9,329,10,1],[332,9,332,10,1],[333,13,333,66,1],[334,9,334,10,1],[345,9,345,10,0],[347,13,351,102,0],[353,13,353,50,0],[354,13,354,42,0],[356,13,356,102,0],[357,13,357,80,0],[358,13,358,95,0],[361,13,361,84,0],[361,84,361,149,0],[361,149,361,151,0],[361,13,361,151,0],[362,13,362,33,0],[363,17,366,68,0],[368,13,368,14,0],[369,17,369,80,0],[370,17,370,72,0],[371,13,371,14,0],[373,13,373,63,0],[375,13,375,123,0],[376,9,376,10,0],[388,9,388,10,1],[389,13,389,113,1],[390,13,390,184,1],[391,13,391,14,1],[392,17,392,74,1],[393,17,393,42,1],[394,17,394,134,1],[395,17,395,18,1],[396,21,396,126,1],[397,21,397,128,1],[398,17,398,18,1],[399,17,399,54,1],[401,13,401,14,1],[402,18,402,210,0],[403,13,403,14,0],[405,17,405,111,0],[406,17,406,83,0],[407,17,407,18,0],[408,21,408,59,0],[409,17,409,18,0],[410,22,410,79,0],[411,17,411,18,0],[413,21,413,99,0],[414,21,414,71,0],[415,17,415,18,0],[416,22,416,90,0],[417,17,417,18,0],[421,21,421,73,0],[422,21,422,28,0],[422,30,422,42,0],[422,43,422,45,0],[422,46,422,85,0],[422,85,422,138,0],[422,138,422,139,0],[422,46,422,139,0],[423,25,423,129,0],[425,21,425,111,0],[426,21,426,67,0],[427,17,427,18,0],[429,17,429,18,0],[431,21,431,99,0],[432,21,432,71,0],[433,17,433,18,0],[436,17,436,84,0],[438,13,438,14,0],[440,13,440,14,0],[441,17,441,37,0],[442,13,442,14,0],[443,9,443,10,1],[446,9,446,10,1],[448,13,448,37,1],[448,38,448,45,1],[450,13,450,42,1],[453,13,453,14,1],[454,17,454,46,1],[455,17,455,18,1],[456,21,456,91,1],[457,17,457,18,1],[458,22,458,44,0],[459,17,459,18,0],[460,21,460,168,0],[463,17,463,64,1],[465,17,465,36,1],[466,13,466,14,1],[467,13,467,32,0],[468,13,468,14,0],[469,17,469,37,0],[471,17,471,130,0],[472,17,472,61,0],[473,13,473,14,0],[474,9,474,10,1],[477,9,477,10,1],[478,13,478,50,1],[479,13,479,38,1],[480,9,480,10,1],[483,9,483,10,0],[484,13,484,121,0],[485,17,485,51,0],[487,13,487,33,0],[488,13,488,14,0],[490,17,491,74,0],[492,17,492,18,0],[493,21,493,107,0],[496,17,496,94,0],[497,17,497,89,0],[498,17,498,53,0],[499,13,499,14,0],[500,13,500,28,0],[501,9,501,10,0],[504,9,504,10,0],[506,13,506,14,0],[507,17,507,62,0],[508,17,508,54,0],[509,17,509,18,0],[510,21,510,51,0],[513,17,513,89,0],[517,17,517,94,0],[537,17,537,54,0],[539,17,539,61,0],[541,17,541,87,0],[544,17,544,133,0],[545,17,545,18,0],[546,21,546,89,0],[547,21,547,75,0],[549,21,549,74,0],[552,21,552,96,0],[553,21,553,97,0],[557,17,557,76,0],[558,17,558,83,0],[559,17,565,23,0],[567,13,567,33,0],[568,13,568,14,0],[569,17,569,51,0],[571,9,571,10,0],[578,9,578,10,0],[580,13,580,14,0],[582,17,582,62,0],[583,17,583,54,0],[584,17,584,18,0],[585,21,585,51,0],[588,17,588,75,0],[590,17,590,94,0],[593,17,593,58,0],[595,17,595,61,0],[597,17,597,103,0],[599,17,599,123,0],[601,17,601,60,0],[606,17,606,152,0],[607,17,607,18,0],[609,21,609,98,0],[610,17,610,18,0],[617,17,621,119,0],[625,17,625,86,0],[626,17,626,18,0],[627,21,627,120,0],[628,17,628,18,0],[632,17,632,181,0],[634,17,634,63,0],[636,17,636,39,0],[637,17,637,18,0],[638,21,638,192,0],[641,17,641,65,0],[645,17,645,92,0],[647,17,647,93,0],[649,13,649,33,0],[650,13,650,14,0],[651,17,651,51,0],[653,9,653,10,0],[656,9,656,10,0],[657,13,657,68,0],[658,13,658,14,0],[659,17,666,149,0],[668,13,668,33,0],[669,9,669,10,0],[698,9,698,10,0],[699,13,700,74,0],[701,13,701,14,0],[702,17,702,103,0],[705,13,705,121,0],[706,13,706,14,0],[707,17,713,20,0],[715,13,715,46,0],[716,9,716,10,0],[719,9,719,10,0],[720,13,720,81,0],[722,13,722,33,0],[723,13,723,14,0],[724,17,724,139,0],[725,13,725,14,0],[727,13,734,15,0],[735,9,735,10,0],[739,43,739,47,0],[739,48,739,52,0],[740,37,740,41,0],[740,42,740,46,0],[741,35,741,39,0],[741,40,741,44,0],[742,40,742,44,0],[742,45,742,49,0],[746,9,746,10,0],[747,13,747,35,0],[748,13,748,83,0],[749,17,749,96,0],[750,13,750,45,0],[751,13,751,27,0],[752,13,752,14,0],[753,17,753,123,0],[754,17,754,64,0],[754,64,754,101,0],[754,101,754,103,0],[754,17,754,103,0],[755,17,755,44,0],[756,17,756,18,0],[757,21,757,141,0],[758,21,758,85,0],[759,21,759,65,0],[760,17,760,18,0],[761,13,761,14,0],[764,13,766,64,0],[767,13,767,14,0],[768,17,768,30,0],[771,13,771,25,0],[772,9,772,10,0]]);
+    </script>
+  </body>
+</html>

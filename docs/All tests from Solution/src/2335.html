@@ -1,0 +1,1954 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.MacroEngines\RazorDynamicNode\DynamicNode.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Dynamic;
+using System.Linq;
+using System.Threading;
+using System.Web;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Dynamics;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Strings;
+using umbraco.interfaces;
+using System.Collections;
+using System.Reflection;
+using umbraco.cms.businesslogic.web;
+using umbraco.cms.businesslogic.propertytype;
+using umbraco.cms.businesslogic.property;
+using umbraco.BusinessLogic;
+using umbraco.DataLayer;
+using umbraco.cms.businesslogic;
+using System.Xml;
+using System.Xml.Linq;
+using umbraco.cms.businesslogic.media;
+using umbraco.MacroEngines.Library;
+using umbraco.BusinessLogic.Utils;
+
+using Examine;
+using Examine.SearchCriteria;
+using Examine.LuceneEngine.SearchCriteria;
+
+namespace umbraco.MacroEngines
+{
+    public class DynamicNode : DynamicObject, INode
+    {
+		/// &lt;summary&gt;
+		/// This callback is used only so we can set it dynamically for use in unit tests
+		/// &lt;/summary&gt;
+		internal static Func&lt;string, string, Guid&gt; GetDataTypeCallback = (docTypeAlias, propertyAlias) =&gt;
+			ContentType.GetDataType(docTypeAlias, propertyAlias);
+
+        #region consts
+        // these are private readonlys as const can&#39;t be Guids
+        private readonly Guid DATATYPE_YESNO_GUID = new Guid(Constants.PropertyEditors.TrueFalse);
+        private readonly Guid DATATYPE_TINYMCE_GUID = new Guid(Constants.PropertyEditors.TinyMCEv3);
+        private readonly Guid DATATYPE_DATETIMEPICKER_GUID = new Guid(Constants.PropertyEditors.DateTime);
+        private readonly Guid DATATYPE_DATEPICKER_GUID = new Guid(Constants.PropertyEditors.Date);
+        //private readonly Guid DATATYPE_INTEGER_GUID = new Guid(&quot;1413afcb-d19a-4173-8e9a-68288d2a73b8&quot;);
+        #endregion
+
+		private DynamicNodeList _cachedChildren;
+		private readonly ConcurrentDictionary&lt;string, object&gt; _cachedMemberOutput = new ConcurrentDictionary&lt;string, object&gt;();
+        private readonly ConcurrentDictionary&lt;string, PropertyResult&gt; _cachedProperties = new ConcurrentDictionary&lt;string, PropertyResult&gt;();
+
+        internal readonly DynamicBackingItem n;
+
+        public DynamicNodeList ownerList;
+
+        public DynamicNode(DynamicBackingItem n)
+        {
+            if (n != null)
+                this.n = n;
+            else
+                throw new ArgumentNullException(&quot;n&quot;, &quot;A node must be provided to make a dynamic instance&quot;);
+        }
+        public DynamicNode(int NodeId)
+        {
+            this.n = new DynamicBackingItem(NodeId);
+        }
+        public DynamicNode(int NodeId, DynamicBackingItemType ItemType)
+        {
+            this.n = new DynamicBackingItem(NodeId, ItemType);
+        }
+        public DynamicNode(string NodeId)
+        {
+            int DynamicBackingItemId = 0;
+            if (int.TryParse(NodeId, out DynamicBackingItemId))
+            {
+                this.n = new DynamicBackingItem(DynamicBackingItemId);
+                return;
+            }
+            throw new ArgumentException(&quot;Cannot instantiate a DynamicNode without an id&quot;);
+        }
+        public DynamicNode(INode Node)
+        {
+            this.n = new DynamicBackingItem(Node);
+        }
+        public DynamicNode(object NodeId)
+        {
+            int DynamicBackingItemId = 0;
+            if (int.TryParse(string.Format(&quot;{0}&quot;, NodeId), out DynamicBackingItemId))
+            {
+                this.n = new DynamicBackingItem(DynamicBackingItemId);
+                return;
+            }
+            throw new ArgumentException(&quot;Cannot instantiate a DynamicNode without an id&quot;);
+        }
+        public DynamicNode()
+        {
+            //Empty constructor for a special case with Generic Methods
+        }
+
+        public DynamicNode Up()
+        {
+            return DynamicNodeWalker.Up(this);
+        }
+        public DynamicNode Up(int number)
+        {
+            return DynamicNodeWalker.Up(this, number);
+        }
+        public DynamicNode Up(string nodeTypeAlias)
+        {
+            return DynamicNodeWalker.Up(this, nodeTypeAlias);
+        }
+        public DynamicNode Down()
+        {
+            return DynamicNodeWalker.Down(this);
+        }
+        public DynamicNode Down(int number)
+        {
+            return DynamicNodeWalker.Down(this, number);
+        }
+        public DynamicNode Down(string nodeTypeAlias)
+        {
+            return DynamicNodeWalker.Down(this, nodeTypeAlias);
+        }
+        public DynamicNode Next()
+        {
+            return DynamicNodeWalker.Next(this);
+        }
+        public DynamicNode Next(int number)
+        {
+            return DynamicNodeWalker.Next(this, number);
+        }
+        public DynamicNode Next(string nodeTypeAlias)
+        {
+            return DynamicNodeWalker.Next(this, nodeTypeAlias);
+        }
+
+        public DynamicNode Previous()
+        {
+            return DynamicNodeWalker.Previous(this);
+        }
+        public DynamicNode Previous(int number)
+        {
+            return DynamicNodeWalker.Previous(this, number);
+        }
+        public DynamicNode Previous(string nodeTypeAlias)
+        {
+            return DynamicNodeWalker.Previous(this, nodeTypeAlias);
+        }
+        public DynamicNode Sibling(int number)
+        {
+            return DynamicNodeWalker.Sibling(this, number);
+        }
+        public DynamicNode Sibling(string nodeTypeAlias)
+        {
+            return DynamicNodeWalker.Sibling(this, nodeTypeAlias);
+        }
+        public DynamicNodeList GetChildrenAsList
+        {
+            get
+            {
+	            if (_cachedChildren == null)
+	            {
+					List&lt;DynamicBackingItem&gt; children = n.ChildrenAsList;
+					//testing
+					if (children.Count == 0 &amp;&amp; n.Id == 0)
+					{
+						_cachedChildren = new DynamicNodeList(new List&lt;DynamicBackingItem&gt; {this.n});
+					}
+					else
+					{
+                        _cachedChildren = new DynamicNodeList(children);
+					}
+	            }
+				return _cachedChildren;
+            }
+        }
+        public DynamicNodeList XPath(string xPath)
+        {
+            //if this DN was initialized with an underlying NodeFactory.Node
+            if (n != null &amp;&amp; n.Type == DynamicBackingItemType.Content)
+            {
+                //get the underlying xml content
+                XmlDocument doc = umbraco.content.Instance.XmlContent;
+                if (doc != null)
+                {
+                    //get n as a XmlNode (to be used as the context point for the xpath)
+                    //rather than just applying the xPath to the root node, this lets us use .. etc from the DynamicNode point
+
+
+                    //in test mode, n.Id is 0, let this always succeed
+                    if (n.Id == 0)
+                    {
+                        List&lt;DynamicNode&gt; selfList = new List&lt;DynamicNode&gt;() { this };
+                        return new DynamicNodeList(selfList);
+                    }
+                    XmlNode node = doc.SelectSingleNode(string.Format(&quot;//*[@id=&#39;{0}&#39;]&quot;, n.Id));
+                    if (node != null)
+                    {
+                        //got the current node (within the XmlContent instance)
+                        XmlNodeList nodes = node.SelectNodes(xPath);
+                        if (nodes.Count &gt; 0)
+                        {
+                            //we got some resulting nodes
+                            List&lt;NodeFactory.Node&gt; nodeFactoryNodeList = new List&lt;NodeFactory.Node&gt;();
+                            //attempt to convert each node in the set to a NodeFactory.Node
+                            foreach (XmlNode nodeXmlNode in nodes)
+                            {
+                                try
+                                {
+                                    nodeFactoryNodeList.Add(new NodeFactory.Node(nodeXmlNode));
+                                }
+                                catch (Exception) { } //swallow the exceptions - the returned nodes might not be full nodes, e.g. property
+                            }
+                            //Wanted to do this, but because we return DynamicNodeList here, the only
+                            //common parent class is DynamicObject
+                            //maybe some future refactoring will solve this?
+                            //if (nodeFactoryNodeList.Count == 0)
+                            //{
+                            //    //if the xpath resulted in a node set, but none of them could be converted to NodeFactory.Node
+                            //    XElement xElement = XElement.Parse(node.OuterXml);
+                            //    //return 
+                            //    return new DynamicXml(xElement);
+                            //}
+                            //convert the NodeFactory nodelist to IEnumerable&lt;DynamicNode&gt; and return it as a DynamicNodeList
+                            return new DynamicNodeList(nodeFactoryNodeList.ConvertAll(nfNode =&gt; new DynamicNode((INode)nfNode)));
+                        }
+                        else
+                        {
+                            // XPath returned no nodes, return an empty DynamicNodeList
+                            return new DynamicNodeList();
+                        }
+                    }
+                    else
+                    {
+                        throw new NullReferenceException(&quot;Couldn&#39;t locate the DynamicNode within the XmlContent&quot;);
+                    }
+                }
+                else
+                {
+                    throw new NullReferenceException(&quot;umbraco.content.Instance.XmlContent is null&quot;);
+                }
+            }
+            else
+            {
+                throw new NullReferenceException(&quot;DynamicNode wasn&#39;t initialized with an underlying NodeFactory.Node&quot;);
+            }
+        }
+        
+        
+        public DynamicNodeList Search(string term, bool useWildCards = true, string searchProvider = null)
+        {
+            var searcher = Examine.ExamineManager.Instance.DefaultSearchProvider;
+            if(!string.IsNullOrEmpty(searchProvider))
+                searcher = Examine.ExamineManager.Instance.SearchProviderCollection[searchProvider];
+
+            var t = term.Escape().Value;
+            if (useWildCards)
+                t = term.MultipleCharacterWildcard().Value;
+
+            string luceneQuery = &quot;+__Path:(&quot; + this.Path.Replace(&quot;-&quot;, &quot;\\-&quot;) + &quot;*) +&quot; + t;
+            var crit = searcher.CreateSearchCriteria().RawQuery(luceneQuery);
+
+            return Search(crit, searcher);
+        }
+
+        public DynamicNodeList SearchDescendants(string term, bool useWildCards = true, string searchProvider = null)
+        {
+            return Search(term, useWildCards, searchProvider);
+        }
+
+        public DynamicNodeList SearchChildren(string term, bool useWildCards = true, string searchProvider = null)
+        {
+            var searcher = Examine.ExamineManager.Instance.DefaultSearchProvider;
+            if (!string.IsNullOrEmpty(searchProvider))
+                searcher = Examine.ExamineManager.Instance.SearchProviderCollection[searchProvider];
+
+            var t = term.Escape().Value;
+            if (useWildCards)
+                t = term.MultipleCharacterWildcard().Value;
+
+            string luceneQuery = &quot;+parentID:&quot; + this.Id.ToString() + &quot; +&quot; + t;
+            var crit = searcher.CreateSearchCriteria().RawQuery(luceneQuery);
+
+            return Search(crit, searcher);
+        }
+
+
+        public DynamicNodeList Search(Examine.SearchCriteria.ISearchCriteria criteria, Examine.Providers.BaseSearchProvider searchProvider = null)
+        {
+            var s = Examine.ExamineManager.Instance.DefaultSearchProvider;
+            if (searchProvider != null)
+                s = searchProvider;
+            
+            var results = s.Search(criteria);
+            return ExamineSearchUtill.ConvertSearchResultToDynamicNode(results);
+        }
+        
+        
+        public bool HasProperty(string name)
+        {
+            if (n != null)
+            {
+                return GetProperty(name) != null;
+            }
+            return false;
+        }
+
+        public override bool TryInvokeMember(InvokeMemberBinder binder, object[] args, out object result)
+        {
+            try
+            {
+                //Property?
+                result = typeof(DynamicNode).InvokeMember(binder.Name,
+                                                  System.Reflection.BindingFlags.Instance |
+                                                  System.Reflection.BindingFlags.Public |
+                                                  System.Reflection.BindingFlags.GetProperty,
+                                                  null,
+                                                  this,
+                                                  args);
+                return true;
+            }
+            catch (MissingMethodException)
+            {
+                try
+                {
+                    //Static or Instance Method?
+                    result = typeof(DynamicNode).InvokeMember(binder.Name,
+                                                  System.Reflection.BindingFlags.Instance |
+                                                  System.Reflection.BindingFlags.Public |
+                                                  System.Reflection.BindingFlags.Static |
+                                                  System.Reflection.BindingFlags.InvokeMethod,
+                                                  null,
+                                                  this,
+                                                  args);
+                    return true;
+                }
+                catch (MissingMethodException)
+                {
+                    try
+                    {
+                        result = ExecuteExtensionMethod(args, binder.Name, false);
+                        return true;
+                    }
+                    catch (TargetInvocationException)
+                    {
+                        result = new DynamicNull();
+                        return true;
+                    }
+
+                    catch
+                    {
+                        result = null;
+                        return false;
+                    }
+
+                }
+
+
+            }
+            catch
+            {
+                result = null;
+                return false;
+            }
+
+        }
+
+        private object ExecuteExtensionMethod(object[] args, string name, bool argsContainsThis)
+        {
+            object result = null;
+
+            MethodInfo methodToExecute = ExtensionMethodFinder.FindExtensionMethod(typeof(IEnumerable&lt;DynamicNode&gt;), args, name, false);
+            if (methodToExecute == null)
+            {
+                methodToExecute = ExtensionMethodFinder.FindExtensionMethod(typeof(DynamicNodeList), args, name, false);
+            }
+            if (methodToExecute != null)
+            {
+                var genericArgs = (new[] { this }).Concat(args);
+                result = methodToExecute.Invoke(null, genericArgs.ToArray());
+            }
+            else
+            {
+                throw new MissingMethodException();
+            }
+            if (result != null)
+            {
+                if (result is IEnumerable&lt;DynamicBackingItem&gt;)
+                {
+                    result = new DynamicNodeList((IEnumerable&lt;DynamicBackingItem&gt;)result);
+                }
+                if (result is IEnumerable&lt;DynamicNode&gt;)
+                {
+                    result = new DynamicNodeList((IEnumerable&lt;DynamicNode&gt;)result);
+                }
+                if (result is DynamicBackingItem)
+                {
+                    result = new DynamicNode((DynamicBackingItem)result);
+                }
+            }
+            return result;
+        }
+
+    	private static Dictionary&lt;System.Tuple&lt;Guid, int&gt;, Type&gt; _razorDataTypeModelTypes = null;
+    	private static readonly ReaderWriterLockSlim _locker = new ReaderWriterLockSlim();
+
+    	internal static Dictionary&lt;System.Tuple&lt;Guid, int&gt;, Type&gt; RazorDataTypeModelTypes
+    	{
+    		get
+    		{
+    			using (var l = new UpgradeableReadLock(_locker))
+    			{
+    				if (_razorDataTypeModelTypes == null)
+    				{
+    					l.UpgradeToWriteLock();
+
+    					var foundTypes = new Dictionary&lt;System.Tuple&lt;Guid, int&gt;, Type&gt;();
+
+						try
+						{
+							PluginManager.Current.ResolveRazorDataTypeModels()
+								.ToList()
+								.ConvertAll(type =&gt;
+								{
+									var razorDataTypeModelAttributes = type.GetCustomAttributes&lt;RazorDataTypeModel&gt;(true);
+									return razorDataTypeModelAttributes.ToList().ConvertAll(razorDataTypeModelAttribute =&gt;
+									{
+										var g = razorDataTypeModelAttribute.DataTypeEditorId;
+										var priority = razorDataTypeModelAttribute.Priority;
+										return new KeyValuePair&lt;System.Tuple&lt;Guid, int&gt;, Type&gt;(new System.Tuple&lt;Guid, int&gt;(g, priority), type);
+									});
+								})
+								.SelectMany(item =&gt; item)
+								.ToList()
+								.ForEach(item =&gt;
+								{
+									System.Tuple&lt;Guid, int&gt; key = item.Key;
+									if (!foundTypes.ContainsKey(key))
+									{
+										foundTypes.Add(key, item.Value);
+									}
+								});
+
+							//there is no error, so set the collection
+							_razorDataTypeModelTypes = foundTypes;
+
+						}
+						catch (Exception ex)
+						{
+							LogHelper.Warn&lt;DynamicNode&gt;(&quot;Exception occurred while populating cache, will keep RazorDataTypeModelTypes to null so that this error remains visible and you don&#39;t end up with an empty cache with silent failure.&quot;
+								+ string.Format(&quot;The exception was {0} and the message was {1}. {2}&quot;, ex.GetType().FullName, ex.Message, ex.StackTrace));							
+						}
+
+    				}
+					return _razorDataTypeModelTypes;
+    			}
+    		}
+    	}
+
+		private static Guid GetDataType(string docTypeAlias, string propertyAlias)
+		{
+			return GetDataTypeCallback(docTypeAlias, propertyAlias);
+		}
+
+        /// &lt;summary&gt;
+        /// Returns the value from the property result and ensure it is filtered through the razor data type converters
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;propResult&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;result&quot;&gt;The value result for the property&lt;/param&gt;
+        /// &lt;returns&gt;true if getting the property data was successful&lt;/returns&gt;
+        private bool TryGetPropertyData(PropertyResult propResult, out object result)
+        {
+            if (propResult == null) throw new ArgumentNullException(&quot;propResult&quot;);
+            //special casing for true/false properties
+            //int/decimal are handled by ConvertPropertyValueByDataType
+            //fallback is stringT
+            if (n.NodeTypeAlias == null &amp;&amp; propResult.Alias == null)
+            {
+                throw new ArgumentNullException(&quot;No node alias or property alias available. Unable to look up the datatype of the property you are trying to fetch.&quot;);
+            }
+
+            //contextAlias is the node which the property data was returned from
+            //Guid dataType = ContentType.GetDataType(data.ContextAlias, data.Alias);					
+            var dataType = GetDataType(propResult.ContextAlias, propResult.Alias);
+            
+            //now we need to map to the old object until we can clean all this nonsense up
+            var configMapping = UmbracoConfig.For.UmbracoSettings().Scripting.DataTypeModelStaticMappings
+                                                    .Select(x =&gt; new RazorDataTypeModelStaticMappingItem()
+                                                        {
+                                                            DataTypeGuid = x.DataTypeGuid,
+                                                            NodeTypeAlias = x.NodeTypeAlias,
+                                                            PropertyTypeAlias = x.PropertyTypeAlias,
+                                                            Raw = string.Empty,
+                                                            TypeName = x.MappingName
+                                                        }).ToList();
+            
+            var staticMapping = configMapping
+                .FirstOrDefault(mapping =&gt; mapping.Applies(dataType, propResult.ContextAlias, propResult.Alias));
+            
+            if (staticMapping != null)
+            {
+                var dataTypeType = Type.GetType(staticMapping.TypeName);
+                if (dataTypeType != null)
+                {
+                    object valueOutput = null;
+                    if (TryCreateInstanceRazorDataTypeModel(dataType, dataTypeType, propResult.Value, out valueOutput))
+                    {
+                        result = valueOutput;
+                        return true;
+                    }
+                    LogHelper.Warn&lt;DynamicNode&gt;(string.Format(&quot;Failed to create the instance of the model binder&quot;));
+                }
+                else
+                {
+                    LogHelper.Warn&lt;DynamicNode&gt;(string.Format(&quot;staticMapping type name {0} came back as null from Type.GetType; check the casing, assembly presence, assembly framework version, namespace&quot;, staticMapping.TypeName));
+                }
+            }
+
+            if (RazorDataTypeModelTypes != null &amp;&amp; RazorDataTypeModelTypes.Any(model =&gt; model.Key.Item1 == dataType) &amp;&amp; dataType != Guid.Empty)
+            {
+                var razorDataTypeModelDefinition = RazorDataTypeModelTypes.Where(model =&gt; model.Key.Item1 == dataType).OrderByDescending(model =&gt; model.Key.Item2).FirstOrDefault();
+                if (!(razorDataTypeModelDefinition.Equals(default(KeyValuePair&lt;System.Tuple&lt;Guid, int&gt;, Type&gt;))))
+                {
+                    Type dataTypeType = razorDataTypeModelDefinition.Value;
+                    object valueResult = null;
+                    if (TryCreateInstanceRazorDataTypeModel(dataType, dataTypeType, propResult.Value, out valueResult))
+                    {
+                        result = valueResult;
+                        return true;
+                    }
+                    LogHelper.Warn&lt;DynamicNode&gt;(string.Format(&quot;Failed to create the instance of the model binder&quot;));
+                }
+                else
+                {
+                    LogHelper.Warn&lt;DynamicNode&gt;(string.Format(&quot;Could not get the dataTypeType for the RazorDataTypeModel&quot;));
+                }
+            }
+
+            result = propResult.Value;
+            //convert the string value to a known type
+            var returnVal = ConvertPropertyValueByDataType(ref result, propResult.Alias, dataType);
+            
+            return returnVal;
+        }
+
+        public override bool TryGetMember(GetMemberBinder binder, out object result)
+        {
+			var name = binder.Name;
+
+			//check the cache first!
+            if (_cachedMemberOutput.TryGetValue(binder.Name, out result))
+			{
+				return true;
+			}
+
+            result = null; //this will never be returned
+
+            if (name.InvariantEquals(&quot;ChildrenAsList&quot;) || name.InvariantEquals(&quot;Children&quot;))
+            {
+                result = GetChildrenAsList;
+				//cache the result so we don&#39;t have to re-process the whole thing
+                _cachedMemberOutput.TryAdd(binder.Name, result);
+                return true;
+            }
+            if (binder.Name.InvariantEquals(&quot;parentId&quot;))
+            {
+                var parent = n.Parent;
+                if (parent == null)
+                {
+                    throw new InvalidOperationException(string.Format(&quot;The node {0} does not have a parent&quot;, Id));
+                }
+                result = parent.Id;
+                _cachedMemberOutput.TryAdd(binder.Name, result);
+                return true;
+            }
+
+            bool propertyExists = false;
+            if (n != null)
+            {
+                bool recursive = false;
+                if (name.StartsWith(&quot;_&quot;))
+                {
+                    name = name.Substring(1, name.Length - 1);
+                    recursive = true;
+                }
+                    
+                PropertyResult prop;
+                if (!_cachedProperties.TryGetValue(binder.Name, out prop))
+                {
+                    prop = n.GetProperty(name, recursive, out propertyExists);
+                    // check for nicer support of Pascal Casing EVEN if alias is camelCasing:
+                    if (prop == null &amp;&amp; name.Substring(0, 1).ToUpper() == name.Substring(0, 1) &amp;&amp; !propertyExists)
+                    {
+                        prop = n.GetProperty(name.Substring(0, 1).ToLower() + name.Substring((1)), recursive, out propertyExists);
+                    }
+                }
+                    
+                if (prop != null)
+                {
+                    if (TryGetPropertyData(prop, out result))
+                    {
+                        //cache the result so we don&#39;t have to re-process the whole thing
+                        _cachedMemberOutput.TryAdd(binder.Name, result);
+                        return true;
+                    }
+                }
+
+                //check if the alias is that of a child type
+
+                var typeChildren = n.ChildrenAsList;
+                if (typeChildren != null)
+                {
+
+	                var filteredTypeChildren = typeChildren
+		                .Where(x =&gt; x.NodeTypeAlias.InvariantEquals(name) || x.NodeTypeAlias.MakePluralName().InvariantEquals(binder.Name))
+		                .ToArray();
+                    if (filteredTypeChildren.Any())
+                    {
+                        result = new DynamicNodeList(filteredTypeChildren);
+						//cache the result so we don&#39;t have to re-process the whole thing
+                        _cachedMemberOutput.TryAdd(binder.Name, result);
+                        return true;
+                    }
+
+                }
+
+                //lookup the property using reflection
+
+                result = GetReflectedProperty(binder.Name);
+
+                if (result != null)
+                {
+                    _cachedMemberOutput.TryAdd(binder.Name, result);
+                    return true;
+                }
+
+            }
+
+            //if property access, type lookup and member invoke all failed
+            //at this point, we&#39;re going to return null
+            //instead, we return a DynamicNull - see comments in that file
+            //this will let things like Model.ChildItem work and return nothing instead of crashing
+            if (!propertyExists &amp;&amp; result == null)
+            {
+                //.Where explictly checks for this type
+                //and will make it false
+                //which means backwards equality (&amp;&amp; property != true) will pass
+                //forwwards equality (&amp;&amp; property or &amp;&amp; property == true) will fail
+                result = new DynamicNull();
+                return true;
+            }
+            return true;
+        }
+
+        private object GetReflectedProperty(string alias)
+        {
+            var attempt = n.GetType().GetMemberIgnoreCase(n, alias);
+            
+            return attempt.Success ? attempt.Result : null;
+        }
+
+        private bool TryCreateInstanceRazorDataTypeModel(Guid dataType, Type dataTypeType, string value, out object result)
+        {
+            IRazorDataTypeModel razorDataTypeModel = Activator.CreateInstance(dataTypeType, false) as IRazorDataTypeModel;
+            if (razorDataTypeModel != null)
+            {
+                object instance = null;
+                if (razorDataTypeModel.Init(n.Id, value, out instance))
+                {
+                    if (instance == null)
+                    {
+						LogHelper.Warn&lt;DynamicNode&gt;(&quot;razorDataTypeModel successfully instantiated but returned null for instance&quot;);
+                    }
+                	result = instance;
+                    return true;
+                }
+                else
+                {
+                    if (instance == null)
+                    {
+						LogHelper.Warn&lt;DynamicNode&gt;(&quot;razorDataTypeModel successfully instantiated but returned null for instance&quot;);
+                    }
+                }
+            }
+            else
+            {
+				LogHelper.Warn&lt;DynamicNode&gt;(string.Format(&quot;DataTypeModel {0} failed to instantiate, perhaps it is lacking a parameterless constructor or doesn&#39;t implement IRazorDataTypeModel?&quot;, dataTypeType.FullName));
+            }
+            result = null;
+            return false;
+        }
+        private bool ConvertPropertyValueByDataType(ref object result, string name, Guid dataType)
+        {
+            //the resulting property is a string, but to support some of the nice linq stuff in .Where
+            //we should really check some more types
+            string sResult = string.Format(&quot;{0}&quot;, result).Trim();
+
+            //boolean
+            if (dataType == DATATYPE_YESNO_GUID)
+            {
+                bool parseResult;
+                if (string.IsNullOrEmpty(string.Format(&quot;{0}&quot;, result)))
+                {
+                    result = false;
+                    return true;
+                }
+                if (Boolean.TryParse(sResult.Replace(&quot;1&quot;, &quot;true&quot;).Replace(&quot;0&quot;, &quot;false&quot;), out parseResult))
+                {
+                    result = parseResult;
+                    return true;
+                }
+            }
+
+            ////integer
+            ////this will eat csv strings, so only do it if the decimal also includes a decimal seperator (according to the current culture)
+            //if (dataType == DATATYPE_INTEGER_GUID)
+            //{
+            //    int iResult = 0;
+            //    if (int.TryParse(sResult, System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.CurrentCulture, out iResult))
+            //    {
+            //        result = iResult;
+            //        return true;
+            //    }
+            //}
+
+            //this will eat csv strings, so only do it if the decimal also includes a decimal seperator (according to the current culture)
+            if (sResult.Contains(System.Globalization.CultureInfo.CurrentCulture.NumberFormat.NumberDecimalSeparator))
+            {
+                //decimal
+                decimal dResult = 0;
+                if (decimal.TryParse(sResult, System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.CurrentCulture, out dResult))
+                {
+                    result = dResult;
+                    return true;
+                }
+            }
+            if (dataType == DATATYPE_DATETIMEPICKER_GUID || dataType == DATATYPE_DATEPICKER_GUID)
+            {
+                //date
+                DateTime dtResult = DateTime.MinValue;
+                if (DateTime.TryParse(string.Format(&quot;{0}&quot;, result), out dtResult))
+                {
+                    result = dtResult;
+                    return true;
+                }
+                else
+                {
+                    result = new DynamicNull();
+                    return true;
+                }
+            }
+
+            // Rich text editor (return IHtmlString so devs doesn&#39;t need to decode html
+            if (dataType == DATATYPE_TINYMCE_GUID)
+            {
+                result = new HtmlString(result.ToString());
+                return true;
+            }
+
+
+            if (string.Equals(&quot;true&quot;, sResult, StringComparison.CurrentCultureIgnoreCase))
+            {
+                result = true;
+                return true;
+            }
+            if (string.Equals(&quot;false&quot;, sResult, StringComparison.CurrentCultureIgnoreCase))
+            {
+                result = false;
+                return true;
+            }
+
+            if (result != null)
+            {
+                //a really rough check to see if this may be valid xml
+                if (XmlHelper.CouldItBeXml(sResult))
+                {
+                    try
+                    {
+                        XElement e = XElement.Parse(XmlHelper.StripDashesInElementOrAttributeNames(sResult), LoadOptions.None);
+                        if (e != null)
+                        {
+                            //check that the document element is not one of the disallowed elements
+                            //allows RTE to still return as html if it&#39;s valid xhtml
+                            string documentElement = e.Name.LocalName;
+                            if (UmbracoConfig.For.UmbracoSettings().Scripting.NotDynamicXmlDocumentElements.Any(tag =&gt;
+                                                                                  string.Equals(tag.Element, documentElement, StringComparison.CurrentCultureIgnoreCase)) == false)
+                            {
+                                result = new DynamicXml(e);
+                                return true;
+                            }
+                            else
+                            {
+                                //we will just return this as a string
+                                return true;
+                            }
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        //we will just return this as a string
+                        return true;
+                    }
+
+                }
+            }
+
+            return true;
+        }
+
+        public DynamicNode Media(string propertyAlias)
+        {
+            if (n != null)
+            {
+                IProperty prop = n.GetProperty(propertyAlias);
+                if (prop != null)
+                {
+                    int mediaNodeId;
+                    if (int.TryParse(prop.Value, out mediaNodeId))
+                    {
+                        return razorLibrary.Value.MediaById(mediaNodeId);
+                    }
+                }
+                return null;
+            }
+            return null;
+        }
+        public bool IsProtected
+        {
+            get
+            {
+                if (n != null)
+                {
+                    return umbraco.library.IsProtected(n.Id, n.Path);
+                }
+                return false;
+            }
+        }
+        public bool HasAccess
+        {
+            get
+            {
+                if (n != null)
+                {
+                    return umbraco.library.HasAccess(n.Id, n.Path);
+                }
+                return true;
+            }
+        }
+
+        public string Media(string propertyAlias, string mediaPropertyAlias)
+        {
+            if (n != null)
+            {
+                IProperty prop = n.GetProperty(propertyAlias);
+                if (prop == null &amp;&amp; propertyAlias.Substring(0, 1).ToUpper() == propertyAlias.Substring(0, 1))
+                {
+                    prop = n.GetProperty(propertyAlias.Substring(0, 1).ToLower() + propertyAlias.Substring((1)));
+                }
+                if (prop != null)
+                {
+                    int mediaNodeId;
+                    if (int.TryParse(prop.Value, out mediaNodeId))
+                    {
+                        umbraco.cms.businesslogic.media.Media media = new cms.businesslogic.media.Media(mediaNodeId);
+                        if (media != null)
+                        {
+                            Property mprop = media.getProperty(mediaPropertyAlias);
+                            // check for nicer support of Pascal Casing EVEN if alias is camelCasing:
+                            if (prop == null &amp;&amp; mediaPropertyAlias.Substring(0, 1).ToUpper() == mediaPropertyAlias.Substring(0, 1))
+                            {
+                                mprop = media.getProperty(mediaPropertyAlias.Substring(0, 1).ToLower() + mediaPropertyAlias.Substring((1)));
+                            }
+                            if (mprop != null)
+                            {
+                                return string.Format(&quot;{0}&quot;, mprop.Value);
+                            }
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+
+        //this is from SqlMetal and just makes it a bit of fun to allow pluralisation
+        private static string MakePluralName(string name)
+        {
+            if ((name.EndsWith(&quot;x&quot;, StringComparison.OrdinalIgnoreCase) || name.EndsWith(&quot;ch&quot;, StringComparison.OrdinalIgnoreCase)) || (name.EndsWith(&quot;s&quot;, StringComparison.OrdinalIgnoreCase) || name.EndsWith(&quot;sh&quot;, StringComparison.OrdinalIgnoreCase)))
+            {
+                name = name + &quot;es&quot;;
+                return name;
+            }
+            if ((name.EndsWith(&quot;y&quot;, StringComparison.OrdinalIgnoreCase) &amp;&amp; (name.Length &gt; 1)) &amp;&amp; !IsVowel(name[name.Length - 2]))
+            {
+                name = name.Remove(name.Length - 1, 1);
+                name = name + &quot;ies&quot;;
+                return name;
+            }
+            if (!name.EndsWith(&quot;s&quot;, StringComparison.OrdinalIgnoreCase))
+            {
+                name = name + &quot;s&quot;;
+            }
+            return name;
+        }
+
+        private static bool IsVowel(char c)
+        {
+            switch (c)
+            {
+                case &#39;O&#39;:
+                case &#39;U&#39;:
+                case &#39;Y&#39;:
+                case &#39;A&#39;:
+                case &#39;E&#39;:
+                case &#39;I&#39;:
+                case &#39;o&#39;:
+                case &#39;u&#39;:
+                case &#39;y&#39;:
+                case &#39;a&#39;:
+                case &#39;e&#39;:
+                case &#39;i&#39;:
+                    return true;
+            }
+            return false;
+        }
+        public DynamicNode AncestorOrSelf()
+        {
+            return AncestorOrSelf(node =&gt; node.Level == 1);
+        }
+        public DynamicNode AncestorOrSelf(int level)
+        {
+            return AncestorOrSelf(node =&gt; node.Level == level);
+        }
+        public DynamicNode AncestorOrSelf(string nodeTypeAlias)
+        {
+            return AncestorOrSelf(node =&gt; node.NodeTypeAlias == nodeTypeAlias);
+        }
+        public DynamicNode AncestorOrSelf(Func&lt;DynamicNode, bool&gt; func)
+        {
+            if (func(this)) return this;
+
+            var content = this;
+            while (content.Level &gt; 1) // while we have a parent, consider the parent
+            {
+                // see note in .Parent - strange things can happen
+                var parent = content.Parent;
+                if (parent == content) return null;
+                content = parent;
+
+                if (func(content))
+                    return content;
+            }
+
+            return null;
+        }
+
+        public DynamicNodeList AncestorsOrSelf()
+        {
+            return AncestorsOrSelf(n =&gt; true);
+        }
+
+        public DynamicNodeList AncestorsOrSelf(int level)
+        {
+            return AncestorsOrSelf(n =&gt; n.Level &lt;= level);
+        }
+
+        public DynamicNodeList AncestorsOrSelf(string nodeTypeAlias)
+        {
+            return AncestorsOrSelf(n =&gt; n.NodeTypeAlias == nodeTypeAlias);
+        }
+
+        public DynamicNodeList AncestorsOrSelf(Func&lt;DynamicNode, bool&gt; func)
+        {
+		    var ancestors = new List&lt;DynamicNode&gt;();
+
+		    if (func(this))
+		        ancestors.Add(this);
+
+            var content = this;
+            while (content.Level &gt; 1) // while we have a parent, consider the parent
+            {
+                // see note in .Parent - strange things can happen
+                var parent = content.Parent;
+                if (parent == content) break;
+                content = parent;
+
+                if (func(content))
+                    ancestors.Add(content);
+            }
+
+		    ancestors.Reverse();
+		    return new DynamicNodeList(ancestors);
+        }
+
+        public DynamicNodeList Descendants(string nodeTypeAlias)
+        {
+            return Descendants(p =&gt; p.NodeTypeAlias == nodeTypeAlias);
+        }
+        public DynamicNodeList Descendants(int level)
+        {
+            return Descendants(p =&gt; p.Level &gt;= level);
+        }
+        public DynamicNodeList Descendants()
+        {
+            return Descendants(n =&gt; true);
+        }
+        public DynamicNodeList Descendants(Func&lt;DynamicBackingItem, bool&gt; func)
+        {
+            var flattenedNodes = this.n.ChildrenAsList.SelectRecursive(item =&gt; item.ChildrenAsList).Where(func);
+            return new DynamicNodeList(flattenedNodes.Select(dynamicBackingItem =&gt; new DynamicNode(dynamicBackingItem)));
+        }
+        public DynamicNodeList DescendantsOrSelf(int level)
+        {
+            return DescendantsOrSelf(p =&gt; p.Level &gt;= level);
+        }
+        public DynamicNodeList DescendantsOrSelf(string nodeTypeAlias)
+        {
+            return DescendantsOrSelf(p =&gt; p.NodeTypeAlias == nodeTypeAlias);
+        }
+        public DynamicNodeList DescendantsOrSelf()
+        {
+            return DescendantsOrSelf(p =&gt; true);
+        }
+        public DynamicNodeList DescendantsOrSelf(Func&lt;DynamicBackingItem, bool&gt; func)
+        {
+            if (this.n != null)
+            {
+                var thisNode = new List&lt;DynamicBackingItem&gt;();
+                if (func(this.n))
+                {
+                    thisNode.Add(this.n);
+                }
+                var flattenedNodes = this.n.ChildrenAsList.SelectRecursive(item =&gt; item.ChildrenAsList).Where(func);
+                return new DynamicNodeList(thisNode.Concat(flattenedNodes).Select(dynamicBackingItem =&gt; new DynamicNode(dynamicBackingItem)));
+            }
+            return new DynamicNodeList(new List&lt;DynamicBackingItem&gt;());
+        }
+        public DynamicNodeList Ancestors(int level)
+        {
+            return Ancestors(n =&gt; n.Level &lt;= level);
+        }
+        public DynamicNodeList Ancestors(string nodeTypeAlias)
+        {
+            return Ancestors(n =&gt; n.NodeTypeAlias == nodeTypeAlias);
+        }
+        public DynamicNodeList Ancestors()
+        {
+            return Ancestors(n =&gt; true);
+        }
+        public DynamicNodeList Ancestors(Func&lt;DynamicNode, bool&gt; func)
+        {
+            List&lt;DynamicNode&gt; ancestorList = new List&lt;DynamicNode&gt;();
+            var node = this;
+            while (node != null)
+            {
+                if (node.Level == 1) break;
+                DynamicNode parent = node.Parent;
+                if (parent != null)
+                {
+                    if (this != parent)
+                    {
+                        node = parent;
+                        if (func(node))
+                        {
+                            ancestorList.Add(node);
+                        }
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    break;
+                }
+            }
+            ancestorList.Reverse();
+            return new DynamicNodeList(ancestorList);
+        }
+
+        public DynamicNode Parent
+        {
+            get
+            {
+                if (n == null)
+                    return null;
+
+                if (n.Parent != null)
+                    return new DynamicNode(n.Parent);
+
+                // DynamicBackingItem.Id will return zero if IsNull else it should return non-zero;
+                // it&#39;s IsNull when it&#39;s neither content nor media - which might happen when created
+                // an invalid identifier. And then it&#39;s a &quot;non-existing&quot; node which is its own parent.
+                // Does not make much sense, but, hey...
+
+                if (n != null &amp;&amp; n.Id == 0)
+                    return this; // ouch
+
+                return null;
+            }
+        }
+
+        private Lazy&lt;RazorLibraryCore&gt; razorLibrary = new Lazy&lt;RazorLibraryCore&gt;(() =&gt;
+        {
+            return new RazorLibraryCore(null);
+        });
+        [Obsolete(&quot;@Model.NodeById is obsolute, use @Library.NodeById&quot;)]
+        public DynamicNode NodeById(int Id)
+        {
+            var node = razorLibrary.Value.NodeById(Id);
+            if (node is DynamicNull)
+            {
+                return new DynamicNode(0);
+            }
+            return node;
+        }
+        [Obsolete(&quot;@Model.NodeById is obsolute, use @Library.NodeById&quot;)]
+        public DynamicNode NodeById(string Id)
+        {
+            var node = razorLibrary.Value.NodeById(Id);
+            if (node is DynamicNull)
+            {
+                return new DynamicNode(0);
+            }
+            return node;
+        }
+        [Obsolete(&quot;@Model.NodeById is obsolute, use @Library.NodeById&quot;)]
+        public DynamicNode NodeById(object Id)
+        {
+            var node = razorLibrary.Value.NodeById(Id);
+            if (node is DynamicNull)
+            {
+                return new DynamicNode(0);
+            }
+            return node;
+        }
+        [Obsolete(&quot;@Model.NodeById is obsolute, use @Library.NodeById&quot;)]
+        public DynamicNodeList NodesById(List&lt;object&gt; Ids)
+        {
+            return razorLibrary.Value.NodesById(Ids);
+        }
+        [Obsolete(&quot;@Model.NodeById is obsolute, use @Library.NodeById&quot;)]
+        public DynamicNodeList NodesById(List&lt;int&gt; Ids)
+        {
+            return razorLibrary.Value.NodesById(Ids);
+        }
+        [Obsolete(&quot;@Model.NodeById is obsolute, use @Library.NodeById&quot;)]
+        public DynamicNodeList NodesById(params object[] Ids)
+        {
+            return razorLibrary.Value.NodesById(Ids);
+        }
+        [Obsolete(&quot;@Model.MediaById is obsolute, use @Library.MediaById&quot;)]
+        public DynamicNode MediaById(int Id)
+        {
+            var media = razorLibrary.Value.MediaById(Id);
+            if (media is DynamicNull)
+            {
+                return new DynamicNode(0);
+            }
+            return media;
+        }
+        [Obsolete(&quot;@Model.MediaById is obsolute, use @Library.MediaById&quot;)]
+        public DynamicNode MediaById(string Id)
+        {
+            var media = razorLibrary.Value.MediaById(Id);
+            if (media is DynamicNull)
+            {
+                return new DynamicNode(0);
+            }
+            return media;
+        }
+        [Obsolete(&quot;@Model.MediaById is obsolute, use @Library.MediaById&quot;)]
+        public DynamicNode MediaById(object Id)
+        {
+            var media = razorLibrary.Value.MediaById(Id);
+            if (media is DynamicNull)
+            {
+                return new DynamicNode(0);
+            }
+            return media;
+        }
+        [Obsolete(&quot;@Model.MediaById is obsolute, use @Library.MediaById&quot;)]
+        public DynamicNodeList MediaById(List&lt;object&gt; Ids)
+        {
+            return razorLibrary.Value.MediaById(Ids);
+        }
+        [Obsolete(&quot;@Model.MediaById is obsolute, use @Library.MediaById&quot;)]
+        public DynamicNodeList MediaById(List&lt;int&gt; Ids)
+        {
+            return razorLibrary.Value.MediaById(Ids);
+        }
+        [Obsolete(&quot;@Model.MediaById is obsolute, use @Library.MediaById&quot;)]
+        public DynamicNodeList MediaById(params object[] Ids)
+        {
+            return razorLibrary.Value.MediaById(Ids);
+        }
+
+        public int template
+        {
+            get { if (n == null) return 0; return n.template; }
+        }
+
+        public int SortOrder
+        {
+            get { if (n == null) return 0; return n.SortOrder; }
+        }
+
+        public string Name
+        {
+            get { if (n == null) return null; return n.Name; }
+        }
+        public bool Visible
+        {
+            get
+            {
+                if (n == null) return true;
+                IProperty umbracoNaviHide = n.GetProperty(Constants.Conventions.Content.NaviHide);
+                if (umbracoNaviHide != null)
+                {
+                    return umbracoNaviHide.Value != &quot;1&quot;;
+                }
+                return true;
+            }
+        }
+        public string Url
+        {
+            get { if (n == null) return null; return n.Url; }
+        }
+
+        public string UrlName
+        {
+            get { if (n == null) return null; return n.UrlName; }
+        }
+
+        public string NodeTypeAlias
+        {
+            get { if (n == null) return null; return n.NodeTypeAlias; }
+        }
+
+        public string WriterName
+        {
+            get { if (n == null) return null; return n.WriterName; }
+        }
+
+        public string CreatorName
+        {
+            get { if (n == null) return null; return n.CreatorName; }
+        }
+
+        public int WriterID
+        {
+            get { if (n == null) return 0; return n.WriterID; }
+        }
+
+        public int CreatorID
+        {
+            get { if (n == null) return 0; return n.CreatorID; }
+        }
+
+        public string Path
+        {
+            get { return n.Path; }
+        }
+
+        public DateTime CreateDate
+        {
+            get { if (n == null) return DateTime.MinValue; return n.CreateDate; }
+        }
+        public int Id
+        {
+            get { if (n == null) return 0; return n.Id; }
+        }
+
+        public DateTime UpdateDate
+        {
+            get { if (n == null) return DateTime.MinValue; return n.UpdateDate; }
+        }
+
+        public Guid Version
+        {
+            get { if (n == null) return Guid.Empty; return n.Version; }
+        }
+
+        public string NiceUrl
+        {
+            get { if (n == null) return null; return n.NiceUrl; }
+        }
+
+        public int Level
+        {
+            get { if (n == null) return 0; return n.Level; }
+        }
+
+        public List&lt;IProperty&gt; PropertiesAsList
+        {
+            get { if (n == null) return null; return n.PropertiesAsList; }
+        }
+
+        public DynamicNodeList ChildrenAsList
+        {
+            get
+            {
+            	return GetChildrenAsList;
+            	//if (n == null) return null; return n.ChildrenAsList;
+            }
+        }
+
+	    public DynamicNodeList Children
+	    {
+		    get { return ChildrenAsList; }
+	    }
+
+        public IProperty GetProperty(string alias)
+        {
+            if (n == null) return null;
+
+            PropertyResult prop;
+            
+            //check the cache first!
+            if (_cachedProperties.TryGetValue(alias, out prop))
+            {                                
+                return prop;
+            }
+
+            try
+            {
+                prop = n.GetProperty(alias);
+                if (prop == null)
+                {
+                    // check for nicer support of Pascal Casing EVEN if alias is camelCasing:
+                    if (alias.Substring(0, 1).ToUpper() == alias.Substring(0, 1))
+                    {
+                        //change the alias to the other case to check
+                        alias = alias.Substring(0, 1).ToLower() + alias.Substring((1));
+                        prop = n.GetProperty(alias);
+                    }
+                }
+                if (prop == null &amp;&amp; alias.StartsWith(&quot;_&quot;))
+                {
+                    //if the prop is still null but it starts with an _ then we&#39;ll check recursively
+                    var recursiveAlias = alias.Substring(1, alias.Length - 1);
+                    prop = n.GetProperty(recursiveAlias, true);
+                }
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+
+            if (prop == null)
+                return null;
+
+            //cache it!
+            _cachedProperties.TryAdd(alias, prop);
+
+            return prop;
+        }
+        public IProperty GetProperty(string alias, bool recursive)
+        {
+            if (!recursive) return GetProperty(alias);
+            if (n == null) return null;
+            DynamicBackingItem context = this.n;
+            IProperty prop = n.GetProperty(alias);
+            while (prop == null)
+            {
+                context = context.Parent;
+                if (context == null) break;
+                prop = context.GetProperty(alias);
+            }
+            if (prop != null)
+            {
+                return prop;
+            }
+            return null;
+        }
+        public string GetPropertyValue(string alias)
+        {
+            return GetPropertyValue(alias, null);
+        }
+        public string GetPropertyValue(string alias, string fallback)
+        {
+            string prop;
+            if (alias.StartsWith(&quot;@&quot;))
+            {
+                var p = GetReflectedProperty(alias.TrimStart(&#39;@&#39;));
+                prop = p == null ? null : p.ToString();
+            }
+            else
+            {
+                var p = GetProperty(alias);
+                prop = p != null ? p.Value : null;
+            }
+            return !prop.IsNullOrWhiteSpace() ? prop : fallback;
+        }
+        public string GetPropertyValue(string alias, bool recursive)
+        {
+            var p = alias.StartsWith(&quot;@&quot;)
+                    ? GetReflectedProperty(alias.TrimStart(&#39;@&#39;))
+                    : GetPropertyValue(alias, recursive, null);
+            return (string) p;
+        }
+        public string GetPropertyValue(string alias, bool recursive, string fallback)
+        {
+            var prop = GetProperty(alias, recursive);
+            if (prop != null) return prop.Value;
+            return fallback;
+        }
+        public System.Data.DataTable ChildrenAsTable()
+        {
+            if (n == null) return null;
+            return n.ChildrenAsTable();
+        }
+
+        public System.Data.DataTable ChildrenAsTable(string nodeTypeAliasFilter)
+        {
+            if (n == null) return null;
+            return n.ChildrenAsTable(nodeTypeAliasFilter);
+        }
+        public bool IsNull(string alias, bool recursive)
+        {
+            var prop = GetProperty(alias, recursive);
+            if (prop == null) return true;
+            return (prop as PropertyResult).IsNull();
+        }
+        public bool IsNull(string alias)
+        {
+            return IsNull(alias, false);
+        }
+        public bool HasValue(string alias)
+        {
+            return HasValue(alias, false);
+        }
+        public bool HasValue(string alias, bool recursive)
+        {
+            var prop = GetProperty(alias, recursive);
+            if (prop == null) return false;
+            return (prop as PropertyResult).HasValue();
+        }
+        public IHtmlString HasValue(string alias, string valueIfTrue, string valueIfFalse)
+        {
+            return HasValue(alias, false) ? new HtmlString(valueIfTrue) : new HtmlString(valueIfFalse);
+        }
+        public IHtmlString HasValue(string alias, bool recursive, string valueIfTrue, string valueIfFalse)
+        {
+            return HasValue(alias, recursive) ? new HtmlString(valueIfTrue) : new HtmlString(valueIfFalse);
+        }
+        public IHtmlString HasValue(string alias, string valueIfTrue)
+        {
+            return HasValue(alias, false) ? new HtmlString(valueIfTrue) : new HtmlString(string.Empty);
+        }
+        public IHtmlString HasValue(string alias, bool recursive, string valueIfTrue)
+        {
+            return HasValue(alias, recursive) ? new HtmlString(valueIfTrue) : new HtmlString(string.Empty);
+        }
+        public int Position()
+        {
+            return this.Index();
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the owner list is null and attempts to create it if there is a parent. 
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;Successful if the owners list is not null, false if the owners list could not be created and remains null&lt;/returns&gt;
+        private bool EnsureOwnersList()
+        {
+            if (this.ownerList == null &amp;&amp; this.Parent != null)
+            {
+                var list = this.Parent.ChildrenAsList.Select(n =&gt; new DynamicNode(n));
+                this.ownerList = new DynamicNodeList(list);                
+            }
+            return this.ownerList != null;
+        }
+
+        public int Index()
+        {
+            if (EnsureOwnersList())
+            {
+                List&lt;DynamicNode&gt; container = this.ownerList.Items.ToList();
+                int currentIndex = container.FindIndex(n =&gt; n.Id == this.Id);
+                if (currentIndex != -1)
+                {
+                    return currentIndex;
+                }
+                throw new IndexOutOfRangeException(string.Format(&quot;Node {0} belongs to a DynamicNodeList but could not retrieve the index for it&#39;s position in the list&quot;, this.Id));
+            }
+            throw new ArgumentNullException(string.Format(&quot;Node {0} has been orphaned and doesn&#39;t belong to a DynamicNodeList&quot;, this.Id));
+        }
+
+        public bool IsFirst()
+        {
+            return IsHelper(n =&gt; n.Index() == 0);
+        }
+        public HtmlString IsFirst(string valueIfTrue)
+        {
+            return IsHelper(n =&gt; n.Index() == 0, valueIfTrue);
+        }
+        public HtmlString IsFirst(string valueIfTrue, string valueIfFalse)
+        {
+            return IsHelper(n =&gt; n.Index() == 0, valueIfTrue, valueIfFalse);
+        }
+        public bool IsNotFirst()
+        {
+            return !IsHelper(n =&gt; n.Index() == 0);
+        }
+        public HtmlString IsNotFirst(string valueIfTrue)
+        {
+            return IsHelper(n =&gt; n.Index() != 0, valueIfTrue);
+        }
+        public HtmlString IsNotFirst(string valueIfTrue, string valueIfFalse)
+        {
+            return IsHelper(n =&gt; n.Index() != 0, valueIfTrue, valueIfFalse);
+        }
+        public bool IsPosition(int index)
+        {
+            if (!EnsureOwnersList())
+            {
+                return false;
+            }
+            return IsHelper(n =&gt; n.Index() == index);
+        }
+        public HtmlString IsPosition(int index, string valueIfTrue)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(string.Empty);
+            }
+            return IsHelper(n =&gt; n.Index() == index, valueIfTrue);
+        }
+        public HtmlString IsPosition(int index, string valueIfTrue, string valueIfFalse)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(valueIfFalse);
+            }
+            return IsHelper(n =&gt; n.Index() == index, valueIfTrue, valueIfFalse);
+        }
+        public bool IsModZero(int modulus)
+        {
+            if (!EnsureOwnersList())
+            {
+                return false;
+            }
+            return IsHelper(n =&gt; n.Index() % modulus == 0);
+        }
+        public HtmlString IsModZero(int modulus, string valueIfTrue)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(string.Empty);
+            }
+            return IsHelper(n =&gt; n.Index() % modulus == 0, valueIfTrue);
+        }
+        public HtmlString IsModZero(int modulus, string valueIfTrue, string valueIfFalse)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(valueIfFalse);
+            }
+            return IsHelper(n =&gt; n.Index() % modulus == 0, valueIfTrue, valueIfFalse);
+        }
+
+        public bool IsNotModZero(int modulus)
+        {
+            if (!EnsureOwnersList())
+            {
+                return false;
+            }
+            return IsHelper(n =&gt; n.Index() % modulus != 0);
+        }
+        public HtmlString IsNotModZero(int modulus, string valueIfTrue)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(string.Empty);
+            }
+            return IsHelper(n =&gt; n.Index() % modulus != 0, valueIfTrue);
+        }
+        public HtmlString IsNotModZero(int modulus, string valueIfTrue, string valueIfFalse)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(valueIfFalse);
+            }
+            return IsHelper(n =&gt; n.Index() % modulus != 0, valueIfTrue, valueIfFalse);
+        }
+        public bool IsNotPosition(int index)
+        {
+            if (!EnsureOwnersList())
+            {
+                return false;
+            }
+            return !IsHelper(n =&gt; n.Index() == index);
+        }
+        public HtmlString IsNotPosition(int index, string valueIfTrue)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(string.Empty);
+            }
+            return IsHelper(n =&gt; n.Index() != index, valueIfTrue);
+        }
+        public HtmlString IsNotPosition(int index, string valueIfTrue, string valueIfFalse)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(valueIfFalse);
+            }
+            return IsHelper(n =&gt; n.Index() != index, valueIfTrue, valueIfFalse);
+        }
+        public bool IsLast()
+        {
+            if (!EnsureOwnersList())
+            {
+                return false;
+            }
+            int count = this.ownerList.Items.Count;
+            return IsHelper(n =&gt; n.Index() == count - 1);
+        }
+        public HtmlString IsLast(string valueIfTrue)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(string.Empty);
+            }
+            int count = this.ownerList.Items.Count;
+            return IsHelper(n =&gt; n.Index() == count - 1, valueIfTrue);
+        }
+        public HtmlString IsLast(string valueIfTrue, string valueIfFalse)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(valueIfFalse);
+            }
+            int count = this.ownerList.Items.Count;
+            return IsHelper(n =&gt; n.Index() == count - 1, valueIfTrue, valueIfFalse);
+        }
+        public bool IsNotLast()
+        {
+            if (!EnsureOwnersList())
+            {
+                return false;
+            }
+            int count = this.ownerList.Items.Count;
+            return !IsHelper(n =&gt; n.Index() == count - 1);
+        }
+        public HtmlString IsNotLast(string valueIfTrue)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(string.Empty);
+            }
+            int count = this.ownerList.Items.Count;
+            return IsHelper(n =&gt; n.Index() != count - 1, valueIfTrue);
+        }
+        public HtmlString IsNotLast(string valueIfTrue, string valueIfFalse)
+        {
+            if (!EnsureOwnersList())
+            {
+                return new HtmlString(valueIfFalse);
+            }
+            int count = this.ownerList.Items.Count;
+            return IsHelper(n =&gt; n.Index() != count - 1, valueIfTrue, valueIfFalse);
+        }
+        public bool IsEven()
+        {
+            return IsHelper(n =&gt; n.Index() % 2 == 0);
+        }
+        public HtmlString IsEven(string valueIfTrue)
+        {
+            return IsHelper(n =&gt; n.Index() % 2 == 0, valueIfTrue);
+        }
+        public HtmlString IsEven(string valueIfTrue, string valueIfFalse)
+        {
+            return IsHelper(n =&gt; n.Index() % 2 == 0, valueIfTrue, valueIfFalse);
+        }
+        public bool IsOdd()
+        {
+            return IsHelper(n =&gt; n.Index() % 2 == 1);
+        }
+        public HtmlString IsOdd(string valueIfTrue)
+        {
+            return IsHelper(n =&gt; n.Index() % 2 == 1, valueIfTrue);
+        }
+        public HtmlString IsOdd(string valueIfTrue, string valueIfFalse)
+        {
+            return IsHelper(n =&gt; n.Index() % 2 == 1, valueIfTrue, valueIfFalse);
+        }
+        public bool IsEqual(DynamicNode other)
+        {
+            return IsHelper(n =&gt; n.Id == other.Id);
+        }
+        public HtmlString IsEqual(DynamicNode other, string valueIfTrue)
+        {
+            return IsHelper(n =&gt; n.Id == other.Id, valueIfTrue);
+        }
+        public HtmlString IsEqual(DynamicNode other, string valueIfTrue, string valueIfFalse)
+        {
+            return IsHelper(n =&gt; n.Id == other.Id, valueIfTrue, valueIfFalse);
+        }
+        public bool IsNotEqual(DynamicNode other)
+        {
+            return IsHelper(n =&gt; n.Id != other.Id);
+        }
+        public HtmlString IsNotEqual(DynamicNode other, string valueIfTrue)
+        {
+            return IsHelper(n =&gt; n.Id != other.Id, valueIfTrue);
+        }
+        public HtmlString IsNotEqual(DynamicNode other, string valueIfTrue, string valueIfFalse)
+        {
+            return IsHelper(n =&gt; n.Id != other.Id, valueIfTrue, valueIfFalse);
+        }
+        public bool IsDescendant(DynamicNode other)
+        {
+            var ancestors = this.Ancestors();
+            return IsHelper(n =&gt; ancestors.Items.Find(ancestor =&gt; ancestor.Id == other.Id) != null);
+        }
+        public HtmlString IsDescendant(DynamicNode other, string valueIfTrue)
+        {
+            var ancestors = this.Ancestors();
+            return IsHelper(n =&gt; ancestors.Items.Find(ancestor =&gt; ancestor.Id == other.Id) != null, valueIfTrue);
+        }
+        public HtmlString IsDescendant(DynamicNode other, string valueIfTrue, string valueIfFalse)
+        {
+            var ancestors = this.Ancestors();
+            return IsHelper(n =&gt; ancestors.Items.Find(ancestor =&gt; ancestor.Id == other.Id) != null, valueIfTrue, valueIfFalse);
+        }
+        public bool IsDescendantOrSelf(DynamicNode other)
+        {
+            var ancestors = this.AncestorsOrSelf();
+            return IsHelper(n =&gt; ancestors.Items.Find(ancestor =&gt; ancestor.Id == other.Id) != null);
+        }
+        public HtmlString IsDescendantOrSelf(DynamicNode other, string valueIfTrue)
+        {
+            var ancestors = this.AncestorsOrSelf();
+            return IsHelper(n =&gt; ancestors.Items.Find(ancestor =&gt; ancestor.Id == other.Id) != null, valueIfTrue);
+        }
+        public HtmlString IsDescendantOrSelf(DynamicNode other, string valueIfTrue, string valueIfFalse)
+        {
+            var ancestors = this.AncestorsOrSelf();
+            return IsHelper(n =&gt; ancestors.Items.Find(ancestor =&gt; ancestor.Id == other.Id) != null, valueIfTrue, valueIfFalse);
+        }
+        public bool IsAncestor(DynamicNode other)
+        {
+            var descendants = this.Descendants();
+            return IsHelper(n =&gt; descendants.Items.Find(descendant =&gt; descendant.Id == other.Id) != null);
+        }
+        public HtmlString IsAncestor(DynamicNode other, string valueIfTrue)
+        {
+            var descendants = this.Descendants();
+            return IsHelper(n =&gt; descendants.Items.Find(descendant =&gt; descendant.Id == other.Id) != null, valueIfTrue);
+        }
+        public HtmlString IsAncestor(DynamicNode other, string valueIfTrue, string valueIfFalse)
+        {
+            var descendants = this.Descendants();
+            return IsHelper(n =&gt; descendants.Items.Find(descendant =&gt; descendant.Id == other.Id) != null, valueIfTrue, valueIfFalse);
+        }
+        public bool IsAncestorOrSelf(DynamicNode other)
+        {
+            var descendants = this.DescendantsOrSelf();
+            return IsHelper(n =&gt; descendants.Items.Find(descendant =&gt; descendant.Id == other.Id) != null);
+        }
+        public HtmlString IsAncestorOrSelf(DynamicNode other, string valueIfTrue)
+        {
+            var descendants = this.DescendantsOrSelf();
+            return IsHelper(n =&gt; descendants.Items.Find(descendant =&gt; descendant.Id == other.Id) != null, valueIfTrue);
+        }
+        public HtmlString IsAncestorOrSelf(DynamicNode other, string valueIfTrue, string valueIfFalse)
+        {
+            var descendants = this.DescendantsOrSelf();
+            return IsHelper(n =&gt; descendants.Items.Find(descendant =&gt; descendant.Id == other.Id) != null, valueIfTrue, valueIfFalse);
+        }
+        public bool IsHelper(Func&lt;DynamicNode, bool&gt; test)
+        {
+            return test(this);
+        }
+        public HtmlString IsHelper(Func&lt;DynamicNode, bool&gt; test, string valueIfTrue)
+        {
+            return IsHelper(test, valueIfTrue, string.Empty);
+        }
+        public HtmlString IsHelper(Func&lt;DynamicNode, bool&gt; test, string valueIfTrue, string valueIfFalse)
+        {
+            return test(this) ? new HtmlString(valueIfTrue) : new HtmlString(valueIfFalse);
+        }
+        public HtmlString Where(string predicate, string valueIfTrue)
+        {
+            return Where(predicate, valueIfTrue, string.Empty);
+        }
+        public HtmlString Where(string predicate, string valueIfTrue, string valueIfFalse)
+        {
+            if (Where(predicate))
+            {
+                return new HtmlString(valueIfTrue);
+            }
+            return new HtmlString(valueIfFalse);
+        }
+        public bool Where(string predicate)
+        {
+            //Totally gonna cheat here
+            var dynamicNodeList = new DynamicNodeList();
+            dynamicNodeList.Add(this);
+            var filtered = dynamicNodeList.Where&lt;DynamicNode&gt;(predicate);
+            if (filtered.Count() == 1)
+            {
+                //this node matches the predicate
+                return true;
+            }
+            return false;
+        }
+
+		#region Explicit INode implementation
+		INode INode.Parent
+		{
+			get { return Parent; }
+		}
+
+		int INode.Id
+		{
+			get { return Id; }
+		}
+
+		int INode.template
+		{
+			get { return template; }
+		}
+
+		int INode.SortOrder
+		{
+			get { return SortOrder; }
+		}
+
+		string INode.Name
+		{
+			get { return Name; }
+		}
+
+		string INode.Url
+		{
+			get { return Url; }
+		}
+
+		string INode.UrlName
+		{
+			get { return UrlName; }
+		}
+
+		string INode.NodeTypeAlias
+		{
+			get { return NodeTypeAlias; }
+		}
+
+		string INode.WriterName
+		{
+			get { return WriterName; }
+		}
+
+		string INode.CreatorName
+		{
+			get { return CreatorName; }
+		}
+
+		int INode.WriterID
+		{
+			get { return WriterID; }
+		}
+
+		int INode.CreatorID
+		{
+			get { return CreatorID; }
+		}
+
+		string INode.Path
+		{
+			get { return Path; }
+		}
+
+		DateTime INode.CreateDate
+		{
+			get { return CreateDate; }
+		}
+
+		DateTime INode.UpdateDate
+		{
+			get { return UpdateDate; }
+		}
+
+		Guid INode.Version
+		{
+			get { return Version; }
+		}
+
+		string INode.NiceUrl
+		{
+			get { return NiceUrl; }
+		}
+
+		int INode.Level
+		{
+			get { return Level; }
+		}
+
+		List&lt;IProperty&gt; INode.PropertiesAsList
+		{
+			get { return PropertiesAsList; }
+		}
+
+		List&lt;INode&gt; INode.ChildrenAsList
+		{
+			get { return new List&lt;INode&gt;(ChildrenAsList.Select(x =&gt; x).ToList()); }
+		}
+
+		IProperty INode.GetProperty(string Alias)
+		{
+			return GetProperty(Alias);
+		}
+
+		IProperty INode.GetProperty(string Alias, out bool propertyExists)
+		{
+			var p = GetProperty(Alias, false);
+			propertyExists = p != null;
+			return p;
+		}
+
+		System.Data.DataTable INode.ChildrenAsTable()
+		{
+			return ChildrenAsTable();
+		}
+
+		System.Data.DataTable INode.ChildrenAsTable(string nodeTypeAliasFilter)
+		{
+			return ChildrenAsTable(nodeTypeAliasFilter);
+		} 
+		#endregion
+	}
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[39,3,40,4,1],[40,4,40,56,0],[40,56,40,57,1],[39,3,40,57,1],[44,9,44,99,1],[44,9,44,99,0],[44,9,44,99,1],[44,9,44,99,1],[44,9,44,99,0],[44,9,44,99,1],[44,9,44,99,0],[45,9,45,101,1],[45,9,45,101,0],[45,9,45,101,0],[45,9,45,101,1],[45,9,45,101,1],[45,9,45,101,0],[45,9,45,101,1],[46,9,46,107,1],[46,9,46,107,0],[46,9,46,107,0],[46,9,46,107,1],[46,9,46,107,0],[46,9,46,107,1],[46,9,46,107,1],[47,9,47,99,0],[47,9,47,99,0],[47,9,47,99,1],[47,9,47,99,1],[47,9,47,99,0],[47,9,47,99,1],[47,9,47,99,1],[52,3,52,122,1],[52,3,52,122,1],[52,3,52,122,0],[52,3,52,122,0],[52,3,52,122,1],[52,3,52,122,0],[52,3,52,122,1],[53,9,53,142,1],[53,9,53,142,0],[53,9,53,142,1],[53,9,53,142,1],[53,9,53,142,0],[53,9,53,142,1],[53,9,53,142,0],[59,9,59,49,1],[60,9,60,10,1],[61,13,61,27,1],[62,17,62,28,1],[64,17,64,108,0],[65,9,65,10,1],[66,9,66,39,1],[67,9,67,10,1],[68,13,68,53,1],[69,9,69,10,1],[70,9,70,72,1],[71,9,71,10,1],[72,13,72,63,1],[73,9,73,10,1],[74,9,74,42,0],[75,9,75,10,0],[76,13,76,42,0],[77,13,77,64,0],[78,13,78,14,0],[79,17,79,71,0],[80,17,80,24,0],[82,13,82,91,0],[83,9,83,10,0],[84,9,84,39,1],[85,9,85,10,1],[86,13,86,51,1],[87,9,87,10,1],[88,9,88,42,0],[89,9,89,10,0],[90,13,90,42,0],[91,13,91,86,0],[92,13,92,14,0],[93,17,93,71,0],[94,17,94,24,0],[96,13,96,91,0],[97,9,97,10,0],[98,9,98,29,0],[99,9,99,10,0],[101,9,101,10,0],[104,9,104,10,1],[105,13,105,47,1],[106,9,106,10,1],[108,9,108,10,1],[109,13,109,55,1],[110,9,110,10,1],[112,9,112,10,0],[113,13,113,62,0],[114,9,114,10,0],[116,9,116,10,1],[117,13,117,49,1],[118,9,118,10,1],[120,9,120,10,1],[121,13,121,57,1],[122,9,122,10,1],[124,9,124,10,0],[125,13,125,64,0],[126,9,126,10,0],[128,9,128,10,1],[129,13,129,49,1],[130,9,130,10,1],[132,9,132,10,1],[133,13,133,57,1],[134,9,134,10,1],[136,9,136,10,0],[137,13,137,64,0],[138,9,138,10,0],[141,9,141,10,1],[142,13,142,53,1],[143,9,143,10,1],[145,9,145,10,1],[146,13,146,61,1],[147,9,147,10,1],[149,9,149,10,0],[150,13,150,68,0],[151,9,151,10,0],[153,9,153,10,0],[154,13,154,60,0],[155,9,155,10,0],[157,9,157,10,0],[158,13,158,67,0],[159,9,159,10,0],[163,13,163,14,1],[164,14,164,42,1],[165,14,165,15,1],[166,6,166,59,1],[168,6,168,43,1],[169,6,169,7,0],[170,7,170,84,0],[171,6,171,7,0],[173,6,173,7,1],[174,25,174,73,1],[175,6,175,7,1],[176,14,176,15,1],[177,5,177,28,1],[178,13,178,14,1],[181,9,181,10,0],[183,13,183,71,0],[184,13,184,14,0],[186,17,186,71,0],[187,17,187,33,0],[188,17,188,18,0],[194,21,194,35,0],[195,21,195,22,0],[196,25,196,87,0],[197,25,197,62,0],[199,21,199,96,0],[200,21,200,38,0],[201,21,201,22,0],[203,25,203,69,0],[204,25,204,45,0],[205,25,205,26,0],[207,29,207,103,0],[209,29,209,36,0],[209,38,209,57,0],[209,58,209,60,0],[209,61,209,66,0],[210,29,210,30,0],[212,33,212,34,0],[213,37,213,96,0],[214,33,214,34,0],[215,33,215,50,0],[215,51,215,52,0],[215,53,215,54,0],[216,29,216,30,0],[228,29,228,97,0],[228,97,228,127,0],[228,127,228,130,0],[228,29,228,130,0],[231,25,231,26,0],[233,29,233,58,0],[237,21,237,22,0],[238,25,238,115,0],[242,17,242,18,0],[243,21,243,101,0],[247,13,247,14,0],[248,17,248,120,0],[250,9,250,10,0],[254,9,254,10,0],[255,13,255,82,0],[256,13,256,54,0],[257,17,257,101,0],[259,13,259,41,0],[260,13,260,30,0],[261,17,261,60,0],[263,13,263,91,0],[264,13,264,78,0],[266,13,266,43,0],[267,9,267,10,0],[270,9,270,10,0],[271,13,271,63,0],[272,9,272,10,0],[275,9,275,10,0],[276,13,276,82,0],[277,13,277,55,0],[278,17,278,101,0],[280,13,280,41,0],[281,13,281,30,0],[282,17,282,60,0],[284,13,284,79,0],[285,13,285,78,0],[287,13,287,43,0],[288,9,288,10,0],[292,9,292,10,0],[293,13,293,75,0],[294,13,294,40,0],[295,17,295,36,0],[297,13,297,46,0],[298,13,298,81,0],[299,9,299,10,0],[303,9,303,10,1],[304,13,304,27,1],[305,13,305,14,1],[306,17,306,50,1],[308,13,308,26,0],[309,9,309,10,1],[312,9,312,10,1],[314,13,314,14,1],[316,17,322,57,1],[323,17,323,29,1],[325,13,325,43,0],[326,13,326,14,0],[328,17,328,18,0],[330,21,337,57,0],[338,21,338,33,0],[340,17,340,47,0],[341,17,341,18,0],[343,21,343,22,0],[344,25,344,83,0],[345,25,345,37,0],[347,21,347,54,0],[348,21,348,22,0],[349,25,349,52,0],[350,25,350,37,0],[353,21,353,26,0],[354,21,354,22,0],[355,25,355,39,0],[356,25,356,38,0],[363,13,363,18,0],[364,13,364,14,0],[365,17,365,31,0],[366,17,366,30,0],[369,9,369,10,1],[372,9,372,10,0],[373,13,373,34,0],[375,13,375,137,0],[376,13,376,41,0],[377,13,377,14,0],[378,17,378,121,0],[379,13,379,14,0],[380,13,380,41,0],[381,13,381,14,0],[382,17,382,65,0],[383,17,383,78,0],[384,13,384,14,0],[386,13,386,14,0],[387,17,387,52,0],[389,13,389,32,0],[390,13,390,14,0],[391,17,391,63,0],[392,17,392,18,0],[393,21,393,91,0],[394,17,394,18,0],[395,17,395,56,0],[396,17,396,18,0],[397,21,397,84,0],[398,17,398,18,0],[399,17,399,50,0],[400,17,400,18,0],[401,21,401,74,0],[402,17,402,18,0],[403,13,403,14,0],[404,13,404,27,0],[405,9,405,10,0],[407,6,407,95,1],[408,6,408,88,1],[413,7,413,8,1],[414,15,414,55,1],[415,8,415,9,1],[416,9,416,46,1],[417,9,417,10,1],[418,10,418,33,1],[420,10,420,75,1],[423,7,423,8,1],[424,8,427,9,1],[427,9,427,10,1],[427,10,428,10,1],[428,10,428,96,1],[428,96,429,10,1],[429,10,430,10,1],[430,10,430,11,1],[430,11,431,11,1],[431,11,431,64,1],[431,64,432,11,1],[432,11,432,63,1],[432,63,433,11,1],[433,11,433,114,1],[433,114,434,10,1],[434,10,434,11,1],[434,11,434,13,1],[429,10,434,13,1],[434,13,435,9,1],[435,9,435,10,1],[435,10,436,29,1],[436,29,436,33,1],[436,33,439,9,1],[439,9,439,10,1],[439,10,440,10,1],[440,10,440,49,1],[440,49,441,10,1],[441,10,441,43,1],[441,43,442,10,1],[442,10,442,11,1],[442,11,443,11,1],[443,11,443,43,1],[443,43,444,10,1],[444,10,444,11,1],[444,11,445,9,1],[445,9,445,10,1],[445,10,445,12,1],[424,8,445,12,1],[448,8,448,46,1],[450,7,450,8,1],[451,7,451,27,0],[452,7,452,8,0],[453,8,454,130,0],[455,7,455,8,0],[457,9,457,10,1],[458,6,458,38,1],[460,7,460,8,1],[464,3,464,4,1],[465,4,465,60,1],[466,3,466,4,1],[475,9,475,10,1],[476,13,476,36,1],[476,37,476,83,0],[480,13,480,69,1],[481,13,481,14,0],[482,17,482,167,0],[487,13,487,83,1],[490,13,491,66,1],[491,66,498,58,0],[498,58,498,69,1],[490,13,498,69,1],[500,13,501,44,1],[501,44,501,112,0],[501,112,501,114,1],[500,13,501,114,1],[503,13,503,39,1],[504,13,504,14,0],[505,17,505,73,0],[506,17,506,42,0],[507,17,507,18,0],[508,21,508,47,0],[509,21,509,120,0],[510,21,510,22,0],[511,25,511,46,0],[512,25,512,37,0],[514,21,514,117,0],[515,17,515,18,0],[517,17,517,18,0],[518,21,518,231,0],[519,17,519,18,0],[520,13,520,14,0],[522,13,522,89,1],[522,89,522,116,1],[522,116,522,144,1],[522,13,522,144,1],[523,13,523,14,1],[524,17,524,91,1],[524,91,524,118,1],[524,118,524,147,1],[524,147,524,162,1],[524,162,524,181,1],[524,17,524,181,1],[525,17,525,114,1],[526,17,526,18,1],[527,21,527,76,1],[528,21,528,47,1],[529,21,529,120,1],[530,21,530,22,1],[531,25,531,46,1],[532,25,532,37,1],[534,21,534,117,0],[535,17,535,18,0],[537,17,537,18,0],[538,21,538,125,0],[539,17,539,18,0],[540,13,540,14,0],[542,13,542,39,1],[544,13,544,100,1],[546,13,546,30,1],[547,9,547,10,1],[550,9,550,10,1],[551,4,551,27,1],[554,13,554,74,1],[555,4,555,5,1],[556,5,556,17,1],[559,13,559,27,1],[561,13,561,92,1],[562,13,562,14,0],[563,17,563,44,0],[565,17,565,65,0],[566,17,566,29,0],[568,13,568,57,1],[569,13,569,14,1],[570,17,570,39,1],[571,17,571,36,1],[572,17,572,18,0],[573,21,573,115,0],[575,17,575,36,1],[576,17,576,65,1],[577,17,577,29,1],[580,13,580,41,1],[581,13,581,27,1],[582,13,582,14,1],[583,17,583,40,1],[584,17,584,42,1],[585,17,585,18,1],[586,21,586,63,1],[587,21,587,38,1],[588,17,588,18,1],[591,17,591,75,1],[592,17,592,18,1],[593,21,593,79,1],[595,21,595,115,1],[596,21,596,22,1],[597,25,597,131,1],[598,21,598,22,1],[599,17,599,18,1],[601,17,601,34,1],[602,17,602,18,1],[603,21,603,62,1],[604,21,604,22,1],[606,25,606,73,1],[607,25,607,37,1],[609,17,609,18,0],[613,17,613,53,1],[614,17,614,42,1],[615,17,615,18,1],[617,18,618,31,1],[618,31,618,133,1],[618,133,619,30,1],[617,18,619,30,1],[620,21,620,52,1],[621,21,621,22,1],[622,25,622,76,1],[624,25,624,73,1],[625,25,625,37,1],[628,17,628,18,1],[632,17,632,60,1],[634,17,634,36,1],[635,17,635,18,1],[636,21,636,69,1],[637,21,637,33,1],[640,13,640,14,1],[646,13,646,51,1],[647,13,647,14,1],[652,17,652,44,1],[653,17,653,29,1],[655,13,655,25,0],[656,9,656,10,1],[659,9,659,10,1],[660,13,660,69,1],[662,13,662,60,1],[663,9,663,10,1],[666,9,666,10,1],[667,13,667,123,1],[668,13,668,44,1],[669,13,669,14,1],[670,17,670,40,1],[671,17,671,72,1],[672,17,672,18,1],[673,21,673,42,1],[674,21,674,22,0],[675,7,675,114,0],[676,21,676,22,0],[677,18,677,36,1],[678,21,678,33,1],[681,17,681,18,0],[682,21,682,42,0],[683,21,683,22,0],[684,7,684,114,0],[685,21,685,22,0],[686,17,686,18,0],[687,13,687,14,0],[689,13,689,14,0],[690,5,690,207,0],[691,13,691,14,0],[692,13,692,27,0],[693,13,693,26,0],[694,9,694,10,1],[696,9,696,10,1],[699,13,699,66,1],[702,13,702,49,1],[703,13,703,14,0],[705,17,705,72,0],[706,17,706,18,0],[707,21,707,36,0],[708,21,708,33,0],[710,17,710,107,0],[711,17,711,18,0],[712,21,712,42,0],[713,21,713,33,0],[715,13,715,14,0],[730,13,730,119,1],[731,13,731,14,0],[733,17,733,37,0],[734,17,734,151,0],[735,17,735,18,0],[736,21,736,38,0],[737,21,737,33,0],[739,13,739,14,0],[740,13,740,98,1],[741,13,741,14,0],[743,17,743,55,0],[744,17,744,83,0],[745,17,745,18,0],[746,21,746,39,0],[747,21,747,33,0],[750,17,750,18,0],[751,21,751,48,0],[752,21,752,33,0],[757,13,757,51,1],[758,13,758,14,0],[759,17,759,60,0],[760,17,760,29,0],[764,13,764,91,1],[765,13,765,14,0],[766,17,766,31,0],[767,17,767,29,0],[769,13,769,92,1],[770,13,770,14,0],[771,17,771,32,0],[772,17,772,29,0],[775,13,775,32,1],[776,13,776,14,1],[778,17,778,53,1],[779,17,779,18,0],[781,21,781,22,0],[782,25,782,128,0],[783,25,783,39,0],[784,25,784,26,0],[787,29,787,71,0],[788,29,789,83,0],[789,83,789,169,0],[789,169,789,180,0],[788,29,789,180,0],[790,29,790,30,0],[791,33,791,60,0],[792,33,792,45,0],[795,29,795,30,0],[797,33,797,45,0],[800,21,800,22,0],[801,21,801,38,0],[802,21,802,22,0],[804,25,804,37,0],[807,17,807,18,0],[808,13,808,14,1],[810,13,810,25,1],[811,9,811,10,1],[814,9,814,10,0],[815,13,815,27,0],[816,13,816,14,0],[817,17,817,63,0],[818,17,818,34,0],[819,17,819,18,0],[821,21,821,67,0],[822,21,822,22,0],[823,25,823,74,0],[825,17,825,18,0],[826,17,826,29,0],[828,13,828,25,0],[829,9,829,10,0],[833,13,833,14,0],[834,17,834,31,0],[835,17,835,18,0],[836,21,836,70,0],[838,17,838,30,0],[839,13,839,14,0],[844,13,844,14,0],[845,17,845,31,0],[846,17,846,18,0],[847,21,847,68,0],[849,17,849,29,0],[850,13,850,14,0],[854,9,854,10,0],[855,13,855,27,0],[856,13,856,14,0],[857,17,857,63,0],[858,17,858,110,0],[859,17,859,18,0],[860,21,860,114,0],[861,17,861,18,0],[862,17,862,34,0],[863,17,863,18,0],[865,21,865,67,0],[866,21,866,22,0],[867,25,867,118,0],[868,25,868,43,0],[869,25,869,26,0],[870,29,870,84,0],[872,29,872,132,0],[873,29,873,30,0],[874,33,874,141,0],[875,29,875,30,0],[876,29,876,47,0],[877,29,877,30,0],[878,33,878,74,0],[880,25,880,26,0],[881,21,881,22,0],[882,17,882,18,0],[883,13,883,14,0],[884,13,884,25,0],[885,9,885,10,0],[889,9,889,10,0],[890,13,890,252,0],[891,13,891,14,0],[892,17,892,36,0],[893,17,893,29,0],[895,13,895,130,0],[896,13,896,14,0],[897,17,897,56,0],[898,17,898,37,0],[899,17,899,29,0],[901,13,901,73,0],[902,13,902,14,0],[903,17,903,35,0],[904,13,904,14,0],[905,13,905,25,0],[906,9,906,10,0],[909,9,909,10,0],[910,13,910,23,0],[924,21,924,33,0],[926,13,926,26,0],[927,9,927,10,0],[929,9,929,10,1],[930,13,930,43,1],[930,43,930,58,1],[930,58,930,60,1],[930,13,930,60,1],[931,9,931,10,1],[933,9,933,10,0],[934,13,934,43,0],[934,43,934,62,0],[934,62,934,64,0],[934,13,934,64,0],[935,9,935,10,0],[937,9,937,10,0],[938,13,938,43,0],[938,43,938,78,0],[938,78,938,80,0],[938,13,938,80,0],[939,9,939,10,0],[941,9,941,10,1],[942,13,942,28,1],[942,29,942,41,0],[944,13,944,32,1],[945,13,945,38,1],[946,13,946,14,1],[948,17,948,45,1],[949,17,949,39,1],[949,40,949,52,0],[950,17,950,34,1],[952,17,952,35,1],[953,21,953,36,1],[954,13,954,14,0],[956,13,956,25,0],[957,9,957,10,1],[960,9,960,10,1],[961,13,961,41,1],[961,41,961,45,1],[961,45,961,47,1],[961,13,961,47,1],[962,9,962,10,1],[965,9,965,10,0],[966,13,966,41,0],[966,41,966,57,0],[966,57,966,59,0],[966,13,966,59,0],[967,9,967,10,0],[970,9,970,10,0],[971,13,971,41,0],[971,41,971,73,0],[971,73,971,75,0],[971,13,971,75,0],[972,9,972,10,0],[975,9,975,10,1],[976,7,976,47,1],[978,7,978,22,1],[979,11,979,31,1],[981,13,981,32,1],[982,13,982,38,1],[983,13,983,14,1],[985,17,985,45,1],[986,17,986,39,1],[986,40,986,46,0],[987,17,987,34,1],[989,17,989,35,1],[990,21,990,44,1],[991,13,991,14,1],[993,7,993,27,1],[994,7,994,45,1],[995,9,995,10,1],[998,9,998,10,0],[999,13,999,37,0],[999,37,999,69,0],[999,69,999,71,0],[999,13,999,71,0],[1000,9,1000,10,0],[1002,9,1002,10,0],[1003,13,1003,37,0],[1003,37,1003,53,0],[1003,53,1003,55,0],[1003,13,1003,55,0],[1004,9,1004,10,0],[1006,9,1006,10,1],[1007,13,1007,37,1],[1007,37,1007,41,1],[1007,41,1007,43,1],[1007,13,1007,43,1],[1008,9,1008,10,1],[1010,9,1010,10,1],[1011,13,1011,80,1],[1011,80,1011,99,1],[1011,99,1011,113,1],[1011,13,1011,113,1],[1012,13,1012,84,1],[1012,84,1012,119,1],[1012,119,1012,122,1],[1012,13,1012,122,1],[1013,9,1013,10,1],[1015,9,1015,10,0],[1016,13,1016,43,0],[1016,43,1016,59,0],[1016,59,1016,61,0],[1016,13,1016,61,0],[1017,9,1017,10,0],[1019,9,1019,10,0],[1020,13,1020,43,0],[1020,43,1020,75,0],[1020,75,1020,77,0],[1020,13,1020,77,0],[1021,9,1021,10,0],[1023,9,1023,10,1],[1024,13,1024,43,1],[1024,43,1024,47,1],[1024,47,1024,49,1],[1024,13,1024,49,1],[1025,9,1025,10,1],[1027,9,1027,10,1],[1028,13,1028,32,1],[1029,13,1029,14,1],[1030,17,1030,63,1],[1031,17,1031,34,1],[1032,17,1032,18,1],[1033,21,1033,42,1],[1034,17,1034,18,1],[1035,17,1035,84,1],[1035,84,1035,103,1],[1035,103,1035,117,1],[1035,17,1035,117,1],[1036,17,1036,105,1],[1036,105,1036,140,1],[1036,140,1036,143,1],[1036,17,1036,143,1],[1038,13,1038,72,0],[1039,9,1039,10,1],[1041,9,1041,10,0],[1042,13,1042,35,0],[1042,35,1042,51,0],[1042,51,1042,53,0],[1042,13,1042,53,0],[1043,9,1043,10,0],[1045,9,1045,10,0],[1046,13,1046,35,0],[1046,35,1046,67,0],[1046,67,1046,69,0],[1046,13,1046,69,0],[1047,9,1047,10,0],[1049,9,1049,10,1],[1050,13,1050,35,1],[1050,35,1050,39,1],[1050,39,1050,41,1],[1050,13,1050,41,1],[1051,9,1051,10,1],[1053,9,1053,10,1],[1054,13,1054,70,1],[1055,13,1055,29,1],[1056,13,1056,33,1],[1057,13,1057,14,1],[1058,17,1058,37,1],[1058,38,1058,44,1],[1059,17,1059,50,1],[1060,17,1060,36,1],[1061,17,1061,18,1],[1062,21,1062,40,1],[1063,21,1063,22,1],[1064,25,1064,39,1],[1065,25,1065,40,1],[1066,25,1066,26,1],[1067,29,1067,52,1],[1068,25,1068,26,1],[1069,21,1069,22,1],[1071,21,1071,22,0],[1072,25,1072,31,0],[1074,17,1074,18,1],[1076,17,1076,18,0],[1077,21,1077,27,0],[1079,13,1079,14,1],[1080,13,1080,36,1],[1081,13,1081,54,1],[1082,9,1082,10,1],[1087,13,1087,14,1],[1088,17,1088,31,1],[1089,21,1089,33,0],[1091,17,1091,38,1],[1092,21,1092,54,1],[1099,17,1099,44,1],[1100,21,1100,33,0],[1102,17,1102,29,1],[1103,13,1103,14,1],[1106,9,1107,9,1],[1107,9,1107,10,0],[1107,10,1108,13,1],[1108,13,1108,47,0],[1108,47,1109,9,1],[1109,9,1109,10,0],[1109,10,1109,12,1],[1106,9,1109,12,1],[1106,9,1107,9,0],[1107,9,1107,10,0],[1107,10,1108,13,0],[1108,13,1108,47,0],[1108,47,1109,9,0],[1109,9,1109,10,0],[1109,10,1109,12,0],[1106,9,1109,12,0],[1106,9,1107,9,0],[1107,9,1107,10,0],[1107,10,1108,13,0],[1108,13,1108,47,0],[1108,47,1109,9,0],[1109,9,1109,10,0],[1109,10,1109,12,0],[1106,9,1109,12,0],[1106,9,1107,9,1],[1107,9,1107,10,0],[1107,10,1108,13,1],[1108,13,1108,47,0],[1108,47,1109,9,1],[1109,9,1109,10,0],[1109,10,1109,12,1],[1106,9,1109,12,1],[1106,9,1107,9,0],[1107,9,1107,10,0],[1107,10,1108,13,0],[1108,13,1108,47,0],[1108,47,1109,9,0],[1109,9,1109,10,0],[1109,10,1109,12,0],[1106,9,1109,12,0],[1106,9,1107,9,1],[1107,9,1107,10,0],[1107,10,1108,13,1],[1108,13,1108,47,0],[1108,47,1109,9,1],[1109,9,1109,10,0],[1109,10,1109,12,1],[1106,9,1109,12,1],[1106,9,1107,9,1],[1107,9,1107,10,0],[1107,10,1108,13,1],[1108,13,1108,47,0],[1108,47,1109,9,1],[1109,9,1109,10,0],[1109,10,1109,12,1],[1106,9,1109,12,1],[1112,9,1112,10,0],[1113,13,1113,56,0],[1114,13,1114,37,0],[1115,13,1115,14,0],[1116,17,1116,43,0],[1118,13,1118,25,0],[1119,9,1119,10,0],[1122,9,1122,10,0],[1123,13,1123,56,0],[1124,13,1124,37,0],[1125,13,1125,14,0],[1126,17,1126,43,0],[1128,13,1128,25,0],[1129,9,1129,10,0],[1132,9,1132,10,0],[1133,13,1133,56,0],[1134,13,1134,37,0],[1135,13,1135,14,0],[1136,17,1136,43,0],[1138,13,1138,25,0],[1139,9,1139,10,0],[1142,9,1142,10,0],[1143,13,1143,54,0],[1144,9,1144,10,0],[1147,9,1147,10,0],[1148,13,1148,54,0],[1149,9,1149,10,0],[1152,9,1152,10,0],[1153,13,1153,54,0],[1154,9,1154,10,0],[1157,9,1157,10,0],[1158,13,1158,58,0],[1159,13,1159,38,0],[1160,13,1160,14,0],[1161,17,1161,43,0],[1163,13,1163,26,0],[1164,9,1164,10,0],[1167,9,1167,10,0],[1168,13,1168,58,0],[1169,13,1169,38,0],[1170,13,1170,14,0],[1171,17,1171,43,0],[1173,13,1173,26,0],[1174,9,1174,10,0],[1177,9,1177,10,0],[1178,13,1178,58,0],[1179,13,1179,38,0],[1180,13,1180,14,0],[1181,17,1181,43,0],[1183,13,1183,26,0],[1184,9,1184,10,0],[1187,9,1187,10,0],[1188,13,1188,54,0],[1189,9,1189,10,0],[1192,9,1192,10,0],[1193,13,1193,54,0],[1194,9,1194,10,0],[1197,9,1197,10,0],[1198,13,1198,54,0],[1199,9,1199,10,0],[1203,17,1203,18,0],[1203,19,1203,33,0],[1203,34,1203,43,0],[1203,44,1203,62,0],[1203,63,1203,64,0],[1208,17,1208,18,0],[1208,19,1208,33,0],[1208,34,1208,43,0],[1208,44,1208,63,0],[1208,64,1208,65,0],[1213,17,1213,18,0],[1213,19,1213,33,0],[1213,34,1213,46,0],[1213,47,1213,61,0],[1213,62,1213,63,0],[1218,13,1218,14,1],[1219,17,1219,31,1],[1219,32,1219,44,0],[1220,17,1220,99,1],[1221,17,1221,45,1],[1222,17,1222,18,1],[1223,21,1223,57,1],[1225,17,1225,29,1],[1226,13,1226,14,1],[1230,17,1230,18,0],[1230,19,1230,33,0],[1230,34,1230,46,0],[1230,47,1230,60,0],[1230,61,1230,62,0],[1235,17,1235,18,0],[1235,19,1235,33,0],[1235,34,1235,46,0],[1235,47,1235,64,0],[1235,65,1235,66,0],[1240,17,1240,18,1],[1240,19,1240,33,1],[1240,34,1240,46,0],[1240,47,1240,70,1],[1240,71,1240,72,1],[1245,17,1245,18,0],[1245,19,1245,33,0],[1245,34,1245,46,0],[1245,47,1245,67,0],[1245,68,1245,69,0],[1250,17,1250,18,1],[1250,19,1250,33,1],[1250,34,1250,46,0],[1250,47,1250,68,1],[1250,69,1250,70,1],[1255,17,1255,18,0],[1255,19,1255,33,0],[1255,34,1255,43,0],[1255,44,1255,62,0],[1255,63,1255,64,0],[1260,17,1260,18,0],[1260,19,1260,33,0],[1260,34,1260,43,0],[1260,44,1260,63,0],[1260,64,1260,65,0],[1265,17,1265,18,0],[1265,19,1265,33,0],[1265,34,1265,35,0],[1270,17,1270,18,0],[1270,19,1270,33,0],[1270,34,1270,59,0],[1270,60,1270,80,0],[1270,81,1270,82,0],[1274,17,1274,18,1],[1274,19,1274,33,1],[1274,34,1274,43,0],[1274,44,1274,56,1],[1274,57,1274,58,1],[1279,17,1279,18,1],[1279,19,1279,33,1],[1279,34,1279,59,0],[1279,60,1279,80,1],[1279,81,1279,82,1],[1284,17,1284,18,0],[1284,19,1284,33,0],[1284,34,1284,52,0],[1284,53,1284,70,0],[1284,71,1284,72,0],[1289,17,1289,18,0],[1289,19,1289,33,0],[1289,34,1289,46,0],[1289,47,1289,64,0],[1289,65,1289,66,0],[1294,17,1294,18,1],[1294,19,1294,33,1],[1294,34,1294,43,0],[1294,44,1294,59,1],[1294,60,1294,61,1],[1299,17,1299,18,0],[1299,19,1299,33,0],[1299,34,1299,46,0],[1299,47,1299,73,0],[1299,74,1299,75,0],[1305,13,1305,14,1],[1306,14,1306,39,1],[1308,13,1308,14,1],[1313,11,1313,12,1],[1313,13,1313,35,1],[1313,36,1313,37,1],[1317,9,1317,10,1],[1318,13,1318,27,1],[1318,28,1318,40,0],[1323,13,1323,64,1],[1324,13,1324,14,1],[1325,17,1325,29,1],[1329,13,1329,14,1],[1330,17,1330,45,1],[1331,17,1331,34,1],[1332,17,1332,18,1],[1334,21,1334,82,1],[1335,21,1335,22,1],[1337,25,1337,88,1],[1338,25,1338,53,1],[1339,21,1339,22,1],[1340,17,1340,18,1],[1341,17,1341,59,1],[1342,17,1342,18,1],[1344,21,1344,79,1],[1345,21,1345,64,1],[1346,17,1346,18,1],[1347,13,1347,14,1],[1348,13,1348,30,0],[1349,13,1349,14,0],[1350,17,1350,29,0],[1353,13,1353,30,1],[1354,17,1354,29,1],[1357,13,1357,51,1],[1359,13,1359,25,1],[1360,9,1360,10,1],[1362,9,1362,10,1],[1363,13,1363,28,1],[1363,29,1363,55,1],[1364,13,1364,27,1],[1364,28,1364,40,0],[1365,13,1365,49,1],[1366,13,1366,51,1],[1367,13,1367,33,1],[1368,13,1368,14,1],[1369,17,1369,42,1],[1370,17,1370,37,1],[1370,38,1370,44,0],[1371,17,1371,51,1],[1372,13,1372,14,1],[1373,13,1373,30,1],[1374,13,1374,14,1],[1375,17,1375,29,1],[1377,13,1377,25,0],[1378,9,1378,10,1],[1380,9,1380,10,1],[1381,13,1381,50,1],[1382,9,1382,10,1],[1384,9,1384,10,1],[1386,13,1386,39,1],[1387,13,1387,14,0],[1388,17,1388,68,0],[1389,17,1389,56,0],[1390,13,1390,14,0],[1392,13,1392,14,1],[1393,17,1393,44,1],[1394,17,1394,51,1],[1395,13,1395,14,1],[1396,13,1396,65,1],[1397,9,1397,10,1],[1399,9,1399,10,0],[1400,13,1402,64,0],[1403,13,1403,31,0],[1404,9,1404,10,0],[1406,9,1406,10,0],[1407,13,1407,54,0],[1408,13,1408,30,0],[1408,31,1408,49,0],[1409,13,1409,29,0],[1410,9,1410,10,0],[1412,9,1412,10,0],[1413,13,1413,27,0],[1413,28,1413,40,0],[1414,13,1414,40,0],[1415,9,1415,10,0],[1418,9,1418,10,0],[1419,13,1419,27,0],[1419,28,1419,40,0],[1420,13,1420,59,0],[1421,9,1421,10,0],[1423,9,1423,10,0],[1424,13,1424,54,0],[1425,13,1425,30,0],[1425,31,1425,43,0],[1426,13,1426,54,0],[1427,9,1427,10,0],[1429,9,1429,10,0],[1430,13,1430,41,0],[1431,9,1431,10,0],[1433,9,1433,10,1],[1434,13,1434,43,1],[1435,9,1435,10,1],[1437,9,1437,10,1],[1438,13,1438,54,1],[1439,13,1439,30,1],[1439,31,1439,44,1],[1440,13,1440,56,1],[1441,9,1441,10,1],[1443,9,1443,10,0],[1444,13,1444,104,0],[1445,9,1445,10,0],[1447,9,1447,10,0],[1448,13,1448,108,0],[1449,9,1449,10,0],[1451,9,1451,10,0],[1452,13,1452,104,0],[1453,9,1453,10,0],[1455,9,1455,10,0],[1456,13,1456,108,0],[1457,9,1457,10,0],[1459,9,1459,10,0],[1460,13,1460,33,0],[1461,9,1461,10,0],[1468,9,1468,10,1],[1469,13,1469,63,1],[1470,13,1470,14,1],[1471,17,1471,67,1],[1471,67,1471,85,1],[1471,85,1471,87,1],[1471,17,1471,87,1],[1472,17,1472,60,1],[1473,13,1473,14,1],[1474,13,1474,43,1],[1475,9,1475,10,1],[1478,9,1478,10,1],[1479,13,1479,36,1],[1480,13,1480,14,1],[1481,17,1481,77,1],[1482,17,1482,61,1],[1482,61,1482,76,1],[1482,76,1482,78,1],[1482,17,1482,78,1],[1483,17,1483,40,1],[1484,17,1484,18,1],[1485,21,1485,41,1],[1487,17,1487,180,0],[1489,13,1489,139,0],[1490,9,1490,10,1],[1493,9,1493,10,1],[1494,13,1494,34,1],[1494,34,1494,48,1],[1494,48,1494,50,1],[1494,13,1494,50,1],[1495,9,1495,10,1],[1497,9,1497,10,0],[1498,13,1498,34,0],[1498,34,1498,48,0],[1498,48,1498,63,0],[1498,13,1498,63,0],[1499,9,1499,10,0],[1501,9,1501,10,0],[1502,13,1502,34,0],[1502,34,1502,48,0],[1502,48,1502,77,0],[1502,13,1502,77,0],[1503,9,1503,10,0],[1505,9,1505,10,1],[1506,13,1506,35,1],[1506,35,1506,49,1],[1506,49,1506,51,1],[1506,13,1506,51,1],[1507,9,1507,10,1],[1509,9,1509,10,0],[1510,13,1510,34,0],[1510,34,1510,48,0],[1510,48,1510,63,0],[1510,13,1510,63,0],[1511,9,1511,10,0],[1513,9,1513,10,0],[1514,13,1514,34,0],[1514,34,1514,48,0],[1514,48,1514,77,0],[1514,13,1514,77,0],[1515,9,1515,10,0],[1517,9,1517,10,1],[1518,13,1518,37,1],[1519,13,1519,14,0],[1520,17,1520,30,0],[1522,13,1522,34,1],[1522,34,1522,52,1],[1522,52,1522,54,1],[1522,13,1522,54,1],[1523,9,1523,10,1],[1525,9,1525,10,0],[1526,13,1526,37,0],[1527,13,1527,14,0],[1528,17,1528,53,0],[1530,13,1530,34,0],[1530,34,1530,52,0],[1530,52,1530,67,0],[1530,13,1530,67,0],[1531,9,1531,10,0],[1533,9,1533,10,0],[1534,13,1534,37,0],[1535,13,1535,14,0],[1536,17,1536,53,0],[1538,13,1538,34,0],[1538,34,1538,52,0],[1538,52,1538,81,0],[1538,13,1538,81,0],[1539,9,1539,10,0],[1541,9,1541,10,0],[1542,13,1542,37,0],[1543,13,1543,14,0],[1544,17,1544,30,0],[1546,13,1546,34,0],[1546,34,1546,58,0],[1546,58,1546,60,0],[1546,13,1546,60,0],[1547,9,1547,10,0],[1549,9,1549,10,0],[1550,13,1550,37,0],[1551,13,1551,14,0],[1552,17,1552,53,0],[1554,13,1554,34,0],[1554,34,1554,58,0],[1554,58,1554,73,0],[1554,13,1554,73,0],[1555,9,1555,10,0],[1557,9,1557,10,0],[1558,13,1558,37,0],[1559,13,1559,14,0],[1560,17,1560,53,0],[1562,13,1562,34,0],[1562,34,1562,58,0],[1562,58,1562,87,0],[1562,13,1562,87,0],[1563,9,1563,10,0],[1566,9,1566,10,0],[1567,13,1567,37,0],[1568,13,1568,14,0],[1569,17,1569,30,0],[1571,13,1571,34,0],[1571,34,1571,58,0],[1571,58,1571,60,0],[1571,13,1571,60,0],[1572,9,1572,10,0],[1574,9,1574,10,0],[1575,13,1575,37,0],[1576,13,1576,14,0],[1577,17,1577,53,0],[1579,13,1579,34,0],[1579,34,1579,58,0],[1579,58,1579,73,0],[1579,13,1579,73,0],[1580,9,1580,10,0],[1582,9,1582,10,0],[1583,13,1583,37,0],[1584,13,1584,14,0],[1585,17,1585,53,0],[1587,13,1587,34,0],[1587,34,1587,58,0],[1587,58,1587,87,0],[1587,13,1587,87,0],[1588,9,1588,10,0],[1590,9,1590,10,0],[1591,13,1591,37,0],[1592,13,1592,14,0],[1593,17,1593,30,0],[1595,13,1595,35,0],[1595,35,1595,53,0],[1595,53,1595,55,0],[1595,13,1595,55,0],[1596,9,1596,10,0],[1598,9,1598,10,0],[1599,13,1599,37,0],[1600,13,1600,14,0],[1601,17,1601,53,0],[1603,13,1603,34,0],[1603,34,1603,52,0],[1603,52,1603,67,0],[1603,13,1603,67,0],[1604,9,1604,10,0],[1606,9,1606,10,0],[1607,13,1607,37,0],[1608,13,1608,14,0],[1609,17,1609,53,0],[1611,13,1611,34,0],[1611,34,1611,52,0],[1611,52,1611,81,0],[1611,13,1611,81,0],[1612,9,1612,10,0],[1614,9,1614,10,1],[1615,13,1615,37,1],[1616,13,1616,14,0],[1617,17,1617,30,0],[1619,13,1619,52,1],[1620,13,1620,34,1],[1620,34,1620,56,1],[1620,56,1620,58,1],[1620,13,1620,58,1],[1621,9,1621,10,1],[1623,9,1623,10,0],[1624,13,1624,37,0],[1625,13,1625,14,0],[1626,17,1626,53,0],[1628,13,1628,52,0],[1629,13,1629,34,0],[1629,34,1629,56,0],[1629,56,1629,71,0],[1629,13,1629,71,0],[1630,9,1630,10,0],[1632,9,1632,10,0],[1633,13,1633,37,0],[1634,13,1634,14,0],[1635,17,1635,53,0],[1637,13,1637,52,0],[1638,13,1638,34,0],[1638,34,1638,56,0],[1638,56,1638,85,0],[1638,13,1638,85,0],[1639,9,1639,10,0],[1641,9,1641,10,0],[1642,13,1642,37,0],[1643,13,1643,14,0],[1644,17,1644,30,0],[1646,13,1646,52,0],[1647,13,1647,35,0],[1647,35,1647,57,0],[1647,57,1647,59,0],[1647,13,1647,59,0],[1648,9,1648,10,0],[1650,9,1650,10,0],[1651,13,1651,37,0],[1652,13,1652,14,0],[1653,17,1653,53,0],[1655,13,1655,52,0],[1656,13,1656,34,0],[1656,34,1656,56,0],[1656,56,1656,71,0],[1656,13,1656,71,0],[1657,9,1657,10,0],[1659,9,1659,10,0],[1660,13,1660,37,0],[1661,13,1661,14,0],[1662,17,1662,53,0],[1664,13,1664,52,0],[1665,13,1665,34,0],[1665,34,1665,56,0],[1665,56,1665,85,0],[1665,13,1665,85,0],[1666,9,1666,10,0],[1668,9,1668,10,0],[1669,13,1669,34,0],[1669,34,1669,52,0],[1669,52,1669,54,0],[1669,13,1669,54,0],[1670,9,1670,10,0],[1672,9,1672,10,0],[1673,13,1673,34,0],[1673,34,1673,52,0],[1673,52,1673,67,0],[1673,13,1673,67,0],[1674,9,1674,10,0],[1676,9,1676,10,0],[1677,13,1677,34,0],[1677,34,1677,52,0],[1677,52,1677,81,0],[1677,13,1677,81,0],[1678,9,1678,10,0],[1680,9,1680,10,0],[1681,13,1681,34,0],[1681,34,1681,52,0],[1681,52,1681,54,0],[1681,13,1681,54,0],[1682,9,1682,10,0],[1684,9,1684,10,0],[1685,13,1685,34,0],[1685,34,1685,52,0],[1685,52,1685,67,0],[1685,13,1685,67,0],[1686,9,1686,10,0],[1688,9,1688,10,0],[1689,13,1689,34,0],[1689,34,1689,52,0],[1689,52,1689,81,0],[1689,13,1689,81,0],[1690,9,1690,10,0],[1692,9,1692,10,0],[1693,13,1693,34,0],[1693,34,1693,50,0],[1693,50,1693,52,0],[1693,13,1693,52,0],[1694,9,1694,10,0],[1696,9,1696,10,0],[1697,13,1697,34,0],[1697,34,1697,50,0],[1697,50,1697,65,0],[1697,13,1697,65,0],[1698,9,1698,10,0],[1700,9,1700,10,0],[1701,13,1701,34,0],[1701,34,1701,50,0],[1701,50,1701,79,0],[1701,13,1701,79,0],[1702,9,1702,10,0],[1704,9,1704,10,0],[1705,13,1705,34,0],[1705,34,1705,50,0],[1705,50,1705,52,0],[1705,13,1705,52,0],[1706,9,1706,10,0],[1708,9,1708,10,0],[1709,13,1709,34,0],[1709,34,1709,50,0],[1709,50,1709,65,0],[1709,13,1709,65,0],[1710,9,1710,10,0],[1712,9,1712,10,0],[1713,13,1713,34,0],[1713,34,1713,50,0],[1713,50,1713,79,0],[1713,13,1713,79,0],[1714,9,1714,10,0],[1716,9,1716,10,0],[1717,13,1717,46,0],[1718,13,1718,34,0],[1718,34,1718,67,0],[1718,67,1718,90,0],[1718,90,1718,99,0],[1718,34,1718,99,0],[1718,99,1718,101,0],[1718,13,1718,101,0],[1719,9,1719,10,0],[1721,9,1721,10,0],[1722,13,1722,46,0],[1723,13,1723,34,0],[1723,34,1723,67,0],[1723,67,1723,90,0],[1723,90,1723,99,0],[1723,34,1723,99,0],[1723,99,1723,114,0],[1723,13,1723,114,0],[1724,9,1724,10,0],[1726,9,1726,10,0],[1727,13,1727,46,0],[1728,13,1728,34,0],[1728,34,1728,67,0],[1728,67,1728,90,0],[1728,90,1728,99,0],[1728,34,1728,99,0],[1728,99,1728,128,0],[1728,13,1728,128,0],[1729,9,1729,10,0],[1731,9,1731,10,0],[1732,13,1732,52,0],[1733,13,1733,34,0],[1733,34,1733,67,0],[1733,67,1733,90,0],[1733,90,1733,99,0],[1733,34,1733,99,0],[1733,99,1733,101,0],[1733,13,1733,101,0],[1734,9,1734,10,0],[1736,9,1736,10,0],[1737,13,1737,52,0],[1738,13,1738,34,0],[1738,34,1738,67,0],[1738,67,1738,90,0],[1738,90,1738,99,0],[1738,34,1738,99,0],[1738,99,1738,114,0],[1738,13,1738,114,0],[1739,9,1739,10,0],[1741,9,1741,10,0],[1742,13,1742,52,0],[1743,13,1743,34,0],[1743,34,1743,67,0],[1743,67,1743,90,0],[1743,90,1743,99,0],[1743,34,1743,99,0],[1743,99,1743,128,0],[1743,13,1743,128,0],[1744,9,1744,10,0],[1746,9,1746,10,0],[1747,13,1747,50,0],[1748,13,1748,34,0],[1748,34,1748,71,0],[1748,71,1748,96,0],[1748,96,1748,105,0],[1748,34,1748,105,0],[1748,105,1748,107,0],[1748,13,1748,107,0],[1749,9,1749,10,0],[1751,9,1751,10,0],[1752,13,1752,50,0],[1753,13,1753,34,0],[1753,34,1753,71,0],[1753,71,1753,96,0],[1753,96,1753,105,0],[1753,34,1753,105,0],[1753,105,1753,120,0],[1753,13,1753,120,0],[1754,9,1754,10,0],[1756,9,1756,10,0],[1757,13,1757,50,0],[1758,13,1758,34,0],[1758,34,1758,71,0],[1758,71,1758,96,0],[1758,96,1758,105,0],[1758,34,1758,105,0],[1758,105,1758,134,0],[1758,13,1758,134,0],[1759,9,1759,10,0],[1761,9,1761,10,0],[1762,13,1762,56,0],[1763,13,1763,34,0],[1763,34,1763,71,0],[1763,71,1763,96,0],[1763,96,1763,105,0],[1763,34,1763,105,0],[1763,105,1763,107,0],[1763,13,1763,107,0],[1764,9,1764,10,0],[1766,9,1766,10,0],[1767,13,1767,56,0],[1768,13,1768,34,0],[1768,34,1768,71,0],[1768,71,1768,96,0],[1768,96,1768,105,0],[1768,34,1768,105,0],[1768,105,1768,120,0],[1768,13,1768,120,0],[1769,9,1769,10,0],[1771,9,1771,10,0],[1772,13,1772,56,0],[1773,13,1773,34,0],[1773,34,1773,71,0],[1773,71,1773,96,0],[1773,96,1773,105,0],[1773,34,1773,105,0],[1773,105,1773,134,0],[1773,13,1773,134,0],[1774,9,1774,10,0],[1776,9,1776,10,1],[1777,13,1777,31,1],[1778,9,1778,10,1],[1780,9,1780,10,0],[1781,13,1781,62,0],[1782,9,1782,10,0],[1784,9,1784,10,0],[1785,13,1785,92,0],[1786,9,1786,10,0],[1788,9,1788,10,0],[1789,13,1789,64,0],[1790,9,1790,10,0],[1792,9,1792,10,0],[1793,13,1793,34,0],[1794,13,1794,14,0],[1795,17,1795,52,0],[1797,13,1797,49,0],[1798,9,1798,10,0],[1800,9,1800,10,0],[1802,13,1802,57,0],[1803,13,1803,39,0],[1804,13,1804,74,0],[1805,13,1805,39,0],[1806,13,1806,14,0],[1808,17,1808,29,0],[1810,13,1810,26,0],[1811,9,1811,10,0],[1816,8,1816,9,0],[1816,10,1816,24,0],[1816,25,1816,26,0],[1821,8,1821,9,1],[1821,10,1821,20,1],[1821,21,1821,22,1],[1826,8,1826,9,0],[1826,10,1826,26,0],[1826,27,1826,28,0],[1831,8,1831,9,0],[1831,10,1831,27,0],[1831,28,1831,29,0],[1836,8,1836,9,0],[1836,10,1836,22,0],[1836,23,1836,24,0],[1841,8,1841,9,0],[1841,10,1841,21,0],[1841,22,1841,23,0],[1846,8,1846,9,0],[1846,10,1846,25,0],[1846,26,1846,27,0],[1851,8,1851,9,0],[1851,10,1851,31,0],[1851,32,1851,33,0],[1856,8,1856,9,0],[1856,10,1856,28,0],[1856,29,1856,30,0],[1861,8,1861,9,0],[1861,10,1861,29,0],[1861,30,1861,31,0],[1866,8,1866,9,0],[1866,10,1866,26,0],[1866,27,1866,28,0],[1871,8,1871,9,0],[1871,10,1871,27,0],[1871,28,1871,29,0],[1876,8,1876,9,0],[1876,10,1876,22,0],[1876,23,1876,24,0],[1881,8,1881,9,0],[1881,10,1881,28,0],[1881,29,1881,30,0],[1886,8,1886,9,0],[1886,10,1886,28,0],[1886,29,1886,30,0],[1891,8,1891,9,0],[1891,10,1891,25,0],[1891,26,1891,27,0],[1896,8,1896,9,0],[1896,10,1896,25,0],[1896,26,1896,27,0],[1901,8,1901,9,0],[1901,10,1901,23,0],[1901,24,1901,25,0],[1906,8,1906,9,0],[1906,10,1906,34,0],[1906,35,1906,36,0],[1911,8,1911,9,0],[1911,10,1911,60,0],[1911,60,1911,61,0],[1911,61,1911,73,0],[1911,10,1911,73,0],[1911,74,1911,75,0],[1915,3,1915,4,0],[1916,4,1916,30,0],[1917,3,1917,4,0],[1920,3,1920,4,0],[1921,4,1921,38,0],[1922,4,1922,31,0],[1923,4,1923,13,0],[1924,3,1924,4,0],[1927,3,1927,4,0],[1928,4,1928,29,0],[1929,3,1929,4,0],[1932,3,1932,4,0],[1933,4,1933,48,0],[1934,3,1934,4,0]]);
+    </script>
+  </body>
+</html>

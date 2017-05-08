@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\ObjectResolution\Resolution.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Linq;
+using System.Threading;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Core.ObjectResolution
+{
+	/// &lt;summary&gt;
+	/// Represents the status of objects resolution.
+	/// &lt;/summary&gt;
+	/// &lt;remarks&gt;
+	/// &lt;para&gt;Before resolution is frozen it is possible to access its configuration, but not to get values.&lt;/para&gt;
+	/// &lt;para&gt;Once resolution is frozen, it is not possible to access its configuration anymore, but it is possible to get values.&lt;/para&gt;
+	/// &lt;/remarks&gt;
+	internal static class Resolution
+	{
+		private static readonly ReaderWriterLockSlim ConfigurationLock = new ReaderWriterLockSlim(LockRecursionPolicy.SupportsRecursion);
+        private volatile static bool _isFrozen;
+
+	    /// &lt;summary&gt;
+		/// Occurs when resolution is frozen.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;Occurs only once, since resolution can be frozen only once.&lt;/remarks&gt;
+		public static event EventHandler Frozen;
+
+		/// &lt;summary&gt;
+		/// Gets or sets a value indicating whether resolution of objects is frozen.
+		/// &lt;/summary&gt;
+		// internal for unit tests, use ReadFrozen if you want to be sure
+		internal static bool IsFrozen
+		{
+		    get
+		    {
+		        using (new ReadLock(ConfigurationLock))
+		        {
+                    return _isFrozen;
+                }
+		    }
+		}
+
+	    public static IDisposable Reader(bool canReadUnfrozen = false)
+	    {
+            IDisposable l = new ReadLock(ConfigurationLock);
+            if (canReadUnfrozen || _isFrozen) return l;
+
+            l.Dispose();
+            throw new InvalidOperationException(&quot;Resolution is not frozen, it is not yet possible to get values from it.&quot;);
+	    }
+
+		/// &lt;summary&gt;
+		/// Returns a disposable object that represents safe access to unfrozen resolution configuration.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;Should be used in a &lt;c&gt;using(Resolution.Configuration) { ... }&lt;/c&gt;  mode.&lt;/remarks&gt;
+		public static IDisposable Configuration
+		{
+			get
+			{
+				IDisposable l = new WriteLock(ConfigurationLock);
+			    if (_isFrozen == false) return l;
+
+			    l.Dispose();
+			    throw new InvalidOperationException(&quot;Resolution is frozen, it is not possible to configure it anymore.&quot;);
+			}
+		}
+
+        // NOTE - the ugly code below exists only because of umbraco.BusinessLogic.Actions.Action.ReRegisterActionsAndHandlers
+        // which wants to re-register actions and handlers instead of properly restarting the application. Don&#39;t even think
+        // about using it for anything else. Also, while the backdoor is open, the resolution system is locked so nothing
+        // can work properly =&gt; deadlocks. Therefore, open the backdoor, do resolution changes EXCLUSIVELY, and close the door!
+
+        /// &lt;summary&gt;
+        /// Returns a disposable object that reprents dirty access to temporarily unfrozen resolution configuration.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// &lt;para&gt;Should not be used.&lt;/para&gt;
+        /// &lt;para&gt;Should be used in a &lt;c&gt;using(Resolution.DirtyBackdoorToConfiguration) { ... }&lt;/c&gt; mode.&lt;/para&gt;
+        /// &lt;para&gt;Because we just lift the frozen state, and we don&#39;t actually re-freeze, the &lt;c&gt;Frozen&lt;/c&gt; event does not trigger.&lt;/para&gt;
+        /// &lt;/remarks&gt;
+        internal static IDisposable DirtyBackdoorToConfiguration
+        {
+            get { return new DirtyBackdoor(); }
+        }
+
+        // keep the class here because it needs write-access to Resolution.IsFrozen
+        private class DirtyBackdoor : IDisposable
+        {
+
+            private readonly IDisposable _lock;
+            private readonly bool _frozen;
+
+            public DirtyBackdoor()
+            {
+                LogHelper.Debug(typeof(DirtyBackdoor), &quot;Creating back door for resolution&quot;);
+
+                _lock = new WriteLock(ConfigurationLock);
+                _frozen = _isFrozen;
+                _isFrozen = false;
+            }
+
+            public void Dispose()
+            {
+                LogHelper.Debug(typeof(DirtyBackdoor), &quot;Disposing back door for resolution&quot;);
+
+                _isFrozen = _frozen;
+                _lock.Dispose();
+            }
+        }
+
+		/// &lt;summary&gt;
+		/// Freezes resolution.
+		/// &lt;/summary&gt;
+		/// &lt;exception cref=&quot;InvalidOperationException&quot;&gt;resolution is already frozen.&lt;/exception&gt;
+		public static void Freeze()
+		{
+            LogHelper.Debug(typeof (Resolution), &quot;Freezing resolution&quot;);
+
+		    using (new WriteLock(ConfigurationLock))
+		    {
+                if (_isFrozen)
+                    throw new InvalidOperationException(&quot;Resolution is frozen. It is not possible to freeze it again.&quot;);
+
+                _isFrozen = true;
+            }
+
+            LogHelper.Debug(typeof(Resolution), &quot;Resolution is frozen&quot;);
+
+		    if (Frozen == null) return;
+
+		    try
+		    {
+		        Frozen(null, null);
+		    }
+		    catch (Exception e)
+		    {
+		        LogHelper.Error(typeof (Resolution), &quot;Exception in Frozen event handler.&quot;, e);
+		        throw;
+		    }
+		}
+        
+        /// &lt;summary&gt;
+        /// Resets resolution, ie unfreezes it and clears Frozen event.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;To be used in unit tests.&lt;/remarks&gt;
+        internal static void Reset()
+        {
+            LogHelper.Debug(typeof(Resolution), &quot;Resetting resolution&quot;);
+
+            /*
+            var trace = new System.Diagnostics.StackTrace();
+            var testing = trace.GetFrames().Any(frame =&gt;
+                frame.GetMethod().DeclaringType.FullName.StartsWith(&quot;Umbraco.Tests&quot;));
+            if (testing == false)
+                throw new InvalidOperationException(&quot;Only unit tests can reset configuration.&quot;);
+            */
+
+            using (new WriteLock(ConfigurationLock))
+            {
+                _isFrozen = false;
+            }
+            Frozen = null;
+        }
+	}
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[17,3,17,132,1],[33,7,33,8,1],[34,11,34,50,1],[35,11,35,12,1],[36,21,36,38,1],[38,7,38,8,1],[42,6,42,7,1],[43,13,43,61,1],[44,13,44,46,1],[44,47,44,56,1],[46,13,46,25,1],[47,13,47,124,1],[48,6,48,7,1],[57,4,57,5,1],[58,5,58,54,1],[59,8,59,31,1],[59,32,59,41,1],[61,8,61,20,1],[62,8,62,113,1],[63,4,63,5,1],[81,17,81,18,0],[81,19,81,46,0],[81,47,81,48,0],[91,13,91,35,0],[92,13,92,14,0],[93,17,93,93,0],[95,17,95,58,0],[96,17,96,37,0],[97,17,97,35,0],[98,13,98,14,0],[101,13,101,14,0],[102,17,102,94,0],[104,17,104,37,0],[105,17,105,33,0],[106,13,106,14,0],[114,3,114,4,1],[115,13,115,73,1],[117,7,117,47,1],[118,7,118,8,1],[119,17,119,31,1],[120,21,120,121,1],[122,17,122,34,1],[123,13,123,14,1],[125,13,125,73,1],[127,7,127,26,1],[127,27,127,34,1],[130,7,130,8,1],[131,11,131,30,1],[132,7,132,8,1],[133,7,133,26,0],[134,7,134,8,0],[135,11,135,89,0],[136,11,136,17,0],[138,3,138,4,1],[145,9,145,10,1],[146,13,146,73,1],[156,13,156,53,1],[157,13,157,14,1],[158,17,158,35,1],[159,13,159,14,1],[160,13,160,27,1],[161,9,161,10,1]]);
+    </script>
+  </body>
+</html>

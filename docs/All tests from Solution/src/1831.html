@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Migrations\Upgrades\TargetVersionSeven\AlterTagRelationsTable.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Data;
+using System.Linq;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.SqlSyntax;
+
+namespace Umbraco.Core.Persistence.Migrations.Upgrades.TargetVersionSeven
+{
+    [Migration(&quot;7.0.0&quot;, 8, GlobalSettings.UmbracoMigrationName)]
+    public class AlterTagRelationsTable : MigrationBase
+    {
+        public AlterTagRelationsTable(ISqlSyntaxProvider sqlSyntax, ILogger logger) : base(sqlSyntax, logger)
+        {
+        }
+
+        public override void Up()
+        {
+            if (Context == null || Context.Database == null) return;
+
+            Initial();
+
+            Upgrade();
+
+            Final();
+        }
+
+        private void Initial()
+        {
+            var constraints = SqlSyntax.GetConstraintsPerColumn(Context.Database).Distinct().ToArray();
+
+            //create a new col which we will make a foreign key, but first needs to be populated with data.
+            Alter.Table(&quot;cmsTagRelationship&quot;).AddColumn(&quot;propertyTypeId&quot;).AsInt32().Nullable();
+
+            //drop the foreign key on umbracoNode.  Must drop foreign key first before primary key can be removed in MySql.
+            if (Context.CurrentDatabaseProvider == DatabaseProviders.MySql)
+            {
+                Delete.ForeignKey().FromTable(&quot;cmsTagRelationship&quot;).ForeignColumn(&quot;nodeId&quot;).ToTable(&quot;umbracoNode&quot;).PrimaryColumn(&quot;id&quot;);
+                //check for another strange really old one that might have existed
+                if (constraints.Any(x =&gt; x.Item1 == &quot;cmsTagRelationship&quot; &amp;&amp; x.Item2 == &quot;tagId&quot;))
+                {
+                    Delete.ForeignKey().FromTable(&quot;cmsTagRelationship&quot;).ForeignColumn(&quot;tagId&quot;).ToTable(&quot;cmsTags&quot;).PrimaryColumn(&quot;id&quot;);
+                }
+            }
+            else
+            {
+                //Before we try to delete this constraint, we&#39;ll see if it exists first, some older schemas never had it and some older schema&#39;s had this named
+                // differently than the default.
+
+                var constraintMatches = constraints.Where(x =&gt; x.Item1 == &quot;cmsTagRelationship&quot; &amp;&amp; x.Item2 == &quot;nodeId&quot; &amp;&amp; x.Item3.InvariantStartsWith(&quot;PK_&quot;) == false);
+
+                foreach (var constraint in constraintMatches)
+                {
+                    Delete.ForeignKey(constraint.Item3).OnTable(&quot;cmsTagRelationship&quot;);
+                }
+            }
+
+            //we need to drop the primary key, this is sql specific since MySQL has never had primary keys on this table
+            // at least since 6.0 and the new installation way but perhaps it had them way back in 4.x so we need to check
+            // it exists before trying to drop it.
+            if (Context.CurrentDatabaseProvider == DatabaseProviders.MySql)
+            {   
+                //this will let us know if this pk exists on this table
+                if (constraints.Count(x =&gt; x.Item1.InvariantEquals(&quot;cmsTagRelationship&quot;) &amp;&amp; x.Item3.InvariantEquals(&quot;PRIMARY&quot;)) &gt; 0)
+                {
+                    Delete.PrimaryKey(&quot;PK_cmsTagRelationship&quot;).FromTable(&quot;cmsTagRelationship&quot;);
+                }
+            }
+            else
+            {
+                //lookup the PK by name
+                var pkName = constraints.FirstOrDefault(x =&gt; x.Item1.InvariantEquals(&quot;cmsTagRelationship&quot;) &amp;&amp; x.Item3.InvariantStartsWith(&quot;PK_&quot;));
+                if (pkName != null)
+                {
+                    Delete.PrimaryKey(pkName.Item3).FromTable(&quot;cmsTagRelationship&quot;);    
+                }
+            }
+            
+        }
+
+        private void Upgrade()
+        {
+            //get all data from the tag relationship table
+            var tagRelations = Context.Database.Fetch&lt;TagRelationshipDto&gt;(&quot;SELECT nodeId, tagId FROM cmsTagRelationship&quot;);
+
+            //get all node id -&gt; property type id references for nodes that are in a tag relations and for properties that are of those nodes that are of the tag data type
+            var propertyTypeIdRef = Context.Database.Fetch&lt;PropertyTypeReferenceDto&gt;(@&quot;SELECT DISTINCT cmsTagRelationship.nodeId as NodeId, cmsPropertyType.id as PropertyTypeId
+                FROM cmsTags 
+                INNER JOIN cmsTagRelationship ON cmsTagRelationship.tagId = cmsTags.id
+                INNER JOIN umbracoNode ON umbracoNode.id = cmsTagRelationship.nodeId
+                INNER JOIN cmsContent ON cmsContent.nodeId = umbracoNode.id
+                INNER JOIN cmsContentType ON cmsContentType.nodeId = cmsContent.contentType
+                INNER JOIN cmsPropertyType ON cmsPropertyType.contentTypeId = cmsContentType.nodeId
+                INNER JOIN cmsDataType ON cmsDataType.nodeId = cmsPropertyType.dataTypeId
+                WHERE cmsDataType.controlId = &#39;4023E540-92F5-11DD-AD8B-0800200C9A66&#39;&quot;);
+
+            foreach (var tr in tagRelations)
+            {
+                //for each tag relation we need to assign it a property type id which must exist in our references, if it doesn&#39;t it means that 
+                // someone has tag data that relates to node that is not in the cmsContent table - we&#39;ll have to delete it and log it if that is the case.
+
+                var propertyTypes = propertyTypeIdRef.Where(x =&gt; x.NodeId == tr.NodeId).ToArray();
+                if (propertyTypes.Length == 0)
+                {
+                    Logger.Warn&lt;AlterTagRelationsTable&gt;(&quot;There was no cmsContent reference for cmsTagRelationship for nodeId &quot;
+                        + tr.NodeId +
+                        &quot;. The new tag system only supports tags with references to content in the cmsContent and cmsPropertyType tables. This row will be deleted: &quot;
+                        + string.Format(&quot;nodeId: {0}, tagId: {1}&quot;, tr.NodeId, tr.TagId));
+                    Delete.FromTable(&quot;cmsTagRelationship&quot;).Row(new { nodeId = tr.NodeId, tagId = tr.TagId });
+                }
+                else
+                {
+                    //update the first one found to the existing row, there might be more if there are more than one tag property assigned to the node
+                    //in that case we need to create a row.
+
+                    //update the table with the alias, the current editorAlias will contain the original id
+                    var first = propertyTypes[0];
+                    Update.Table(&quot;cmsTagRelationship&quot;)
+                          .Set(new { propertyTypeId = first.PropertyTypeId })
+                          .Where(new { nodeId = tr.NodeId, tagId = tr.TagId });
+
+                    if (propertyTypes.Length &gt; 1)
+                    {
+                        //now we need to create rows for the other ones
+                        for (var i = 1; i &lt; propertyTypes.Length; i++)
+                        {
+                            Insert.IntoTable(&quot;cmsTagRelationship&quot;).Row(new { nodeId = tr.NodeId, tagId = tr.TagId, propertyTypeId = propertyTypes[i].PropertyTypeId });
+                        }
+                    }
+                }
+            }
+        }
+
+        private void Final()
+        {
+            //we need to change this to not nullable
+            Alter.Table(&quot;cmsTagRelationship&quot;).AlterColumn(&quot;propertyTypeId&quot;).AsInt32().NotNullable();
+
+            //we need to re-add the new primary key on all 3 columns
+            Create.PrimaryKey(&quot;PK_cmsTagRelationship&quot;).OnTable(&quot;cmsTagRelationship&quot;).Columns(new[] { &quot;nodeId&quot;, &quot;propertyTypeId&quot;, &quot;tagId&quot; });
+
+            //now we need to add a foreign key to the propertyTypeId column and change it&#39;s constraints
+            Create.ForeignKey(&quot;FK_cmsTagRelationship_cmsPropertyType&quot;)
+                  .FromTable(&quot;cmsTagRelationship&quot;)
+                  .ForeignColumn(&quot;propertyTypeId&quot;)
+                  .ToTable(&quot;cmsPropertyType&quot;)
+                  .PrimaryColumn(&quot;id&quot;)
+                  .OnDelete(Rule.None)
+                  .OnUpdate(Rule.None);
+
+            //now we need to add a foreign key to the nodeId column to cmsContent (intead of the original umbracoNode)
+            Create.ForeignKey(&quot;FK_cmsTagRelationship_cmsContent&quot;)
+                  .FromTable(&quot;cmsTagRelationship&quot;)
+                  .ForeignColumn(&quot;nodeId&quot;)
+                  .ToTable(&quot;cmsContent&quot;)
+                  .PrimaryColumn(&quot;nodeId&quot;)
+                  .OnDelete(Rule.None)
+                  .OnUpdate(Rule.None);
+        }
+
+        public override void Down()
+        {
+            throw new DataLossException(&quot;Cannot downgrade from a version 7 database to a prior version, the database schema has already been modified&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// A custom class to map to so that we can linq to it easily without dynamics
+        /// &lt;/summary&gt;
+        private class PropertyTypeReferenceDto
+        {
+            public int NodeId { get; set; }
+            public int PropertyTypeId { get; set; }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[15,87,15,110,0],[16,9,16,10,0],[17,9,17,10,0],[20,9,20,10,0],[21,13,21,61,0],[21,62,21,69,0],[23,13,23,23,0],[25,13,25,23,0],[27,13,27,21,0],[28,9,28,10,0],[31,9,31,10,0],[32,13,32,104,0],[35,13,35,96,0],[38,13,38,76,0],[39,13,39,14,0],[40,17,40,136,0],[42,17,42,42,0],[42,42,42,95,0],[42,95,42,97,0],[42,17,42,97,0],[43,17,43,18,0],[44,21,44,135,0],[45,17,45,18,0],[46,13,46,14,0],[48,13,48,14,0],[52,17,52,64,0],[52,64,52,165,0],[52,165,52,167,0],[52,17,52,167,0],[54,17,54,24,0],[54,26,54,40,0],[54,41,54,43,0],[54,44,54,61,0],[55,17,55,18,0],[56,21,56,87,0],[57,17,57,18,0],[58,13,58,14,0],[63,13,63,76,0],[64,13,64,14,0],[66,17,66,44,0],[66,44,66,127,0],[66,127,66,133,0],[66,17,66,133,0],[67,17,67,18,0],[68,21,68,96,0],[69,17,69,18,0],[70,13,70,14,0],[72,13,72,14,0],[74,17,74,62,0],[74,62,74,145,0],[74,145,74,147,0],[74,17,74,147,0],[75,17,75,36,0],[76,17,76,18,0],[77,21,77,85,0],[78,17,78,18,0],[79,13,79,14,0],[81,9,81,10,0],[84,9,84,10,0],[86,13,86,123,0],[89,13,97,88,0],[99,13,99,20,0],[99,22,99,28,0],[99,29,99,31,0],[99,32,99,44,0],[100,13,100,14,0],[104,17,104,66,0],[104,66,104,87,0],[104,87,104,99,0],[104,17,104,99,0],[105,17,105,47,0],[106,17,106,18,0],[107,21,110,90,0],[111,21,111,110,0],[112,17,112,18,0],[114,17,114,18,0],[119,21,119,50,0],[120,21,122,80,0],[124,21,124,50,0],[125,21,125,22,0],[127,30,127,39,0],[127,41,127,65,0],[127,67,127,70,0],[128,25,128,26,0],[129,29,129,168,0],[130,25,130,26,0],[131,21,131,22,0],[132,17,132,18,0],[133,13,133,14,0],[134,9,134,10,0],[137,9,137,10,0],[139,13,139,101,0],[142,13,142,141,0],[145,13,151,40,0],[154,13,160,40,0],[161,9,161,10,0],[164,9,164,10,0],[165,13,165,153,0],[173,33,173,37,0],[173,38,173,42,0],[174,41,174,45,0],[174,46,174,50,0]]);
+    </script>
+  </body>
+</html>

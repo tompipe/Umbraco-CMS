@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\page.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using System.Text;
+using System.Web;
+using System.Web.UI;
+using System.Xml;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.PublishedContent;
+using Umbraco.Web.Editors;
+using Umbraco.Web.Routing;
+using umbraco.cms.businesslogic.property;
+using umbraco.cms.businesslogic.template;
+using umbraco.cms.businesslogic.web;
+using umbraco.interfaces;
+using Umbraco.Core.Configuration;
+using Property = umbraco.cms.businesslogic.property.Property;
+
+namespace umbraco
+{
+	/// &lt;summary&gt;
+	/// Summary description for page.
+	/// &lt;/summary&gt;
+	public class page
+	{
+
+		#region Private members and properties
+
+		string _pageName;
+		int _parentId;
+		string _writerName;
+		string _creatorName;
+		string _path;
+		int _nodeType;
+		string _nodeTypeAlias;
+		string[] _splitpath;
+		DateTime _createDate;
+		DateTime _updateDate;
+		int _pageId;
+		Guid _pageVersion;
+		readonly int _template;
+
+		readonly Hashtable _elements = new Hashtable();
+		readonly StringBuilder _pageContent = new StringBuilder();
+		Control _pageContentControl = new Control();	
+
+		#endregion
+
+		#region Constructors
+
+		/// &lt;summary&gt;
+		/// Initializes a new instance of the &lt;see cref=&quot;page&quot;/&gt; class for a yet unpublished document, identified by its &lt;c&gt;id&lt;/c&gt; and &lt;c&gt;version&lt;/c&gt;.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;id&quot;&gt;The identifier of the document.&lt;/param&gt;
+		/// &lt;param name=&quot;version&quot;&gt;The version to be displayed.&lt;/param&gt;
+		public page(int id, Guid version)
+			: this(new Document(id, version))
+		{ }
+
+		/// &lt;summary&gt;
+		/// Initializes a new instance of the &lt;see cref=&quot;page&quot;/&gt; class for a yet unpublished document.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;document&quot;&gt;The document.&lt;/param&gt;
+		public page(Document document)
+		{
+			var docParentId = -1;
+			try
+			{
+				docParentId = document.ParentId;
+			}
+			catch (ArgumentException)
+			{
+				//ignore if no parent
+			}
+
+			populatePageData(document.Id,
+				document.Text, document.ContentType.Id, document.ContentType.Alias,
+				document.User.Name, document.Creator.Name, document.CreateDateTime, document.UpdateDate,
+				document.Path, document.Version, docParentId);
+
+			foreach (Property prop in document.GenericProperties)
+			{
+				string value = prop.Value != null ? prop.Value.ToString() : String.Empty;
+				_elements.Add(prop.PropertyType.Alias, value);
+			}
+
+			_template = document.Template;
+		}
+
+		/// &lt;summary&gt;
+		/// Initializes a new instance of the &lt;see cref=&quot;page&quot;/&gt; class for a published document request.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;docreq&quot;&gt;The &lt;see cref=&quot;PublishedContentRequest&quot;/&gt; pointing to the document.&lt;/param&gt;
+		/// &lt;remarks&gt;
+		/// The difference between creating the page with PublishedContentRequest vs an IPublishedContent item is 
+		/// that the PublishedContentRequest takes into account how a template is assigned during the routing process whereas
+		/// with an IPublishedContent item, the template id is asssigned purely based on the default.
+		/// &lt;/remarks&gt;
+		internal page(PublishedContentRequest docreq)
+		{
+
+			if (!docreq.HasPublishedContent)
+				throw new ArgumentException(&quot;Document request has no node.&quot;, &quot;docreq&quot;);
+			
+			populatePageData(docreq.PublishedContent.Id,
+				docreq.PublishedContent.Name, docreq.PublishedContent.DocumentTypeId, docreq.PublishedContent.DocumentTypeAlias,
+				docreq.PublishedContent.WriterName, docreq.PublishedContent.CreatorName, docreq.PublishedContent.CreateDate, docreq.PublishedContent.UpdateDate,
+				docreq.PublishedContent.Path, docreq.PublishedContent.Version, docreq.PublishedContent.Parent == null ? -1 : docreq.PublishedContent.Parent.Id);
+
+			if (docreq.HasTemplate)
+			{
+
+				this._template = docreq.TemplateModel.Id;
+				_elements[&quot;template&quot;] = _template.ToString();				
+			}
+
+			PopulateElementData(docreq.PublishedContent);
+
+		}
+
+		/// &lt;summary&gt;
+		/// Initializes a new instance of the page for a published document
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;doc&quot;&gt;&lt;/param&gt;
+		internal page(IPublishedContent doc)
+		{
+			if (doc == null) throw new ArgumentNullException(&quot;doc&quot;);
+			
+			populatePageData(doc.Id,
+				doc.Name, doc.DocumentTypeId, doc.DocumentTypeAlias,
+				doc.WriterName, doc.CreatorName, doc.CreateDate, doc.UpdateDate,
+				doc.Path, doc.Version, doc.Parent == null ? -1 : doc.Parent.Id);
+
+			if (doc.TemplateId &gt; 0)
+			{
+				//set the template to whatever is assigned to the doc
+				_template = doc.TemplateId;
+				_elements[&quot;template&quot;] = _template.ToString();	
+			}			
+			
+			PopulateElementData(doc);
+		}
+
+		/// &lt;summary&gt;
+		/// Initializes a new instance of the &lt;see cref=&quot;page&quot;/&gt; class for a published document.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;node&quot;&gt;The &lt;c&gt;XmlNode&lt;/c&gt; representing the document.&lt;/param&gt;
+		public page(XmlNode node)
+		{			
+			populatePageData(node);
+
+		    if (UmbracoConfig.For.UmbracoSettings().WebRouting.DisableAlternativeTemplates == false)
+		    {
+                // Check for alternative template
+		        if (HttpContext.Current.Items[Constants.Conventions.Url.AltTemplate] != null &amp;&amp;
+		            HttpContext.Current.Items[Constants.Conventions.Url.AltTemplate].ToString() != String.Empty)
+		        {
+		            _template =
+		                umbraco.cms.businesslogic.template.Template.GetTemplateIdFromAlias(
+		                    HttpContext.Current.Items[Constants.Conventions.Url.AltTemplate].ToString());
+		            _elements.Add(&quot;template&quot;, _template.ToString());
+		        }
+		        else if (helper.Request(Constants.Conventions.Url.AltTemplate) != String.Empty)
+		        {
+		            _template =
+		                umbraco.cms.businesslogic.template.Template.GetTemplateIdFromAlias(
+		                    helper.Request(Constants.Conventions.Url.AltTemplate).ToLower());
+		            _elements.Add(&quot;template&quot;, _template.ToString());
+		        }
+		    }
+
+		    if (_template == 0)
+			{
+				try
+				{
+					_template = Convert.ToInt32(node.Attributes.GetNamedItem(&quot;template&quot;).Value);
+					_elements.Add(&quot;template&quot;, node.Attributes.GetNamedItem(&quot;template&quot;).Value);
+				}
+				catch
+				{
+					HttpContext.Current.Trace.Warn(&quot;umbracoPage&quot;, &quot;No template defined&quot;);
+				}
+			}
+
+			populateElementData(node);
+
+		}
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the page for a content.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The content.&lt;/param&gt;
+        /// &lt;remarks&gt;This is for &lt;see cref=&quot;MacroController&quot;/&gt; usage only.&lt;/remarks&gt;
+	    internal page(IContent content)
+            : this(new PagePublishedContent(content))
+	    { }
+
+		#endregion
+
+		#region Initialize
+
+		void populatePageData(int pageID,
+			string pageName, int nodeType, string nodeTypeAlias,
+			string writerName, string creatorName, DateTime createDate, DateTime updateDate,
+			string path, Guid pageVersion, int parentId)
+		{
+			this._pageId = pageID;
+			this._pageName = pageName;
+			this._nodeType = nodeType;
+			this._nodeTypeAlias = nodeTypeAlias;
+			this._writerName = writerName;
+			this._creatorName = creatorName;
+			this._createDate = createDate;
+			this._updateDate = updateDate;
+			this._parentId = parentId;
+			this._path = path;
+			this._splitpath = path.Split(&#39;,&#39;);
+			this._pageVersion = pageVersion;
+
+			// Update the elements hashtable
+			_elements.Add(&quot;pageID&quot;, pageID);
+			_elements.Add(&quot;parentID&quot;, parentId);
+			_elements.Add(&quot;pageName&quot;, pageName);
+			_elements.Add(&quot;nodeType&quot;, nodeType);
+			_elements.Add(&quot;nodeTypeAlias&quot;, nodeTypeAlias);
+			_elements.Add(&quot;writerName&quot;, writerName);
+			_elements.Add(&quot;creatorName&quot;, creatorName);
+			_elements.Add(&quot;createDate&quot;, createDate);
+			_elements.Add(&quot;updateDate&quot;, updateDate);
+			_elements.Add(&quot;path&quot;, path);
+			_elements.Add(&quot;splitpath&quot;, _splitpath);
+			_elements.Add(&quot;pageVersion&quot;, pageVersion);
+		}
+
+		void populatePageData(XmlNode node)
+		{
+			String s;
+			DateTime dt;
+			Guid guid;
+			int i;
+
+			if (int.TryParse(attrValue(node, &quot;id&quot;), out i))
+				_elements[&quot;pageID&quot;] = this._pageId = i;
+
+			if ((s = attrValue(node, &quot;nodeName&quot;)) != null)
+				_elements[&quot;pageName&quot;] = this._pageName = s;
+
+			if (int.TryParse(attrValue(node, &quot;parentId&quot;), out i))
+				_elements[&quot;parentId&quot;] = this._parentId = i;
+
+			if (int.TryParse(attrValue(node, &quot;nodeType&quot;), out i))
+				_elements[&quot;nodeType&quot;] = this._nodeType = i;
+			if ((s = attrValue(node, &quot;nodeTypeAlias&quot;)) != null)
+				_elements[&quot;nodeTypeAlias&quot;] = this._nodeTypeAlias = s;
+
+			if ((s = attrValue(node, &quot;writerName&quot;)) != null)
+				_elements[&quot;writerName&quot;] = this._writerName = s;
+			if ((s = attrValue(node, &quot;creatorName&quot;)) != null)
+				_elements[&quot;creatorName&quot;] = this._creatorName = s;
+
+			if (DateTime.TryParse(attrValue(node, &quot;createDate&quot;), out dt))
+				_elements[&quot;createDate&quot;] = this._createDate = dt;
+			if (DateTime.TryParse(attrValue(node, &quot;updateDate&quot;), out dt))
+				_elements[&quot;updateDate&quot;] = this._updateDate = dt;
+
+			if (Guid.TryParse(attrValue(node, &quot;pageVersion&quot;), out guid))
+				_elements[&quot;pageVersion&quot;] = this._pageVersion = guid;
+
+			if ((s = attrValue(node, &quot;path&quot;)) != null)
+			{
+				_elements[&quot;path&quot;] = this._path = s;
+				_elements[&quot;splitpath&quot;] = this._splitpath = _path.Split(&#39;,&#39;);
+			}
+		}
+
+		string attrValue(XmlNode node, string attributeName)
+		{
+			var attr = node.Attributes.GetNamedItem(attributeName);
+			var value = attr != null ? attr.Value : null;
+			return value;
+		}
+
+		/// &lt;summary&gt;
+		/// Puts the properties of the node into the elements table
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;node&quot;&gt;&lt;/param&gt;
+		void PopulateElementData(IPublishedContent node)
+		{
+			foreach(var p in node.Properties)
+			{
+				if (_elements.ContainsKey(p.PropertyTypeAlias) == false)				
+				{
+                    // note: legacy used the raw value (see populating from an Xml node below)
+                    // so we&#39;re doing the same here, using DataValue. If we use Value then every
+                    // value will be converted NOW - including RTEs that may contain macros that
+                    // require that the &#39;page&#39; is already initialized = catch-22.
+
+                    // to properly fix this, we&#39;d need to turn the elements collection into some
+                    // sort of collection of lazy values.
+
+					_elements[p.PropertyTypeAlias] = p.DataValue;
+				}
+			}			
+		}
+
+		void populateElementData(XmlNode node)
+		{
+			string xpath = &quot;./* [not(@isDoc)]&quot;;
+
+			foreach (XmlNode data in node.SelectNodes(xpath))
+			{
+				// ignore empty elements
+				if (data.ChildNodes.Count == 0)
+					continue;
+
+				string alias = data.Name;
+				string value = data.FirstChild.Value;
+
+				// moved to PublishedContentRequest + UmbracoModule
+				//if (alias == &quot;umbracoRedirect&quot;)
+				//{
+				//    int i;
+				//    if (int.TryParse(value, out i))
+				//        HttpContext.Current.Response.Redirect(library.NiceUrl(int.Parse(data.FirstChild.Value)), true);
+				//}
+
+				if (_elements.ContainsKey(alias))
+				{
+					LogHelper.Debug&lt;page&gt;(
+						string.Format(&quot;Aliases must be unique, an element with alias \&quot;{0}\&quot; has already been loaded!&quot;, alias), 
+						true);					
+				}
+				else
+				{
+					_elements[alias] = value;
+					LogHelper.Debug&lt;page&gt;(
+						string.Format(&quot;Load element \&quot;{0}\&quot;&quot;, alias),
+						true);					
+				}
+			}
+		}
+
+		#endregion
+
+		#region Wtf?
+
+		public void RenderPage(int templateId)
+		{
+			if (templateId != 0)
+			{				
+				template templateDesign = new template(templateId);
+			
+				_pageContentControl = templateDesign.ParseWithControls(this);
+				_pageContent.Append(templateDesign.TemplateContent);
+			}
+		}
+
+		#endregion
+
+		#region Public properties
+
+		public Control PageContentControl
+		{
+			get { return _pageContentControl; }
+		}
+
+		public string PageName
+		{
+			get { return _pageName; }
+		}
+
+		public int ParentId
+		{
+			get { return _parentId; }
+		}
+
+		public string NodeTypeAlias
+		{
+			get { return _nodeTypeAlias; }
+		}
+
+		public int NodeType
+		{
+			get { return _nodeType; }
+		}
+
+		public string WriterName
+		{
+			get { return _writerName; }
+		}
+
+		public string CreatorName
+		{
+			get { return _creatorName; }
+		}
+
+		public DateTime CreateDate
+		{
+			get { return _createDate; }
+		}
+
+		public DateTime UpdateDate
+		{
+			get { return _updateDate; }
+		}
+
+		public int PageID
+		{
+			get { return _pageId; }
+		}
+
+		public int Template
+		{
+			get { return _template; }
+		}
+
+		public Hashtable Elements
+		{
+			get { return _elements; }
+		}
+
+		public string PageContent
+		{
+			get { return _pageContent.ToString(); }
+		}
+
+		public string[] SplitPath
+		{
+			get { return this._splitpath; }
+		}
+
+		#endregion
+
+		#region ToString
+
+		public override string ToString()
+		{
+			return _pageName;
+		}
+
+		#endregion
+
+        #region PublishedContent
+
+        private class PagePublishedProperty : PublishedPropertyBase
+        {
+            private readonly object _dataValue;
+            private readonly IPublishedContent _content;
+
+            public PagePublishedProperty(PublishedPropertyType propertyType, IPublishedContent content)
+                : base(propertyType)
+            {
+                _dataValue = null;
+                _content = content;
+            }
+
+            public PagePublishedProperty(PublishedPropertyType propertyType, IPublishedContent content, Umbraco.Core.Models.Property property)
+                : base(propertyType)
+            {
+                _dataValue = property.Value;
+                _content = content;
+            }
+
+            public override bool HasValue
+            {
+                get { return _dataValue != null &amp;&amp; ((_dataValue is string) == false || string.IsNullOrWhiteSpace((string)_dataValue) == false); }
+            }
+
+            public override object DataValue
+            {
+                get { return _dataValue; }
+            }
+
+            public override object Value
+            {
+                get
+                {
+                    // isPreviewing is true here since we want to preview anyway...
+                    const bool isPreviewing = true;
+                    var source = PropertyType.ConvertDataToSource(_dataValue, isPreviewing);
+                    return PropertyType.ConvertSourceToObject(source, isPreviewing);
+                }
+            }
+
+            public override object XPathValue
+            {
+                get { throw new NotImplementedException(); }
+            }
+        }
+
+        private class PagePublishedContent : IPublishedContent
+        {
+            private readonly IContent _inner;
+            private readonly int _id;
+            private readonly string _creatorName;
+            private readonly string _writerName;
+            private readonly PublishedContentType _contentType;
+            private readonly IPublishedProperty[] _properties;
+            private readonly IPublishedContent _parent;
+
+            private PagePublishedContent(int id)
+            {
+                _id = id;
+            }
+
+            public PagePublishedContent(IContent inner)
+            {
+                if (inner == null)
+                    throw new NullReferenceException(&quot;content&quot;);
+
+                _inner = inner;
+                _id = _inner.Id;
+
+                _creatorName = _inner.GetCreatorProfile().Name;
+                _writerName = _inner.GetWriterProfile().Name;
+
+                _contentType = new PublishedContentType(_inner.ContentType);
+
+                _properties = _contentType.PropertyTypes
+                    .Select(x =&gt;
+                    {
+                        var p = _inner.Properties.SingleOrDefault(xx =&gt; xx.Alias == x.PropertyTypeAlias);
+                        return p == null ? new PagePublishedProperty(x, this) : new PagePublishedProperty(x, this, p);
+                    })
+                    .Cast&lt;IPublishedProperty&gt;()
+                    .ToArray();
+
+                _parent = new PagePublishedContent(_inner.ParentId);
+            }
+
+            public IEnumerable&lt;IPublishedContent&gt; ContentSet
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public PublishedContentType ContentType
+            {
+                get { return _contentType; }
+            }
+
+            public int Id
+            {
+                get { return _id; }
+            }
+
+            public int TemplateId
+            {
+                get { return _inner.Template == null ? 0 : _inner.Template.Id; }
+            }
+
+            public int SortOrder
+            {
+                get { return _inner.SortOrder; }
+            }
+
+            public string Name
+            {
+                get { return _inner.Name; }
+            }
+
+            public string UrlName
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public string DocumentTypeAlias
+            {
+                get { return _inner.ContentType.Alias; }
+            }
+
+            public int DocumentTypeId
+            {
+                get { return _inner.ContentTypeId; }
+            }
+
+            public string WriterName
+            {
+                get { return _writerName; }
+            }
+
+            public string CreatorName
+            {
+                get { return _creatorName; }
+            }
+
+            public int WriterId
+            {
+                get { return _inner.WriterId; }
+            }
+
+            public int CreatorId
+            {
+                get { return _inner.CreatorId; }
+            }
+
+            public string Path
+            {
+                get { return _inner.Path; }
+            }
+
+            public DateTime CreateDate
+            {
+                get { return _inner.CreateDate; }
+            }
+
+            public DateTime UpdateDate
+            {
+                get { return _inner.UpdateDate; }
+            }
+
+            public Guid Version
+            {
+                get { return _inner.Version; }
+            }
+
+            public int Level
+            {
+                get { return _inner.Level; }
+            }
+
+            public string Url
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public PublishedItemType ItemType
+            {
+                get { return PublishedItemType.Content; }
+            }
+
+            public bool IsDraft
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public int GetIndex()
+            {
+                throw new NotImplementedException();
+            }
+
+            public IPublishedContent Parent
+            {
+                get { return _parent; }
+            }
+
+            public IEnumerable&lt;IPublishedContent&gt; Children
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public ICollection&lt;IPublishedProperty&gt; Properties
+            {
+                get { return _properties; }
+            }
+
+            public IPublishedProperty GetProperty(string alias)
+            {
+                throw new NotImplementedException();
+            }
+
+            public IPublishedProperty GetProperty(string alias, bool recurse)
+            {
+                throw new NotImplementedException();
+            }
+
+            public object this[string alias]
+            {
+                get { throw new NotImplementedException(); }
+            }
+        }
+
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[47,3,47,50,0],[47,3,47,50,0],[47,3,47,50,0],[47,3,47,50,1],[48,3,48,61,0],[48,3,48,61,0],[48,3,48,61,0],[48,3,48,61,1],[49,3,49,47,0],[49,3,49,47,0],[49,3,49,47,0],[49,3,49,47,1],[61,6,61,37,0],[62,3,62,4,0],[62,5,62,6,0],[68,3,68,33,0],[69,3,69,4,0],[70,4,70,25,0],[72,4,72,5,0],[73,5,73,37,0],[74,4,74,5,0],[75,4,75,29,0],[76,4,76,5,0],[78,4,78,5,0],[80,4,83,51,0],[85,4,85,11,0],[85,13,85,26,0],[85,27,85,29,0],[85,30,85,56,0],[86,4,86,5,0],[87,5,87,78,0],[88,5,88,51,0],[89,4,89,5,0],[91,4,91,34,0],[92,3,92,4,0],[103,3,103,48,1],[104,3,104,4,1],[106,4,106,36,1],[107,5,107,76,0],[109,4,112,149,1],[114,4,114,27,1],[115,4,115,5,0],[117,5,117,46,0],[118,5,118,50,0],[119,4,119,5,0],[121,4,121,49,1],[123,3,123,4,1],[129,3,129,39,0],[130,3,130,4,0],[131,4,131,20,0],[131,21,131,60,0],[133,4,136,69,0],[138,4,138,27,0],[139,4,139,5,0],[141,5,141,32,0],[142,5,142,50,0],[143,4,143,5,0],[145,4,145,29,0],[146,3,146,4,0],[152,3,152,28,0],[153,3,153,4,0],[154,4,154,27,0],[156,7,156,95,0],[157,7,157,8,0],[159,11,160,107,0],[161,11,161,12,0],[162,15,164,100,0],[165,15,165,63,0],[166,11,166,12,0],[167,16,167,90,0],[168,11,168,12,0],[169,15,171,88,0],[172,15,172,63,0],[173,11,173,12,0],[174,7,174,8,0],[176,7,176,26,0],[177,4,177,5,0],[179,5,179,6,0],[180,6,180,82,0],[181,6,181,80,0],[182,5,182,6,0],[183,5,183,10,0],[184,5,184,6,0],[185,6,185,75,0],[186,5,186,6,0],[187,4,187,5,0],[189,4,189,30,0],[191,3,191,4,0],[199,15,199,54,0],[200,6,200,7,0],[200,8,200,9,0],[210,3,210,4,1],[211,4,211,26,1],[212,4,212,30,1],[213,4,213,30,1],[214,4,214,40,1],[215,4,215,34,1],[216,4,216,36,1],[217,4,217,34,1],[218,4,218,34,1],[219,4,219,30,1],[220,4,220,22,1],[221,4,221,38,1],[222,4,222,36,1],[225,4,225,36,1],[226,4,226,40,1],[227,4,227,40,1],[228,4,228,40,1],[229,4,229,50,1],[230,4,230,44,1],[231,4,231,46,1],[232,4,232,44,1],[233,4,233,44,1],[234,4,234,32,1],[235,4,235,43,1],[236,4,236,46,1],[237,3,237,4,1],[240,3,240,4,0],[246,4,246,51,0],[247,5,247,44,0],[249,4,249,50,0],[250,5,250,48,0],[252,4,252,57,0],[253,5,253,48,0],[255,4,255,57,0],[256,5,256,48,0],[257,4,257,55,0],[258,5,258,58,0],[260,4,260,52,0],[261,5,261,52,0],[262,4,262,53,0],[263,5,263,54,0],[265,4,265,65,0],[266,5,266,53,0],[267,4,267,65,0],[268,5,268,53,0],[270,4,270,64,0],[271,5,271,57,0],[273,4,273,46,0],[274,4,274,5,0],[275,5,275,40,0],[276,5,276,65,0],[277,4,277,5,0],[278,3,278,4,0],[281,3,281,4,0],[282,4,282,59,0],[283,4,283,49,0],[284,4,284,17,0],[285,3,285,4,0],[292,3,292,4,1],[293,4,293,11,1],[293,12,293,17,0],[293,18,293,20,1],[293,21,293,36,1],[294,4,294,5,0],[295,5,295,61,0],[296,5,296,6,0],[305,6,305,51,0],[306,5,306,6,0],[307,4,307,5,0],[308,3,308,4,1],[311,3,311,4,0],[312,4,312,39,0],[314,4,314,11,0],[314,13,314,25,0],[314,26,314,28,0],[314,29,314,52,0],[315,4,315,5,0],[317,5,317,36,0],[318,6,318,15,0],[320,5,320,30,0],[321,5,321,42,0],[331,5,331,38,0],[332,5,332,6,0],[333,6,335,13,0],[336,5,336,6,0],[338,5,338,6,0],[339,6,339,31,0],[340,6,342,13,0],[343,5,343,6,0],[344,4,344,5,0],[345,3,345,4,0],[352,3,352,4,0],[353,4,353,24,0],[354,4,354,5,0],[355,5,355,56,0],[357,5,357,66,0],[358,5,358,57,0],[359,4,359,5,0],[360,3,360,4,0],[368,8,368,9,0],[368,10,368,37,0],[368,38,368,39,0],[373,8,373,9,0],[373,10,373,27,0],[373,28,373,29,0],[378,8,378,9,0],[378,10,378,27,0],[378,28,378,29,0],[383,8,383,9,0],[383,10,383,32,0],[383,33,383,34,0],[388,8,388,9,0],[388,10,388,27,0],[388,28,388,29,0],[393,8,393,9,0],[393,10,393,29,0],[393,30,393,31,0],[398,8,398,9,0],[398,10,398,30,0],[398,31,398,32,0],[403,8,403,9,0],[403,10,403,29,0],[403,30,403,31,0],[408,8,408,9,0],[408,10,408,29,0],[408,30,408,31,0],[413,8,413,9,0],[413,10,413,25,0],[413,26,413,27,0],[418,8,418,9,0],[418,10,418,27,0],[418,28,418,29,0],[423,8,423,9,1],[423,10,423,27,1],[423,28,423,29,1],[428,8,428,9,0],[428,10,428,41,0],[428,42,428,43,0],[433,8,433,9,0],[433,10,433,33,0],[433,34,433,35,0],[441,3,441,4,0],[442,4,442,21,0],[443,3,443,4,0],[455,19,455,37,0],[456,13,456,14,0],[457,17,457,35,0],[458,17,458,36,0],[459,13,459,14,0],[462,19,462,37,0],[463,13,463,14,0],[464,17,464,45,0],[465,17,465,36,0],[466,13,466,14,0],[470,21,470,22,0],[470,23,470,144,0],[470,145,470,146,0],[475,21,475,22,0],[475,23,475,41,0],[475,42,475,43,0],[481,17,481,18,0],[484,21,484,93,0],[485,21,485,85,0],[486,17,486,18,0],[491,21,491,22,0],[491,23,491,59,0],[505,13,505,49,0],[506,13,506,14,0],[507,17,507,26,0],[508,13,508,14,0],[510,13,510,56,0],[511,13,511,14,0],[512,17,512,35,0],[513,21,513,65,0],[515,17,515,32,0],[516,17,516,33,0],[518,17,518,64,0],[519,17,519,62,0],[521,17,521,77,0],[523,17,525,21,0],[525,21,525,22,0],[525,22,526,25,0],[526,25,526,73,0],[526,73,526,104,0],[526,104,526,106,0],[526,25,526,106,0],[526,106,527,25,0],[527,25,527,119,0],[527,119,528,21,0],[528,21,528,22,0],[528,22,530,32,0],[523,17,530,32,0],[532,17,532,69,0],[533,13,533,14,0],[537,21,537,22,0],[537,23,537,59,0],[542,21,542,22,0],[542,23,542,43,0],[542,44,542,45,0],[547,21,547,22,0],[547,23,547,34,0],[547,35,547,36,0],[552,21,552,22,0],[552,23,552,79,0],[552,80,552,81,0],[557,21,557,22,0],[557,23,557,47,0],[557,48,557,49,0],[562,21,562,22,0],[562,23,562,42,0],[562,43,562,44,0],[567,21,567,22,0],[567,23,567,59,0],[572,21,572,22,0],[572,23,572,55,0],[572,56,572,57,0],[577,21,577,22,0],[577,23,577,51,0],[577,52,577,53,0],[582,21,582,22,0],[582,23,582,42,0],[582,43,582,44,0],[587,21,587,22,0],[587,23,587,43,0],[587,44,587,45,0],[592,21,592,22,0],[592,23,592,46,0],[592,47,592,48,0],[597,21,597,22,0],[597,23,597,47,0],[597,48,597,49,0],[602,21,602,22,0],[602,23,602,42,0],[602,43,602,44,0],[607,21,607,22,0],[607,23,607,48,0],[607,49,607,50,0],[612,21,612,22,0],[612,23,612,48,0],[612,49,612,50,0],[617,21,617,22,0],[617,23,617,45,0],[617,46,617,47,0],[622,21,622,22,0],[622,23,622,43,0],[622,44,622,45,0],[627,21,627,22,0],[627,23,627,59,0],[632,21,632,22,0],[632,23,632,56,0],[632,57,632,58,0],[637,21,637,22,0],[637,23,637,59,0],[641,13,641,14,0],[642,17,642,53,0],[647,21,647,22,0],[647,23,647,38,0],[647,39,647,40,0],[652,21,652,22,0],[652,23,652,59,0],[657,21,657,22,0],[657,23,657,42,0],[657,43,657,44,0],[661,13,661,14,0],[662,17,662,53,0],[666,13,666,14,0],[667,17,667,53,0],[672,21,672,22,0],[672,23,672,59,0]]);
+    </script>
+  </body>
+</html>

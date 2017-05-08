@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Sync\DatabaseServerMessenger.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Web;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using Umbraco.Core.Cache;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence;
+using umbraco.interfaces;
+using Umbraco.Core.Persistence.SqlSyntax;
+
+namespace Umbraco.Core.Sync
+{
+    /// &lt;summary&gt;
+    /// An &lt;see cref=&quot;IServerMessenger&quot;/&gt; that works by storing messages in the database.
+    /// &lt;/summary&gt;
+    //
+    // this messenger writes ALL instructions to the database,
+    // but only processes instructions coming from remote servers,
+    // thus ensuring that instructions run only once
+    //
+    public class DatabaseServerMessenger : ServerMessengerBase
+    {
+        private readonly ApplicationContext _appContext;
+        private readonly ManualResetEvent _syncIdle;
+        private readonly object _locko = new object();
+        private readonly ILogger _logger;
+        private int _lastId = -1;
+        private DateTime _lastSync;
+        private DateTime _lastPruned;
+        private bool _initialized;
+        private bool _syncing;
+        private bool _released;
+        private readonly ProfilingLogger _profilingLogger;
+
+        protected DatabaseServerMessengerOptions Options { get; private set; }
+        protected ApplicationContext ApplicationContext { get { return _appContext; } }
+
+        public DatabaseServerMessenger(ApplicationContext appContext, bool distributedEnabled, DatabaseServerMessengerOptions options)
+            : base(distributedEnabled)
+        {
+            if (appContext == null) throw new ArgumentNullException(&quot;appContext&quot;);
+            if (options == null) throw new ArgumentNullException(&quot;options&quot;);
+
+            _appContext = appContext;
+            Options = options;
+            _lastPruned = _lastSync = DateTime.UtcNow;
+            _syncIdle = new ManualResetEvent(true);
+            _profilingLogger = appContext.ProfilingLogger;
+            _logger = appContext.ProfilingLogger.Logger;
+        }
+
+        #region Messenger
+
+        protected override bool RequiresDistributed(IEnumerable&lt;IServerAddress&gt; servers, ICacheRefresher refresher, MessageType dispatchType)
+        {
+            // we don&#39;t care if there&#39;s servers listed or not,
+            // if distributed call is enabled we will make the call
+            return _initialized &amp;&amp; DistributedEnabled;
+        }
+
+        protected override void DeliverRemote(
+            IEnumerable&lt;IServerAddress&gt; servers,
+            ICacheRefresher refresher,
+            MessageType messageType,
+            IEnumerable&lt;object&gt; ids = null,
+            string json = null)
+        {
+            var idsA = ids == null ? null : ids.ToArray();
+
+            Type idType;
+            if (GetArrayType(idsA, out idType) == false)
+                throw new ArgumentException(&quot;All items must be of the same type, either int or Guid.&quot;, &quot;ids&quot;);
+
+            var instructions = RefreshInstruction.GetInstructions(refresher, messageType, idsA, idType, json);
+
+            var dto = new CacheInstructionDto
+            {
+                UtcStamp = DateTime.UtcNow,
+                Instructions = JsonConvert.SerializeObject(instructions, Formatting.None),
+                OriginIdentity = LocalIdentity
+            };
+
+            ApplicationContext.DatabaseContext.Database.Insert(dto);
+        }
+
+        #endregion
+
+        #region Sync
+
+        /// &lt;summary&gt;
+        /// Boots the messenger.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Thread safety: this is NOT thread safe. Because it is NOT meant to run multi-threaded.
+        /// Callers MUST ensure thread-safety.
+        /// &lt;/remarks&gt;
+        protected void Boot()
+        {
+            // weight:10, must release *before* the facade service, because once released
+            // the service will *not* be able to properly handle our notifications anymore
+            const int weight = 10;
+
+            var registered = ApplicationContext.MainDom.Register(
+                () =&gt;
+                {
+                    lock (_locko)
+                    {
+                        _released = true; // no more syncs
+                    }
+
+                    // wait a max of 5 seconds and then return, so that we don&#39;t block
+                    // the entire MainDom callbacks chain and prevent the AppDomain from
+                    // properly releasing MainDom - a timeout here means that one refresher
+                    // is taking too much time processing, however when it&#39;s done we will
+                    // not update lastId and stop everything
+                    var idle =_syncIdle.WaitOne(5000);
+                    if (idle == false)
+                    {
+                        _logger.Warn&lt;DatabaseServerMessenger&gt;(&quot;The wait lock timed out, application is shutting down. The current instruction batch will be re-processed.&quot;);
+                    }
+                },
+                weight);
+
+            if (registered == false)
+                return;
+
+            ReadLastSynced(); // get _lastId
+            EnsureInstructions(); // reset _lastId if instrs are missing
+            Initialize(); // boot
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes a server that has never synchronized before.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Thread safety: this is NOT thread safe. Because it is NOT meant to run multi-threaded.
+        /// Callers MUST ensure thread-safety.
+        /// &lt;/remarks&gt;
+        private void Initialize()
+        {
+            lock (_locko)
+            {
+                if (_released) return;
+
+                var coldboot = false;
+                if (_lastId &lt; 0) // never synced before
+                {
+                    // we haven&#39;t synced - in this case we aren&#39;t going to sync the whole thing, we will assume this is a new
+                    // server and it will need to rebuild it&#39;s own caches, eg Lucene or the xml cache file.
+                    _logger.Warn&lt;DatabaseServerMessenger&gt;(&quot;No last synced Id found, this generally means this is a new server/install.&quot;
+                        + &quot; The server will build its caches and indexes, and then adjust its last synced Id to the latest found in&quot;
+                        + &quot; the database and maintain cache updates based on that Id.&quot;);
+
+                    coldboot = true;
+                }
+                else
+                {
+                    //check for how many instructions there are to process
+                    //TODO: In 7.6 we need to store the count of instructions per row since this is not affective because there can be far more than one (if not thousands)
+                    // of instructions in a single row.
+                    var count = _appContext.DatabaseContext.Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM umbracoCacheInstruction WHERE id &gt; @lastId&quot;, new {lastId = _lastId});
+                    if (count &gt; Options.MaxProcessingInstructionCount)
+                    {
+                        //too many instructions, proceed to cold boot
+                        _logger.Warn&lt;DatabaseServerMessenger&gt;(&quot;The instruction count ({0}) exceeds the specified MaxProcessingInstructionCount ({1}).&quot;
+                            + &quot; The server will skip existing instructions, rebuild its caches and indexes entirely, adjust its last synced Id&quot;
+                            + &quot; to the latest found in the database and maintain cache updates based on that Id.&quot;,
+                            () =&gt; count, () =&gt; Options.MaxProcessingInstructionCount);
+
+                        coldboot = true;
+                    }
+                }
+
+                if (coldboot)
+                {
+                    // go get the last id in the db and store it
+                    // note: do it BEFORE initializing otherwise some instructions might get lost
+                    // when doing it before, some instructions might run twice - not an issue
+                    var maxId = _appContext.DatabaseContext.Database.ExecuteScalar&lt;int&gt;(&quot;SELECT MAX(id) FROM umbracoCacheInstruction&quot;);
+
+                    //if there is a max currently, or if we&#39;ve never synced
+                    if (maxId &gt; 0 || _lastId &lt; 0)
+                        SaveLastSynced(maxId);
+
+                    // execute initializing callbacks
+                    if (Options.InitializingCallbacks != null)
+                        foreach (var callback in Options.InitializingCallbacks)
+                            callback();
+                }
+
+                _initialized = true;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Synchronize the server (throttled).
+        /// &lt;/summary&gt;
+        protected void Sync()
+        {
+            lock (_locko)
+            {
+                if (_syncing)
+                    return;
+
+                //Don&#39;t continue if we are released
+                if (_released)
+                    return;
+
+                if ((DateTime.UtcNow - _lastSync).TotalSeconds &lt;= Options.ThrottleSeconds)
+                    return;
+
+                //Set our flag and the lock to be in it&#39;s original state (i.e. it can be awaited)
+                _syncing = true;
+                _syncIdle.Reset();
+                _lastSync = DateTime.UtcNow;
+            }
+
+            try
+            {
+                using (_profilingLogger.DebugDuration&lt;DatabaseServerMessenger&gt;(&quot;Syncing from database...&quot;))
+                {
+                    ProcessDatabaseInstructions();
+
+                    //Check for pruning throttling
+                    if ((_released || (DateTime.UtcNow - _lastPruned).TotalSeconds &lt;= Options.PruneThrottleSeconds))
+                        return;
+
+                    _lastPruned = _lastSync;
+
+                    switch (_appContext.GetCurrentServerRole())
+                    {
+                        case ServerRole.Single:
+                        case ServerRole.Master:
+                            PruneOldInstructions();
+                            break;
+                    }
+                }
+            }
+            finally
+            {
+                lock (_locko)
+                {
+                    //We must reset our flag and signal any waiting locks
+                    _syncing = false;
+                }
+
+                _syncIdle.Set();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Process instructions from the database.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Thread safety: this is NOT thread safe. Because it is NOT meant to run multi-threaded.
+        /// &lt;/remarks&gt;
+        /// &lt;returns&gt;
+        /// Returns the number of processed instructions
+        /// &lt;/returns&gt;
+        private void ProcessDatabaseInstructions()
+        {
+            // NOTE
+            // we &#39;could&#39; recurse to ensure that no remaining instructions are pending in the table before proceeding but I don&#39;t think that
+            // would be a good idea since instructions could keep getting added and then all other threads will probably get stuck from serving requests
+            // (depending on what the cache refreshers are doing). I think it&#39;s best we do the one time check, process them and continue, if there are
+            // pending requests after being processed, they&#39;ll just be processed on the next poll.
+            //
+            // FIXME not true if we&#39;re running on a background thread, assuming we can?
+
+
+            var sql = new Sql().Select(&quot;*&quot;)
+                .From&lt;CacheInstructionDto&gt;(_appContext.DatabaseContext.SqlSyntax)
+                .Where&lt;CacheInstructionDto&gt;(dto =&gt; dto.Id &gt; _lastId)
+                .OrderBy&lt;CacheInstructionDto&gt;(dto =&gt; dto.Id, _appContext.DatabaseContext.SqlSyntax);
+
+            //only retrieve the top 100 (just in case there&#39;s tons)
+            // even though MaxProcessingInstructionCount is by default 1000 we still don&#39;t want to process that many
+            // rows in one request thread since each row can contain a ton of instructions (until 7.5.5 in which case
+            // a row can only contain MaxProcessingInstructionCount)
+            var topSql = _appContext.DatabaseContext.SqlSyntax.SelectTop(sql, 100);
+
+            // only process instructions coming from a remote server, and ignore instructions coming from
+            // the local server as they&#39;ve already been processed. We should NOT assume that the sequence of
+            // instructions in the database makes any sense whatsoever, because it&#39;s all async.
+            var localIdentity = LocalIdentity;
+
+            var lastId = 0;
+
+            //tracks which ones have already been processed to avoid duplicates
+            var processed = new HashSet&lt;RefreshInstruction&gt;();
+
+            //It would have been nice to do this in a Query instead of Fetch using a data reader to save
+            // some memory however we cannot do thta because inside of this loop the cache refreshers are also
+            // performing some lookups which cannot be done with an active reader open
+            foreach (var dto in _appContext.DatabaseContext.Database.Fetch&lt;CacheInstructionDto&gt;(topSql))
+            {
+                //If this flag gets set it means we&#39;re shutting down! In this case, we need to exit asap and cannot
+                // continue processing anything otherwise we&#39;ll hold up the app domain shutdown
+                if (_released)
+                {
+                    break;
+                }
+
+                if (dto.OriginIdentity == localIdentity)
+                {
+                    // just skip that local one but update lastId nevertheless
+                    lastId = dto.Id;
+                    continue;
+                }
+
+                // deserialize remote instructions &amp; skip if it fails
+                JArray jsonA;
+                try
+                {
+                    jsonA = JsonConvert.DeserializeObject&lt;JArray&gt;(dto.Instructions);
+                }
+                catch (JsonException ex)
+                {
+                    _logger.Error&lt;DatabaseServerMessenger&gt;(string.Format(&quot;Failed to deserialize instructions ({0}: \&quot;{1}\&quot;).&quot;, dto.Id, dto.Instructions), ex);
+                    lastId = dto.Id; // skip
+                    continue;
+                }
+
+                var instructionBatch = GetAllInstructions(jsonA);
+
+                //process as per-normal
+                var success = ProcessDatabaseInstructions(instructionBatch, dto, processed, ref lastId);
+
+                //if they couldn&#39;t be all processed (i.e. we&#39;re shutting down) then exit
+                if (success == false)
+                {
+                    _logger.Info&lt;DatabaseServerMessenger&gt;(&quot;The current batch of instructions was not processed, app is shutting down&quot;);
+                    break;
+                }
+
+            }
+
+            if (lastId &gt; 0)
+                SaveLastSynced(lastId);
+        }
+
+        /// &lt;summary&gt;
+        /// Processes the instruction batch and checks for errors
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;instructionBatch&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;dto&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;processed&quot;&gt;
+        /// Tracks which instructions have already been processed to avoid duplicates
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;lastId&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// returns true if all instructions in the batch were processed, otherwise false if they could not be due to the app being shut down
+        /// &lt;/returns&gt;
+        private bool ProcessDatabaseInstructions(IReadOnlyCollection&lt;RefreshInstruction&gt; instructionBatch, CacheInstructionDto dto, HashSet&lt;RefreshInstruction&gt; processed, ref int lastId)
+        {
+            // execute remote instructions &amp; update lastId
+            try
+            {
+                var result = NotifyRefreshers(instructionBatch, processed);
+                if (result)
+                {
+                    //if all instructions we&#39;re processed, set the last id
+                    lastId = dto.Id;
+                }
+                return result;
+            }
+            //catch (ThreadAbortException ex)
+            //{
+            //    //This will occur if the instructions processing is taking too long since this is occuring on a request thread.
+            //    // Or possibly if IIS terminates the appdomain. In any case, we should deal with this differently perhaps...
+            //}
+            catch (Exception ex)
+            {
+                _logger.Error&lt;DatabaseServerMessenger&gt;(
+                    string.Format(&quot;DISTRIBUTED CACHE IS NOT UPDATED. Failed to execute instructions (id: {0}, instruction count: {1}). Instruction is being skipped/ignored&quot;, dto.Id, instructionBatch.Count), ex);
+
+                //we cannot throw here because this invalid instruction will just keep getting processed over and over and errors
+                // will be thrown over and over. The only thing we can do is ignore and move on.
+                lastId = dto.Id;
+                return false;
+            }
+
+            ////if this is returned it will not be saved
+            //return -1;
+        }
+
+        /// &lt;summary&gt;
+        /// Remove old instructions from the database
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Always leave the last (most recent) record in the db table, this is so that not all instructions are removed which would cause
+        /// the site to cold boot if there&#39;s been no instruction activity for more than DaysToRetainInstructions.
+        /// See: http://issues.umbraco.org/issue/U4-7643#comment=67-25085
+        /// &lt;/remarks&gt;
+        private void PruneOldInstructions()
+        {
+            var pruneDate = DateTime.UtcNow.AddDays(-Options.DaysToRetainInstructions);
+
+            // using 2 queries is faster than convoluted joins
+
+            var maxId = _appContext.DatabaseContext.Database.ExecuteScalar&lt;int&gt;(&quot;SELECT MAX(id) FROM umbracoCacheInstruction;&quot;);
+
+            var delete = new Sql().Append(@&quot;DELETE FROM umbracoCacheInstruction WHERE utcStamp &lt; @pruneDate AND id &lt; @maxId&quot;,
+                new { pruneDate, maxId });
+
+            _appContext.DatabaseContext.Database.Execute(delete);
+        }
+
+        /// &lt;summary&gt;
+        /// Ensure that the last instruction that was processed is still in the database.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// If the last instruction is not in the database anymore, then the messenger
+        /// should not try to process any instructions, because some instructions might be lost,
+        /// and it should instead cold-boot.
+        /// However, if the last synced instruction id is &#39;0&#39; and there are &#39;0&#39; records, then this indicates
+        /// that it&#39;s a fresh site and no user actions have taken place, in this circumstance we do not want to cold
+        /// boot. See: http://issues.umbraco.org/issue/U4-8627
+        /// &lt;/remarks&gt;
+        private void EnsureInstructions()
+        {
+            if (_lastId == 0)
+            {
+                var sql = new Sql().Select(&quot;COUNT(*)&quot;)
+                    .From&lt;CacheInstructionDto&gt;(_appContext.DatabaseContext.SqlSyntax);
+
+                var count = _appContext.DatabaseContext.Database.ExecuteScalar&lt;int&gt;(sql);
+
+                //if there are instructions but we haven&#39;t synced, then a cold boot is necessary
+                if (count &gt; 0)
+                    _lastId = -1;
+            }
+            else
+            {
+                var sql = new Sql().Select(&quot;*&quot;)
+                .From&lt;CacheInstructionDto&gt;(_appContext.DatabaseContext.SqlSyntax)
+                .Where&lt;CacheInstructionDto&gt;(dto =&gt; dto.Id == _lastId);
+
+                var dtos = _appContext.DatabaseContext.Database.Fetch&lt;CacheInstructionDto&gt;(sql);
+
+                //if the last synced instruction is not found in the db, then a cold boot is necessary
+                if (dtos.Count == 0)
+                    _lastId = -1;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Reads the last-synced id from file into memory.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Thread safety: this is NOT thread safe. Because it is NOT meant to run multi-threaded.
+        /// &lt;/remarks&gt;
+        private void ReadLastSynced()
+        {
+            var path = SyncFilePath;
+            if (File.Exists(path) == false) return;
+
+            var content = File.ReadAllText(path);
+            int last;
+            if (int.TryParse(content, out last))
+                _lastId = last;
+        }
+
+        /// &lt;summary&gt;
+        /// Updates the in-memory last-synced id and persists it to file.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;The id.&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// Thread safety: this is NOT thread safe. Because it is NOT meant to run multi-threaded.
+        /// &lt;/remarks&gt;
+        private void SaveLastSynced(int id)
+        {
+            File.WriteAllText(SyncFilePath, id.ToString(CultureInfo.InvariantCulture));
+            _lastId = id;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the unique local identity of the executing AppDomain.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// &lt;para&gt;It is not only about the &quot;server&quot; (machine name and appDomainappId), but also about
+        /// an AppDomain, within a Process, on that server - because two AppDomains running at the same
+        /// time on the same server (eg during a restart) are, practically, a LB setup.&lt;/para&gt;
+        /// &lt;para&gt;Practically, all we really need is the guid, the other infos are here for information
+        /// and debugging purposes.&lt;/para&gt;
+        /// &lt;/remarks&gt;
+        protected static readonly string LocalIdentity = NetworkHelper.MachineName // eg DOMAIN\SERVER
+            + &quot;/&quot; + HttpRuntime.AppDomainAppId // eg /LM/S3SVC/11/ROOT
+            + &quot; [P&quot; + Process.GetCurrentProcess().Id // eg 1234
+            + &quot;/D&quot; + AppDomain.CurrentDomain.Id // eg 22
+            + &quot;] &quot; + Guid.NewGuid().ToString(&quot;N&quot;).ToUpper(); // make it truly unique
+
+        /// &lt;summary&gt;
+        /// Gets the sync file path for the local server.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;The sync file path for the local server.&lt;/returns&gt;
+        private static string SyncFilePath
+        {
+            get
+            {
+                var tempFolder = IOHelper.MapPath(&quot;~/App_Data/TEMP/DistCache/&quot; + NetworkHelper.FileSafeMachineName);
+                if (Directory.Exists(tempFolder) == false)
+                    Directory.CreateDirectory(tempFolder);
+
+                return Path.Combine(tempFolder, HttpRuntime.AppDomainAppId.ReplaceNonAlphanumericChars(string.Empty) + &quot;-lastsynced.txt&quot;);
+            }
+        }
+
+        #endregion
+
+        #region Notify refreshers
+
+        private static ICacheRefresher GetRefresher(Guid id)
+        {
+            var refresher = CacheRefreshersResolver.Current.GetById(id);
+            if (refresher == null)
+                throw new InvalidOperationException(&quot;Cache refresher with ID \&quot;&quot; + id + &quot;\&quot; does not exist.&quot;);
+            return refresher;
+        }
+
+        private static IJsonCacheRefresher GetJsonRefresher(Guid id)
+        {
+            return GetJsonRefresher(GetRefresher(id));
+        }
+
+        private static IJsonCacheRefresher GetJsonRefresher(ICacheRefresher refresher)
+        {
+            var jsonRefresher = refresher as IJsonCacheRefresher;
+            if (jsonRefresher == null)
+                throw new InvalidOperationException(&quot;Cache refresher with ID \&quot;&quot; + refresher.UniqueIdentifier + &quot;\&quot; does not implement &quot; + typeof(IJsonCacheRefresher) + &quot;.&quot;);
+            return jsonRefresher;
+        }
+
+        /// &lt;summary&gt;
+        /// Parses out the individual instructions to be processed
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;jsonArray&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private static List&lt;RefreshInstruction&gt; GetAllInstructions(IEnumerable&lt;JToken&gt; jsonArray)
+        {
+            var result = new List&lt;RefreshInstruction&gt;();
+            foreach (var jsonItem in jsonArray)
+            {
+                // could be a JObject in which case we can convert to a RefreshInstruction,
+                // otherwise it could be another JArray - in which case we&#39;ll iterate that.
+                var jsonObj = jsonItem as JObject;
+                if (jsonObj != null)
+                {
+                    var instruction = jsonObj.ToObject&lt;RefreshInstruction&gt;();
+                    result.Add(instruction);
+                }
+                else
+                {
+                    var jsonInnerArray = (JArray)jsonItem;
+                    result.AddRange(GetAllInstructions(jsonInnerArray)); // recurse
+                }
+            }
+            return result;
+        }
+
+        /// &lt;summary&gt;
+        /// executes the instructions against the cache refresher instances
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;instructions&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;processed&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// Returns true if all instructions were processed, otherwise false if the processing was interupted (i.e. app shutdown)
+        /// &lt;/returns&gt;
+        private bool NotifyRefreshers(IEnumerable&lt;RefreshInstruction&gt; instructions, HashSet&lt;RefreshInstruction&gt; processed)
+        {
+            foreach (var instruction in instructions)
+            {
+                //Check if the app is shutting down, we need to exit if this happens.
+                if (_released)
+                {
+                    return false;
+                }
+
+                //this has already been processed
+                if (processed.Contains(instruction))
+                    continue;
+
+                switch (instruction.RefreshType)
+                {
+                    case RefreshMethodType.RefreshAll:
+                        RefreshAll(instruction.RefresherId);
+                        break;
+                    case RefreshMethodType.RefreshByGuid:
+                        RefreshByGuid(instruction.RefresherId, instruction.GuidId);
+                        break;
+                    case RefreshMethodType.RefreshById:
+                        RefreshById(instruction.RefresherId, instruction.IntId);
+                        break;
+                    case RefreshMethodType.RefreshByIds:
+                        RefreshByIds(instruction.RefresherId, instruction.JsonIds);
+                        break;
+                    case RefreshMethodType.RefreshByJson:
+                        RefreshByJson(instruction.RefresherId, instruction.JsonPayload);
+                        break;
+                    case RefreshMethodType.RemoveById:
+                        RemoveById(instruction.RefresherId, instruction.IntId);
+                        break;
+                }
+
+                processed.Add(instruction);
+            }
+            return true;
+        }
+
+        private static void RefreshAll(Guid uniqueIdentifier)
+        {
+            var refresher = GetRefresher(uniqueIdentifier);
+            refresher.RefreshAll();
+        }
+
+        private static void RefreshByGuid(Guid uniqueIdentifier, Guid id)
+        {
+            var refresher = GetRefresher(uniqueIdentifier);
+            refresher.Refresh(id);
+        }
+
+        private static void RefreshById(Guid uniqueIdentifier, int id)
+        {
+            var refresher = GetRefresher(uniqueIdentifier);
+            refresher.Refresh(id);
+        }
+
+        private static void RefreshByIds(Guid uniqueIdentifier, string jsonIds)
+        {
+            var refresher = GetRefresher(uniqueIdentifier);
+            foreach (var id in JsonConvert.DeserializeObject&lt;int[]&gt;(jsonIds))
+                refresher.Refresh(id);
+        }
+
+        private static void RefreshByJson(Guid uniqueIdentifier, string jsonPayload)
+        {
+            var refresher = GetJsonRefresher(uniqueIdentifier);
+            refresher.Refresh(jsonPayload);
+        }
+
+        private static void RemoveById(Guid uniqueIdentifier, int id)
+        {
+            var refresher = GetRefresher(uniqueIdentifier);
+            refresher.Remove(id);
+        }
+
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[33,9,33,55,1],[35,9,35,34,1],[43,60,43,64,0],[43,65,43,77,1],[44,63,44,64,0],[44,65,44,84,0],[44,85,44,86,0],[47,15,47,39,1],[48,9,48,10,1],[49,13,49,36,1],[49,37,49,83,0],[50,13,50,33,1],[50,34,50,77,0],[52,13,52,38,1],[53,13,53,31,1],[54,13,54,55,1],[55,13,55,52,1],[56,13,56,59,1],[57,13,57,57,1],[58,9,58,10,1],[63,9,63,10,0],[66,13,66,55,0],[67,9,67,10,0],[75,9,75,10,0],[76,13,76,59,0],[79,13,79,57,0],[80,17,80,111,0],[82,13,82,111,0],[84,13,89,15,0],[91,13,91,69,0],[92,9,92,10,0],[106,9,106,10,0],[111,13,113,17,0],[113,17,113,18,0],[113,18,114,21,0],[114,21,114,34,0],[114,34,115,21,0],[115,21,115,22,0],[115,22,116,25,0],[116,25,116,42,0],[116,42,117,21,0],[117,21,117,22,0],[117,22,124,21,0],[124,21,124,55,0],[124,55,125,21,0],[125,21,125,39,0],[125,39,126,21,0],[126,21,126,22,0],[126,22,127,25,0],[127,25,127,173,0],[127,173,128,21,0],[128,21,128,22,0],[128,22,129,17,0],[129,17,129,18,0],[129,18,130,25,0],[111,13,130,25,0],[132,13,132,37,0],[133,17,133,24,0],[135,13,135,30,0],[136,13,136,34,0],[137,13,137,26,0],[138,9,138,10,0],[148,9,148,10,0],[149,13,149,26,0],[150,13,150,14,0],[151,17,151,31,0],[151,32,151,39,0],[153,17,153,38,0],[154,17,154,33,0],[155,17,155,18,0],[158,21,160,89,0],[162,21,162,37,0],[163,17,163,18,0],[165,17,165,18,0],[169,21,169,180,0],[170,21,170,71,0],[171,21,171,22,0],[173,25,176,35,0],[176,35,176,40,0],[176,40,176,48,0],[176,48,176,85,0],[176,85,176,87,0],[173,25,176,87,0],[178,25,178,41,0],[179,21,179,22,0],[180,17,180,18,0],[182,17,182,30,0],[183,17,183,18,0],[187,21,187,136,0],[190,21,190,50,0],[191,25,191,47,0],[194,21,194,63,0],[195,25,195,32,0],[195,34,195,46,0],[195,47,195,49,0],[195,50,195,79,0],[196,29,196,40,0],[197,17,197,18,0],[199,17,199,37,0],[200,13,200,14,0],[201,9,201,10,0],[207,9,207,10,0],[208,13,208,26,0],[209,13,209,14,0],[210,17,210,30,0],[211,21,211,28,0],[214,17,214,31,0],[215,21,215,28,0],[217,17,217,91,0],[218,21,218,28,0],[221,17,221,33,0],[222,17,222,35,0],[223,17,223,45,0],[224,13,224,14,0],[227,13,227,14,0],[228,17,228,108,0],[229,17,229,18,0],[230,21,230,51,0],[233,21,233,117,0],[234,25,234,32,0],[236,21,236,45,0],[238,21,238,64,0],[242,29,242,52,0],[243,29,243,35,0],[245,17,245,18,0],[246,13,246,14,0],[248,13,248,14,0],[249,17,249,30,0],[250,17,250,18,0],[252,21,252,38,0],[253,17,253,18,0],[255,17,255,33,0],[256,13,256,14,0],[257,9,257,10,0],[269,9,269,10,0],[279,13,282,101,0],[288,13,288,84,0],[293,13,293,47,0],[295,13,295,28,0],[298,13,298,63,0],[303,13,303,20,0],[303,22,303,29,0],[303,30,303,32,0],[303,33,303,104,0],[304,13,304,14,0],[307,17,307,31,0],[308,17,308,18,0],[309,21,309,27,0],[312,17,312,57,0],[313,17,313,18,0],[315,21,315,37,0],[316,21,316,30,0],[322,17,322,18,0],[323,21,323,85,0],[324,17,324,18,0],[325,17,325,41,0],[326,17,326,18,0],[327,21,327,159,0],[328,21,328,37,0],[329,21,329,30,0],[332,17,332,66,0],[335,17,335,105,0],[338,17,338,38,0],[339,17,339,18,0],[340,21,340,136,0],[341,21,341,27,0],[344,13,344,14,0],[346,13,346,28,0],[347,17,347,40,0],[348,9,348,10,0],[363,9,363,10,0],[366,13,366,14,0],[367,17,367,76,0],[368,17,368,28,0],[369,17,369,18,0],[371,21,371,37,0],[372,17,372,18,0],[373,17,373,31,0],[380,13,380,33,0],[381,13,381,14,0],[382,17,383,212,0],[387,17,387,33,0],[388,17,388,30,0],[393,9,393,10,0],[404,9,404,10,0],[405,13,405,88,0],[409,13,409,129,0],[411,13,412,43,0],[414,13,414,66,0],[415,9,415,10,0],[429,9,429,10,0],[430,13,430,30,0],[431,13,431,14,0],[432,17,433,87,0],[435,17,435,90,0],[438,17,438,31,0],[439,21,439,34,0],[440,13,440,14,0],[442,13,442,14,0],[443,17,445,71,0],[447,17,447,97,0],[450,17,450,37,0],[451,21,451,34,0],[452,13,452,14,0],[453,9,453,10,0],[462,9,462,10,0],[463,13,463,37,0],[464,13,464,44,0],[464,45,464,52,0],[466,13,466,50,0],[468,13,468,49,0],[469,17,469,32,0],[470,9,470,10,0],[480,9,480,10,0],[481,13,481,88,0],[482,13,482,26,0],[483,9,483,10,0],[495,9,499,61,1],[508,13,508,14,0],[509,17,509,117,0],[510,17,510,59,0],[511,21,511,59,0],[513,17,513,139,0],[514,13,514,14,0],[522,9,522,10,0],[523,13,523,73,0],[524,13,524,35,0],[525,17,525,111,0],[526,13,526,30,0],[527,9,527,10,0],[530,9,530,10,0],[531,13,531,55,0],[532,9,532,10,0],[535,9,535,10,0],[536,13,536,66,0],[537,13,537,39,0],[538,17,538,175,0],[539,13,539,34,0],[540,9,540,10,0],[548,9,548,10,0],[549,13,549,57,0],[550,13,550,20,0],[550,22,550,34,0],[550,35,550,37,0],[550,38,550,47,0],[551,13,551,14,0],[554,17,554,51,0],[555,17,555,37,0],[556,17,556,18,0],[557,21,557,78,0],[558,21,558,45,0],[559,17,559,18,0],[561,17,561,18,0],[562,21,562,59,0],[563,21,563,73,0],[564,17,564,18,0],[565,13,565,14,0],[566,13,566,27,0],[567,9,567,10,0],[578,9,578,10,0],[579,13,579,20,0],[579,22,579,37,0],[579,38,579,40,0],[579,41,579,53,0],[580,13,580,14,0],[582,17,582,31,0],[583,17,583,18,0],[584,21,584,34,0],[588,17,588,53,0],[589,21,589,30,0],[591,17,591,49,0],[594,25,594,61,0],[595,25,595,31,0],[597,25,597,84,0],[598,25,598,31,0],[600,25,600,81,0],[601,25,601,31,0],[603,25,603,84,0],[604,25,604,31,0],[606,25,606,89,0],[607,25,607,31,0],[609,25,609,80,0],[610,25,610,31,0],[613,17,613,44,0],[614,13,614,14,0],[615,13,615,25,0],[616,9,616,10,0],[619,9,619,10,0],[620,13,620,60,0],[621,13,621,36,0],[622,9,622,10,0],[625,9,625,10,0],[626,13,626,60,0],[627,13,627,35,0],[628,9,628,10,0],[631,9,631,10,0],[632,13,632,60,0],[633,13,633,35,0],[634,9,634,10,0],[637,9,637,10,0],[638,13,638,60,0],[639,13,639,20,0],[639,22,639,28,0],[639,29,639,31,0],[639,32,639,77,0],[640,17,640,39,0],[641,9,641,10,0],[644,9,644,10,0],[645,13,645,64,0],[646,13,646,44,0],[647,9,647,10,0],[650,9,650,10,0],[651,13,651,60,0],[652,13,652,34,0],[653,9,653,10,0]]);
+    </script>
+  </body>
+</html>

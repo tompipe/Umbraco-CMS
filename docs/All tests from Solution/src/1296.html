@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\HealthCheck\Checks\Security\ClickJackingCheck.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
+using System.Xml.XPath;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.IO;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Web.HealthCheck.Checks.Security
+{
+    [HealthCheck(
+        &quot;ED0D7E40-971E-4BE8-AB6D-8CC5D0A6A5B0&quot;,
+        &quot;Click-Jacking Protection&quot;,
+        Description = &quot;Checks if your site is allowed to be IFRAMEd by another site and thus would be susceptible to click-jacking.&quot;,
+        Group = &quot;Security&quot;)]
+    public class ClickJackingCheck : HealthCheck
+    {
+        private readonly ILocalizedTextService _textService;
+
+        private const string SetFrameOptionsHeaderInConfigActiobn = &quot;setFrameOptionsHeaderInConfig&quot;;
+
+        private const string XFrameOptionsHeader = &quot;X-Frame-Options&quot;;
+        private const string XFrameOptionsValue = &quot;sameorigin&quot;; // Note can&#39;t use &quot;deny&quot; as that would prevent Umbraco itself using IFRAMEs
+
+        public ClickJackingCheck(HealthCheckContext healthCheckContext) : base(healthCheckContext)
+        {
+            _textService = healthCheckContext.ApplicationContext.Services.TextService;
+        }
+
+        /// &lt;summary&gt;
+        /// Get the status for this health check
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override IEnumerable&lt;HealthCheckStatus&gt; GetStatus()
+        {
+            //return the statuses
+            return new[] { CheckForFrameOptionsHeader() };
+        }
+
+        /// &lt;summary&gt;
+        /// Executes the action and returns it&#39;s status
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;action&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override HealthCheckStatus ExecuteAction(HealthCheckAction action)
+        {
+            switch (action.Alias)
+            {
+                case SetFrameOptionsHeaderInConfigActiobn:
+                    return SetFrameOptionsHeaderInConfig();
+                default:
+                    throw new InvalidOperationException(&quot;HttpsCheck action requested is either not executable or does not exist&quot;);
+            }
+        }
+
+        private HealthCheckStatus CheckForFrameOptionsHeader()
+        {
+            var message = string.Empty;
+            var success = false;
+            var url = HealthCheckContext.HttpContext.Request.Url;
+
+            // Access the site home page and check for the click-jack protection header or meta tag
+            var serverVariables = HealthCheckContext.HttpContext.Request.ServerVariables;
+            var useSsl = GlobalSettings.UseSSL || serverVariables[&quot;SERVER_PORT&quot;] == &quot;443&quot;;
+            var address = string.Format(&quot;http{0}://{1}:{2}&quot;, useSsl ? &quot;s&quot; : &quot;&quot;, url.Host.ToLower(), url.Port);
+            var request = WebRequest.Create(address);
+            request.Method = &quot;GET&quot;;
+            try
+            {
+                var response = request.GetResponse();
+
+                // Check first for header
+                success = DoHeadersContainFrameOptions(response);
+
+                // If not found, check for meta-tag
+                if (success == false)
+                {
+                    success = DoMetaTagsContainFrameOptions(response);
+                }
+
+                message = success
+                    ? _textService.Localize(&quot;healthcheck/clickJackingCheckHeaderFound&quot;)
+                    : _textService.Localize(&quot;healthcheck/clickJackingCheckHeaderNotFound&quot;);
+            }
+            catch (Exception ex)
+            {
+                message = _textService.Localize(&quot;healthcheck/httpsCheckInvalidUrl&quot;, new[] { address, ex.Message });
+            }
+
+            var actions = new List&lt;HealthCheckAction&gt;();
+            if (success == false)
+            {
+                actions.Add(new HealthCheckAction(SetFrameOptionsHeaderInConfigActiobn, Id)
+                {
+                    Name = _textService.Localize(&quot;healthcheck/clickJackingSetHeaderInConfig&quot;),
+                    Description = _textService.Localize(&quot;healthcheck/clickJackingSetHeaderInConfigDescription&quot;)
+                });
+            }
+
+            return
+                new HealthCheckStatus(message)
+                {
+                    ResultType = success ? StatusResultType.Success : StatusResultType.Error,
+                    Actions = actions
+                };
+        }
+
+        private static bool DoHeadersContainFrameOptions(WebResponse response)
+        {
+            return response.Headers.AllKeys.Contains(XFrameOptionsHeader);
+        }
+
+        private static bool DoMetaTagsContainFrameOptions(WebResponse response)
+        {
+            using (var stream = response.GetResponseStream())
+            {
+                if (stream == null) return false;
+                using (var reader = new StreamReader(stream))
+                {
+                    var html = reader.ReadToEnd();
+                    var metaTags = ParseMetaTags(html);
+                    return metaTags.ContainsKey(XFrameOptionsHeader);
+                }
+            }
+        }
+
+        private static Dictionary&lt;string, string&gt; ParseMetaTags(string html)
+        {
+            var regex = new Regex(&quot;&lt;meta http-equiv=\&quot;(.+?)\&quot; content=\&quot;(.+?)\&quot;&quot;, RegexOptions.IgnoreCase);
+
+            return regex.Matches(html)
+                .Cast&lt;Match&gt;()
+                .ToDictionary(m =&gt; m.Groups[1].Value, m =&gt; m.Groups[2].Value);
+        }
+
+        private HealthCheckStatus SetFrameOptionsHeaderInConfig()
+        {
+            var errorMessage = string.Empty;
+            var success = SaveHeaderToConfigFile(out errorMessage);
+
+            if (success)
+            {
+                return
+                    new HealthCheckStatus(_textService.Localize(&quot;healthcheck/clickJackingSetHeaderInConfigSuccess&quot;))
+                    {
+                        ResultType = StatusResultType.Success
+                    };
+            }
+
+            return
+                new HealthCheckStatus(_textService.Localize(&quot;healthcheck/clickJackingSetHeaderInConfigError&quot;, new [] { errorMessage }))
+                {
+                    ResultType = StatusResultType.Error
+                };
+        }
+
+        private static bool SaveHeaderToConfigFile(out string errorMessage)
+        {
+            try
+            {
+                // There don&#39;t look to be any useful classes defined in https://msdn.microsoft.com/en-us/library/system.web.configuration(v=vs.110).aspx
+                // for working with the customHeaders section, so working with the XML directly.
+                var configFile = IOHelper.MapPath(&quot;~/Web.config&quot;);
+                var doc = XDocument.Load(configFile);
+                var systemWebServerElement = doc.XPathSelectElement(&quot;/configuration/system.webServer&quot;);
+                var httpProtocolElement = systemWebServerElement.Element(&quot;httpProtocol&quot;);
+                if (httpProtocolElement == null)
+                {
+                    httpProtocolElement = new XElement(&quot;httpProtocol&quot;);
+                    systemWebServerElement.Add(httpProtocolElement);
+                }
+
+                var customHeadersElement = httpProtocolElement.Element(&quot;customHeaders&quot;);
+                if (customHeadersElement == null)
+                {
+                    customHeadersElement = new XElement(&quot;customHeaders&quot;);
+                    httpProtocolElement.Add(customHeadersElement);
+                }
+
+                var removeHeaderElement = customHeadersElement.Elements(&quot;remove&quot;)
+                    .SingleOrDefault(x =&gt; x.Attribute(&quot;name&quot;) != null &amp;&amp;
+                                          x.Attribute(&quot;name&quot;).Value == XFrameOptionsHeader);
+                if (removeHeaderElement == null)
+                {
+                    removeHeaderElement = new XElement(&quot;remove&quot;);
+                    removeHeaderElement.Add(new XAttribute(&quot;name&quot;, XFrameOptionsHeader));
+                    customHeadersElement.Add(removeHeaderElement);
+                }
+
+                var addHeaderElement = customHeadersElement.Elements(&quot;add&quot;)
+                    .SingleOrDefault(x =&gt; x.Attribute(&quot;name&quot;) != null &amp;&amp;
+                                          x.Attribute(&quot;name&quot;).Value == XFrameOptionsHeader);
+                if (addHeaderElement == null)
+                {
+                    addHeaderElement = new XElement(&quot;add&quot;);
+                    addHeaderElement.Add(new XAttribute(&quot;name&quot;, XFrameOptionsHeader));
+                    addHeaderElement.Add(new XAttribute(&quot;value&quot;, XFrameOptionsValue));
+                    customHeadersElement.Add(addHeaderElement);
+                }
+
+                doc.Save(configFile);
+
+                errorMessage = string.Empty;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                errorMessage = ex.Message;
+                return false;
+            }
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[29,75,29,99,0],[30,9,30,10,0],[31,13,31,87,0],[32,9,32,10,0],[39,9,39,10,0],[41,13,41,59,0],[42,9,42,10,0],[50,9,50,10,0],[51,13,51,34,0],[54,21,54,60,0],[56,21,56,131,0],[58,9,58,10,0],[61,9,61,10,0],[62,13,62,40,0],[63,13,63,33,0],[64,13,64,66,0],[67,13,67,90,0],[68,13,68,91,0],[69,13,69,111,0],[70,13,70,54,0],[71,13,71,36,0],[73,13,73,14,0],[74,17,74,54,0],[77,17,77,66,0],[80,17,80,38,0],[81,17,81,18,0],[82,21,82,71,0],[83,17,83,18,0],[85,17,87,92,0],[88,13,88,14,0],[89,13,89,33,0],[90,13,90,14,0],[91,17,91,116,0],[92,13,92,14,0],[94,13,94,57,0],[95,13,95,34,0],[96,13,96,14,0],[97,17,101,20,0],[102,13,102,14,0],[104,13,109,19,0],[110,9,110,10,0],[113,9,113,10,0],[114,13,114,75,0],[115,9,115,10,0],[118,9,118,10,0],[119,20,119,61,0],[120,13,120,14,0],[121,17,121,36,0],[121,37,121,50,0],[122,24,122,61,0],[123,17,123,18,0],[124,21,124,51,0],[125,21,125,56,0],[126,21,126,70,0],[129,9,129,10,0],[132,9,132,10,0],[133,13,133,108,0],[135,13,137,36,0],[137,36,137,53,0],[137,53,137,60,0],[137,60,137,77,0],[137,77,137,79,0],[135,13,137,79,0],[138,9,138,10,0],[141,9,141,10,0],[142,13,142,45,0],[143,13,143,68,0],[145,13,145,25,0],[146,13,146,14,0],[147,17,151,23,0],[154,13,158,19,0],[159,9,159,10,0],[162,9,162,10,0],[164,13,164,14,0],[167,17,167,67,0],[168,17,168,54,0],[169,17,169,104,0],[170,17,170,90,0],[171,17,171,49,0],[172,17,172,18,0],[173,21,173,72,0],[174,21,174,69,0],[175,17,175,18,0],[177,17,177,89,0],[178,17,178,50,0],[179,17,179,18,0],[180,21,180,74,0],[181,21,181,67,0],[182,17,182,18,0],[184,17,185,43,0],[185,43,186,91,0],[186,91,186,93,0],[184,17,186,93,0],[187,17,187,49,0],[188,17,188,18,0],[189,21,189,66,0],[190,21,190,90,0],[191,21,191,67,0],[192,17,192,18,0],[194,17,195,43,0],[195,43,196,91,0],[196,91,196,93,0],[194,17,196,93,0],[197,17,197,46,0],[198,17,198,18,0],[199,21,199,60,0],[200,21,200,87,0],[201,21,201,87,0],[202,21,202,64,0],[203,17,203,18,0],[205,17,205,38,0],[207,17,207,45,0],[208,17,208,29,0],[210,13,210,33,0],[211,13,211,14,0],[212,17,212,43,0],[213,17,213,30,0],[215,9,215,10,0]]);
+    </script>
+  </body>
+</html>

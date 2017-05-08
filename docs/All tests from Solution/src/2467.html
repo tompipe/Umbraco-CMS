@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\Actions\Action.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Web;
+using System.Reflection;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using umbraco.BasePages;
+using umbraco.BusinessLogic.Utils;
+using umbraco.cms;
+using umbraco.cms.businesslogic.web;
+using umbraco.cms.businesslogic.workflow;
+using umbraco.interfaces;
+using System.Text.RegularExpressions;
+using System.Linq;
+using Umbraco.Core.IO;
+using TypeFinder = Umbraco.Core.TypeFinder;
+
+namespace umbraco.BusinessLogic.Actions
+{
+    /// &lt;summary&gt;
+    /// Actions and Actionhandlers are a key concept to umbraco and a developer whom wish to apply
+    /// businessrules whenever data is changed within umbraco, by implementing the IActionHandler
+    /// interface it&#39;s possible to invoke methods (foreign to umbraco) - this can be used whenever
+    /// there is a specific rule which needs to be applied to content.
+    ///
+    /// The Action class itself has responsibility for registering actions and actionhandlers,
+    /// and contains methods which will be invoked whenever a change is made to ex. a document, media or member
+    /// 
+    /// An action/actionhandler will automatically be registered, using reflection 
+    /// which is enabling thirdparty developers to extend the core functionality of
+    /// umbraco without changing the codebase.
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;Actions and ActionHandlers are obsolete and should no longer be used&quot;)]
+    public class Action
+    {
+        private static readonly Dictionary&lt;string, string&gt; ActionJs = new Dictionary&lt;string, string&gt;();
+
+        private static readonly object Lock = new object();
+
+        static Action()
+        {
+            ReRegisterActionsAndHandlers();
+        }
+
+        /// &lt;summary&gt;
+        /// This is used when an IAction or IActionHandler is installed into the system
+        /// and needs to be loaded into memory.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// TODO: this shouldn&#39;t be needed... we should restart the app pool when a package is installed!
+        /// &lt;/remarks&gt;
+        public static void ReRegisterActionsAndHandlers()
+        {
+            lock (Lock)
+            {
+                // NOTE use the DirtyBackdoor to change the resolution configuration EXCLUSIVELY
+                // ie do NOT do ANYTHING else while holding the backdoor, because while it is open
+                // the whole resolution system is locked =&gt; nothing can work properly =&gt; deadlocks
+
+                var newResolver = new ActionsResolver(
+                    new ActivatorServiceProvider(), LoggerResolver.Current.Logger,
+                        () =&gt; TypeFinder.FindClassesOfType&lt;IAction&gt;(PluginManager.Current.AssembliesToScan));
+
+                using (Umbraco.Core.ObjectResolution.Resolution.DirtyBackdoorToConfiguration)
+                {
+                    ActionsResolver.Reset(false); // and do NOT reset the whole resolution!
+                    ActionsResolver.Current = newResolver;
+                }
+
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Jacascript for the contextmenu
+        /// Suggestion: this method should be moved to the presentation layer.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;language&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;String representation&lt;/returns&gt;
+        public string ReturnJavascript(string language)
+        {
+            return findActions(language);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a list of JavaScript file paths.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static List&lt;string&gt; GetJavaScriptFileReferences()
+        {
+            return ActionsResolver.Current.Actions
+                .Where(x =&gt; !string.IsNullOrWhiteSpace(x.JsSource))
+                .Select(x =&gt; x.JsSource).ToList();
+            //return ActionJsReference;
+        }
+
+        /// &lt;summary&gt;
+        /// Javascript menuitems - tree contextmenu
+        /// Umbraco console
+        /// 
+        /// Suggestion: this method should be moved to the presentation layer.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;language&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private static string findActions(string language)
+        {
+            if (!ActionJs.ContainsKey(language))
+            {
+                string _actionJsList = &quot;&quot;;
+
+                foreach (IAction action in ActionsResolver.Current.Actions)
+                {
+                    // Adding try/catch so this rutine doesn&#39;t fail if one of the actions fail
+                    // Add to language JsList
+                    try
+                    {
+                        // NH: Add support for css sprites
+                        string icon = action.Icon;
+                        if (!string.IsNullOrEmpty(icon) &amp;&amp; icon.StartsWith(&quot;.&quot;))
+                            icon = icon.Substring(1, icon.Length - 1);
+                        else
+                            icon = &quot;images/&quot; + icon;
+
+                        _actionJsList += string.Format(&quot;,\n\tmenuItem(\&quot;{0}\&quot;, \&quot;{1}\&quot;, \&quot;{2}\&quot;, \&quot;{3}\&quot;)&quot;,
+                            action.Letter, icon, ui.GetText(&quot;actions&quot;, action.Alias, language), action.JsFunctionName);
+                    }
+                    catch (Exception ee)
+                    {
+                        LogHelper.Error&lt;Action&gt;(&quot;Error registrering action to javascript&quot;, ee);
+                    }
+                }
+
+                if (_actionJsList.Length &gt; 0)
+                    _actionJsList = _actionJsList.Substring(2, _actionJsList.Length - 2);
+
+                _actionJsList = &quot;\nvar menuMethods = new Array(\n&quot; + _actionJsList + &quot;\n)\n&quot;;
+                ActionJs.Add(language, _actionJsList);
+            }
+
+            return ActionJs[language];
+
+        }
+
+        /// &lt;summary&gt;
+        /// 
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;An arraylist containing all javascript variables for the contextmenu in the tree&lt;/returns&gt;
+        [Obsolete(&quot;Use ActionsResolver.Current.Actions instead&quot;)]
+        public static ArrayList GetAll()
+        {
+            return new ArrayList(ActionsResolver.Current.Actions.ToList());
+        }
+
+        /// &lt;summary&gt;
+        /// This method will return a list of IAction&#39;s based on a string list. Each character in the list may represent
+        /// an IAction. This will associate any found IActions based on the Letter property of the IAction with the character being referenced.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;actions&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;returns a list of actions that have an associated letter found in the action string list&lt;/returns&gt;
+        public static List&lt;IAction&gt; FromString(string actions)
+        {
+            List&lt;IAction&gt; list = new List&lt;IAction&gt;();
+            foreach (char c in actions.ToCharArray())
+            {
+                IAction action = ActionsResolver.Current.Actions.ToList().Find(
+                    delegate(IAction a)
+                    {
+                        return a.Letter == c;
+                    }
+                );
+                if (action != null)
+                    list.Add(action);
+            }
+            return list;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the string representation of the actions that make up the actions collection
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static string ToString(List&lt;IAction&gt; actions)
+        {
+            string[] strMenu = Array.ConvertAll&lt;IAction, string&gt;(actions.ToArray(), delegate(IAction a) { return (a.Letter.ToString()); });
+            return string.Join(&quot;&quot;, strMenu);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a list of IActions that are permission assignable
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static List&lt;IAction&gt; GetPermissionAssignable()
+        {
+            return ActionsResolver.Current.Actions.ToList().FindAll(
+                delegate(IAction a)
+                {
+                    return (a.CanBePermissionAssigned);
+                }
+            );
+        }
+
+        /// &lt;summary&gt;
+        /// Check if the current IAction is using legacy javascript methods
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;action&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;false if the Iaction is incompatible with 4.5&lt;/returns&gt;
+        public static bool ValidateActionJs(IAction action)
+        {
+            return !action.JsFunctionName.Contains(&quot;+&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Method to convert the old modal calls to the new ones
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;javascript&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static string ConvertLegacyJs(string javascript)
+        {
+            MatchCollection tags =
+    Regex.Matches(javascript, &quot;openModal[^;]*;&quot;, RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+            foreach (Match tag in tags)
+            {
+                string[] function = tag.Value.Split(&#39;,&#39;);
+                if (function.Length &gt; 0)
+                {
+                    string newFunction = &quot;UmbClientMgr.openModalWindow&quot; + function[0].Substring(9).Replace(&quot;parent.nodeID&quot;, &quot;UmbClientMgr.mainTree().getActionNode().nodeId&quot;).Replace(&quot;nodeID&quot;, &quot;UmbClientMgr.mainTree().getActionNode().nodeId&quot;).Replace(&quot;parent.returnRandom()&quot;, &quot;&#39;&quot; + Guid.NewGuid().ToString() + &quot;&#39;&quot;);
+                    newFunction += &quot;, &quot; + function[1];
+                    newFunction += &quot;, true&quot;;
+                    newFunction += &quot;, &quot; + function[2];
+                    newFunction += &quot;, &quot; + function[3];
+                    javascript = javascript.Replace(tag.Value, newFunction);
+                }
+            }
+
+            return javascript;
+        }
+    }
+
+    /// &lt;summary&gt;
+    /// This class is used to manipulate IActions that are implemented in a wrong way
+    /// For instance incompatible trees with 4.0 vs 4.5
+    /// &lt;/summary&gt;
+    public class PlaceboAction : IAction
+    {
+        public char Letter { get; set; }
+        public bool ShowInNotifier { get; set; }
+        public bool CanBePermissionAssigned { get; set; }
+        public string Icon { get; set; }
+        public string Alias { get; set; }
+        public string JsFunctionName { get; set; }
+        public string JsSource { get; set; }
+
+        public PlaceboAction() { }
+        public PlaceboAction(IAction legacyAction)
+        {
+            Letter = legacyAction.Letter;
+            ShowInNotifier = legacyAction.ShowInNotifier;
+            CanBePermissionAssigned = legacyAction.CanBePermissionAssigned;
+            Icon = legacyAction.Icon;
+            Alias = legacyAction.Alias;
+            JsFunctionName = legacyAction.JsFunctionName;
+            JsSource = legacyAction.JsSource;
+        }
+    }
+
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[37,9,37,104,0],[39,9,39,60,0],[42,9,42,10,0],[43,13,43,44,0],[44,9,44,10,0],[54,9,54,10,0],[55,13,55,24,0],[56,13,56,14,0],[61,17,63,31,0],[63,31,63,108,0],[63,108,63,110,0],[61,17,63,110,0],[65,17,65,94,0],[66,17,66,18,0],[67,21,67,50,0],[68,21,68,59,0],[69,17,69,18,0],[71,13,71,14,0],[72,9,72,10,0],[81,9,81,10,0],[82,13,82,42,0],[83,9,83,10,0],[90,9,90,10,0],[91,13,92,29,0],[92,29,92,67,0],[92,67,93,30,0],[93,30,93,40,0],[93,40,93,51,0],[91,13,93,51,0],[95,9,95,10,0],[106,9,106,10,0],[107,13,107,49,0],[108,13,108,14,0],[109,17,109,43,0],[111,17,111,24,0],[111,26,111,40,0],[111,41,111,43,0],[111,44,111,75,0],[112,17,112,18,0],[116,21,116,22,0],[118,25,118,51,0],[119,25,119,81,0],[120,29,120,71,0],[122,29,122,53,0],[124,25,125,120,0],[126,21,126,22,0],[127,21,127,41,0],[128,21,128,22,0],[129,25,129,96,0],[130,21,130,22,0],[131,17,131,18,0],[133,17,133,46,0],[134,21,134,90,0],[136,17,136,94,0],[137,17,137,55,0],[138,13,138,14,0],[140,13,140,39,0],[142,9,142,10,0],[150,9,150,10,0],[151,13,151,76,0],[152,9,152,10,0],[161,9,161,10,0],[162,13,162,54,0],[163,13,163,20,0],[163,22,163,28,0],[163,29,163,31,0],[163,32,163,53,0],[164,13,164,14,0],[165,17,167,21,0],[167,21,167,22,0],[167,22,168,25,0],[168,25,168,46,0],[168,46,169,21,0],[169,21,169,22,0],[169,22,170,19,0],[165,17,170,19,0],[171,17,171,36,0],[172,21,172,38,0],[173,13,173,14,0],[174,13,174,25,0],[175,9,175,10,0],[182,9,182,10,0],[183,13,183,105,0],[183,105,183,106,0],[183,106,183,107,0],[183,107,183,136,0],[183,136,183,137,0],[183,137,183,138,0],[183,138,183,140,0],[183,13,183,140,0],[184,13,184,45,0],[185,9,185,10,0],[192,9,192,10,0],[193,13,195,17,0],[195,17,195,18,0],[195,18,196,21,0],[196,21,196,56,0],[196,56,197,17,0],[197,17,197,18,0],[197,18,198,15,0],[193,13,198,15,0],[199,9,199,10,0],[207,9,207,10,0],[208,13,208,57,0],[209,9,209,10,0],[217,9,217,10,0],[218,13,219,114,0],[220,13,220,20,0],[220,22,220,31,0],[220,32,220,34,0],[220,35,220,39,0],[221,13,221,14,0],[222,17,222,58,0],[223,17,223,41,0],[224,17,224,18,0],[225,21,225,315,0],[226,21,226,55,0],[227,21,227,45,0],[228,21,228,55,0],[229,21,229,55,0],[230,21,230,77,0],[231,17,231,18,0],[232,13,232,14,0],[234,13,234,31,0],[235,9,235,10,0],[244,30,244,34,0],[244,35,244,39,0],[245,38,245,42,0],[245,43,245,47,0],[246,47,246,51,0],[246,52,246,56,0],[247,30,247,34,0],[247,35,247,39,0],[248,31,248,35,0],[248,36,248,40,0],[249,40,249,44,0],[249,45,249,49,0],[250,34,250,38,0],[250,39,250,43,0],[252,9,252,31,0],[252,32,252,33,0],[252,34,252,35,0],[253,9,253,51,0],[254,9,254,10,0],[255,13,255,42,0],[256,13,256,58,0],[257,13,257,76,0],[258,13,258,38,0],[259,13,259,40,0],[260,13,260,58,0],[261,13,261,46,0],[262,9,262,10,0]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\UI\LegacyDialogHandler.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Web;
+using System.Xml;
+using Umbraco.Core;
+using Umbraco.Core.IO;
+using umbraco.BasePages;
+using umbraco.BusinessLogic;
+using umbraco.interfaces;
+using System.Linq;
+
+namespace Umbraco.Web.UI
+{
+    /// &lt;summary&gt;
+    /// This is used to replace the old umbraco.presentation.create.dialogHandler_temp class which is used
+    /// to handle sections create/delete actions.
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// We need to overhaul how all of this is handled which is why this is a legacy class
+    /// http://issues.umbraco.org/issue/U4-1373
+    /// &lt;/remarks&gt;
+    public static class LegacyDialogHandler
+    {
+        private enum Operation
+        {
+            Create,
+            Delete
+        }
+
+        private const string ContextKeyCreate = &quot;LegacyDialogHandler-Create-&quot;;
+        private const string ContextKeyDelete = &quot;LegacyDialogHandler-Delete-&quot;;
+
+        /// &lt;summary&gt;
+        /// Gets the ITask for the operation for the node Type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbracoUser&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;op&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;nodeType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// Returns the ITask if one is found and can be made, otherwise null
+        /// &lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This will first check if we&#39;ve already created the ITask in the current Http request
+        /// &lt;/remarks&gt;
+        private static ITask GetTaskForOperation(HttpContextBase httpContext, User umbracoUser, Operation op, string nodeType)
+        {
+            if (httpContext == null) throw new ArgumentNullException(&quot;httpContext&quot;);
+            if (umbracoUser == null) throw new ArgumentNullException(&quot;umbracoUser&quot;);
+            if (nodeType == null) throw new ArgumentNullException(&quot;nodeType&quot;);
+
+            var ctxKey = op == Operation.Create ? ContextKeyCreate : ContextKeyDelete;
+
+            //check contextual cache
+            if (httpContext.Items[ctxKey] != null)
+            {
+                return (ITask) httpContext.Items[ctxKey];
+            }
+
+            var operationNode = op == Operation.Create ? &quot;create&quot; : &quot;delete&quot;;
+            var createDef = GetXmlDoc();
+            var def = createDef.SelectSingleNode(&quot;//nodeType [@alias = &#39;&quot; + nodeType + &quot;&#39;]&quot;);
+            if (def == null)
+            {
+                return null;
+            }
+            var del = def.SelectSingleNode(&quot;./tasks/&quot; + operationNode);
+            if (del == null)
+            {
+                return null;
+            }
+            if (!del.Attributes.HasAttribute(&quot;assembly&quot;))
+            {
+                return null;
+            }
+            var taskAssembly = del.AttributeValue&lt;string&gt;(&quot;assembly&quot;);
+            
+            if (!del.Attributes.HasAttribute(&quot;type&quot;))
+            {
+                return null;
+            }
+            var taskType = del.AttributeValue&lt;string&gt;(&quot;type&quot;);
+
+            var assembly = Assembly.LoadFrom(IOHelper.MapPath(SystemDirectories.Bin + &quot;/&quot; + taskAssembly + &quot;.dll&quot;));
+            var type = assembly.GetType(taskAssembly + &quot;.&quot; + taskType);
+            var typeInstance = Activator.CreateInstance(type) as ITask;
+            if (typeInstance == null)
+            {
+                return null;
+            }
+
+            //set the user/user id for the instance
+            var dialogTask = typeInstance as LegacyDialogTask;
+            if (dialogTask != null)
+            {
+                dialogTask.User = umbracoUser;
+            }
+            else
+            {
+                typeInstance.UserId = umbracoUser.Id;
+            }
+
+            //put in contextual cache 
+            httpContext.Items[ctxKey] = typeInstance;
+
+            return typeInstance;
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the user has access to launch the ITask that matches the node type based on the app assigned
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;umbracoUser&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;nodeType&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// If the ITask doesn&#39;t implement LegacyDialogTask then we will return &#39;true&#39; since we cannot validate
+        /// the application assigned.
+        /// 
+        /// TODO: Create an API to assign a nodeType to an app so developers can manually secure it
+        /// &lt;/remarks&gt;
+        internal static bool UserHasCreateAccess(HttpContextBase httpContext, User umbracoUser, string nodeType)
+        {
+            var task = GetTaskForOperation(httpContext, umbracoUser, Operation.Create, nodeType);
+            var dialogTask = task as LegacyDialogTask;
+            if (dialogTask != null)
+            {
+                return dialogTask.ValidateUserForApplication();
+            }
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if the user has access to launch the ITask that matches the node type based on the app assigned
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;umbracoUser&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;nodeType&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// If the ITask doesn&#39;t implement LegacyDialogTask then we will return &#39;true&#39; since we cannot validate
+        /// the application assigned.
+        /// 
+        /// TODO: Create an API to assign a nodeType to an app so developers can manually secure it
+        /// &lt;/remarks&gt;
+        internal static bool UserHasDeleteAccess(HttpContextBase httpContext, User umbracoUser, string nodeType)
+        {
+            var task = GetTaskForOperation(httpContext, umbracoUser, Operation.Delete, nodeType);
+            var dialogTask = task as LegacyDialogTask;
+            if (dialogTask != null)
+            {
+                return dialogTask.ValidateUserForApplication();
+            }
+            return true;
+        }
+
+        public static void Delete(HttpContextBase httpContext, User umbracoUser, string nodeType, int nodeId, string text)
+        {
+            var typeInstance = GetTaskForOperation(httpContext, umbracoUser, Operation.Delete, nodeType);
+            
+            typeInstance.ParentID = nodeId;
+            typeInstance.Alias = text;
+
+            typeInstance.Delete();
+        }
+
+        public static string Create(HttpContextBase httpContext, User umbracoUser, string nodeType, int nodeId, string text, int typeId = 0)
+        {
+            var typeInstance = GetTaskForOperation(httpContext, umbracoUser, Operation.Create, nodeType);
+            
+            typeInstance.TypeID = typeId;
+            typeInstance.ParentID = nodeId;
+            typeInstance.Alias = text;
+
+            typeInstance.Save();
+
+            // check for returning url
+            var returnUrlTask = typeInstance as ITaskReturnUrl;
+            return returnUrlTask != null
+                ? returnUrlTask.ReturnUrl
+                : &quot;&quot;;
+        }
+
+        internal static string Create(HttpContextBase httpContext, User umbracoUser, string nodeType, int nodeId, string text, IDictionary&lt;string, object&gt; additionalValues, int typeId = 0)
+        {
+            var typeInstance = GetTaskForOperation(httpContext, umbracoUser, Operation.Create, nodeType);
+
+            typeInstance.TypeID = typeId;
+            typeInstance.ParentID = nodeId;
+            typeInstance.Alias = text;
+
+            // check for returning url
+            ITaskReturnUrl returnUrlTask = typeInstance as LegacyDialogTask;
+            if (returnUrlTask != null)
+            {
+                // if castable to LegacyDialogTask: add in additionalValues
+                ((LegacyDialogTask) returnUrlTask).AdditionalValues = additionalValues;
+            }
+            else
+            {
+                // otherwise cast to returnUrl interface
+                returnUrlTask = typeInstance as ITaskReturnUrl;
+            }
+            
+            typeInstance.Save();
+            
+            return returnUrlTask != null
+                ? returnUrlTask.ReturnUrl
+                : &quot;&quot;;
+        }
+
+        private static XmlDocument GetXmlDoc()
+        {
+            // Load task settings
+            var createDef = new XmlDocument();
+            using (var defReader = new XmlTextReader(IOHelper.MapPath(SystemFiles.CreateUiXml)))
+            {
+                createDef.Load(defReader);
+                defReader.Close();
+                return createDef;
+            }            
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[50,9,50,10,0],[51,13,51,37,0],[51,38,51,85,0],[52,13,52,37,0],[52,38,52,85,0],[53,13,53,34,0],[53,35,53,79,0],[55,13,55,87,0],[58,13,58,51,0],[59,13,59,14,0],[60,17,60,58,0],[63,13,63,78,0],[64,13,64,41,0],[65,13,65,94,0],[66,13,66,29,0],[67,13,67,14,0],[68,17,68,29,0],[70,13,70,72,0],[71,13,71,29,0],[72,13,72,14,0],[73,17,73,29,0],[75,13,75,58,0],[76,13,76,14,0],[77,17,77,29,0],[79,13,79,71,0],[81,13,81,54,0],[82,13,82,14,0],[83,17,83,29,0],[85,13,85,63,0],[87,13,87,117,0],[88,13,88,72,0],[89,13,89,72,0],[90,13,90,38,0],[91,13,91,14,0],[92,17,92,29,0],[96,13,96,63,0],[97,13,97,36,0],[98,13,98,14,0],[99,17,99,47,0],[100,13,100,14,0],[102,13,102,14,0],[103,17,103,54,0],[104,13,104,14,0],[107,13,107,54,0],[109,13,109,33,0],[110,9,110,10,0],[126,9,126,10,0],[127,13,127,98,0],[128,13,128,55,0],[129,13,129,36,0],[130,13,130,14,0],[131,17,131,64,0],[133,13,133,25,0],[134,9,134,10,0],[150,9,150,10,0],[151,13,151,98,0],[152,13,152,55,0],[153,13,153,36,0],[154,13,154,14,0],[155,17,155,64,0],[157,13,157,25,0],[158,9,158,10,0],[161,9,161,10,0],[162,13,162,106,0],[164,13,164,44,0],[165,13,165,39,0],[167,13,167,35,0],[168,9,168,10,0],[171,9,171,10,0],[172,13,172,106,0],[174,13,174,42,0],[175,13,175,44,0],[176,13,176,39,0],[178,13,178,33,0],[181,13,181,64,0],[182,13,184,22,0],[185,9,185,10,0],[188,9,188,10,0],[189,13,189,106,0],[191,13,191,42,0],[192,13,192,44,0],[193,13,193,39,0],[196,13,196,77,0],[197,13,197,39,0],[198,13,198,14,0],[200,17,200,88,0],[201,13,201,14,0],[203,13,203,14,0],[205,17,205,64,0],[206,13,206,14,0],[208,13,208,33,0],[210,13,212,22,0],[213,9,213,10,0],[216,9,216,10,0],[218,13,218,47,0],[219,20,219,96,0],[220,13,220,14,0],[221,17,221,43,0],[222,17,222,35,0],[223,17,223,34,0],[225,9,225,10,0]]);
+    </script>
+  </body>
+</html>

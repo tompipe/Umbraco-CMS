@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\webservices\legacyAjaxCalls.asmx.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Web;
+using System.Web.Security;
+using System.Web.Services;
+using System.ComponentModel;
+using System.Web.Script.Services;
+using System.Xml;
+using System.Xml.Xsl;
+using System.IO;
+using System.Text.RegularExpressions;
+using System.Net;
+using System.Web.UI;
+using Umbraco.Core;
+using Umbraco.Core.IO;
+using Umbraco.Web.UI;
+using Umbraco.Web;
+using Umbraco.Web.Cache;
+using Umbraco.Web.WebServices;
+
+using umbraco.BusinessLogic;
+using umbraco.businesslogic.Exceptions;
+using umbraco.cms.businesslogic.web;
+using umbraco.cms.businesslogic.media;
+using umbraco.BasePages;
+
+
+namespace umbraco.presentation.webservices
+{
+    /// &lt;summary&gt;
+    /// Summary description for legacyAjaxCalls
+    /// &lt;/summary&gt;
+    [WebService(Namespace = &quot;http://umbraco.org/webservices&quot;)]
+    [WebServiceBinding(ConformsTo = WsiProfiles.BasicProfile1_1)]
+    [ToolboxItem(false)]
+    [ScriptService]
+    public class legacyAjaxCalls : UmbracoAuthorizedWebService
+    {
+        private User _currentUser;
+
+        [WebMethod]
+        public bool ValidateUser(string username, string password)
+        {
+            if (ValidateCredentials(username, password))
+            {
+                var u = new BusinessLogic.User(username);
+                BasePage.doLogin(u);
+                return true;
+            }
+            return false;
+        }
+
+        /// &lt;summary&gt;
+        /// method to accept a string value for the node id. Used for tree&#39;s such as python
+        /// and xslt since the file names are the node IDs
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;nodeId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;nodeType&quot;&gt;&lt;/param&gt;
+        [WebMethod]
+        [ScriptMethod]
+        public void Delete(string nodeId, string alias, string nodeType)
+        {
+            if (!AuthorizeRequest())
+                return;
+            
+            //U4-2686 - alias is html encoded, make sure to decode 
+            alias = HttpUtility.HtmlDecode(alias);
+
+            //check which parameters to pass depending on the types passed in
+            int intNodeId;
+            if (nodeType == &quot;memberGroups&quot;)
+            {
+                 LegacyDialogHandler.Delete(
+                    new HttpContextWrapper(HttpContext.Current),
+                    UmbracoUser,
+                    nodeType, 0, nodeId);
+            }
+            else if (int.TryParse(nodeId, out intNodeId) &amp;&amp; nodeType != &quot;member&quot;) // Fix for #26965 - numeric member login gets parsed as nodeId
+            {
+                LegacyDialogHandler.Delete(
+                    new HttpContextWrapper(HttpContext.Current),
+                    UmbracoUser,
+                    nodeType, intNodeId, alias);
+            }
+            else
+            {
+                LegacyDialogHandler.Delete(
+                    new HttpContextWrapper(HttpContext.Current),
+                    UmbracoUser,
+                    nodeType, 0, nodeId);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Permanently deletes a document/media object.
+        /// Used to remove an item from the recycle bin.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;nodeId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;nodeType&quot;&gt;&lt;/param&gt;
+        [WebMethod]
+        [ScriptMethod]
+        public void DeleteContentPermanently(string nodeId, string nodeType)
+        {
+            int intNodeId;
+            if (int.TryParse(nodeId, out intNodeId))
+            {
+                switch (nodeType)
+                {
+                    case &quot;media&quot;:
+                    case &quot;mediaRecycleBin&quot;:
+                        //ensure user has access to media
+                        AuthorizeRequest(DefaultApps.media.ToString(), true);
+
+                        new Media(intNodeId).delete(true);
+                        break;
+                    case &quot;content&quot;:
+                    case &quot;contentRecycleBin&quot;:
+                    default:
+                        //ensure user has access to content
+                        AuthorizeRequest(DefaultApps.content.ToString(), true);
+
+                        new Document(intNodeId).delete(true);
+                        break;
+                }                
+            }
+            else
+            {
+                throw new ArgumentException(&quot;The nodeId argument could not be parsed to an integer&quot;);
+            }
+        }
+
+        [WebMethod]
+        [ScriptMethod]
+        public void DisableUser(int userId)
+        {
+            AuthorizeRequest(DefaultApps.users.ToString(), true);
+
+            BusinessLogic.User.GetUser(userId).disable();
+        }
+
+        [WebMethod]
+        [ScriptMethod]
+        public string GetNodeName(int nodeId)
+        {
+
+            AuthorizeRequest(true);
+
+            return new cms.businesslogic.CMSNode(nodeId).Text;
+        }
+
+        [WebMethod]
+        [ScriptMethod]
+        public string[] GetNodeBreadcrumbs(int nodeId)
+        {
+
+            AuthorizeRequest(true);
+
+            var node = new cms.businesslogic.CMSNode(nodeId);
+            var crumbs = new System.Collections.Generic.List&lt;string&gt;() { node.Text };
+            while (node != null &amp;&amp; node.Level &gt; 1)
+            {
+                node = node.Parent;
+                crumbs.Add(node.Text);
+            }
+            crumbs.Reverse();
+            return crumbs.ToArray();
+        }
+
+        [WebMethod]
+        [ScriptMethod]
+        public string NiceUrl(int nodeId)
+        {
+
+            AuthorizeRequest(true);
+
+            return library.NiceUrl(nodeId);
+        }
+
+        [WebMethod]
+        [ScriptMethod]
+        public string ProgressStatus(string Key)
+        {
+            AuthorizeRequest(true);
+
+            return Application[helper.Request(&quot;key&quot;)].ToString();
+        }
+
+        [Obsolete(&quot;This is no longer used and will be removed in future versions&quot;)]
+        [WebMethod]
+        [ScriptMethod]
+        public void RenewUmbracoSession()
+        {
+            AuthorizeRequest(true);
+
+            BasePage.RenewLoginTimeout();
+
+        }
+
+        [Obsolete(&quot;This is no longer used and will be removed in future versions&quot;)]
+        [WebMethod]
+        [ScriptMethod]
+        public int GetSecondsBeforeUserLogout()
+        {
+            //TODO: Change this to not throw an exception otherwise we end up with JS errors all the time when recompiling!!
+
+            AuthorizeRequest(true);
+            var timeout = BasePage.GetTimeout(true);
+            var timeoutDate = new DateTime(timeout);
+            var currentDate = DateTime.Now;
+            
+            return (int) timeoutDate.Subtract(currentDate).TotalSeconds;
+
+        }
+
+        [WebMethod]
+        [ScriptMethod]
+        public string TemplateMasterPageContentContainer(int templateId, int masterTemplateId)
+        {
+            AuthorizeRequest(DefaultApps.settings.ToString(), true);
+            return new cms.businesslogic.template.Template(templateId).GetMasterContentElement(masterTemplateId);
+        }
+
+        [WebMethod]
+        [ScriptMethod]
+        public string SaveFile(string fileName, string fileAlias, string fileContents, string fileType, int fileID, int masterID, bool ignoreDebug)
+        {
+            switch (fileType)
+            {
+                case &quot;xslt&quot;:
+                    AuthorizeRequest(DefaultApps.developer.ToString(), true);
+                    return SaveXslt(fileName, fileContents, ignoreDebug);
+                case &quot;python&quot;:
+                    AuthorizeRequest(DefaultApps.developer.ToString(), true);
+                    return &quot;true&quot;;
+                case &quot;css&quot;:
+                    AuthorizeRequest(DefaultApps.settings.ToString(), true);
+                    return SaveCss(fileName, fileContents, fileID);
+                case &quot;script&quot;:
+                    AuthorizeRequest(DefaultApps.settings.ToString(), true);
+                    return SaveScript(fileName, fileContents);
+                case &quot;template&quot;:
+                    AuthorizeRequest(DefaultApps.settings.ToString(), true);
+                    return SaveTemplate(fileName, fileAlias, fileContents, fileID, masterID);
+                default:
+                    throw new ArgumentException(String.Format(&quot;Invalid fileType passed: &#39;{0}&#39;&quot;, fileType));
+            }
+
+        }
+
+        public string Tidy(string textToTidy)
+        {
+            AuthorizeRequest(true);
+            return library.Tidy(helper.Request(&quot;StringToTidy&quot;), true);
+        }
+
+        private static string SaveCss(string fileName, string fileContents, int fileId)
+        {
+            string returnValue;
+            var stylesheet = new StyleSheet(fileId)
+                {
+                    Content = fileContents,
+                    Text = fileName
+                };
+
+            try
+            {
+                stylesheet.saveCssToFile();
+                returnValue = &quot;true&quot;;
+            }
+            catch (Exception ee)
+            {
+                throw new Exception(&quot;Couldn&#39;t save file&quot;, ee);
+            }
+
+	        return returnValue;
+        }
+
+        private string SaveXslt(string fileName, string fileContents, bool ignoreDebugging)
+        {
+            IOHelper.EnsurePathExists(SystemDirectories.Xslt);
+
+			var tempFileName = IOHelper.MapPath(SystemDirectories.Xslt + &quot;/&quot; + System.DateTime.Now.Ticks + &quot;_temp.xslt&quot;);
+            using (var sw = File.CreateText(tempFileName))
+            {
+				sw.Write(fileContents);
+				sw.Close();    
+            }
+            
+            // Test the xslt
+            var errorMessage = &quot;&quot;;
+            if (!ignoreDebugging)
+            {
+                try
+                {
+
+                    // Check if there&#39;s any documents yet
+                    if (content.Instance.XmlContent.SelectNodes(&quot;/root/node&quot;).Count &gt; 0)
+                    {
+                        var macroXml = new XmlDocument();
+                        macroXml.LoadXml(&quot;&lt;macro/&gt;&quot;);
+
+                        var macroXslt = new XslCompiledTransform();
+                        var umbPage = new page(content.Instance.XmlContent.SelectSingleNode(&quot;//node [@parentID = -1]&quot;));
+
+                        var xslArgs = macro.AddMacroXsltExtensions();
+                        var lib = new library(umbPage);
+                        xslArgs.AddExtensionObject(&quot;urn:umbraco.library&quot;, lib);
+                        HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, &quot;After adding extensions&quot;);
+
+                        // Add the current node
+                        xslArgs.AddParam(&quot;currentPage&quot;, &quot;&quot;, library.GetXmlNodeById(umbPage.PageID.ToString()));
+                        HttpContext.Current.Trace.Write(&quot;umbracoMacro&quot;, &quot;Before performing transformation&quot;);
+
+                        // Create reader and load XSL file
+                        // We need to allow custom DTD&#39;s, useful for defining an ENTITY
+                        var readerSettings = new XmlReaderSettings();
+                        readerSettings.ProhibitDtd = false;
+                        using (var xmlReader = XmlReader.Create(tempFileName, readerSettings))
+                        {
+                            var xslResolver = new XmlUrlResolver
+                                {
+                                    Credentials = CredentialCache.DefaultCredentials
+                                };
+                            macroXslt.Load(xmlReader, XsltSettings.TrustedXslt, xslResolver);
+                            xmlReader.Close();
+                            // Try to execute the transformation
+                            var macroResult = new HtmlTextWriter(new StringWriter());
+                            macroXslt.Transform(macroXml, xslArgs, macroResult);
+                            macroResult.Close();
+                        }
+                    }
+                    else
+                    {
+                        errorMessage = &quot;stub&quot;;
+                    }
+
+                }
+                catch (Exception errorXslt)
+                {
+                    errorMessage = (errorXslt.InnerException ?? errorXslt).ToString();
+
+                    // Full error message
+                    errorMessage = errorMessage.Replace(&quot;\n&quot;, &quot;&lt;br/&gt;\n&quot;);
+
+                    // Find error
+                    var m = Regex.Matches(errorMessage, @&quot;\d*[^,],\d[^\)]&quot;, RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+                    foreach (Match mm in m)
+                    {
+                        var errorLine = mm.Value.Split(&#39;,&#39;);
+
+                        if (errorLine.Length &gt; 0)
+                        {
+                            var theErrorLine = int.Parse(errorLine[0]);
+                            var theErrorChar = int.Parse(errorLine[1]);
+
+                            errorMessage = &quot;Error in XSLT at line &quot; + errorLine[0] + &quot;, char &quot; + errorLine[1] + &quot;&lt;br/&gt;&quot;;
+                            errorMessage += &quot;&lt;span style=\&quot;font-family: courier; font-size: 11px;\&quot;&gt;&quot;;
+
+                            var xsltText = fileContents.Split(&quot;\n&quot;.ToCharArray());
+                            for (var i = 0; i &lt; xsltText.Length; i++)
+                            {
+                                if (i &gt;= theErrorLine - 3 &amp;&amp; i &lt;= theErrorLine + 1)
+                                    if (i + 1 == theErrorLine)
+                                    {
+                                        errorMessage += &quot;&lt;b&gt;&quot; + (i + 1) + &quot;: &amp;gt;&amp;gt;&amp;gt;&amp;nbsp;&amp;nbsp;&quot; + Server.HtmlEncode(xsltText[i].Substring(0, theErrorChar));
+                                        errorMessage += &quot;&lt;span style=\&quot;text-decoration: underline; border-bottom: 1px solid red\&quot;&gt;&quot; + Server.HtmlEncode(xsltText[i].Substring(theErrorChar, xsltText[i].Length - theErrorChar)).Trim() + &quot;&lt;/span&gt;&quot;;
+                                        errorMessage += &quot; &amp;lt;&amp;lt;&amp;lt;&lt;/b&gt;&lt;br/&gt;&quot;;
+                                    }
+                                    else
+                                        errorMessage += (i + 1) + &quot;: &amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&quot; + Server.HtmlEncode(xsltText[i]) + &quot;&lt;br/&gt;&quot;;
+                            }
+                            errorMessage += &quot;&lt;/span&gt;&quot;;
+
+                        }
+                    }
+                }
+
+            }
+
+
+            if (errorMessage == &quot;&quot; &amp;&amp; fileName.ToLower().EndsWith(&quot;.xslt&quot;))
+            {
+                //Hardcoded security-check... only allow saving files in xslt directory... 
+                var savePath = IOHelper.MapPath(SystemDirectories.Xslt + &quot;/&quot; + fileName);
+
+                if (savePath.StartsWith(IOHelper.MapPath(SystemDirectories.Xslt)))
+                {
+					using (var sw = File.CreateText(savePath))
+	                {
+						sw.Write(fileContents);
+						sw.Close();
+	                }
+                    errorMessage = &quot;true&quot;;
+                }
+                else
+                {
+                    errorMessage = &quot;Illegal path&quot;;
+                }
+            }
+
+            File.Delete(tempFileName);
+
+            return errorMessage;
+        }
+		
+        private static string SaveScript(string filename, string contents)
+        {
+            var val = contents;
+            string returnValue;
+            try
+            {
+                var savePath = IOHelper.MapPath(SystemDirectories.Scripts + &quot;/&quot; + filename);
+
+                //Directory check.. only allow files in script dir and below to be edited
+                if (savePath.StartsWith(IOHelper.MapPath(SystemDirectories.Scripts + &quot;/&quot;)))
+                {
+                    //ensure the folder exists before saving
+                    Directory.CreateDirectory(Path.GetDirectoryName(savePath));
+
+                    using (var sw = File.CreateText(IOHelper.MapPath(SystemDirectories.Scripts + &quot;/&quot; + filename)))
+                    {
+                        sw.Write(val);
+                        sw.Close();
+                        returnValue = &quot;true&quot;;
+                    }
+                    
+                }
+                else
+                {
+                    throw new ArgumentException(&quot;Couldnt save to file - Illegal path&quot;);
+                }
+            }
+            catch (Exception ex)
+            {
+                throw new ArgumentException(String.Format(&quot;Couldnt save to file &#39;{0}&#39;&quot;, filename), ex);
+            }
+
+
+            return returnValue;
+        }
+
+        private static string SaveTemplate(string templateName, string templateAlias, string templateContents, int templateID, int masterTemplateID)
+        {
+            var tp = new cms.businesslogic.template.Template(templateID);
+            var retVal = &quot;false&quot;;
+
+	        tp.Text = templateName;
+	        tp.Alias = templateAlias;
+	        tp.MasterTemplate = masterTemplateID;
+	        tp.Design = templateContents;
+
+            tp.Save();
+
+	        retVal = &quot;true&quot;;
+
+	        return retVal;
+        }
+
+        [Obsolete(&quot;You should use the AuthorizeRequest methods on the base class of UmbracoAuthorizedWebService and ensure you inherit from that class for umbraco asmx web services&quot;)]
+        public static void Authorize()
+        {
+            // check for secure connection
+            if (GlobalSettings.UseSSL &amp;&amp; !HttpContext.Current.Request.IsSecureConnection)
+                throw new UserAuthorizationException(&quot;This installation requires a secure connection (via SSL). Please update the URL to include https://&quot;);
+
+            if (!BasePage.ValidateUserContextID(BasePages.BasePage.umbracoUserContextID))
+                throw new Exception(&quot;Client authorization failed. User is not logged in&quot;);
+
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[42,9,42,10,0],[43,13,43,57,0],[44,13,44,14,0],[45,17,45,58,0],[46,17,46,37,0],[47,17,47,29,0],[49,13,49,26,0],[50,9,50,10,0],[62,9,62,10,0],[63,13,63,37,0],[64,17,64,24,0],[67,13,67,51,0],[71,13,71,44,0],[72,13,72,14,0],[73,18,76,42,0],[77,13,77,14,0],[78,18,78,82,0],[79,13,79,14,0],[80,17,83,49,0],[84,13,84,14,0],[86,13,86,14,0],[87,17,90,42,0],[91,13,91,14,0],[92,9,92,10,0],[103,9,103,10,0],[105,13,105,53,0],[106,13,106,14,0],[107,17,107,34,0],[112,25,112,78,0],[114,25,114,59,0],[115,25,115,31,0],[120,25,120,80,0],[122,25,122,62,0],[123,25,123,31,0],[125,13,125,14,0],[127,13,127,14,0],[128,17,128,102,0],[130,9,130,10,0],[135,9,135,10,0],[136,13,136,66,0],[138,13,138,58,0],[139,9,139,10,0],[144,9,144,10,0],[146,13,146,36,0],[148,13,148,63,0],[149,9,149,10,0],[154,9,154,10,0],[156,13,156,36,0],[158,13,158,62,0],[159,13,159,86,0],[160,13,160,51,0],[161,13,161,14,0],[162,17,162,36,0],[163,17,163,39,0],[164,13,164,14,0],[165,13,165,30,0],[166,13,166,37,0],[167,9,167,10,0],[172,9,172,10,0],[174,13,174,36,0],[176,13,176,44,0],[177,9,177,10,0],[182,9,182,10,0],[183,13,183,36,0],[185,13,185,66,0],[186,9,186,10,0],[192,9,192,10,0],[193,13,193,36,0],[195,13,195,42,0],[197,9,197,10,0],[203,9,203,10,0],[206,13,206,36,0],[207,13,207,53,0],[208,13,208,53,0],[209,13,209,44,0],[211,13,211,73,0],[213,9,213,10,0],[218,9,218,10,0],[219,13,219,69,0],[220,13,220,114,0],[221,9,221,10,0],[226,9,226,10,0],[227,13,227,30,0],[230,21,230,78,0],[231,21,231,74,0],[233,21,233,78,0],[234,21,234,35,0],[236,21,236,77,0],[237,21,237,68,0],[239,21,239,77,0],[240,21,240,63,0],[242,21,242,77,0],[243,21,243,94,0],[245,21,245,108,0],[248,9,248,10,0],[251,9,251,10,0],[252,13,252,36,0],[253,13,253,71,0],[254,9,254,10,0],[257,9,257,10,0],[259,13,263,19,0],[266,13,266,14,0],[267,17,267,44,0],[268,17,268,38,0],[269,13,269,14,0],[270,13,270,33,0],[271,13,271,14,0],[272,17,272,63,0],[275,10,275,29,0],[276,9,276,10,0],[279,9,279,10,0],[280,13,280,63,0],[282,4,282,113,0],[283,20,283,58,0],[284,13,284,14,0],[285,5,285,28,0],[286,5,286,16,0],[287,13,287,14,0],[290,13,290,35,0],[291,13,291,34,0],[292,13,292,14,0],[294,17,294,18,0],[297,21,297,89,0],[298,21,298,22,0],[299,25,299,58,0],[300,25,300,54,0],[302,25,302,68,0],[303,25,303,121,0],[305,25,305,70,0],[306,25,306,56,0],[307,25,307,80,0],[308,25,308,100,0],[311,25,311,112,0],[312,25,312,109,0],[316,25,316,70,0],[317,25,317,60,0],[318,32,318,94,0],[319,25,319,26,0],[320,29,323,35,0],[324,29,324,94,0],[325,29,325,47,0],[327,29,327,86,0],[328,29,328,81,0],[329,29,329,49,0],[330,25,330,26,0],[331,21,331,22,0],[333,21,333,22,0],[334,25,334,47,0],[335,21,335,22,0],[337,17,337,18,0],[338,17,338,44,0],[339,17,339,18,0],[340,21,340,87,0],[343,21,343,74,0],[346,21,346,141,0],[347,21,347,28,0],[347,30,347,38,0],[347,39,347,41,0],[347,42,347,43,0],[348,21,348,22,0],[349,25,349,61,0],[351,25,351,50,0],[352,25,352,26,0],[353,29,353,72,0],[354,29,354,72,0],[356,29,356,121,0],[357,29,357,103,0],[359,29,359,83,0],[360,34,360,43,0],[360,45,360,64,0],[360,66,360,69,0],[361,29,361,30,0],[362,33,362,84,0],[363,37,363,63,0],[364,37,364,38,0],[365,41,365,164,0],[366,41,366,244,0],[367,41,367,82,0],[368,37,368,38,0],[370,41,370,145,0],[371,29,371,30,0],[372,29,372,55,0],[374,25,374,26,0],[375,21,375,22,0],[376,17,376,18,0],[378,13,378,14,0],[381,13,381,76,0],[382,13,382,14,0],[384,17,384,90,0],[386,17,386,83,0],[387,17,387,18,0],[388,13,388,47,0],[389,18,389,19,0],[390,7,390,30,0],[391,7,391,18,0],[392,18,392,19,0],[393,21,393,43,0],[394,17,394,18,0],[396,17,396,18,0],[397,21,397,51,0],[398,17,398,18,0],[399,13,399,14,0],[401,13,401,39,0],[403,13,403,33,0],[404,9,404,10,0],[407,9,407,10,0],[408,13,408,32,0],[411,13,411,14,0],[412,17,412,93,0],[415,17,415,92,0],[416,17,416,18,0],[418,21,418,80,0],[420,28,420,114,0],[421,21,421,22,0],[422,25,422,39,0],[423,25,423,36,0],[424,25,424,46,0],[425,21,425,22,0],[427,17,427,18,0],[429,17,429,18,0],[430,21,430,88,0],[432,13,432,14,0],[433,13,433,33,0],[434,13,434,14,0],[435,17,435,104,0],[439,13,439,32,0],[440,9,440,10,0],[443,9,443,10,0],[444,13,444,74,0],[445,13,445,34,0],[447,10,447,33,0],[448,10,448,35,0],[449,10,449,47,0],[450,10,450,39,0],[452,13,452,23,0],[454,10,454,26,0],[456,10,456,24,0],[457,9,457,10,0],[461,9,461,10,0],[463,13,463,90,0],[464,17,464,157,0],[466,13,466,90,0],[467,17,467,91,0],[469,9,469,10,0]]);
+    </script>
+  </body>
+</html>

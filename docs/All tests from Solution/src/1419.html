@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\ObjectExtensions.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
+using System.Xml;
+
+namespace Umbraco.Core
+{
+	/// &lt;summary&gt;
+	/// Provides object extension methods.
+	/// &lt;/summary&gt;
+	public static class ObjectExtensions
+	{
+		//private static readonly ConcurrentDictionary&lt;Type, Func&lt;object&gt;&gt; ObjectFactoryCache = new ConcurrentDictionary&lt;Type, Func&lt;object&gt;&gt;();
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;input&quot;&gt;&lt;/param&gt;
+		/// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		public static IEnumerable&lt;T&gt; AsEnumerableOfOne&lt;T&gt;(this T input)
+		{
+			return Enumerable.Repeat(input, 1);
+		}
+
+		/// &lt;summary&gt;
+		/// 
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;input&quot;&gt;&lt;/param&gt;
+		public static void DisposeIfDisposable(this object input)
+		{
+			var disposable = input as IDisposable;
+			if (disposable != null) disposable.Dispose();
+		}
+
+		/// &lt;summary&gt;
+		/// Provides a shortcut way of safely casting an input when you cannot guarantee the &lt;typeparamref name=&quot;T&quot;/&gt; is
+		/// an instance type (i.e., when the C# AS keyword is not applicable).
+		/// &lt;/summary&gt;
+		/// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+		/// &lt;param name=&quot;input&quot;&gt;The input.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		internal static T SafeCast&lt;T&gt;(this object input)
+		{
+			if (ReferenceEquals(null, input) || ReferenceEquals(default(T), input)) return default(T);
+			if (input is T) return (T)input;
+			return default(T);
+		}
+
+		/// &lt;summary&gt;
+		/// Tries to convert the input object to the output type using TypeConverters
+		/// &lt;/summary&gt;
+		/// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+		/// &lt;param name=&quot;input&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		public static Attempt&lt;T&gt; TryConvertTo&lt;T&gt;(this object input)
+		{
+			var result = TryConvertTo(input, typeof(T));
+            if (result.Success == false)
+            {
+                //just try a straight up conversion
+                try
+                {
+                    var converted = (T) input;
+                    return Attempt&lt;T&gt;.Succeed(converted);
+                }
+                catch (Exception e)
+                {
+                    return Attempt&lt;T&gt;.Fail(e);
+                }
+            }
+			return result.Success == false ? Attempt&lt;T&gt;.Fail() : Attempt&lt;T&gt;.Succeed((T)result.Result);
+		}
+
+		/// &lt;summary&gt;
+		/// Tries to convert the input object to the output type using TypeConverters. If the destination
+		/// type is a superclass of the input type, if will use &lt;see cref=&quot;Convert.ChangeType(object,System.Type)&quot;/&gt;.
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;input&quot;&gt;The input.&lt;/param&gt;
+		/// &lt;param name=&quot;destinationType&quot;&gt;Type of the destination.&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		public static Attempt&lt;object&gt; TryConvertTo(this object input, Type destinationType)
+		{
+            // if null...
+		    if (input == null)
+		    {
+		        // nullable is ok
+                if (destinationType.IsGenericType &amp;&amp; destinationType.GetGenericTypeDefinition() == typeof(Nullable&lt;&gt;))
+                    return Attempt&lt;object&gt;.Succeed(null);
+
+                // value type is nok, else can be null, so is ok
+		        return Attempt&lt;object&gt;.SucceedIf(destinationType.IsValueType == false, null);
+            }
+
+            // easy
+			if (destinationType == typeof(object)) return Attempt.Succeed(input);
+			if (input.GetType() == destinationType) return Attempt.Succeed(input);
+
+            // check for string so that overloaders of ToString() can take advantage of the conversion.
+            if (destinationType == typeof(string)) return Attempt&lt;object&gt;.Succeed(input.ToString());
+
+			// if we&#39;ve got a nullable of something, we try to convert directly to that thing.
+			if (destinationType.IsGenericType &amp;&amp; destinationType.GetGenericTypeDefinition() == typeof(Nullable&lt;&gt;))
+			{
+			    var underlyingType = Nullable.GetUnderlyingType(destinationType);
+
+                //special case for empty strings for bools/dates which should return null if an empty string
+			    var asString = input as string;
+			    if (asString != null &amp;&amp; string.IsNullOrEmpty(asString) &amp;&amp; (underlyingType == typeof(DateTime) || underlyingType == typeof(bool)))
+                {
+                    return Attempt&lt;object&gt;.Succeed(null);
+                }
+
+				// recursively call into myself with the inner (not-nullable) type and handle the outcome
+                var nonNullable = input.TryConvertTo(underlyingType);
+
+				// and if sucessful, fall on through to rewrap in a nullable; if failed, pass on the exception
+				if (nonNullable.Success)
+					input = nonNullable.Result; // now fall on through...
+				else
+					return Attempt&lt;object&gt;.Fail(nonNullable.Exception);
+			}
+
+			// we&#39;ve already dealed with nullables, so any other generic types need to fall through
+			if (destinationType.IsGenericType == false)
+			{
+				if (input is string)
+				{
+                    // try convert from string, returns an Attempt if the string could be
+                    // processed (either succeeded or failed), else null if we need to try
+                    // other methods
+					var result = TryConvertToFromString(input as string, destinationType);
+					if (result.HasValue) return result.Value;
+				}
+
+                //TODO: Do a check for destination type being IEnumerable&lt;T&gt; and source type implementing IEnumerable&lt;T&gt; with
+                // the same &#39;T&#39;, then we&#39;d have to find the extension method for the type AsEnumerable() and execute it.
+
+				if (TypeHelper.IsTypeAssignableFrom(destinationType, input.GetType())
+					&amp;&amp; TypeHelper.IsTypeAssignableFrom&lt;IConvertible&gt;(input))
+				{
+                    try
+                    {
+                        var casted = Convert.ChangeType(input, destinationType);
+                        return Attempt.Succeed(casted);
+                    }
+                    catch (Exception e)
+                    {
+                        return Attempt&lt;object&gt;.Fail(e);
+                    }
+				}
+			}
+
+			var inputConverter = TypeDescriptor.GetConverter(input);
+			if (inputConverter.CanConvertTo(destinationType))
+			{
+				try
+				{
+					var converted = inputConverter.ConvertTo(input, destinationType);
+					return Attempt.Succeed(converted);
+				}
+				catch (Exception e)
+				{
+					return Attempt&lt;object&gt;.Fail(e);
+				}
+			}
+
+			if (destinationType == typeof(bool))
+			{
+				var boolConverter = new CustomBooleanTypeConverter();
+				if (boolConverter.CanConvertFrom(input.GetType()))
+				{
+					try
+					{
+						var converted = boolConverter.ConvertFrom(input);
+						return Attempt.Succeed(converted);
+					}
+					catch (Exception e)
+					{
+						return Attempt&lt;object&gt;.Fail(e);
+					}
+				}
+			}
+
+			var outputConverter = TypeDescriptor.GetConverter(destinationType);
+			if (outputConverter.CanConvertFrom(input.GetType()))
+			{
+				try
+				{
+					var converted = outputConverter.ConvertFrom(input);
+					return Attempt.Succeed(converted);
+				}
+				catch (Exception e)
+				{
+					return Attempt&lt;object&gt;.Fail(e);
+				}
+			}
+
+			if (TypeHelper.IsTypeAssignableFrom&lt;IConvertible&gt;(input))
+			{
+				try
+				{
+					var casted = Convert.ChangeType(input, destinationType);
+					return Attempt.Succeed(casted);
+				}
+				catch (Exception e)
+				{
+					return Attempt&lt;object&gt;.Fail(e);
+				}
+			}
+
+			return Attempt&lt;object&gt;.Fail();
+		}
+
+        // returns an attempt if the string has been processed (either succeeded or failed)
+        // returns null if we need to try other methods
+		private static Attempt&lt;object&gt;? TryConvertToFromString(this string input, Type destinationType)
+		{
+            // easy
+			if (destinationType == typeof(string))
+				return Attempt&lt;object&gt;.Succeed(input);
+
+            // null, empty, whitespaces
+			if (string.IsNullOrWhiteSpace(input))
+			{
+				if (destinationType == typeof(bool)) // null/empty = bool false
+					return Attempt&lt;object&gt;.Succeed(false);
+				if (destinationType == typeof(DateTime)) // null/empty = min DateTime value
+                    return Attempt&lt;object&gt;.Succeed(DateTime.MinValue);
+
+			    // cannot decide here,
+                // any of the types below will fail parsing and will return a failed attempt
+                // but anything else will not be processed and will return null
+                // so even though the string is null/empty we have to proceed
+			}
+
+			// look for type conversions in the expected order of frequency of use...
+			if (destinationType.IsPrimitive)
+			{
+			    if (destinationType == typeof(int)) // aka Int32
+				{
+					int value;
+				    if (int.TryParse(input, out value)) return Attempt&lt;object&gt;.Succeed(value);
+
+                    // because decimal 100.01m will happily convert to integer 100, it
+                    // makes sense that string &quot;100.01&quot; *also* converts to integer 100.
+                    decimal value2;
+                    var input2 = NormalizeNumberDecimalSeparator(input);
+                    return Attempt&lt;object&gt;.SucceedIf(decimal.TryParse(input2, out value2), Convert.ToInt32(value2));
+                }
+
+                if (destinationType == typeof(long)) // aka Int64
+			    {
+			        long value;
+			        if (long.TryParse(input, out value)) return Attempt&lt;object&gt;.Succeed(value);
+
+                    // same as int
+                    decimal value2;
+                    var input2 = NormalizeNumberDecimalSeparator(input);
+			        return Attempt&lt;object&gt;.SucceedIf(decimal.TryParse(input2, out value2), Convert.ToInt64(value2));
+			    }
+
+                // fixme - should we do the decimal trick for short, byte, unsigned?
+
+			    if (destinationType == typeof(bool)) // aka Boolean
+			    {
+			        bool value;
+			        if (bool.TryParse(input, out value)) return Attempt&lt;object&gt;.Succeed(value);
+                    // don&#39;t declare failure so the CustomBooleanTypeConverter can try
+                    return null;
+			    }
+
+			    if (destinationType == typeof(short)) // aka Int16
+			    {
+			        short value;
+			        return Attempt&lt;object&gt;.SucceedIf(short.TryParse(input, out value), value);
+			    }
+
+			    if (destinationType == typeof(double)) // aka Double
+			    {
+			        double value;
+			        var input2 = NormalizeNumberDecimalSeparator(input);
+			        return Attempt&lt;object&gt;.SucceedIf(double.TryParse(input2, out value), value);
+			    }
+
+			    if (destinationType == typeof(float)) // aka Single
+			    {
+			        float value;
+			        var input2 = NormalizeNumberDecimalSeparator(input);
+			        return Attempt&lt;object&gt;.SucceedIf(float.TryParse(input2, out value), value);
+			    }
+
+			    if (destinationType == typeof(char)) // aka Char
+			    {
+			        char value;
+			        return Attempt&lt;object&gt;.SucceedIf(char.TryParse(input, out value), value);
+			    }
+
+			    if (destinationType == typeof(byte)) // aka Byte
+			    {
+			        byte value;
+			        return Attempt&lt;object&gt;.SucceedIf(byte.TryParse(input, out value), value);
+			    }
+
+			    if (destinationType == typeof(sbyte)) // aka SByte
+                {
+			        sbyte value;
+			        return Attempt&lt;object&gt;.SucceedIf(sbyte.TryParse(input, out value), value);
+                }
+
+			    if (destinationType == typeof(uint)) // aka UInt32
+                {
+			        uint value;
+			        return Attempt&lt;object&gt;.SucceedIf(uint.TryParse(input, out value), value);
+                }
+
+			    if (destinationType == typeof(ushort)) // aka UInt16
+                {
+			        ushort value;
+			        return Attempt&lt;object&gt;.SucceedIf(ushort.TryParse(input, out value), value);
+                }
+
+			    if (destinationType == typeof(ulong)) // aka UInt64
+                {
+			        ulong value;
+                    return Attempt&lt;object&gt;.SucceedIf(ulong.TryParse(input, out value), value);
+			    }
+			}
+			else if (destinationType == typeof(Guid))
+			{
+				Guid value;
+			    return Attempt&lt;object&gt;.SucceedIf(Guid.TryParse(input, out value), value);
+			}
+			else if (destinationType == typeof(DateTime))
+			{
+				DateTime value;
+			    if (DateTime.TryParse(input, out value))
+			    {
+			        switch (value.Kind)
+			        {
+			            case DateTimeKind.Unspecified:
+			            case DateTimeKind.Utc:
+                            return Attempt&lt;object&gt;.Succeed(value);
+			            case DateTimeKind.Local:
+			                return Attempt&lt;object&gt;.Succeed(value.ToUniversalTime());
+			            default:
+			                throw new ArgumentOutOfRangeException();
+			        }
+			    }
+			    return Attempt&lt;object&gt;.Fail();
+			}
+			else if (destinationType == typeof(DateTimeOffset))
+			{
+				DateTimeOffset value;
+			    return Attempt&lt;object&gt;.SucceedIf(DateTimeOffset.TryParse(input, out value), value);
+			}
+			else if (destinationType == typeof(TimeSpan))
+			{
+				TimeSpan value;
+			    return Attempt&lt;object&gt;.SucceedIf(TimeSpan.TryParse(input, out value), value);
+			}
+			else if (destinationType == typeof(decimal)) // aka Decimal
+			{
+				decimal value;
+                var input2 = NormalizeNumberDecimalSeparator(input);
+                return Attempt&lt;object&gt;.SucceedIf(decimal.TryParse(input2, out value), value);
+			}
+			else if (destinationType == typeof(Version))
+			{
+				Version value;
+			    return Attempt&lt;object&gt;.SucceedIf(Version.TryParse(input, out value), value);
+			}
+			// E_NOTIMPL IPAddress, BigInteger
+
+			return null; // we can&#39;t decide...
+		}
+
+        private static readonly char[] NumberDecimalSeparatorsToNormalize = {&#39;.&#39;, &#39;,&#39;};
+
+	    private static string NormalizeNumberDecimalSeparator(string s)
+	    {
+	        var normalized = System.Threading.Thread.CurrentThread.CurrentCulture.NumberFormat.NumberDecimalSeparator[0];
+            return s.ReplaceMany(NumberDecimalSeparatorsToNormalize, normalized);
+	    }
+
+		internal static void CheckThrowObjectDisposed(this IDisposable disposable, bool isDisposed, string objectname)
+		{
+			//TODO: Localise this exception
+			if (isDisposed)
+				throw new ObjectDisposedException(objectname);
+		}
+
+		//public enum PropertyNamesCaseType
+		//{
+		//    CamelCase,
+		//    CaseInsensitive
+		//}
+
+		///// &lt;summary&gt;
+		///// Convert an object to a JSON string with camelCase formatting
+		///// &lt;/summary&gt;
+		///// &lt;param name=&quot;obj&quot;&gt;&lt;/param&gt;
+		///// &lt;returns&gt;&lt;/returns&gt;
+		//public static string ToJsonString(this object obj)
+		//{
+		//    return obj.ToJsonString(PropertyNamesCaseType.CamelCase);
+		//}
+
+		///// &lt;summary&gt;
+		///// Convert an object to a JSON string with the specified formatting
+		///// &lt;/summary&gt;
+		///// &lt;param name=&quot;obj&quot;&gt;The obj.&lt;/param&gt;
+		///// &lt;param name=&quot;propertyNamesCaseType&quot;&gt;Type of the property names case.&lt;/param&gt;
+		///// &lt;returns&gt;&lt;/returns&gt;
+		//public static string ToJsonString(this object obj, PropertyNamesCaseType propertyNamesCaseType)
+		//{
+		//    var type = obj.GetType();
+		//    var dateTimeStyle = &quot;yyyy-MM-dd HH:mm:ss&quot;;
+
+		//    if (type.IsPrimitive || typeof(string).IsAssignableFrom(type))
+		//    {
+		//        return obj.ToString();
+		//    }
+
+		//    if (typeof(DateTime).IsAssignableFrom(type) || typeof(DateTimeOffset).IsAssignableFrom(type))
+		//    {
+		//        return Convert.ToDateTime(obj).ToString(dateTimeStyle);
+		//    }
+
+		//    var serializer = new JsonSerializer();
+
+		//    switch (propertyNamesCaseType)
+		//    {
+		//        case PropertyNamesCaseType.CamelCase:
+		//            serializer.ContractResolver = new CamelCasePropertyNamesContractResolver();
+		//            break;
+		//    }
+
+		//    var dateTimeConverter = new IsoDateTimeConverter
+		//        {
+		//            DateTimeStyles = System.Globalization.DateTimeStyles.None,
+		//            DateTimeFormat = dateTimeStyle
+		//        };
+
+		//    if (typeof(IDictionary).IsAssignableFrom(type))
+		//    {
+		//        return JObject.FromObject(obj, serializer).ToString(Formatting.None, dateTimeConverter);
+		//    }
+
+		//    if (type.IsArray || (typeof(IEnumerable).IsAssignableFrom(type)))
+		//    {
+		//        return JArray.FromObject(obj, serializer).ToString(Formatting.None, dateTimeConverter);
+		//    }
+
+		//    return JObject.FromObject(obj, serializer).ToString(Formatting.None, dateTimeConverter);
+		//}
+
+		/// &lt;summary&gt;
+		/// Converts an object into a dictionary
+		/// &lt;/summary&gt;
+		/// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+		/// &lt;typeparam name=&quot;TProperty&quot;&gt;&lt;/typeparam&gt;
+		/// &lt;typeparam name=&quot;TVal&quot;&gt; &lt;/typeparam&gt;
+		/// &lt;param name=&quot;o&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;ignoreProperties&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+        internal static IDictionary&lt;string, TVal&gt; ToDictionary&lt;T, TProperty, TVal&gt;(this T o,
+																				 params Expression&lt;Func&lt;T, TProperty&gt;&gt;[] ignoreProperties)
+		{
+			return o.ToDictionary&lt;TVal&gt;(ignoreProperties.Select(e =&gt; o.GetPropertyInfo(e)).Select(propInfo =&gt; propInfo.Name).ToArray());
+		}
+
+		/// &lt;summary&gt;
+		/// Turns object into dictionary
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;o&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;ignoreProperties&quot;&gt;Properties to ignore&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		internal static IDictionary&lt;string, TVal&gt; ToDictionary&lt;TVal&gt;(this object o, params string[] ignoreProperties)
+		{
+			if (o != null)
+			{
+				var props = TypeDescriptor.GetProperties(o);
+				var d = new Dictionary&lt;string, TVal&gt;();
+				foreach (var prop in props.Cast&lt;PropertyDescriptor&gt;().Where(x =&gt; ignoreProperties.Contains(x.Name) == false))
+				{
+					var val = prop.GetValue(o);
+					if (val != null)
+					{
+						d.Add(prop.Name, (TVal)val);
+					}
+				}
+				return d;
+			}
+			return new Dictionary&lt;string, TVal&gt;();
+		}
+
+		internal static string ToDebugString(this object obj, int levels = 0)
+		{
+			if (obj == null) return &quot;{null}&quot;;
+			try
+			{
+				if (obj is string)
+				{
+					return &quot;\&quot;{0}\&quot;&quot;.InvariantFormat(obj);
+				}
+                if (obj is int || obj is Int16 || obj is Int64 || obj is float || obj is double || obj is bool || obj is int? || obj is Int16? || obj is Int64? || obj is float? || obj is double? || obj is bool?)
+				{
+					return &quot;{0}&quot;.InvariantFormat(obj);
+				}
+				if (obj is Enum)
+				{
+					return &quot;[{0}]&quot;.InvariantFormat(obj);
+				}
+				if (obj is IEnumerable)
+				{
+					var enumerable = (obj as IEnumerable);
+
+					var items = (from object enumItem in enumerable let value = GetEnumPropertyDebugString(enumItem, levels) where value != null select value).Take(10).ToList();
+
+					return items.Any()
+							? &quot;{{ {0} }}&quot;.InvariantFormat(String.Join(&quot;, &quot;, items))
+							: null;
+				}
+
+				var props = obj.GetType().GetProperties();
+				if ((props.Length == 2) &amp;&amp; props[0].Name == &quot;Key&quot; &amp;&amp; props[1].Name == &quot;Value&quot; &amp;&amp; levels &gt; -2)
+				{
+					try
+					{
+						var key = props[0].GetValue(obj, null) as string;
+						var value = props[1].GetValue(obj, null).ToDebugString(levels - 1);
+						return &quot;{0}={1}&quot;.InvariantFormat(key, value);
+					}
+					catch (Exception)
+					{
+						return &quot;[KeyValuePropertyException]&quot;;
+					}
+				}
+				if (levels &gt; -1)
+				{
+					var items =
+						(from propertyInfo in props
+						let value = GetPropertyDebugString(propertyInfo, obj, levels)
+						where value != null
+						select &quot;{0}={1}&quot;.InvariantFormat(propertyInfo.Name, value)).ToArray();
+
+					return items.Any()
+							? &quot;[{0}]:{{ {1} }}&quot;.InvariantFormat(obj.GetType().Name, String.Join(&quot;, &quot;, items))
+							: null;
+				}
+			}
+			catch (Exception ex)
+			{
+				return &quot;[Exception:{0}]&quot;.InvariantFormat(ex.Message);
+			}
+			return null;
+		}
+
+
+		/// &lt;summary&gt;
+		/// Attempts to serialize the value to an XmlString using ToXmlString
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;value&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		internal static Attempt&lt;string&gt; TryConvertToXmlString(this object value, Type type)
+		{
+			try
+			{
+				var output = value.ToXmlString(type);
+				return Attempt.Succeed(output);
+			}
+			catch (NotSupportedException ex)
+			{
+				return Attempt&lt;string&gt;.Fail(ex);
+			}
+		}
+
+		/// &lt;summary&gt;
+		/// Returns an XmlSerialized safe string representation for the value
+		/// &lt;/summary&gt;
+		/// &lt;param name=&quot;value&quot;&gt;&lt;/param&gt;
+		/// &lt;param name=&quot;type&quot;&gt;The Type can only be a primitive type or Guid and byte[] otherwise an exception is thrown&lt;/param&gt;
+		/// &lt;returns&gt;&lt;/returns&gt;
+		internal static string ToXmlString(this object value, Type type)
+		{
+		    if (value == null) return string.Empty;
+			if (type == typeof(string)) return (value.ToString().IsNullOrWhiteSpace() ? &quot;&quot; : value.ToString());
+			if (type == typeof(bool)) return XmlConvert.ToString((bool)value);
+			if (type == typeof(byte)) return XmlConvert.ToString((byte)value);
+			if (type == typeof(char)) return XmlConvert.ToString((char)value);
+            if (type == typeof(DateTime)) return XmlConvert.ToString((DateTime)value, XmlDateTimeSerializationMode.Unspecified);
+			if (type == typeof(DateTimeOffset)) return XmlConvert.ToString((DateTimeOffset)value);
+			if (type == typeof(decimal)) return XmlConvert.ToString((decimal)value);
+			if (type == typeof(double)) return XmlConvert.ToString((double)value);
+			if (type == typeof(float)) return XmlConvert.ToString((float)value);
+			if (type == typeof(Guid)) return XmlConvert.ToString((Guid)value);
+			if (type == typeof(int)) return XmlConvert.ToString((int)value);
+			if (type == typeof(long)) return XmlConvert.ToString((long)value);
+			if (type == typeof(sbyte)) return XmlConvert.ToString((sbyte)value);
+			if (type == typeof(short)) return XmlConvert.ToString((short)value);
+			if (type == typeof(TimeSpan)) return XmlConvert.ToString((TimeSpan)value);
+			if (type == typeof(bool)) return XmlConvert.ToString((bool)value);
+			if (type == typeof(uint)) return XmlConvert.ToString((uint)value);
+			if (type == typeof(ulong)) return XmlConvert.ToString((ulong)value);
+			if (type == typeof(ushort)) return XmlConvert.ToString((ushort)value);
+
+			throw new NotSupportedException(&quot;Cannot convert type &quot; + type.FullName + &quot; to a string using ToXmlString as it is not supported by XmlConvert&quot;);
+		}
+
+        /// &lt;summary&gt;
+        /// Returns an XmlSerialized safe string representation for the value and type
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;value&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+	    internal static string ToXmlString&lt;T&gt;(this object value)
+	    {
+	        return value.ToXmlString(typeof (T));
+	    }
+
+	    private static string GetEnumPropertyDebugString(object enumItem, int levels)
+		{
+			try
+			{
+				return enumItem.ToDebugString(levels - 1);
+			}
+			catch (Exception)
+			{
+				return &quot;[GetEnumPartException]&quot;;
+			}
+		}
+
+		private static string GetPropertyDebugString(PropertyInfo propertyInfo, object obj, int levels)
+		{
+			try
+			{
+				return propertyInfo.GetValue(obj, null).ToDebugString(levels - 1);
+			}
+			catch (Exception)
+			{
+				return &quot;[GetPropertyValueException]&quot;;
+			}
+		}
+	}
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[26,3,26,4,0],[27,4,27,39,0],[28,3,28,4,0],[35,3,35,4,1],[36,4,36,42,1],[37,4,37,27,1],[37,28,37,49,1],[38,3,38,4,1],[48,3,48,4,1],[49,4,49,75,1],[49,76,49,94,0],[50,4,50,19,1],[50,20,50,36,1],[51,4,51,22,0],[52,3,52,4,1],[61,3,61,4,1],[62,4,62,48,1],[63,13,63,41,1],[64,13,64,14,1],[67,17,67,18,1],[68,21,68,47,1],[69,21,69,58,1],[71,17,71,36,1],[72,17,72,18,1],[73,21,73,47,1],[76,4,76,94,1],[77,3,77,4,1],[87,3,87,4,1],[89,7,89,25,1],[90,7,90,8,1],[92,17,92,119,1],[93,21,93,58,1],[96,11,96,88,1],[100,4,100,42,1],[100,43,100,73,1],[101,4,101,43,1],[101,44,101,74,1],[104,13,104,51,1],[104,52,104,101,1],[107,4,107,106,1],[108,4,108,5,1],[109,8,109,73,1],[112,8,112,39,1],[113,8,113,137,1],[114,17,114,18,1],[115,21,115,58,1],[119,17,119,70,1],[122,5,122,29,1],[123,6,123,33,1],[125,6,125,57,0],[126,4,126,5,1],[129,4,129,47,1],[130,4,130,5,1],[131,5,131,25,1],[132,5,132,6,1],[136,6,136,76,1],[137,6,137,26,1],[137,27,137,47,1],[138,5,138,6,1],[143,5,144,62,1],[145,5,145,6,0],[147,21,147,22,0],[148,25,148,81,0],[149,25,149,56,0],[151,21,151,40,0],[152,21,152,22,0],[153,25,153,56,0],[156,4,156,5,1],[158,4,158,60,1],[159,4,159,53,1],[160,4,160,5,1],[162,5,162,6,1],[163,6,163,71,1],[164,6,164,40,1],[166,5,166,24,0],[167,5,167,6,0],[168,6,168,37,0],[172,4,172,40,1],[173,4,173,5,1],[174,5,174,58,1],[175,5,175,55,1],[176,5,176,6,1],[178,6,178,7,1],[179,7,179,56,1],[180,7,180,41,1],[182,6,182,25,0],[183,6,183,7,0],[184,7,184,38,0],[187,4,187,5,0],[189,4,189,71,1],[190,4,190,56,1],[191,4,191,5,1],[193,5,193,6,1],[194,6,194,57,1],[195,6,195,40,1],[197,5,197,24,0],[198,5,198,6,0],[199,6,199,37,0],[203,4,203,61,1],[204,4,204,5,1],[206,5,206,6,1],[207,6,207,62,1],[208,6,208,37,1],[210,5,210,24,0],[211,5,211,6,0],[212,6,212,37,0],[216,4,216,34,1],[217,3,217,4,1],[222,3,222,4,1],[224,4,224,42,1],[225,5,225,43,0],[228,4,228,41,1],[229,4,229,5,1],[230,5,230,41,1],[231,6,231,44,1],[232,5,232,45,1],[233,21,233,71,1],[239,4,239,5,1],[242,4,242,36,1],[243,4,243,5,1],[244,8,244,43,1],[245,5,245,6,1],[247,9,247,44,1],[247,45,247,83,1],[252,21,252,73,1],[253,21,253,117,1],[256,17,256,53,1],[257,8,257,9,1],[259,12,259,48,1],[259,49,259,87,1],[263,21,263,73,0],[264,12,264,108,0],[269,8,269,44,1],[270,8,270,9,1],[272,12,272,48,1],[272,49,272,87,1],[274,21,274,33,1],[277,8,277,45,1],[278,8,278,9,0],[280,12,280,86,0],[283,8,283,46,1],[284,8,284,9,1],[286,12,286,64,1],[287,12,287,88,1],[290,8,290,45,1],[291,8,291,9,1],[293,12,293,64,1],[294,12,294,87,1],[297,8,297,44,0],[298,8,298,9,0],[300,12,300,85,0],[303,8,303,44,0],[304,8,304,9,0],[306,12,306,85,0],[309,8,309,45,0],[310,17,310,18,0],[312,12,312,86,0],[315,8,315,44,0],[316,17,316,18,0],[318,12,318,85,0],[321,8,321,46,0],[322,17,322,18,0],[324,12,324,87,0],[327,8,327,45,0],[328,17,328,18,0],[330,21,330,95,0],[332,4,332,5,0],[333,9,333,45,1],[334,4,334,5,1],[336,8,336,81,1],[338,9,338,49,1],[339,4,339,5,1],[341,8,341,48,1],[342,8,342,9,1],[343,12,343,31,1],[347,29,347,67,1],[349,20,349,76,1],[351,20,351,60,0],[354,8,354,38,0],[356,9,356,55,1],[357,4,357,5,0],[359,8,359,91,0],[361,9,361,49,1],[362,4,362,5,0],[364,8,364,85,0],[366,9,366,48,1],[367,4,367,5,1],[369,17,369,69,1],[370,17,370,94,1],[372,9,372,48,1],[373,4,373,5,0],[375,8,375,84,0],[379,4,379,16,1],[380,3,380,4,1],[382,9,382,88,1],[385,6,385,7,1],[386,10,386,119,1],[387,13,387,82,1],[388,6,388,7,1],[391,3,391,4,0],[393,4,393,19,0],[394,5,394,51,0],[395,3,395,4,0],[473,3,473,4,0],[474,4,474,61,0],[474,61,474,81,0],[474,81,474,102,0],[474,102,474,115,0],[474,115,474,128,0],[474,4,474,128,0],[475,3,475,4,0],[484,3,484,4,1],[485,4,485,18,1],[486,4,486,5,1],[487,5,487,49,1],[488,5,488,44,1],[489,5,489,12,1],[489,14,489,22,1],[489,23,489,25,1],[489,26,489,70,1],[489,70,489,112,1],[489,112,489,113,1],[489,26,489,113,1],[490,5,490,6,1],[491,6,491,33,1],[492,6,492,22,1],[493,6,493,7,1],[494,7,494,35,1],[495,6,495,7,1],[496,5,496,6,1],[497,5,497,14,1],[499,4,499,42,0],[500,3,500,4,1],[503,3,503,4,0],[504,4,504,20,0],[504,21,504,37,0],[506,4,506,5,0],[507,5,507,23,0],[508,5,508,6,0],[509,6,509,44,0],[511,17,511,212,0],[512,5,512,6,0],[513,6,513,40,0],[515,5,515,21,0],[516,5,516,6,0],[517,6,517,42,0],[519,5,519,28,0],[520,5,520,6,0],[521,6,521,44,0],[523,6,523,66,0],[523,66,523,110,0],[523,110,523,117,0],[523,117,523,130,0],[523,130,523,138,0],[523,138,523,143,0],[523,143,523,163,0],[523,6,523,163,0],[525,6,527,15,0],[530,5,530,47,0],[531,5,531,98,0],[532,5,532,6,0],[534,6,534,7,0],[535,7,535,56,0],[536,7,536,74,0],[537,7,537,52,0],[539,6,539,23,0],[540,6,540,7,0],[541,7,541,44,0],[544,5,544,21,0],[545,5,545,6,0],[546,6,548,19,0],[548,19,548,68,0],[548,68,549,13,0],[549,13,549,26,0],[549,26,550,14,0],[550,14,550,65,0],[550,65,550,77,0],[546,6,550,77,0],[552,6,554,15,0],[556,4,556,5,0],[557,4,557,24,0],[558,4,558,5,0],[559,5,559,58,0],[561,4,561,16,0],[562,3,562,4,0],[572,3,572,4,0],[574,4,574,5,0],[575,5,575,42,0],[576,5,576,36,0],[578,4,578,36,0],[579,4,579,5,0],[580,5,580,37,0],[582,3,582,4,0],[591,3,591,4,1],[592,7,592,25,1],[592,26,592,46,0],[593,4,593,31,1],[593,32,593,103,1],[594,4,594,29,1],[594,30,594,70,0],[595,4,595,29,1],[595,30,595,70,0],[596,4,596,29,1],[596,30,596,70,0],[597,13,597,42,1],[597,43,597,129,1],[598,4,598,39,1],[598,40,598,90,0],[599,4,599,32,1],[599,33,599,76,0],[600,4,600,31,1],[600,32,600,74,0],[601,4,601,30,1],[601,31,601,72,0],[602,4,602,29,1],[602,30,602,70,0],[603,4,603,28,1],[603,29,603,68,1],[604,4,604,29,0],[604,30,604,70,0],[605,4,605,30,0],[605,31,605,72,0],[606,4,606,30,0],[606,31,606,72,0],[607,4,607,33,0],[607,34,607,78,0],[608,4,608,29,0],[608,30,608,70,0],[609,4,609,29,0],[609,30,609,70,0],[610,4,610,30,0],[610,31,610,72,0],[611,4,611,31,0],[611,32,611,74,0],[613,4,613,148,0],[614,3,614,4,1],[623,6,623,7,1],[624,10,624,47,1],[625,6,625,7,1],[628,3,628,4,0],[630,4,630,5,0],[631,5,631,47,0],[633,4,633,21,0],[634,4,634,5,0],[635,5,635,37,0],[637,3,637,4,0],[640,3,640,4,0],[642,4,642,5,0],[643,5,643,71,0],[645,4,645,21,0],[646,4,646,5,0],[647,5,647,42,0],[649,3,649,4,0]]);
+    </script>
+  </body>
+</html>

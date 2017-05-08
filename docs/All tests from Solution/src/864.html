@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\PublishedCache\XmlPublishedCache\PublishedMediaCache.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Configuration;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Xml.XPath;
+using Examine;
+using Examine.LuceneEngine.SearchCriteria;
+using Examine.Providers;
+using Lucene.Net.Documents;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Dynamics;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.PublishedContent;
+using Umbraco.Core.Xml;
+using Umbraco.Web.Models;
+using UmbracoExamine;
+using umbraco;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Sync;
+using Umbraco.Web.Cache;
+
+namespace Umbraco.Web.PublishedCache.XmlPublishedCache
+{
+    /// &lt;summary&gt;
+    /// An IPublishedMediaStore that first checks for the media in Examine, and then reverts to the database
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// NOTE: In the future if we want to properly cache all media this class can be extended or replaced when these classes/interfaces are exposed publicly.
+    /// &lt;/remarks&gt;
+    internal class PublishedMediaCache : IPublishedMediaCache
+    {
+        public PublishedMediaCache(ApplicationContext applicationContext)
+        {
+            if (applicationContext == null) throw new ArgumentNullException(&quot;applicationContext&quot;);
+            _applicationContext = applicationContext;
+        }
+
+        /// &lt;summary&gt;
+        /// Generally used for unit testing to use an explicit examine searcher
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;applicationContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;searchProvider&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;indexProvider&quot;&gt;&lt;/param&gt;
+        internal PublishedMediaCache(ApplicationContext applicationContext, BaseSearchProvider searchProvider, BaseIndexProvider indexProvider)
+        {
+            if (applicationContext == null) throw new ArgumentNullException(&quot;applicationContext&quot;);
+            if (searchProvider == null) throw new ArgumentNullException(&quot;searchProvider&quot;);
+            if (indexProvider == null) throw new ArgumentNullException(&quot;indexProvider&quot;);
+
+            _applicationContext = applicationContext;
+            _searchProvider = searchProvider;
+            _indexProvider = indexProvider;
+        }
+
+        static PublishedMediaCache()
+        {
+            InitializeCacheConfig();
+        }
+
+        private readonly ApplicationContext _applicationContext;
+        private readonly BaseSearchProvider _searchProvider;
+        private readonly BaseIndexProvider _indexProvider;
+
+        public virtual IPublishedContent GetById(UmbracoContext umbracoContext, bool preview, int nodeId)
+        {
+            return GetUmbracoMedia(nodeId);
+        }
+
+        public virtual IEnumerable&lt;IPublishedContent&gt; GetAtRoot(UmbracoContext umbracoContext, bool preview)
+        {
+            //TODO: We should be able to look these ids first in Examine!
+
+            var rootMedia = _applicationContext.Services.MediaService.GetRootMedia();
+            return rootMedia.Select(m =&gt; GetUmbracoMedia(m.Id));
+        }
+
+        public virtual IPublishedContent GetSingleByXPath(UmbracoContext umbracoContext, bool preview, string xpath, XPathVariable[] vars)
+        {
+            throw new NotImplementedException(&quot;PublishedMediaCache does not support XPath.&quot;);
+        }
+
+        public virtual IPublishedContent GetSingleByXPath(UmbracoContext umbracoContext, bool preview, XPathExpression xpath, XPathVariable[] vars)
+        {
+            throw new NotImplementedException(&quot;PublishedMediaCache does not support XPath.&quot;);
+        }
+
+        public virtual IEnumerable&lt;IPublishedContent&gt; GetByXPath(UmbracoContext umbracoContext, bool preview, string xpath, XPathVariable[] vars)
+        {
+            throw new NotImplementedException(&quot;PublishedMediaCache does not support XPath.&quot;);
+        }
+
+        public virtual IEnumerable&lt;IPublishedContent&gt; GetByXPath(UmbracoContext umbracoContext, bool preview, XPathExpression xpath, XPathVariable[] vars)
+        {
+            throw new NotImplementedException(&quot;PublishedMediaCache does not support XPath.&quot;);
+        }
+
+        public virtual XPathNavigator GetXPathNavigator(UmbracoContext umbracoContext, bool preview)
+        {
+            throw new NotImplementedException(&quot;PublishedMediaCache does not support XPath.&quot;);
+        }
+
+        public bool XPathNavigatorIsNavigable { get { return false; } }
+
+        public virtual bool HasContent(UmbracoContext context, bool preview) { throw new NotImplementedException(); }
+
+        private ExamineManager GetExamineManagerSafe()
+        {
+            try
+            {
+                return ExamineManager.Instance;
+            }
+            catch (TypeInitializationException)
+            {
+                return null;
+            }
+        }
+
+        private BaseIndexProvider GetIndexProviderSafe()
+        {
+            if (_indexProvider != null)
+                return _indexProvider;
+
+            var eMgr = GetExamineManagerSafe();
+            if (eMgr != null)
+            {
+                try
+                {
+                    //by default use the InternalSearcher
+                    var indexer = eMgr.IndexProviderCollection[Constants.Examine.InternalIndexer];
+                    if (indexer.IndexerData.IncludeNodeTypes.Any() || indexer.IndexerData.ExcludeNodeTypes.Any())
+                    {
+                        LogHelper.Warn&lt;PublishedMediaCache&gt;(&quot;The InternalIndexer for examine is configured incorrectly, it should not list any include/exclude node types or field names, it should simply be configured as: &quot; + &quot;&lt;IndexSet SetName=\&quot;InternalIndexSet\&quot; IndexPath=\&quot;~/App_Data/TEMP/ExamineIndexes/Internal/\&quot; /&gt;&quot;);
+                    }
+                    return indexer;
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.Error&lt;PublishedMediaCache&gt;(&quot;Could not retrieve the InternalIndexer&quot;, ex);
+                    //something didn&#39;t work, continue returning null.
+                }
+            }
+            return null;
+        }
+
+        private BaseSearchProvider GetSearchProviderSafe()
+        {
+            if (_searchProvider != null)
+                return _searchProvider;
+
+            var eMgr = GetExamineManagerSafe();
+            if (eMgr != null)
+            {
+                try
+                {
+                    //by default use the InternalSearcher
+                    return eMgr.SearchProviderCollection[Constants.Examine.InternalSearcher];
+                }
+                catch (FileNotFoundException)
+                {
+                    //Currently examine is throwing FileNotFound exceptions when we have a loadbalanced filestore and a node is published in umbraco
+                    //See this thread: http://examine.cdodeplex.com/discussions/264341
+                    //Catch the exception here for the time being, and just fallback to GetMedia
+                    //TODO: Need to fix examine in LB scenarios!
+                }
+                catch (NullReferenceException)
+                {
+                    //This will occur when the search provider cannot be initialized. In newer examine versions the initialization is lazy and therefore
+                    // the manager will return the singleton without throwing initialization errors, however if examine isn&#39;t configured correctly a null
+                    // reference error will occur because the examine settings are null.
+                }
+            }
+            return null;
+        }
+
+        private IPublishedContent GetUmbracoMedia(int id)
+        {
+            // this recreates an IPublishedContent and model each time
+            // it is called, but at least it should NOT hit the database
+            // nor Lucene each time, relying on the memory cache instead
+
+            if (id &lt;= 0) return null; // fail fast
+
+            var cacheValues = GetCacheValues(id, GetUmbracoMediaCacheValues);
+
+            return cacheValues == null ? null : CreateFromCacheValues(cacheValues);
+        }
+
+        private CacheValues GetUmbracoMediaCacheValues(int id)
+        {
+            var searchProvider = GetSearchProviderSafe();
+
+            if (searchProvider != null)
+            {
+                try
+                {
+                    // first check in Examine as this is WAY faster
+                    //
+                    // the filter will create a query like this:
+                    // +(+__NodeId:3113 -__Path:-1,-21,*) +__IndexType:media
+                    //
+                    // note that since the use of the wildcard, it automatically escapes it in Lucene.
+
+                    var criteria = searchProvider.CreateSearchCriteria(&quot;media&quot;);
+                    var filter = criteria.Id(id).Not().Field(UmbracoContentIndexer.IndexPathFieldName, &quot;-1,-21,&quot;.MultipleCharacterWildcard());
+
+                    var result = searchProvider.Search(filter.Compile()).FirstOrDefault();
+                    if (result != null) return ConvertFromSearchResult(result);
+                }
+                catch (FileNotFoundException ex)
+                {
+                    //Currently examine is throwing FileNotFound exceptions when we have a loadbalanced filestore and a node is published in umbraco
+                    //See this thread: http://examine.cdodeplex.com/discussions/264341
+                    //Catch the exception here for the time being, and just fallback to GetMedia
+                    //TODO: Need to fix examine in LB scenarios!
+                    LogHelper.Error&lt;PublishedMediaCache&gt;(&quot;Could not load data from Examine index for media&quot;, ex);
+                }
+            }
+
+            // don&#39;t log a warning here, as it can flood the log in case of eg a media picker referencing a media
+            // that has been deleted, hence is not in the Examine index anymore (for a good reason). try to get
+            // the media from the service, first
+
+            var media = ApplicationContext.Current.Services.MediaService.GetById(id);
+            if (media == null || media.Trashed) return null; // not found, ok
+
+            // so, the media was not found in Examine&#39;s index *yet* it exists, which probably indicates that
+            // the index is corrupted. Or not up-to-date. Log a warning, but only once, and only if seeing the
+            // error more that a number of times.
+
+            var miss = Interlocked.CompareExchange(ref _examineIndexMiss, 0, 0); // volatile read
+            if (miss &lt; ExamineIndexMissMax &amp;&amp; Interlocked.Increment(ref _examineIndexMiss) == ExamineIndexMissMax)
+                LogHelper.Warn&lt;PublishedMediaCache&gt;(&quot;Failed ({0} times) to retrieve medias from Examine index and had to load&quot;
+                    + &quot; them from DB. This may indicate that the Examine index is corrupted.&quot;,
+                    () =&gt; ExamineIndexMissMax);
+
+            return ConvertFromIMedia(media);
+        }
+
+        private const int ExamineIndexMissMax = 10;
+        private int _examineIndexMiss;
+
+        internal CacheValues ConvertFromXPathNodeIterator(XPathNodeIterator media, int id)
+        {
+            if (media != null &amp;&amp; media.Current != null)
+            {
+                return media.Current.Name.InvariantEquals(&quot;error&quot;)
+                    ? null
+                    : ConvertFromXPathNavigator(media.Current);
+            }
+
+            LogHelper.Warn&lt;PublishedMediaCache&gt;(
+                &quot;Could not retrieve media {0} from Examine index or from legacy library.GetMedia method&quot;,
+                () =&gt; id);
+
+            return null;
+        }
+
+        internal CacheValues ConvertFromSearchResult(SearchResult searchResult)
+        {
+            //NOTE: Some fields will not be included if the config section for the internal index has been
+            //mucked around with. It should index everything and so the index definition should simply be:
+            // &lt;IndexSet SetName=&quot;InternalIndexSet&quot; IndexPath=&quot;~/App_Data/TEMP/ExamineIndexes/Internal/&quot; /&gt;
+
+
+            var values = new Dictionary&lt;string, string&gt;(searchResult.Fields);
+            //we need to ensure some fields exist, because of the above issue
+            if (!new[] { &quot;template&quot;, &quot;templateId&quot; }.Any(values.ContainsKey))
+                values.Add(&quot;template&quot;, 0.ToString());
+            if (!new[] { &quot;sortOrder&quot; }.Any(values.ContainsKey))
+                values.Add(&quot;sortOrder&quot;, 0.ToString());
+            if (!new[] { &quot;urlName&quot; }.Any(values.ContainsKey))
+                values.Add(&quot;urlName&quot;, &quot;&quot;);
+            if (!new[] { &quot;nodeType&quot; }.Any(values.ContainsKey))
+                values.Add(&quot;nodeType&quot;, 0.ToString());
+            if (!new[] { &quot;creatorName&quot; }.Any(values.ContainsKey))
+                values.Add(&quot;creatorName&quot;, &quot;&quot;);
+            if (!new[] { &quot;writerID&quot; }.Any(values.ContainsKey))
+                values.Add(&quot;writerID&quot;, 0.ToString());
+            if (!new[] { &quot;creatorID&quot; }.Any(values.ContainsKey))
+                values.Add(&quot;creatorID&quot;, 0.ToString());
+            if (!new[] { &quot;createDate&quot; }.Any(values.ContainsKey))
+                values.Add(&quot;createDate&quot;, default(DateTime).ToString(&quot;yyyy-MM-dd HH:mm:ss&quot;));
+            if (!new[] { &quot;level&quot; }.Any(values.ContainsKey))
+            {
+                values.Add(&quot;level&quot;, values[&quot;__Path&quot;].Split(&#39;,&#39;).Length.ToString());
+            }
+
+            // because, migration
+            if (values.ContainsKey(&quot;key&quot;) == false)
+                values[&quot;key&quot;] = Guid.Empty.ToString();
+
+            return new CacheValues
+            {
+                Values = values,
+                FromExamine = true
+            };
+
+            //var content = new DictionaryPublishedContent(values,
+            //                                      d =&gt; d.ParentId != -1 //parent should be null if -1
+            //                                               ? GetUmbracoMedia(d.ParentId)
+            //                                               : null,
+            //                                      //callback to return the children of the current node
+            //                                      d =&gt; GetChildrenMedia(d.Id),
+            //                                      GetProperty,
+            //                                      true);
+            //return content.CreateModel();
+        }
+
+        internal CacheValues ConvertFromXPathNavigator(XPathNavigator xpath, bool forceNav = false)
+        {
+            if (xpath == null) throw new ArgumentNullException(&quot;xpath&quot;);
+
+            var values = new Dictionary&lt;string, string&gt; { { &quot;nodeName&quot;, xpath.GetAttribute(&quot;nodeName&quot;, &quot;&quot;) } };
+            if (!UmbracoConfig.For.UmbracoSettings().Content.UseLegacyXmlSchema)
+            {
+                values[&quot;nodeTypeAlias&quot;] = xpath.Name;
+            }
+
+            var result = xpath.SelectChildren(XPathNodeType.Element);
+            //add the attributes e.g. id, parentId etc
+            if (result.Current != null &amp;&amp; result.Current.HasAttributes)
+            {
+                if (result.Current.MoveToFirstAttribute())
+                {
+                    //checking for duplicate keys because of the &#39;nodeTypeAlias&#39; might already be added above.
+                    if (!values.ContainsKey(result.Current.Name))
+                    {
+                        values[result.Current.Name] = result.Current.Value;
+                    }
+                    while (result.Current.MoveToNextAttribute())
+                    {
+                        if (!values.ContainsKey(result.Current.Name))
+                        {
+                            values[result.Current.Name] = result.Current.Value;
+                        }
+                    }
+                    result.Current.MoveToParent();
+                }
+            }
+            // because, migration
+            if (values.ContainsKey(&quot;key&quot;) == false)
+                values[&quot;key&quot;] = Guid.Empty.ToString();
+            //add the user props
+            while (result.MoveNext())
+            {
+                if (result.Current != null &amp;&amp; !result.Current.HasAttributes)
+                {
+                    string value = result.Current.Value;
+                    if (string.IsNullOrEmpty(value))
+                    {
+                        if (result.Current.HasAttributes || result.Current.SelectChildren(XPathNodeType.Element).Count &gt; 0)
+                        {
+                            value = result.Current.OuterXml;
+                        }
+                    }
+                    values[result.Current.Name] = value;
+                }
+            }
+
+            return new CacheValues
+            {
+                Values = values,
+                XPath = forceNav ? xpath : null // outside of tests we do NOT want to cache the navigator!
+            };
+
+            //var content = new DictionaryPublishedContent(values,
+            //    d =&gt; d.ParentId != -1 //parent should be null if -1
+            //        ? GetUmbracoMedia(d.ParentId)
+            //        : null,
+            //    //callback to return the children of the current node based on the xml structure already found
+            //    d =&gt; GetChildrenMedia(d.Id, xpath),
+            //    GetProperty,
+            //    false);
+            //return content.CreateModel();
+        }
+
+        internal CacheValues ConvertFromIMedia(IMedia media)
+        {
+            var values = new Dictionary&lt;string, string&gt;();
+
+            var creator = _applicationContext.Services.UserService.GetProfileById(media.CreatorId);
+            var creatorName = creator == null ? &quot;&quot; : creator.Name;
+
+            values[&quot;id&quot;] = media.Id.ToString();
+            values[&quot;key&quot;] = media.Key.ToString();
+            values[&quot;parentID&quot;] = media.ParentId.ToString();
+            values[&quot;level&quot;] = media.Level.ToString();
+            values[&quot;creatorID&quot;] = media.CreatorId.ToString();
+            values[&quot;creatorName&quot;] = creatorName;
+            values[&quot;writerID&quot;] = media.CreatorId.ToString();
+            values[&quot;writerName&quot;] = creatorName;
+            values[&quot;template&quot;] = &quot;0&quot;;
+            values[&quot;urlName&quot;] = &quot;&quot;;
+            values[&quot;sortOrder&quot;] = media.SortOrder.ToString();
+            values[&quot;createDate&quot;] = media.CreateDate.ToString(&quot;yyyy-MM-dd HH:mm:ss&quot;);
+            values[&quot;updateDate&quot;] = media.UpdateDate.ToString(&quot;yyyy-MM-dd HH:mm:ss&quot;);
+            values[&quot;nodeName&quot;] = media.Name;
+            values[&quot;path&quot;] = media.Path;
+            values[&quot;nodeType&quot;] = media.ContentType.Id.ToString();
+            values[&quot;nodeTypeAlias&quot;] = media.ContentType.Alias;
+
+            // add the user props
+            foreach (var prop in media.Properties)
+                values[prop.Alias] = prop.Value == null ? null : prop.Value.ToString();
+
+            return new CacheValues
+            {
+                Values = values
+            };
+        }
+
+        /// &lt;summary&gt;
+        /// We will need to first check if the document was loaded by Examine, if so we&#39;ll need to check if this property exists
+        /// in the results, if it does not, then we&#39;ll have to revert to looking up in the db.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dd&quot;&gt; &lt;/param&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IPublishedProperty GetProperty(DictionaryPublishedContent dd, string alias)
+        {
+            //lets check if the alias does not exist on the document.
+            //NOTE: Examine will not index empty values and we do not output empty XML Elements to the cache - either of these situations
+            // would mean that the property is missing from the collection whether we are getting the value from Examine or from the library media cache.
+            if (dd.Properties.All(x =&gt; x.PropertyTypeAlias.InvariantEquals(alias) == false))
+            {
+                return null;
+            }
+
+            if (dd.LoadedFromExamine)
+            {
+                //We are going to check for a special field however, that is because in some cases we store a &#39;Raw&#39;
+                //value in the index such as for xml/html.
+                var rawValue = dd.Properties.FirstOrDefault(x =&gt; x.PropertyTypeAlias.InvariantEquals(UmbracoContentIndexer.RawFieldPrefix + alias));
+                return rawValue
+                       ?? dd.Properties.FirstOrDefault(x =&gt; x.PropertyTypeAlias.InvariantEquals(alias));
+            }
+
+            //if its not loaded from examine, then just return the property
+            return dd.Properties.FirstOrDefault(x =&gt; x.PropertyTypeAlias.InvariantEquals(alias));
+        }
+
+        /// &lt;summary&gt;
+        /// A Helper methods to return the children for media whther it is based on examine or xml
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;xpath&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IEnumerable&lt;IPublishedContent&gt; GetChildrenMedia(int parentId, XPathNavigator xpath = null)
+        {
+
+            //if there is no navigator, try examine first, then re-look it up
+            if (xpath == null)
+            {
+                var searchProvider = GetSearchProviderSafe();
+
+                if (searchProvider != null)
+                {
+                    try
+                    {
+                        //first check in Examine as this is WAY faster
+                        var criteria = searchProvider.CreateSearchCriteria(&quot;media&quot;);
+
+                        var filter = criteria.ParentId(parentId).Not().Field(UmbracoContentIndexer.IndexPathFieldName, &quot;-1,-21,&quot;.MultipleCharacterWildcard());
+                        //the above filter will create a query like this, NOTE: That since the use of the wildcard, it automatically escapes it in Lucene.
+                        //+(+parentId:3113 -__Path:-1,-21,*) +__IndexType:media
+
+                        ISearchResults results;
+
+                        //we want to check if the indexer for this searcher has &quot;sortOrder&quot; flagged as sortable.
+                        //if so, we&#39;ll use Lucene to do the sorting, if not we&#39;ll have to manually sort it (slower).
+                        var indexer = GetIndexProviderSafe();
+                        var useLuceneSort = indexer != null &amp;&amp; indexer.IndexerData.StandardFields.Any(x =&gt; x.Name.InvariantEquals(&quot;sortOrder&quot;) &amp;&amp; x.EnableSorting);
+                        if (useLuceneSort)
+                        {
+                            //we have a sortOrder field declared to be sorted, so we&#39;ll use Examine
+                            results = searchProvider.Search(
+                                filter.And().OrderBy(new SortableField(&quot;sortOrder&quot;, SortType.Int)).Compile());
+                        }
+                        else
+                        {
+                            results = searchProvider.Search(filter.Compile());
+                        }
+
+                        if (results.Any())
+                        {
+                            // var medias = results.Select(ConvertFromSearchResult);
+                            var medias = results.Select(x =&gt;
+                            {
+                                int nid;
+                                if (int.TryParse(x[&quot;__NodeId&quot;], out nid) == false &amp;&amp; int.TryParse(x[&quot;NodeId&quot;], out nid) == false)
+                                    throw new Exception(&quot;Failed to extract NodeId from search result.&quot;);
+                                var cacheValues = GetCacheValues(nid, id =&gt; ConvertFromSearchResult(x));
+                                return CreateFromCacheValues(cacheValues);
+                            });
+
+                            return useLuceneSort ? medias : medias.OrderBy(x =&gt; x.SortOrder);
+                        }
+                        else
+                        {
+                            //if there&#39;s no result then return null. Previously we defaulted back to library.GetMedia below
+                            //but this will always get called for when we are getting descendents since many items won&#39;t have
+                            //children and then we are hitting the database again!
+                            //So instead we&#39;re going to rely on Examine to have the correct results like it should.
+                            return Enumerable.Empty&lt;IPublishedContent&gt;();
+                        }
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        //Currently examine is throwing FileNotFound exceptions when we have a loadbalanced filestore and a node is published in umbraco
+                        //See this thread: http://examine.cdodeplex.com/discussions/264341
+                        //Catch the exception here for the time being, and just fallback to GetMedia
+                    }
+                }
+
+                //falling back to get media
+
+                var media = library.GetMedia(parentId, true);
+                if (media != null &amp;&amp; media.Current != null)
+                {
+                    xpath = media.Current;
+                }
+                else
+                {
+                    return Enumerable.Empty&lt;IPublishedContent&gt;();
+                }
+            }
+
+            var mediaList = new List&lt;IPublishedContent&gt;();
+
+            // this is so bad, really
+            var item = xpath.Select(&quot;//*[@id=&#39;&quot; + parentId + &quot;&#39;]&quot;);
+            if (item.Current == null)
+                return Enumerable.Empty&lt;IPublishedContent&gt;();
+            var items = item.Current.SelectChildren(XPathNodeType.Element);
+
+            // and this does not work, because... meh
+            //var q = &quot;//* [@id=&#39;&quot; + parentId + &quot;&#39;]/* [@id]&quot;;
+            //var items = xpath.Select(q);
+
+            foreach (XPathNavigator itemm in items)
+            {
+                int id;
+                if (int.TryParse(itemm.GetAttribute(&quot;id&quot;, &quot;&quot;), out id) == false)
+                    continue; // wtf?
+                var captured = itemm;
+                var cacheValues = GetCacheValues(id, idd =&gt; ConvertFromXPathNavigator(captured));
+                mediaList.Add(CreateFromCacheValues(cacheValues));
+            }
+
+            ////The xpath might be the whole xpath including the current ones ancestors so we need to select the current node
+            //var item = xpath.Select(&quot;//*[@id=&#39;&quot; + parentId + &quot;&#39;]&quot;);
+            //if (item.Current == null)
+            //{
+            //    return Enumerable.Empty&lt;IPublishedContent&gt;();
+            //}
+            //var children = item.Current.SelectChildren(XPathNodeType.Element);
+
+            //foreach(XPathNavigator x in children)
+            //{
+            //    //NOTE: I&#39;m not sure why this is here, it is from legacy code of ExamineBackedMedia, but
+            //    // will leave it here as it must have done something!
+            //    if (x.Name != &quot;contents&quot;)
+            //    {
+            //        //make sure it&#39;s actually a node, not a property
+            //        if (!string.IsNullOrEmpty(x.GetAttribute(&quot;path&quot;, &quot;&quot;)) &amp;&amp;
+            //            !string.IsNullOrEmpty(x.GetAttribute(&quot;id&quot;, &quot;&quot;)))
+            //        {
+            //            mediaList.Add(ConvertFromXPathNavigator(x));
+            //        }
+            //    }
+            //}
+
+            return mediaList;
+        }
+
+        /// &lt;summary&gt;
+        /// An IPublishedContent that is represented all by a dictionary.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This is a helper class and definitely not intended for public use, it expects that all of the values required
+        /// to create an IPublishedContent exist in the dictionary by specific aliases.
+        /// &lt;/remarks&gt;
+        internal class DictionaryPublishedContent : PublishedContentWithKeyBase
+        {
+            // note: I&#39;m not sure this class fully complies with IPublishedContent rules especially
+            // I&#39;m not sure that _properties contains all properties including those without a value,
+            // neither that GetProperty will return a property without a value vs. null... @zpqrtbnk
+
+            // List of properties that will appear in the XML and do not match
+            // anything in the ContentType, so they must be ignored.
+            private static readonly string[] IgnoredKeys = { &quot;version&quot;, &quot;isDoc&quot; };
+
+            public DictionaryPublishedContent(
+                IDictionary&lt;string, string&gt; valueDictionary,
+                Func&lt;int, IPublishedContent&gt; getParent,
+                Func&lt;int, XPathNavigator, IEnumerable&lt;IPublishedContent&gt;&gt; getChildren,
+                Func&lt;DictionaryPublishedContent, string, IPublishedProperty&gt; getProperty,
+                XPathNavigator nav,
+                bool fromExamine)
+            {
+                if (valueDictionary == null) throw new ArgumentNullException(&quot;valueDictionary&quot;);
+                if (getParent == null) throw new ArgumentNullException(&quot;getParent&quot;);
+                if (getProperty == null) throw new ArgumentNullException(&quot;getProperty&quot;);
+
+                _getParent = new Lazy&lt;IPublishedContent&gt;(() =&gt; getParent(ParentId));
+                _getChildren = new Lazy&lt;IEnumerable&lt;IPublishedContent&gt;&gt;(() =&gt; getChildren(Id, nav));
+                _getProperty = getProperty;
+
+                LoadedFromExamine = fromExamine;
+
+                ValidateAndSetProperty(valueDictionary, val =&gt; _id = int.Parse(val), &quot;id&quot;, &quot;nodeId&quot;, &quot;__NodeId&quot;); //should validate the int!
+                ValidateAndSetProperty(valueDictionary, val =&gt; _key = Guid.Parse(val), &quot;key&quot;);
+                // wtf are we dealing with templates for medias?!
+                ValidateAndSetProperty(valueDictionary, val =&gt; _templateId = int.Parse(val), &quot;template&quot;, &quot;templateId&quot;);
+                ValidateAndSetProperty(valueDictionary, val =&gt; _sortOrder = int.Parse(val), &quot;sortOrder&quot;);
+                ValidateAndSetProperty(valueDictionary, val =&gt; _name = val, &quot;nodeName&quot;, &quot;__nodeName&quot;);
+                ValidateAndSetProperty(valueDictionary, val =&gt; _urlName = val, &quot;urlName&quot;);
+                ValidateAndSetProperty(valueDictionary, val =&gt; _documentTypeAlias = val, &quot;nodeTypeAlias&quot;, UmbracoContentIndexer.NodeTypeAliasFieldName);
+                ValidateAndSetProperty(valueDictionary, val =&gt; _documentTypeId = int.Parse(val), &quot;nodeType&quot;);
+                ValidateAndSetProperty(valueDictionary, val =&gt; _writerName = val, &quot;writerName&quot;);
+                ValidateAndSetProperty(valueDictionary, val =&gt; _creatorName = val, &quot;creatorName&quot;, &quot;writerName&quot;); //this is a bit of a hack fix for: U4-1132
+                ValidateAndSetProperty(valueDictionary, val =&gt; _writerId = int.Parse(val), &quot;writerID&quot;);
+                ValidateAndSetProperty(valueDictionary, val =&gt; _creatorId = int.Parse(val), &quot;creatorID&quot;, &quot;writerID&quot;); //this is a bit of a hack fix for: U4-1132
+                ValidateAndSetProperty(valueDictionary, val =&gt; _path = val, &quot;path&quot;, &quot;__Path&quot;);
+                ValidateAndSetProperty(valueDictionary, val =&gt; _createDate = ParseDateTimeValue(val), &quot;createDate&quot;);
+                ValidateAndSetProperty(valueDictionary, val =&gt; _updateDate = ParseDateTimeValue(val), &quot;updateDate&quot;);
+                ValidateAndSetProperty(valueDictionary, val =&gt; _level = int.Parse(val), &quot;level&quot;);
+                ValidateAndSetProperty(valueDictionary, val =&gt;
+                {
+                    int pId;
+                    ParentId = -1;
+                    if (int.TryParse(val, out pId))
+                    {
+                        ParentId = pId;
+                    }
+                }, &quot;parentID&quot;);
+
+                _contentType = PublishedContentType.Get(PublishedItemType.Media, _documentTypeAlias);
+                _properties = new Collection&lt;IPublishedProperty&gt;();
+
+                //handle content type properties
+                //make sure we create them even if there&#39;s no value
+                foreach (var propertyType in _contentType.PropertyTypes)
+                {
+                    var alias = propertyType.PropertyTypeAlias;
+                    _keysAdded.Add(alias);
+                    string value;
+                    const bool isPreviewing = false; // false :: never preview a media
+                    var property = valueDictionary.TryGetValue(alias, out value) == false || value == null
+                        ? new XmlPublishedProperty(propertyType, isPreviewing)
+                        : new XmlPublishedProperty(propertyType, isPreviewing, value);
+                    _properties.Add(property);
+                }
+
+                //loop through remaining values that haven&#39;t been applied
+                foreach (var i in valueDictionary.Where(x =&gt;
+                    _keysAdded.Contains(x.Key) == false // not already processed
+                    &amp;&amp; IgnoredKeys.Contains(x.Key) == false)) // not ignorable
+                {
+                    if (i.Key.InvariantStartsWith(&quot;__&quot;))
+                    {
+                        // no type for that one, dunno how to convert
+                        IPublishedProperty property = new PropertyResult(i.Key, i.Value, PropertyResultType.CustomProperty);
+                        _properties.Add(property);
+                    }
+                    else
+                    {
+                        // this is a property that does not correspond to anything, ignore and log
+                        LogHelper.Warn&lt;PublishedMediaCache&gt;(&quot;Dropping property \&quot;&quot; + i.Key + &quot;\&quot; because it does not belong to the content type.&quot;);
+                    }
+                }
+            }
+
+            private DateTime ParseDateTimeValue(string val)
+            {
+                if (LoadedFromExamine)
+                {
+                    try
+                    {
+                        //we might need to parse the date time using Lucene converters
+                        return DateTools.StringToDate(val);
+                    }
+                    catch (FormatException)
+                    {
+                        //swallow exception, its not formatted correctly so revert to just trying to parse
+                    }
+                }
+
+                return DateTime.Parse(val);
+            }
+
+            /// &lt;summary&gt;
+            /// Flag to get/set if this was laoded from examine cache
+            /// &lt;/summary&gt;
+            internal bool LoadedFromExamine { get; private set; }
+
+            //private readonly Func&lt;DictionaryPublishedContent, IPublishedContent&gt; _getParent;
+            private readonly Lazy&lt;IPublishedContent&gt; _getParent;
+            //private readonly Func&lt;DictionaryPublishedContent, IEnumerable&lt;IPublishedContent&gt;&gt; _getChildren;
+            private readonly Lazy&lt;IEnumerable&lt;IPublishedContent&gt;&gt; _getChildren;
+            private readonly Func&lt;DictionaryPublishedContent, string, IPublishedProperty&gt; _getProperty;
+
+            /// &lt;summary&gt;
+            /// Returns &#39;Media&#39; as the item type
+            /// &lt;/summary&gt;
+            public override PublishedItemType ItemType
+            {
+                get { return PublishedItemType.Media; }
+            }
+
+            public override IPublishedContent Parent
+            {
+                get { return _getParent.Value; }
+            }
+
+            public int ParentId { get; private set; }
+            public override int Id
+            {
+                get { return _id; }
+            }
+
+            public override Guid Key { get { return _key; } }
+
+            public override int TemplateId
+            {
+                get
+                {
+                    //TODO: should probably throw a not supported exception since media doesn&#39;t actually support this.
+                    return _templateId;
+                }
+            }
+
+            public override int SortOrder
+            {
+                get { return _sortOrder; }
+            }
+
+            public override string Name
+            {
+                get { return _name; }
+            }
+
+            public override string UrlName
+            {
+                get { return _urlName; }
+            }
+
+            public override string DocumentTypeAlias
+            {
+                get { return _documentTypeAlias; }
+            }
+
+            public override int DocumentTypeId
+            {
+                get { return _documentTypeId; }
+            }
+
+            public override string WriterName
+            {
+                get { return _writerName; }
+            }
+
+            public override string CreatorName
+            {
+                get { return _creatorName; }
+            }
+
+            public override int WriterId
+            {
+                get { return _writerId; }
+            }
+
+            public override int CreatorId
+            {
+                get { return _creatorId; }
+            }
+
+            public override string Path
+            {
+                get { return _path; }
+            }
+
+            public override DateTime CreateDate
+            {
+                get { return _createDate; }
+            }
+
+            public override DateTime UpdateDate
+            {
+                get { return _updateDate; }
+            }
+
+            public override Guid Version
+            {
+                get { return _version; }
+            }
+
+            public override int Level
+            {
+                get { return _level; }
+            }
+
+            public override bool IsDraft
+            {
+                get { return false; }
+            }
+
+            public override ICollection&lt;IPublishedProperty&gt; Properties
+            {
+                get { return _properties; }
+            }
+
+            public override IEnumerable&lt;IPublishedContent&gt; Children
+            {
+                get { return _getChildren.Value; }
+            }
+
+            public override IPublishedProperty GetProperty(string alias)
+            {
+                return _getProperty(this, alias);
+            }
+
+            public override PublishedContentType ContentType
+            {
+                get { return _contentType; }
+            }
+
+            // override to implement cache
+            //   cache at context level, ie once for the whole request
+            //   but cache is not shared by requests because we wouldn&#39;t know how to clear it
+            public override IPublishedProperty GetProperty(string alias, bool recurse)
+            {
+                if (recurse == false) return GetProperty(alias);
+
+                IPublishedProperty property;
+                string key = null;
+                var cache = UmbracoContextCache.Current;
+
+                if (cache != null)
+                {
+                    key = string.Format(&quot;RECURSIVE_PROPERTY::{0}::{1}&quot;, Id, alias.ToLowerInvariant());
+                    object o;
+                    if (cache.TryGetValue(key, out o))
+                    {
+                        property = o as IPublishedProperty;
+                        if (property == null)
+                            throw new InvalidOperationException(&quot;Corrupted cache.&quot;);
+                        return property;
+                    }
+                }
+
+                // else get it for real, no cache
+                property = base.GetProperty(alias, true);
+
+                if (cache != null)
+                    cache[key] = property;
+
+                return property;
+            }
+
+            private readonly List&lt;string&gt; _keysAdded = new List&lt;string&gt;();
+            private int _id;
+            private Guid _key;
+            private int _templateId;
+            private int _sortOrder;
+            private string _name;
+            private string _urlName;
+            private string _documentTypeAlias;
+            private int _documentTypeId;
+            private string _writerName;
+            private string _creatorName;
+            private int _writerId;
+            private int _creatorId;
+            private string _path;
+            private DateTime _createDate;
+            private DateTime _updateDate;
+            private Guid _version;
+            private int _level;
+            private readonly ICollection&lt;IPublishedProperty&gt; _properties;
+            private readonly PublishedContentType _contentType;
+
+            private void ValidateAndSetProperty(IDictionary&lt;string, string&gt; valueDictionary, Action&lt;string&gt; setProperty, params string[] potentialKeys)
+            {
+                var key = potentialKeys.FirstOrDefault(x =&gt; valueDictionary.ContainsKey(x) &amp;&amp; valueDictionary[x] != null);
+                if (key == null)
+                {
+                    throw new FormatException(&quot;The valueDictionary is not formatted correctly and is missing any of the  &#39;&quot; + string.Join(&quot;,&quot;, potentialKeys) + &quot;&#39; elements&quot;);
+                }
+
+                setProperty(valueDictionary[key]);
+                _keysAdded.Add(key);
+            }
+        }
+
+        // REFACTORING
+
+        // caching the basic atomic values - and the parent id
+        // but NOT caching actual parent nor children and NOT even
+        // the list of children ids - BUT caching the path
+
+        internal class CacheValues
+        {
+            public IDictionary&lt;string, string&gt; Values { get; set; }
+            public XPathNavigator XPath { get; set; }
+            public bool FromExamine { get; set; }
+        }
+
+        public const string PublishedMediaCacheKey = &quot;MediaCacheMeh.&quot;;
+        private const int PublishedMediaCacheTimespanSeconds = 4 * 60; // 4 mins
+        private static TimeSpan _publishedMediaCacheTimespan;
+        private static bool _publishedMediaCacheEnabled;
+
+        private static void InitializeCacheConfig()
+        {
+            var value = ConfigurationManager.AppSettings[&quot;Umbraco.PublishedMediaCache.Seconds&quot;];
+            int seconds;
+            if (int.TryParse(value, out seconds) == false)
+                seconds = PublishedMediaCacheTimespanSeconds;
+            if (seconds &gt; 0)
+            {
+                _publishedMediaCacheEnabled = true;
+                _publishedMediaCacheTimespan = TimeSpan.FromSeconds(seconds);
+            }
+            else
+            {
+                _publishedMediaCacheEnabled = false;
+            }
+        }
+
+        internal IPublishedContent CreateFromCacheValues(CacheValues cacheValues)
+        {
+            var content = new DictionaryPublishedContent(
+                cacheValues.Values,
+                parentId =&gt; parentId &lt; 0 ? null : GetUmbracoMedia(parentId),
+                GetChildrenMedia,
+                GetProperty,
+                cacheValues.XPath, // though, outside of tests, that should be null
+                cacheValues.FromExamine
+            );
+            return content.CreateModel();
+        }
+
+        private static CacheValues GetCacheValues(int id, Func&lt;int, CacheValues&gt; func)
+        {
+            if (_publishedMediaCacheEnabled == false)
+                return func(id);
+
+            var cache = ApplicationContext.Current.ApplicationCache.RuntimeCache;
+            var key = PublishedMediaCacheKey + id;
+            return (CacheValues)cache.GetCacheItem(key, () =&gt; func(id), _publishedMediaCacheTimespan);
+        }
+
+        internal static void ClearCache(int id)
+        {
+            var cache = ApplicationContext.Current.ApplicationCache.RuntimeCache;
+            var sid = id.ToString();
+            var key = PublishedMediaCacheKey + sid;
+
+            // we do clear a lot of things... but the cache refresher is somewhat
+            // convoluted and it&#39;s hard to tell what to clear exactly ;-(
+
+            // clear the parent - NOT (why?)
+            //var exist = (CacheValues) cache.GetCacheItem(key);
+            //if (exist != null)
+            //    cache.ClearCacheItem(PublishedMediaCacheKey + GetValuesValue(exist.Values, &quot;parentID&quot;));
+
+            // clear the item
+            cache.ClearCacheItem(key);
+
+            // clear all children - in case we moved and their path has changed
+            var fid = &quot;/&quot; + sid + &quot;/&quot;;
+            cache.ClearCacheObjectTypes&lt;CacheValues&gt;((k, v) =&gt;
+                GetValuesValue(v.Values, &quot;path&quot;, &quot;__Path&quot;).Contains(fid));
+        }
+
+        private static string GetValuesValue(IDictionary&lt;string, string&gt; d, params string[] keys)
+        {
+            string value = null;
+            var ignored = keys.Any(x =&gt; d.TryGetValue(x, out value));
+            return value ?? &quot;&quot;;
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[37,9,37,74,1],[38,9,38,10,1],[39,13,39,44,1],[39,45,39,99,0],[40,13,40,54,1],[41,9,41,10,1],[49,9,49,144,1],[50,9,50,10,1],[51,13,51,44,1],[51,45,51,99,0],[52,13,52,40,1],[52,41,52,91,0],[53,13,53,39,1],[53,40,53,89,0],[55,13,55,54,1],[56,13,56,46,1],[57,13,57,44,1],[58,9,58,10,1],[61,9,61,10,1],[62,13,62,37,1],[63,9,63,10,1],[70,9,70,10,1],[71,13,71,44,1],[72,9,72,10,1],[75,9,75,10,1],[78,13,78,86,1],[79,13,79,42,1],[79,42,79,63,1],[79,63,79,65,1],[79,13,79,65,1],[80,9,80,10,1],[83,9,83,10,0],[84,13,84,94,0],[88,9,88,10,0],[89,13,89,94,0],[93,9,93,10,0],[94,13,94,94,0],[98,9,98,10,0],[99,13,99,94,0],[103,9,103,10,0],[104,13,104,94,0],[107,53,107,54,0],[107,55,107,68,0],[107,69,107,70,0],[109,78,109,79,0],[109,80,109,116,0],[112,9,112,10,1],[114,13,114,14,1],[115,17,115,48,1],[117,13,117,48,0],[118,13,118,14,0],[119,17,119,29,0],[121,9,121,10,1],[124,9,124,10,1],[125,13,125,40,1],[126,17,126,39,1],[128,13,128,48,0],[129,13,129,30,0],[130,13,130,14,0],[132,17,132,18,0],[134,21,134,99,0],[135,21,135,114,0],[136,21,136,22,0],[137,25,137,326,0],[138,21,138,22,0],[139,21,139,36,0],[141,17,141,37,0],[142,17,142,18,0],[143,21,143,104,0],[145,17,145,18,0],[146,13,146,14,0],[147,13,147,25,0],[148,9,148,10,1],[151,9,151,10,1],[152,13,152,41,1],[153,17,153,40,1],[155,13,155,48,1],[156,13,156,30,1],[157,13,157,14,1],[159,17,159,18,1],[161,21,161,94,1],[163,17,163,46,0],[164,17,164,18,0],[169,17,169,18,0],[170,17,170,47,1],[171,17,171,18,1],[175,17,175,18,1],[176,13,176,14,1],[177,13,177,25,1],[178,9,178,10,1],[181,9,181,10,1],[186,13,186,25,1],[186,26,186,38,0],[188,13,188,78,1],[190,13,190,84,1],[191,9,191,10,1],[194,9,194,10,1],[195,13,195,58,1],[197,13,197,40,1],[198,13,198,14,1],[200,17,200,18,1],[208,21,208,81,1],[209,21,209,143,1],[211,21,211,91,1],[212,21,212,40,1],[212,41,212,80,1],[213,17,213,18,1],[214,17,214,49,0],[215,17,215,18,0],[220,21,220,114,0],[221,17,221,18,0],[222,13,222,14,1],[228,13,228,86,1],[229,13,229,48,1],[229,49,229,61,1],[235,13,235,81,1],[236,13,236,115,1],[237,17,239,27,0],[239,27,239,46,0],[239,46,239,48,0],[237,17,239,48,0],[241,13,241,45,1],[242,9,242,10,1],[248,9,248,10,1],[249,13,249,56,1],[250,13,250,14,1],[251,17,253,64,1],[256,13,258,23,0],[258,23,258,25,0],[258,25,258,27,0],[256,13,258,27,0],[260,13,260,25,0],[261,9,261,10,1],[264,9,264,10,1],[270,13,270,78,1],[272,13,272,77,1],[273,17,273,54,1],[274,13,274,64,1],[275,17,275,55,1],[276,13,276,62,1],[277,17,277,43,1],[278,13,278,63,1],[279,17,279,54,1],[280,13,280,66,1],[281,17,281,47,1],[282,13,282,63,1],[283,17,283,54,1],[284,13,284,64,1],[285,17,285,55,1],[286,13,286,65,1],[287,17,287,93,1],[288,13,288,60,1],[289,13,289,14,1],[290,17,290,84,1],[291,13,291,14,1],[294,13,294,52,1],[295,17,295,55,1],[297,13,301,15,1],[312,9,312,10,1],[315,9,315,10,1],[316,13,316,31,1],[316,32,316,73,0],[318,13,318,112,1],[319,13,319,81,1],[320,13,320,14,1],[321,17,321,54,1],[322,13,322,14,1],[324,13,324,70,1],[326,13,326,72,1],[327,13,327,14,1],[328,17,328,59,1],[329,17,329,18,1],[331,21,331,66,1],[332,21,332,22,1],[333,25,333,76,1],[334,21,334,22,1],[335,21,335,65,1],[336,21,336,22,1],[337,25,337,70,1],[338,25,338,26,1],[339,29,339,80,1],[340,25,340,26,1],[341,21,341,22,1],[342,21,342,51,1],[343,17,343,18,1],[344,13,344,14,1],[346,13,346,52,1],[347,17,347,55,1],[349,13,349,38,1],[350,13,350,14,1],[351,17,351,77,1],[352,17,352,18,1],[353,21,353,57,1],[354,21,354,53,1],[355,21,355,22,0],[356,25,356,124,0],[357,25,357,26,0],[358,29,358,61,0],[359,25,359,26,0],[360,21,360,22,0],[361,21,361,57,1],[362,17,362,18,1],[363,13,363,14,1],[365,13,369,15,1],[380,9,380,10,1],[383,9,383,10,1],[384,13,384,59,1],[386,13,386,100,1],[387,13,387,67,1],[389,13,389,48,1],[390,13,390,50,1],[391,13,391,60,1],[392,13,392,54,1],[393,13,393,62,1],[394,13,394,49,1],[395,13,395,61,1],[396,13,396,48,1],[397,13,397,38,1],[398,13,398,36,1],[399,13,399,62,1],[400,13,400,85,1],[401,13,401,85,1],[402,13,402,45,1],[403,13,403,41,1],[404,13,404,66,1],[405,13,405,63,1],[408,13,408,20,1],[408,22,408,30,1],[408,31,408,33,1],[408,34,408,50,1],[409,17,409,88,1],[411,13,414,15,1],[415,9,415,10,1],[425,9,425,10,1],[429,13,429,40,1],[429,40,429,91,1],[429,91,429,93,1],[429,13,429,93,1],[430,13,430,14,0],[431,17,431,29,0],[434,13,434,38,1],[435,13,435,14,0],[438,17,438,66,0],[438,66,438,147,0],[438,147,438,149,0],[438,17,438,149,0],[439,17,440,61,0],[440,61,440,103,0],[440,103,440,105,0],[439,17,440,105,0],[444,13,444,54,1],[444,54,444,96,1],[444,96,444,98,1],[444,13,444,98,1],[445,9,445,10,1],[454,9,454,10,1],[457,13,457,31,1],[458,13,458,14,1],[459,17,459,62,1],[461,17,461,44,1],[462,17,462,18,1],[464,21,464,22,1],[466,25,466,85,1],[468,25,468,159,1],[476,25,476,62,1],[477,25,477,108,1],[477,108,477,162,1],[477,162,477,164,1],[477,25,477,164,1],[478,25,478,43,1],[479,25,479,26,1],[481,29,482,111,1],[483,25,483,26,1],[485,25,485,26,0],[486,29,486,79,0],[487,25,487,26,0],[489,25,489,43,1],[490,25,490,26,1],[492,29,493,29,1],[493,29,493,30,1],[493,30,495,33,1],[495,33,495,130,1],[495,130,496,37,1],[496,37,496,105,0],[496,105,497,33,1],[497,33,497,77,1],[497,77,497,103,1],[497,103,497,105,1],[497,33,497,105,1],[497,105,498,33,1],[498,33,498,75,1],[498,75,499,29,1],[499,29,499,30,1],[499,30,499,32,1],[492,29,499,32,1],[501,29,501,81,1],[501,81,501,92,0],[501,92,501,94,1],[501,29,501,94,1],[504,25,504,26,1],[509,29,509,74,1],[512,21,512,50,0],[513,21,513,22,0],[517,21,517,22,0],[518,17,518,18,0],[522,17,522,62,1],[523,17,523,60,1],[524,17,524,18,1],[525,21,525,43,1],[526,17,526,18,1],[528,17,528,18,0],[529,21,529,66,0],[531,13,531,14,1],[533,13,533,59,1],[536,13,536,68,1],[537,13,537,38,1],[538,17,538,62,0],[539,13,539,76,1],[545,13,545,20,1],[545,22,545,42,1],[545,43,545,45,1],[545,46,545,51,1],[546,13,546,14,1],[548,17,548,81,1],[549,21,549,30,1],[550,17,550,38,1],[551,17,551,61,1],[551,61,551,96,1],[551,96,551,98,1],[551,17,551,98,1],[552,17,552,67,1],[553,13,553,14,1],[578,13,578,30,1],[579,9,579,10,1],[596,13,596,83,1],[598,13,604,34,1],[605,13,605,14,1],[606,17,606,45,1],[606,46,606,97,0],[607,17,607,39,1],[607,40,607,85,0],[608,17,608,41,1],[608,42,608,89,0],[610,17,610,64,1],[610,64,610,83,1],[610,83,610,85,1],[610,17,610,85,1],[611,17,611,79,1],[611,79,611,99,1],[611,99,611,101,1],[611,17,611,101,1],[612,17,612,44,1],[614,17,614,49,1],[616,17,616,64,1],[616,64,616,84,1],[616,84,616,114,1],[616,17,616,114,1],[617,17,617,64,1],[617,64,617,86,1],[617,86,617,95,1],[617,17,617,95,1],[619,17,619,64,1],[619,64,619,92,1],[619,92,619,120,1],[619,17,619,120,1],[620,17,620,64,1],[620,64,620,91,1],[620,91,620,106,1],[620,17,620,106,1],[621,17,621,64,1],[621,64,621,75,1],[621,75,621,103,1],[621,17,621,103,1],[622,17,622,64,1],[622,64,622,78,1],[622,78,622,91,1],[622,17,622,91,1],[623,17,623,64,1],[623,64,623,88,1],[623,88,623,153,1],[623,17,623,153,1],[624,17,624,64,1],[624,64,624,96,1],[624,96,624,110,1],[624,17,624,110,1],[625,17,625,64,1],[625,64,625,81,1],[625,81,625,97,1],[625,17,625,97,1],[626,17,626,64,1],[626,64,626,82,1],[626,82,626,113,1],[626,17,626,113,1],[627,17,627,64,1],[627,64,627,90,1],[627,90,627,104,1],[627,17,627,104,1],[628,17,628,64,1],[628,64,628,91,1],[628,91,628,118,1],[628,17,628,118,1],[629,17,629,64,1],[629,64,629,75,1],[629,75,629,95,1],[629,17,629,95,1],[630,17,630,64,1],[630,64,630,101,1],[630,101,630,117,1],[630,17,630,117,1],[631,17,631,64,1],[631,64,631,101,1],[631,101,631,117,1],[631,17,631,117,1],[632,17,632,64,1],[632,64,632,87,1],[632,87,632,98,1],[632,17,632,98,1],[633,17,634,17,1],[634,17,634,18,1],[634,18,636,21,1],[636,21,636,35,1],[636,35,637,21,1],[637,21,637,52,1],[637,52,638,21,1],[638,21,638,22,1],[638,22,639,25,1],[639,25,639,40,1],[639,40,640,21,1],[640,21,640,22,1],[640,22,641,17,1],[641,17,641,18,1],[641,18,641,32,1],[633,17,641,32,1],[643,17,643,102,1],[644,17,644,68,1],[648,17,648,24,1],[648,26,648,42,1],[648,43,648,45,1],[648,46,648,72,1],[649,17,649,18,1],[650,21,650,64,1],[651,21,651,43,1],[654,21,656,87,1],[657,21,657,47,1],[658,17,658,18,1],[661,17,661,24,1],[661,26,661,31,1],[661,32,661,34,1],[661,35,662,21,1],[662,21,663,60,1],[663,60,663,61,1],[661,35,663,61,1],[664,17,664,18,1],[665,21,665,57,1],[666,21,666,22,1],[668,25,668,125,1],[669,25,669,51,1],[670,21,670,22,1],[672,21,672,22,1],[674,25,674,148,1],[675,21,675,22,1],[676,17,676,18,1],[677,13,677,14,1],[680,13,680,14,1],[681,17,681,39,1],[682,17,682,18,1],[684,21,684,22,1],[686,25,686,60,1],[688,21,688,44,1],[689,21,689,22,1],[691,21,691,22,1],[692,17,692,18,1],[694,17,694,44,1],[695,13,695,14,1],[700,47,700,51,1],[700,52,700,64,1],[713,21,713,22,0],[713,23,713,54,0],[713,55,713,56,0],[718,21,718,22,1],[718,23,718,47,1],[718,48,718,49,1],[721,35,721,39,1],[721,40,721,52,1],[724,21,724,22,1],[724,23,724,34,1],[724,35,724,36,1],[727,44,727,45,1],[727,46,727,58,1],[727,59,727,60,1],[732,17,732,18,1],[734,21,734,40,1],[735,17,735,18,1],[740,21,740,22,1],[740,23,740,41,1],[740,42,740,43,1],[745,21,745,22,1],[745,23,745,36,1],[745,37,745,38,1],[750,21,750,22,1],[750,23,750,39,1],[750,40,750,41,1],[755,21,755,22,1],[755,23,755,49,1],[755,50,755,51,1],[760,21,760,22,1],[760,23,760,46,1],[760,47,760,48,1],[765,21,765,22,1],[765,23,765,42,1],[765,43,765,44,1],[770,21,770,22,1],[770,23,770,43,1],[770,44,770,45,1],[775,21,775,22,1],[775,23,775,40,1],[775,41,775,42,1],[780,21,780,22,1],[780,23,780,41,1],[780,42,780,43,1],[785,21,785,22,1],[785,23,785,36,1],[785,37,785,38,1],[790,21,790,22,1],[790,23,790,42,1],[790,43,790,44,1],[795,21,795,22,1],[795,23,795,42,1],[795,43,795,44,1],[800,21,800,22,0],[800,23,800,39,0],[800,40,800,41,0],[805,21,805,22,1],[805,23,805,37,1],[805,38,805,39,1],[810,21,810,22,0],[810,23,810,36,0],[810,37,810,38,0],[815,21,815,22,1],[815,23,815,42,1],[815,43,815,44,1],[820,21,820,22,1],[820,23,820,49,1],[820,50,820,51,1],[824,13,824,14,1],[825,17,825,50,1],[826,13,826,14,1],[830,21,830,22,0],[830,23,830,43,0],[830,44,830,45,0],[837,13,837,14,1],[838,17,838,38,1],[838,39,838,65,1],[841,17,841,35,0],[842,17,842,57,0],[844,17,844,35,0],[845,17,845,18,0],[846,21,846,103,0],[848,21,848,55,0],[849,21,849,22,0],[850,25,850,60,0],[851,25,851,46,0],[852,29,852,85,0],[853,25,853,41,0],[855,17,855,18,0],[858,17,858,58,0],[860,17,860,35,0],[861,21,861,43,0],[863,17,863,33,0],[864,13,864,14,1],[866,13,866,75,1],[888,13,888,14,1],[889,17,889,61,1],[889,61,889,121,1],[889,121,889,123,1],[889,17,889,123,1],[890,17,890,33,1],[891,17,891,18,0],[892,21,892,175,0],[895,17,895,51,1],[896,17,896,37,1],[897,13,897,14,1],[908,57,908,61,1],[908,62,908,66,1],[909,43,909,47,1],[909,48,909,52,1],[910,39,910,43,1],[910,44,910,48,1],[919,9,919,10,1],[920,13,920,97,1],[922,13,922,59,1],[923,17,923,62,1],[924,13,924,29,1],[925,13,925,14,1],[926,17,926,52,1],[927,17,927,78,1],[928,13,928,14,1],[930,13,930,14,0],[931,17,931,53,0],[932,13,932,14,0],[933,9,933,10,1],[936,9,936,10,1],[937,13,939,29,1],[939,29,939,76,1],[939,76,944,15,1],[937,13,944,15,1],[945,13,945,42,1],[946,9,946,10,1],[949,9,949,10,1],[950,13,950,54,1],[951,17,951,33,0],[953,13,953,82,1],[954,13,954,51,1],[955,13,955,63,1],[955,63,955,71,1],[955,71,955,103,1],[955,13,955,103,1],[956,9,956,10,1],[959,9,959,10,0],[960,13,960,82,0],[961,13,961,37,0],[962,13,962,52,0],[973,13,973,39,0],[976,13,976,39,0],[977,13,978,17,0],[978,17,978,73,0],[978,73,978,75,0],[977,13,978,75,0],[979,9,979,10,0],[982,9,982,10,0],[983,13,983,33,0],[984,13,984,41,0],[984,41,984,68,0],[984,68,984,70,0],[984,13,984,70,0],[985,13,985,32,0],[986,9,986,10,0]]);
+    </script>
+  </body>
+</html>

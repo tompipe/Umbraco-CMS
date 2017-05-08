@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Publishing\PublishingStrategy.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Events;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Core.Publishing
+{
+    //TODO: Do we need this anymore??
+    /// &lt;summary&gt;
+    /// Currently acts as an interconnection between the new public api and the legacy api for publishing
+    /// &lt;/summary&gt;
+    public class PublishingStrategy : BasePublishingStrategy
+    {
+        private readonly IEventMessagesFactory _eventMessagesFactory;
+        private readonly ILogger _logger;
+
+        public PublishingStrategy(IEventMessagesFactory eventMessagesFactory, ILogger logger)
+        {
+            if (eventMessagesFactory == null) throw new ArgumentNullException(&quot;eventMessagesFactory&quot;);
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            _eventMessagesFactory = eventMessagesFactory;
+            _logger = logger;
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a single piece of Content
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;see cref=&quot;IContent&quot;/&gt; to publish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Id of the User issueing the publish operation&lt;/param&gt;
+        internal Attempt&lt;PublishStatus&gt; PublishInternal(IContent content, int userId)
+        {
+            var evtMsgs = _eventMessagesFactory.Get();
+
+            if (Publishing.IsRaisedEventCancelled(
+                new PublishEventArgs&lt;IContent&gt;(content, evtMsgs), this))
+            {
+                _logger.Info&lt;PublishingStrategy&gt;(
+                        string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; will not be published, the event was cancelled.&quot;, content.Name, content.Id));
+                return Attempt&lt;PublishStatus&gt;.Fail(new PublishStatus(content, PublishStatusType.FailedCancelledByEvent, evtMsgs));
+            }
+
+            //Check if the Content is Expired to verify that it can in fact be published
+            if (content.Status == ContentStatus.Expired)
+            {
+                _logger.Info&lt;PublishingStrategy&gt;(
+                    string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; has expired and could not be published.&quot;,
+                                  content.Name, content.Id));
+                return Attempt&lt;PublishStatus&gt;.Fail(new PublishStatus(content, PublishStatusType.FailedHasExpired, evtMsgs));
+            }
+
+            //Check if the Content is Awaiting Release to verify that it can in fact be published
+            if (content.Status == ContentStatus.AwaitingRelease)
+            {
+                _logger.Info&lt;PublishingStrategy&gt;(
+                    string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; is awaiting release and could not be published.&quot;,
+                                  content.Name, content.Id));
+                return Attempt&lt;PublishStatus&gt;.Fail(new PublishStatus(content, PublishStatusType.FailedAwaitingRelease, evtMsgs));
+            }
+
+            //Check if the Content is Trashed to verify that it can in fact be published
+            if (content.Status == ContentStatus.Trashed)
+            {
+                _logger.Info&lt;PublishingStrategy&gt;(
+                    string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; is trashed and could not be published.&quot;,
+                                  content.Name, content.Id));
+                return Attempt&lt;PublishStatus&gt;.Fail(new PublishStatus(content, PublishStatusType.FailedIsTrashed, evtMsgs));
+            }
+
+            content.ChangePublishedState(PublishedState.Published);
+
+            _logger.Info&lt;PublishingStrategy&gt;(
+                string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; has been published.&quot;,
+                              content.Name, content.Id));
+
+            return Attempt.Succeed(new PublishStatus(content, evtMsgs));
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a single piece of Content
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;see cref=&quot;IContent&quot;/&gt; to publish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Id of the User issueing the publish operation&lt;/param&gt;
+        /// &lt;returns&gt;True if the publish operation was successfull and not cancelled, otherwise false&lt;/returns&gt;
+        public override bool Publish(IContent content, int userId)
+        {
+            return PublishInternal(content, userId).Success;
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a list of content items
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;includeUnpublishedDocuments&quot;&gt;
+        /// By default this is set to true which means that it will publish any content item in the list that is completely unpublished and
+        /// not visible on the front-end. If set to false, this will only publish content that is live on the front-end but has new versions
+        /// that have yet to be published.
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        ///
+        /// This method becomes complex once we start to be able to cancel events or stop publishing a content item in any way because if a
+        /// content item is not published then it&#39;s children shouldn&#39;t be published either. This rule will apply for the following conditions:
+        /// * If a document fails to be published, do not proceed to publish it&#39;s children if:
+        /// ** The document does not have a publish version
+        /// ** The document does have a published version but the includeUnpublishedDocuments = false
+        ///
+        /// In order to do this, we will order the content by level and begin by publishing each item at that level, then proceed to the next
+        /// level and so on. If we detect that the above rule applies when the document publishing is cancelled we&#39;ll add it to the list of
+        /// parentsIdsCancelled so that it&#39;s children don&#39;t get published.
+        ///
+        /// Its important to note that all &#39;root&#39; documents included in the list *will* be published regardless of the rules mentioned
+        /// above (unless it is invalid)!! By &#39;root&#39; documents we are referring to documents in the list with the minimum value for their &#39;level&#39;.
+        /// In most cases the &#39;root&#39; documents will only be one document since under normal circumstance we only publish one document and
+        /// its children. The reason we have to do this is because if a user is publishing a document and it&#39;s children, it is implied that
+        /// the user definitely wants to publish it even if it has never been published before.
+        ///
+        /// &lt;/remarks&gt;
+        internal IEnumerable&lt;Attempt&lt;PublishStatus&gt;&gt; PublishWithChildrenInternal(
+            IEnumerable&lt;IContent&gt; content, int userId, bool includeUnpublishedDocuments = true)
+        {
+            var statuses = new List&lt;Attempt&lt;PublishStatus&gt;&gt;();
+
+            //a list of all document ids that had their publishing cancelled during these iterations.
+            //this helps us apply the rule listed in the notes above by checking if a document&#39;s parent id
+            //matches one in this list.
+            var parentsIdsCancelled = new List&lt;int&gt;();
+
+            //group by levels and iterate over the sorted ascending level.
+            //TODO: This will cause all queries to execute, they will not be lazy but I&#39;m not really sure being lazy actually made
+            // much difference because we iterate over them all anyways?? Morten?
+            // Because we&#39;re grouping I think this will execute all the queries anyways so need to fetch it all first.
+            var fetchedContent = content.ToArray();
+
+            var evtMsgs = _eventMessagesFactory.Get();
+
+            //We&#39;re going to populate the statuses with all content that is already published because below we are only going to iterate over
+            // content that is not published. We&#39;ll set the status to &quot;AlreadyPublished&quot;
+            statuses.AddRange(fetchedContent.Where(x =&gt; x.Published)
+                .Select(x =&gt; Attempt.Succeed(new PublishStatus(x, PublishStatusType.SuccessAlreadyPublished, evtMsgs))));
+
+            int? firstLevel = null;
+
+            //group by level and iterate over each level (sorted ascending)
+            var levelGroups = fetchedContent.GroupBy(x =&gt; x.Level);
+            foreach (var level in levelGroups.OrderBy(x =&gt; x.Key))
+            {
+                //set the first level flag, used to ensure that all documents at the first level will
+                //be published regardless of the rules mentioned in the remarks.
+                if (!firstLevel.HasValue)
+                {
+                    firstLevel = level.Key;
+                }
+
+                /* Only update content thats not already been published - we want to loop through
+                 * all unpublished content to write skipped content (expired and awaiting release) to log.
+                 */
+                foreach (var item in level.Where(x =&gt; x.Published == false))
+                {
+                    //Check if this item should be excluded because it&#39;s parent&#39;s publishing has failed/cancelled
+                    if (parentsIdsCancelled.Contains(item.ParentId))
+                    {
+                        _logger.Info&lt;PublishingStrategy&gt;(
+                            string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; will not be published because it&#39;s parent&#39;s publishing action failed or was cancelled.&quot;, item.Name, item.Id));
+                        //if this cannot be published, ensure that it&#39;s children can definitely not either!
+                        parentsIdsCancelled.Add(item.Id);
+                        continue;
+                    }
+
+                    //Check if this item has never been published (and that it is not at the root level)
+                    if (item.Level != firstLevel &amp;&amp; !includeUnpublishedDocuments &amp;&amp; !item.HasPublishedVersion())
+                    {
+                        //this item does not have a published version and the flag is set to not include them
+                        parentsIdsCancelled.Add(item.Id);
+                        continue;
+                    }
+
+                    //Fire Publishing event
+                    if (Publishing.IsRaisedEventCancelled(
+                        new PublishEventArgs&lt;IContent&gt;(item, evtMsgs), this))
+                    {
+                        //the publishing has been cancelled.
+                        _logger.Info&lt;PublishingStrategy&gt;(
+                            string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; will not be published, the event was cancelled.&quot;, item.Name, item.Id));
+                        statuses.Add(Attempt.Fail(new PublishStatus(item, PublishStatusType.FailedCancelledByEvent, evtMsgs)));
+
+                        //Does this document apply to our rule to cancel it&#39;s children being published?
+                        CheckCancellingOfChildPublishing(item, parentsIdsCancelled, includeUnpublishedDocuments);
+
+                        continue;
+                    }
+
+                    //Check if the content is valid if the flag is set to check
+                    if (item.IsValid() == false)
+                    {
+                        _logger.Info&lt;PublishingStrategy&gt;(
+                            string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; will not be published because some of it&#39;s content is not passing validation rules.&quot;,
+                                          item.Name, item.Id));
+                        statuses.Add(Attempt.Fail(new PublishStatus(item, PublishStatusType.FailedContentInvalid, evtMsgs)
+                        {
+                            InvalidProperties = ((ContentBase)item).LastInvalidProperties
+                        }));
+
+                        //Does this document apply to our rule to cancel it&#39;s children being published?
+                        CheckCancellingOfChildPublishing(item, parentsIdsCancelled, includeUnpublishedDocuments);
+
+                        continue;
+                    }
+
+                    //Check if the Content is Expired to verify that it can in fact be published
+                    if (item.Status == ContentStatus.Expired)
+                    {
+                        _logger.Info&lt;PublishingStrategy&gt;(
+                            string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; has expired and could not be published.&quot;,
+                                          item.Name, item.Id));
+                        statuses.Add(Attempt.Fail(new PublishStatus(item, PublishStatusType.FailedHasExpired, evtMsgs)));
+
+                        //Does this document apply to our rule to cancel it&#39;s children being published?
+                        CheckCancellingOfChildPublishing(item, parentsIdsCancelled, includeUnpublishedDocuments);
+
+                        continue;
+                    }
+
+                    //Check if the Content is Awaiting Release to verify that it can in fact be published
+                    if (item.Status == ContentStatus.AwaitingRelease)
+                    {
+                        _logger.Info&lt;PublishingStrategy&gt;(
+                            string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; is awaiting release and could not be published.&quot;,
+                                          item.Name, item.Id));
+                        statuses.Add(Attempt.Fail(new PublishStatus(item, PublishStatusType.FailedAwaitingRelease, evtMsgs)));
+
+                        //Does this document apply to our rule to cancel it&#39;s children being published?
+                        CheckCancellingOfChildPublishing(item, parentsIdsCancelled, includeUnpublishedDocuments);
+
+                        continue;
+                    }
+
+                    //Check if the Content is Trashed to verify that it can in fact be published
+                    if (item.Status == ContentStatus.Trashed)
+                    {
+                        _logger.Info&lt;PublishingStrategy&gt;(
+                            string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; is trashed and could not be published.&quot;,
+                                          item.Name, item.Id));
+                        statuses.Add(Attempt.Fail(new PublishStatus(item, PublishStatusType.FailedIsTrashed, evtMsgs)));
+
+                        //Does this document apply to our rule to cancel it&#39;s children being published?
+                        CheckCancellingOfChildPublishing(item, parentsIdsCancelled, includeUnpublishedDocuments);
+
+                        continue;
+                    }
+
+                    item.ChangePublishedState(PublishedState.Published);
+
+                    _logger.Info&lt;PublishingStrategy&gt;(
+                        string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; has been published.&quot;,
+                                      item.Name, item.Id));
+
+                    statuses.Add(Attempt.Succeed(new PublishStatus(item, evtMsgs)));
+                }
+
+            }
+
+            return statuses;
+        }
+
+        /// &lt;summary&gt;
+        /// Based on the information provider we&#39;ll check if we should cancel the publishing of this document&#39;s children
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;parentsIdsCancelled&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;includeUnpublishedDocuments&quot;&gt;&lt;/param&gt;
+        /// &lt;remarks&gt;
+        /// See remarks on method: PublishWithChildrenInternal
+        /// &lt;/remarks&gt;
+        private void CheckCancellingOfChildPublishing(IContent content, List&lt;int&gt; parentsIdsCancelled, bool includeUnpublishedDocuments)
+        {
+            //Does this document apply to our rule to cancel it&#39;s children being published?
+            //TODO: We&#39;re going back to the service layer here... not sure how to avoid this? And this will add extra overhead to
+            // any document that fails to publish...
+            var hasPublishedVersion = ApplicationContext.Current.Services.ContentService.HasPublishedVersion(content.Id);
+
+            if (hasPublishedVersion &amp;&amp; !includeUnpublishedDocuments)
+            {
+                //it has a published version but our flag tells us to not include un-published documents and therefore we should
+                // not be forcing decendant/child documents to be published if their parent fails.
+                parentsIdsCancelled.Add(content.Id);
+            }
+            else if (!hasPublishedVersion)
+            {
+                //it doesn&#39;t have a published version so we certainly cannot publish it&#39;s children.
+                parentsIdsCancelled.Add(content.Id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Publishes a list of Content
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;An enumerable list of &lt;see cref=&quot;IContent&quot;/&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Id of the User issueing the publish operation&lt;/param&gt;
+        /// &lt;returns&gt;True if the publish operation was successfull and not cancelled, otherwise false&lt;/returns&gt;
+        public override bool PublishWithChildren(IEnumerable&lt;IContent&gt; content, int userId)
+        {
+            var result = PublishWithChildrenInternal(content, userId);
+
+            //NOTE: This previously always returned true so I&#39;ve left it that way. It returned true because (from Morten)...
+            // ... if one item couldn&#39;t be published it wouldn&#39;t be correct to return false.
+            // in retrospect it should have returned a list of with Ids and Publish Status
+            // come to think of it ... the cache would still be updated for a failed item or at least tried updated.
+            // It would call the Published event for the entire list, but if the Published property isn&#39;t set to True it
+            // wouldn&#39;t actually update the cache for that item. But not really ideal nevertheless...
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Unpublishes a single piece of Content
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;see cref=&quot;IContent&quot;/&gt; to unpublish&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Id of the User issueing the unpublish operation&lt;/param&gt;
+        /// &lt;returns&gt;True if the unpublish operation was successfull and not cancelled, otherwise false&lt;/returns&gt;
+        public override bool UnPublish(IContent content, int userId)
+        {
+            return UnPublishInternal(content, userId).Success;
+        }
+
+        /// &lt;summary&gt;
+        /// Unpublishes a list of Content
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;An enumerable list of &lt;see cref=&quot;IContent&quot;/&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Id of the User issueing the unpublish operation&lt;/param&gt;
+        /// &lt;returns&gt;A list of publish statuses&lt;/returns&gt;
+        private IEnumerable&lt;Attempt&lt;PublishStatus&gt;&gt; UnPublishInternal(IEnumerable&lt;IContent&gt; content, int userId)
+        {
+            return content.Select(x =&gt; UnPublishInternal(x, userId));
+        }
+
+        private Attempt&lt;PublishStatus&gt; UnPublishInternal(IContent content, int userId)
+        {
+            // content should (is assumed to ) be the newest version, which may not be published
+            // don&#39;t know how to test this, so it&#39;s not verified
+            // NOTE
+            // if published != newest, then the published flags need to be reseted by whoever is calling that method
+            // at the moment it&#39;s done by the content service
+
+            var evtMsgs = _eventMessagesFactory.Get();
+
+            //Fire UnPublishing event
+            if (UnPublishing.IsRaisedEventCancelled(
+                new PublishEventArgs&lt;IContent&gt;(content, evtMsgs), this))
+            {
+                _logger.Info&lt;PublishingStrategy&gt;(
+                    string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; will not be unpublished, the event was cancelled.&quot;, content.Name, content.Id));
+                return Attempt.Fail(new PublishStatus(content, PublishStatusType.FailedCancelledByEvent, evtMsgs));
+            }
+
+            //If Content has a release date set to before now, it should be removed so it doesn&#39;t interrupt an unpublish
+            //Otherwise it would remain released == published
+            if (content.ReleaseDate.HasValue &amp;&amp; content.ReleaseDate.Value &lt;= DateTime.Now)
+            {
+                content.ReleaseDate = null;
+
+                _logger.Info&lt;PublishingStrategy&gt;(
+                    string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; had its release date removed, because it was unpublished.&quot;,
+                                  content.Name, content.Id));
+            }
+
+            // if newest is published, unpublish
+            if (content.Published)
+                content.ChangePublishedState(PublishedState.Unpublished);
+
+            _logger.Info&lt;PublishingStrategy&gt;(
+                string.Format(&quot;Content &#39;{0}&#39; with Id &#39;{1}&#39; has been unpublished.&quot;,
+                              content.Name, content.Id));
+
+            return Attempt.Succeed(new PublishStatus(content, evtMsgs));
+        }
+
+        /// &lt;summary&gt;
+        /// Unpublishes a list of Content
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;An enumerable list of &lt;see cref=&quot;IContent&quot;/&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Id of the User issueing the unpublish operation&lt;/param&gt;
+        /// &lt;returns&gt;True if the unpublish operation was successfull and not cancelled, otherwise false&lt;/returns&gt;
+        public override bool UnPublish(IEnumerable&lt;IContent&gt; content, int userId)
+        {
+            var result = UnPublishInternal(content, userId);
+
+            //NOTE: This previously always returned true so I&#39;ve left it that way. It returned true because (from Morten)...
+            // ... if one item couldn&#39;t be published it wouldn&#39;t be correct to return false.
+            // in retrospect it should have returned a list of with Ids and Publish Status
+            // come to think of it ... the cache would still be updated for a failed item or at least tried updated.
+            // It would call the Published event for the entire list, but if the Published property isn&#39;t set to True it
+            // wouldn&#39;t actually update the cache for that item. But not really ideal nevertheless...
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Call to fire event that updating the published content has finalized.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This seperation of the OnPublished event is done to ensure that the Content
+        /// has been properly updated (committed unit of work) and xml saved in the db.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;see cref=&quot;IContent&quot;/&gt; thats being published&lt;/param&gt;
+        public override void PublishingFinalized(IContent content)
+        {
+            var evtMsgs = _eventMessagesFactory.Get();
+            Published.RaiseEvent(
+                new PublishEventArgs&lt;IContent&gt;(content, false, false, evtMsgs), this);
+        }
+
+        /// &lt;summary&gt;
+        /// Call to fire event that updating the published content has finalized.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;An enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; thats being published&lt;/param&gt;
+        /// &lt;param name=&quot;isAllRepublished&quot;&gt;Boolean indicating whether its all content that is republished&lt;/param&gt;
+        public override void PublishingFinalized(IEnumerable&lt;IContent&gt; content, bool isAllRepublished)
+        {
+            var evtMsgs = _eventMessagesFactory.Get();
+            Published.RaiseEvent(
+                new PublishEventArgs&lt;IContent&gt;(content, false, isAllRepublished, evtMsgs), this);
+
+        }
+
+        /// &lt;summary&gt;
+        /// Call to fire event that updating the unpublished content has finalized.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;see cref=&quot;IContent&quot;/&gt; thats being unpublished&lt;/param&gt;
+        public override void UnPublishingFinalized(IContent content)
+        {
+            var evtMsgs = _eventMessagesFactory.Get();
+            UnPublished.RaiseEvent(
+                new PublishEventArgs&lt;IContent&gt;(content, false, false, evtMsgs), this);
+        }
+
+        /// &lt;summary&gt;
+        /// Call to fire event that updating the unpublished content has finalized.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;An enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; thats being unpublished&lt;/param&gt;
+        public override void UnPublishingFinalized(IEnumerable&lt;IContent&gt; content)
+        {
+            var evtMsgs = _eventMessagesFactory.Get();
+            UnPublished.RaiseEvent(
+                new PublishEventArgs&lt;IContent&gt;(content, false, false, evtMsgs), this);
+        }
+
+        /// &lt;summary&gt;
+        /// Occurs before publish
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPublishingStrategy, PublishEventArgs&lt;IContent&gt;&gt; Publishing;
+
+        /// &lt;summary&gt;
+        /// Occurs after publish
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPublishingStrategy, PublishEventArgs&lt;IContent&gt;&gt; Published;
+
+        /// &lt;summary&gt;
+        /// Occurs before unpublish
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPublishingStrategy, PublishEventArgs&lt;IContent&gt;&gt; UnPublishing;
+
+        /// &lt;summary&gt;
+        /// Occurs after unpublish
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;IPublishingStrategy, PublishEventArgs&lt;IContent&gt;&gt; UnPublished;
+
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[21,9,21,94,1],[22,9,22,10,1],[23,13,23,46,1],[23,47,23,103,0],[24,13,24,32,1],[24,33,24,75,0],[25,13,25,58,1],[26,13,26,30,1],[27,9,27,10,1],[35,9,35,10,1],[36,13,36,55,1],[38,13,39,73,1],[40,13,40,14,0],[41,17,42,145,0],[43,17,43,131,0],[47,13,47,57,1],[48,13,48,14,0],[49,17,51,62,0],[52,17,52,125,0],[56,13,56,65,1],[57,13,57,14,0],[58,17,60,62,0],[61,17,61,130,0],[65,13,65,57,1],[66,13,66,14,1],[67,17,69,62,1],[70,17,70,124,1],[73,13,73,68,1],[75,13,77,58,1],[79,13,79,73,1],[80,9,80,10,1],[89,9,89,10,1],[90,13,90,61,1],[91,9,91,10,1],[125,9,125,10,1],[126,13,126,63,1],[131,13,131,55,1],[137,13,137,52,1],[139,13,139,55,1],[143,13,143,57,1],[143,57,143,68,1],[143,68,144,30,1],[144,30,144,119,1],[144,119,144,122,1],[143,13,144,122,1],[146,13,146,36,1],[149,13,149,59,1],[149,59,149,66,1],[149,66,149,68,1],[149,13,149,68,1],[150,13,150,20,1],[150,22,150,31,1],[150,32,150,34,1],[150,35,150,60,1],[150,60,150,65,1],[150,65,150,66,1],[150,35,150,66,1],[151,13,151,14,1],[154,17,154,42,1],[155,17,155,18,1],[156,21,156,44,1],[157,17,157,18,1],[162,17,162,24,1],[162,26,162,34,1],[162,35,162,37,1],[162,38,162,55,1],[162,55,162,75,1],[162,75,162,76,1],[162,38,162,76,1],[163,17,163,18,1],[165,21,165,69,1],[166,21,166,22,1],[167,25,168,182,1],[170,25,170,58,1],[171,25,171,34,1],[175,21,175,113,1],[176,21,176,22,1],[178,25,178,58,1],[179,25,179,34,1],[183,21,184,78,1],[185,21,185,22,1],[187,25,188,143,1],[189,25,189,128,1],[192,25,192,114,1],[194,25,194,34,1],[198,21,198,49,1],[199,21,199,22,1],[200,25,202,64,1],[203,25,206,29,1],[209,25,209,114,1],[211,25,211,34,1],[215,21,215,62,1],[216,21,216,22,0],[217,25,219,64,0],[220,25,220,122,0],[223,25,223,114,0],[225,25,225,34,0],[229,21,229,70,1],[230,21,230,22,0],[231,25,233,64,0],[234,25,234,127,0],[237,25,237,114,0],[239,25,239,34,0],[243,21,243,62,1],[244,21,244,22,0],[245,25,247,64,0],[248,25,248,121,0],[251,25,251,114,0],[253,25,253,34,0],[256,21,256,73,1],[258,21,260,60,1],[262,21,262,85,1],[263,17,263,18,1],[265,13,265,14,1],[267,13,267,29,1],[268,9,268,10,1],[280,9,280,10,1],[284,13,284,122,1],[286,13,286,69,1],[287,13,287,14,0],[290,17,290,53,0],[291,13,291,14,0],[292,18,292,43,1],[293,13,293,14,1],[295,17,295,53,1],[296,13,296,14,1],[297,9,297,10,1],[306,9,306,10,0],[307,13,307,71,0],[315,13,315,25,0],[316,9,316,10,0],[325,9,325,10,1],[326,13,326,63,1],[327,9,327,10,1],[336,9,336,10,0],[337,13,337,40,0],[337,40,337,68,0],[337,68,337,70,0],[337,13,337,70,0],[338,9,338,10,0],[341,9,341,10,1],[348,13,348,55,1],[351,13,352,73,1],[353,13,353,14,0],[354,17,355,143,0],[356,17,356,116,0],[361,13,361,91,1],[362,13,362,14,0],[363,17,363,44,0],[365,17,367,62,0],[368,13,368,14,0],[371,13,371,35,1],[372,17,372,74,1],[374,13,376,58,1],[378,13,378,73,1],[379,9,379,10,1],[388,9,388,10,0],[389,13,389,61,0],[397,13,397,25,0],[398,9,398,10,0],[409,9,409,10,1],[410,13,410,55,1],[411,13,412,87,1],[413,9,413,10,1],[421,9,421,10,1],[422,13,422,55,1],[423,13,424,98,1],[426,9,426,10,1],[433,9,433,10,1],[434,13,434,55,1],[435,13,436,87,1],[437,9,437,10,1],[444,9,444,10,0],[445,13,445,55,0],[446,13,447,87,0],[448,9,448,10,0]]);
+    </script>
+  </body>
+</html>

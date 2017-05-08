@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\CodeFirst\Definitions\ContentTypeDefinitionFactory.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Models;
+using Umbraco.Core.Services;
+using Umbraco.Tests.CodeFirst.Attributes;
+
+namespace Umbraco.Tests.CodeFirst.Definitions
+{
+    public static class ContentTypeDefinitionFactory
+    {
+        private static ConcurrentDictionary&lt;string, DependencyField&gt; _contentTypeCache = new ConcurrentDictionary&lt;string, DependencyField&gt;();
+
+        public static Lazy&lt;IContentType&gt; GetContentTypeDefinition(Type modelType)
+        {
+            //Check for BaseType different from ContentTypeBase
+            bool hasParent = modelType.BaseType != null &amp;&amp; modelType.BaseType != typeof(ContentTypeBase) &amp;&amp; modelType.BaseType != typeof(object);
+            var parent = new Lazy&lt;IContentType&gt;();
+            if(hasParent)
+            {
+                var isResolved = _contentTypeCache.ContainsKey(modelType.BaseType.FullName);
+                parent = isResolved
+                             ? _contentTypeCache[modelType.BaseType.FullName].ContentType
+                             : GetContentTypeDefinition(modelType.BaseType);
+            }
+
+            var contentTypeAttribute = modelType.FirstAttribute&lt;ContentTypeAttribute&gt;();
+            var contentTypeAlias = contentTypeAttribute == null ? modelType.Name.ToUmbracoAlias() : contentTypeAttribute.Alias;
+            //Check if ContentType already exists by looking it up by Alias.
+            var existing = ApplicationContext.Current.Services.ContentTypeService.GetContentType(contentTypeAlias);
+            
+            Lazy&lt;IContentType&gt; contentType = contentTypeAttribute == null
+                                                 ? PlainPocoConvention(modelType, existing)
+                                                 : ContentTypeConvention(contentTypeAttribute, modelType, existing);
+
+            //Check for interfaces that&#39;ll be used for ContentTypeComposition
+            var mixins = GetAliasesFromTypeInterfaces(modelType);
+
+            var definitions = new List&lt;PropertyDefinition&gt;();
+            int order = 0;
+            var objProperties = modelType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly).ToList();
+            foreach (var propertyInfo in objProperties)
+            {
+                var propertyTypeAttribute = propertyInfo.FirstAttribute&lt;PropertyTypeConventionAttribute&gt;();
+                var definition = propertyTypeAttribute == null
+                                     ? new PropertyDefinition()
+                                     : propertyTypeAttribute.GetPropertyConvention();
+
+                //DataTypeDefinition fallback
+                if(definition.DataTypeDefinition == null)
+                {
+                    definition.DataTypeDefinition = Conventions.GetDataTypeDefinitionByAttributeOrType(null, propertyInfo.PropertyType);
+                }
+
+                if(string.IsNullOrEmpty(definition.PropertyGroup))
+                {
+                    definition.PropertyGroup = &quot;Generic Properties&quot;;
+                }
+
+                //Alias fallback
+                if (string.IsNullOrEmpty(definition.Alias))
+                {
+                    var aliasAttribute = propertyInfo.FirstAttribute&lt;AliasAttribute&gt;();
+                    definition.Alias = Conventions.GetPropertyTypeAlias(aliasAttribute, propertyInfo.Name);
+                    definition.Name = Conventions.GetPropertyTypeName(aliasAttribute, propertyInfo.Name);
+                }
+
+                //Description fallback
+                if (string.IsNullOrEmpty(definition.Description))
+                {
+                    var descriptionAttribute = propertyInfo.FirstAttribute&lt;DescriptionAttribute&gt;();
+                    definition.Description = descriptionAttribute != null
+                                                 ? descriptionAttribute.Description
+                                                 : string.Empty;
+                }
+
+                //SortOrder fallback
+                if (definition.Order == default(int))
+                {
+                    var sortOrderAttribute = propertyInfo.FirstAttribute&lt;SortOrderAttribute&gt;();
+                    definition.Order = sortOrderAttribute != null ? sortOrderAttribute.Order : order;
+                }
+
+                definitions.Add(definition);
+                order++;
+            }
+
+            //Loop through definitions for PropertyGroups and create those that not already exists
+            var groupDefinitions = definitions.DistinctBy(d =&gt; d.PropertyGroup);
+            foreach (var groupDefinition in groupDefinitions)
+            {
+                var groupExists = contentType.Value.PropertyGroups.Contains(groupDefinition.PropertyGroup);
+                if(groupExists == false)
+                {
+                    var propertyGroup = new PropertyGroup {Name = groupDefinition.PropertyGroup};
+                    contentType.Value.PropertyGroups.Add(propertyGroup);
+                }
+            }
+
+            //Loop through definitions for PropertyTypes and add them to the correct PropertyGroup
+            foreach (var definition in definitions)
+            {
+                var group = contentType.Value.PropertyGroups.First(x =&gt; x.Name == definition.PropertyGroup);
+                //Check if a PropertyType with the same alias already exists, as we don&#39;t want to override existing ones
+                if(group.PropertyTypes.Contains(definition.Alias)) continue;
+
+                var propertyType = new PropertyType(definition.DataTypeDefinition, definition.Alias)
+                                       {
+                                           Mandatory = definition.Mandatory,
+                                           ValidationRegExp = definition.ValidationRegExp,
+                                           SortOrder = definition.Order,
+                                           Name = definition.Name
+                                       };
+
+                group.PropertyTypes.Add(propertyType);
+            }
+
+            //If current ContentType has a Parent the ParentId should be set and the ContentType added to the composition.
+            if(hasParent)
+            {
+                contentType.Value.SetLazyParentId(new Lazy&lt;int&gt;(() =&gt; parent.Value.Id));
+                contentType.Value.AddContentType(parent.Value);
+            }
+            //Add the resolved ContentType to the internal cache
+            var field = new DependencyField {ContentType = contentType, Alias = contentType.Value.Alias};
+            var dependencies = new List&lt;string&gt;();
+            //If current type has a parent (inherited model) we add the alias of that type as a dependency
+            if(hasParent)
+            {
+                dependencies.Add(parent.Value.Alias);
+            }
+            //Check ContentType for existing &#39;Allowed ContentTypes&#39;
+            if(contentType.Value.AllowedContentTypes.Any())
+            {
+                dependencies.AddRange(contentType.Value.AllowedContentTypes.Select(allowed =&gt; allowed.Alias));
+            }
+            //Check for interfaces with AliasAttribute and add those as dependencies 
+            //NOTE: might also be an idea to check if ContentType has already been created/added to cache that implements the interface.
+            if(mixins.Any())
+            {
+                foreach (var mixin in mixins)
+                {
+                    if(dependencies.Contains(mixin.Item1)) continue;
+
+                    dependencies.Add(mixin.Item1);
+                    var isMixinResolved = _contentTypeCache.ContainsKey(mixin.Item2);
+
+                    Lazy&lt;IContentType&gt; compositionType = null;
+
+                    if (isMixinResolved)
+                    {
+                        compositionType = _contentTypeCache[mixin.Item2].ContentType;
+                    }
+                    else
+                    {
+                        GetContentTypeDefinition(mixin.Item3);
+                        compositionType = _contentTypeCache[mixin.Item2].ContentType;
+                    }
+
+                    contentType.Value.AddContentType(compositionType.Value);
+                }
+            }
+            field.DependsOn = dependencies.ToArray();
+            _contentTypeCache.AddOrUpdate(modelType.FullName, field, (x, y) =&gt; field);
+            return contentType;
+        }
+
+
+        private static int[] GetTopologicalSortOrder(IList&lt;DependencyField&gt; fields)
+        {
+            var g = new TopologicalSorter(fields.Count());
+            var _indexes = new Dictionary&lt;string, int&gt;();
+
+            //add vertices
+            for (int i = 0; i &lt; fields.Count(); i++)
+            {
+                _indexes[fields[i].Alias.ToLower()] = g.AddVertex(i);
+            }
+
+            //add edges
+            for (int i = 0; i &lt; fields.Count; i++)
+            {
+                if (fields[i].DependsOn != null)
+                {
+                    for (int j = 0; j &lt; fields[i].DependsOn.Length; j++)
+                    {
+                        g.AddEdge(i,
+                            _indexes[fields[i].DependsOn[j].ToLower()]);
+                    }
+                }
+            }
+
+            int[] result = g.Sort();
+            return result;
+
+        }
+
+        //public static IEnumerable&lt;Lazy&lt;IContentType&gt;&gt; RetrieveMappedContentTypes()
+		public static IEnumerable&lt;IContentType&gt; RetrieveMappedContentTypes()
+        {
+            var fields = _contentTypeCache.Select(x =&gt; x.Value).ToList();
+            int[] sortOrder = GetTopologicalSortOrder(fields);
+			//var list = new List&lt;Lazy&lt;IContentType&gt;&gt;();
+			var list = new List&lt;IContentType&gt;();
+            for (int i = 0; i &lt; sortOrder.Length; i++)
+            {
+                var field = fields[sortOrder[i]];
+                list.Add(field.ContentType.Value);
+                Debug.Print(field.Alias);
+                if (field.DependsOn != null)
+                    foreach (var item in field.DependsOn)
+                    {
+                        Debug.Print(&quot; -{0}&quot;, item);
+                    }
+            }
+            list.Reverse();
+            return list;
+        }
+
+        public static void ClearContentTypeCache()
+        {
+            _contentTypeCache.Clear();
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieves a list of aliases that correspond to the interfaces on the passed in type,
+        /// which are attributed with the AliasAttribute.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// The modelType is also used to ensure that the implementing class doesn&#39;t reference 
+        /// itself via its interface.
+        /// &lt;/remarks&gt;
+        /// &lt;param name=&quot;modelType&quot;&gt;Type of the model to retrieve interface aliases from&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of strings with aliases&lt;/returns&gt;
+        private static IEnumerable&lt;Tuple&lt;string, string, Type&gt;&gt; GetAliasesFromTypeInterfaces(Type modelType)
+        {
+            var interfaces = modelType.GetInterfaces().ToList().Distinct();
+            var list = new List&lt;Tuple&lt;string, string, Type&gt;&gt;();
+
+            foreach (var interfaceType in interfaces)
+            {
+                var mixinAttribute = interfaceType.FirstAttribute&lt;MixinAttribute&gt;();
+                if (mixinAttribute != null)
+                {
+                    if(mixinAttribute.Type == modelType) continue;
+                    var contentTypeAttribute = mixinAttribute.Type.FirstAttribute&lt;ContentTypeAttribute&gt;();
+                    var contentTypeAlias = contentTypeAttribute == null ? mixinAttribute.Type.Name.ToUmbracoAlias() : contentTypeAttribute.Alias;
+                    var tuple = new Tuple&lt;string, string, Type&gt;(contentTypeAlias, mixinAttribute.Type.FullName, mixinAttribute.Type);
+                    list.Add(tuple);
+                }
+            }
+
+            return list;
+        }
+
+        /// &lt;summary&gt;
+        /// Convention that converts a class decorated with the ContentTypeAttribute to an initial ContentType
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;attribute&quot;&gt;&lt;see cref=&quot;ContentTypeAttribute&quot;/&gt; to use for mapping a &lt;see cref=&quot;IContentType&quot;/&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;modelType&quot;&gt;Type of the current class&lt;/param&gt;
+        /// &lt;param name=&quot;existing&quot;&gt; &lt;/param&gt;
+        /// &lt;returns&gt;A Lazy &lt;see cref=&quot;IContentType&quot;/&gt;&lt;/returns&gt;
+        private static Lazy&lt;IContentType&gt; ContentTypeConvention(ContentTypeAttribute attribute, Type modelType, IContentType existing)
+        {
+            var children = attribute.AllowedChildContentTypes == null
+                               ? new List&lt;ContentTypeSort&gt;()
+                               : AllowedChildContentTypesConvention(
+                                   attribute.AllowedChildContentTypes, modelType);
+            
+            var templates = attribute.AllowedTemplates == null
+                                ? new List&lt;ITemplate&gt;()
+                                : AllowedTemplatesConvention(attribute.AllowedTemplates);
+
+            if(existing != null)
+            {
+                if (children.Any())
+                    existing.AllowedContentTypes = children;
+                
+                if (templates.Any())
+                    existing.AllowedTemplates = templates;
+
+                return new Lazy&lt;IContentType&gt;(() =&gt; existing);
+            }
+
+            var contentType = new ContentType(-1)
+                                  {
+                                      Alias = attribute.Alias,
+                                      Description = attribute.Description,
+                                      Icon = attribute.IconUrl,
+                                      Thumbnail = attribute.Thumbnail,
+                                      Name = string.IsNullOrEmpty(attribute.Name)
+                                                 ? modelType.Name.SplitPascalCasing()
+                                                 : attribute.Name,
+                                      AllowedContentTypes = children,
+                                      AllowedTemplates = templates
+                                  };
+
+            return new Lazy&lt;IContentType&gt;(() =&gt; contentType);
+        }
+
+        /// &lt;summary&gt;
+        /// Convention to resolve referenced templates
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;templateNames&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private static IEnumerable&lt;ITemplate&gt; AllowedTemplatesConvention(IEnumerable&lt;string&gt; templateNames)
+        {
+            var templates = new List&lt;ITemplate&gt;();
+            var engine = UmbracoConfig.For.UmbracoSettings().Templates.DefaultRenderingEngine;
+            foreach (var templateName in templateNames)
+            {
+                var @alias = engine == RenderingEngine.Mvc
+                               ? templateName.Replace(&quot;.cshtml&quot;, &quot;&quot;).Replace(&quot;.vbhtml&quot;, &quot;&quot;)
+                               : templateName.Replace(&quot;.masterpage&quot;, &quot;&quot;);
+
+				var template = ApplicationContext.Current.Services.FileService.GetTemplate(@alias);
+                if(template == null)
+                {
+                    var name = engine == RenderingEngine.Mvc
+                               ? string.Concat(@alias, &quot;.cshtml&quot;)
+                               : string.Concat(@alias, &quot;.masterpage&quot;);
+
+                    template = new Template(string.Empty, name, @alias) { Content = string.Empty};
+					ApplicationContext.Current.Services.FileService.SaveTemplate(template);
+                }
+                templates.Add(template);
+            }
+            return templates;
+        }
+
+        /// &lt;summary&gt;
+        /// Convention to resolve referenced child content types
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;types&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;currentType&quot;&gt; &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private static IEnumerable&lt;ContentTypeSort&gt; AllowedChildContentTypesConvention(IEnumerable&lt;Type&gt; types, Type currentType)
+        {
+            var contentTypeSorts = new List&lt;ContentTypeSort&gt;();
+            int order = 0;
+            foreach (var type in types)
+            {
+                if(type == currentType) continue;//If the referenced type is equal to the current type we skip it to avoid a circular dependency
+
+                
+                var isResolved = _contentTypeCache.ContainsKey(type.FullName);
+                var lazy = isResolved ? _contentTypeCache[type.FullName].ContentType : GetContentTypeDefinition(type);
+                var contentTypeSort = new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; lazy.Value.Id), order, lazy.Value.Alias);
+                contentTypeSorts.Add(contentTypeSort);
+                order++;
+            }
+            return contentTypeSorts;
+        }
+
+        /// &lt;summary&gt;
+        /// Convention that converts a simple POCO to an initial ContentType
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;modelType&quot;&gt;Type of the object to map to a &lt;see cref=&quot;IContentType&quot;/&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;existing&quot;&gt; &lt;/param&gt;
+        /// &lt;returns&gt;A Lazy &lt;see cref=&quot;IContentType&quot;/&gt;&lt;/returns&gt;
+        private static Lazy&lt;IContentType&gt; PlainPocoConvention(Type modelType, IContentType existing)
+        {
+            if(existing != null)
+                return new Lazy&lt;IContentType&gt;(() =&gt; existing);
+
+            var contentType = new ContentType(-1)
+                                  {
+                                      Alias = modelType.Name.ToUmbracoAlias(),
+                                      Description = string.Empty,
+                                      Icon = &quot;folder.gif&quot;,
+                                      Thumbnail = &quot;folder.png&quot;,
+                                      Name = modelType.Name.SplitPascalCasing(),
+                                      AllowedTemplates = new List&lt;ITemplate&gt;(),
+                                      AllowedContentTypes = new List&lt;ContentTypeSort&gt;()
+                                  };
+
+            return new Lazy&lt;IContentType&gt;(() =&gt; contentType);
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[17,9,17,142,1],[20,9,20,10,1],[22,13,22,146,1],[23,13,23,51,1],[24,13,24,26,1],[25,13,25,14,1],[26,17,26,93,1],[27,17,29,77,1],[30,13,30,14,1],[32,13,32,89,1],[33,13,33,128,1],[35,13,35,116,1],[37,13,39,117,1],[42,13,42,66,1],[44,13,44,62,1],[45,13,45,27,1],[46,13,46,164,1],[47,13,47,20,1],[47,22,47,38,1],[47,39,47,41,1],[47,42,47,55,1],[48,13,48,14,1],[49,17,49,108,1],[50,17,52,86,1],[55,17,55,58,1],[56,17,56,18,1],[57,21,57,137,1],[58,17,58,18,1],[60,17,60,67,1],[61,17,61,18,1],[62,21,62,69,1],[63,17,63,18,1],[66,17,66,60,1],[67,17,67,18,1],[68,21,68,88,1],[69,21,69,108,1],[70,21,70,106,1],[71,17,71,18,1],[74,17,74,66,1],[75,17,75,18,1],[76,21,76,100,1],[77,21,79,65,1],[80,17,80,18,1],[83,17,83,54,1],[84,17,84,18,1],[85,21,85,96,1],[86,21,86,102,1],[87,17,87,18,1],[89,17,89,45,1],[90,17,90,25,1],[91,13,91,14,1],[94,13,94,64,1],[94,64,94,79,1],[94,79,94,81,1],[94,13,94,81,1],[95,13,95,20,1],[95,22,95,41,1],[95,42,95,44,1],[95,45,95,61,1],[96,13,96,14,1],[97,17,97,108,1],[98,17,98,41,1],[99,17,99,18,1],[100,21,100,98,1],[101,21,101,73,1],[102,17,102,18,1],[103,13,103,14,1],[106,13,106,20,1],[106,22,106,36,1],[106,37,106,39,1],[106,40,106,51,1],[107,13,107,14,1],[108,17,108,73,1],[108,73,108,107,1],[108,107,108,109,1],[108,17,108,109,1],[110,17,110,67,1],[110,68,110,77,0],[112,17,118,42,1],[120,17,120,55,1],[121,13,121,14,1],[124,13,124,26,1],[125,13,125,14,1],[126,17,126,71,1],[126,71,126,86,1],[126,86,126,89,1],[126,17,126,89,1],[127,17,127,64,1],[128,13,128,14,1],[130,13,130,106,1],[131,13,131,51,1],[133,13,133,26,1],[134,13,134,14,1],[135,17,135,54,1],[136,13,136,14,1],[138,13,138,60,1],[139,13,139,14,1],[140,17,140,95,1],[140,95,140,108,1],[140,108,140,111,1],[140,17,140,111,1],[141,13,141,14,1],[144,13,144,29,1],[145,13,145,14,1],[146,17,146,24,1],[146,26,146,35,1],[146,36,146,38,1],[146,39,146,45,1],[147,17,147,18,1],[148,21,148,59,1],[148,60,148,69,1],[150,21,150,51,1],[151,21,151,86,1],[153,21,153,63,1],[155,21,155,41,1],[156,21,156,22,1],[157,25,157,86,1],[158,21,158,22,1],[160,21,160,22,0],[161,25,161,63,0],[162,25,162,86,0],[163,21,163,22,0],[165,21,165,77,1],[166,17,166,18,1],[167,13,167,14,1],[168,13,168,54,1],[169,13,169,80,1],[169,80,169,85,0],[169,85,169,87,1],[169,13,169,87,1],[170,13,170,32,1],[171,9,171,10,1],[175,9,175,10,1],[176,13,176,59,1],[177,13,177,58,1],[180,18,180,27,1],[180,29,180,47,1],[180,49,180,52,1],[181,13,181,14,1],[182,17,182,70,1],[183,13,183,14,1],[186,18,186,27,1],[186,29,186,45,1],[186,47,186,50,1],[187,13,187,14,1],[188,17,188,49,1],[189,17,189,18,1],[190,26,190,35,1],[190,37,190,67,1],[190,69,190,72,1],[191,21,191,22,1],[192,25,193,73,1],[194,21,194,22,1],[195,17,195,18,1],[196,13,196,14,1],[198,13,198,37,1],[199,13,199,27,1],[201,9,201,10,1],[205,9,205,10,1],[206,13,206,56,1],[206,56,206,63,1],[206,63,206,74,1],[206,13,206,74,1],[207,13,207,63,1],[209,4,209,40,1],[210,18,210,27,1],[210,29,210,49,1],[210,51,210,54,1],[211,13,211,14,1],[212,17,212,50,1],[213,17,213,51,1],[214,17,214,42,1],[215,17,215,45,1],[216,21,216,28,1],[216,30,216,38,1],[216,39,216,41,1],[216,42,216,57,1],[217,21,217,22,1],[218,25,218,52,1],[219,21,219,22,1],[220,13,220,14,1],[221,13,221,28,1],[222,13,222,25,1],[223,9,223,10,1],[226,9,226,10,1],[227,13,227,39,1],[228,9,228,10,1],[241,9,241,10,1],[242,13,242,76,1],[243,13,243,64,1],[245,13,245,20,1],[245,22,245,39,1],[245,40,245,42,1],[245,43,245,53,1],[246,13,246,14,1],[247,17,247,85,1],[248,17,248,44,1],[249,17,249,18,1],[250,21,250,57,1],[250,58,250,67,1],[251,21,251,107,1],[252,21,252,146,1],[253,21,253,134,1],[254,21,254,37,1],[255,17,255,18,1],[256,13,256,14,1],[258,13,258,25,1],[259,9,259,10,1],[269,9,269,10,1],[270,13,273,83,1],[275,13,277,90,1],[279,13,279,33,1],[280,13,280,14,0],[281,17,281,36,0],[282,21,282,61,0],[284,17,284,37,0],[285,21,285,59,0],[287,17,287,53,0],[287,53,287,61,0],[287,61,287,63,0],[287,17,287,63,0],[290,13,301,37,1],[303,13,303,49,1],[303,49,303,60,1],[303,60,303,62,1],[303,13,303,62,1],[304,9,304,10,1],[312,9,312,10,1],[313,13,313,51,1],[314,13,314,95,1],[315,13,315,20,1],[315,22,315,38,1],[315,39,315,41,1],[315,42,315,55,1],[316,13,316,14,1],[317,17,319,74,1],[321,5,321,88,1],[322,17,322,37,1],[323,17,323,18,1],[324,21,326,71,1],[328,21,328,99,1],[329,6,329,77,1],[330,17,330,18,1],[331,17,331,41,1],[332,13,332,14,1],[333,13,333,30,1],[334,9,334,10,1],[343,9,343,10,1],[344,13,344,64,1],[345,13,345,27,1],[346,13,346,20,1],[346,22,346,30,1],[346,31,346,33,1],[346,34,346,39,1],[347,13,347,14,1],[348,17,348,40,1],[348,41,348,50,0],[351,17,351,79,1],[352,17,352,119,1],[353,17,353,79,1],[353,79,353,92,1],[353,92,353,120,1],[353,17,353,120,1],[354,17,354,55,1],[355,17,355,25,1],[356,13,356,14,1],[357,13,357,37,1],[358,9,358,10,1],[367,9,367,10,1],[368,13,368,33,1],[369,17,369,53,1],[369,53,369,61,1],[369,61,369,63,1],[369,17,369,63,1],[371,13,380,37,1],[382,13,382,49,1],[382,49,382,60,1],[382,60,382,62,1],[382,13,382,62,1],[383,9,383,10,1]]);
+    </script>
+  </body>
+</html>

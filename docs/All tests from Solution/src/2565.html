@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\SQLCE4Umbraco\SqlCETableUtility.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Text;
+using umbraco.DataLayer.Utility.Table;
+using umbraco.DataLayer;
+using umbraco;
+
+namespace SqlCE4Umbraco
+{
+    /// &lt;summary&gt;
+    /// SQL Server implementation of &lt;see cref=&quot;DefaultTableUtility&amp;lt;S&amp;gt;&quot;/&gt;.
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;The legacy installers are no longer used and will be removed from the codebase in the future&quot;)]
+    public class SqlCETableUtility : DefaultTableUtility&lt;SqlCEHelper&gt;
+    {
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;SqlCETableUtility&quot;/&gt; class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sqlHelper&quot;&gt;The SQL helper.&lt;/param&gt;
+        public SqlCETableUtility(SqlCEHelper sqlHelper)
+            : base(sqlHelper)
+        { }
+
+        #region DefaultTableUtility&lt;SqlCEHelper&gt; members
+
+        /// &lt;summary&gt;
+        /// Gets the table with the specified name.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;name&quot;&gt;The name.&lt;/param&gt;
+        /// &lt;returns&gt;The table, or &lt;c&gt;null&lt;/c&gt; if no table with that name exists.&lt;/returns&gt;
+        public override ITable GetTable(string name)
+        {
+            if (name == null)
+                throw new ArgumentNullException(&quot;name&quot;);
+
+            ITable table = null;
+
+            // get name in correct casing
+            using (var sqlHelper = SqlHelper)
+                name = sqlHelper.ExecuteScalar&lt;string&gt;(&quot;SELECT name FROM sys.tables WHERE name=@name&quot;,
+                                                          sqlHelper.CreateParameter(&quot;name&quot;, name));
+            if (name != null)
+            {
+                table = new DefaultTable(name);
+
+                using (var sqlHelper = SqlHelper)
+                using (IRecordsReader reader = sqlHelper.ExecuteReader(
+                        @&quot;SELECT c.name AS Name, st.name AS DataType, c.max_length, c.is_nullable, c.is_identity
+                          FROM sys.tables AS t
+                            JOIN sys.columns AS c ON t.object_id = c.object_id
+                            JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+                            JOIN sys.types AS ty ON ty.user_type_id = c.user_type_id
+                            JOIN sys.types st ON ty.system_type_id = st.user_type_id
+                          WHERE t.name = @name
+                          ORDER BY c.column_id&quot;, sqlHelper.CreateParameter(&quot;name&quot;, name)))
+                {
+                    while (reader.Read())
+                    {
+                        table.AddField(table.CreateField(reader.GetString(&quot;Name&quot;), GetType(reader)));
+                    }
+                }
+            }
+
+            return table;
+        }
+
+        /// &lt;summary&gt;
+        /// Saves or updates the table.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;table&quot;&gt;The table to be saved.&lt;/param&gt;
+        public override void SaveTable(ITable table)
+        {
+            if (table == null)
+                throw new ArgumentNullException(&quot;table&quot;);
+
+            ITable oldTable = GetTable(table.Name);
+
+            // create the table if it didn&#39;t exist, update fields otherwise
+            if (oldTable == null)
+            {
+                CreateTable(table);
+            }
+            else
+            {
+                foreach (IField field in table)
+                {
+                    // create the field if it did&#39;t exist in the old table
+                    if (oldTable.FindField(field.Name)==null)
+                    {
+                        CreateColumn(table, field);
+                    }
+                }
+            }
+        }
+
+        #endregion
+
+        #region Protected Helper Methods
+
+        /// &lt;summary&gt;
+        /// Creates the table in the data source.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;table&quot;&gt;The table.&lt;/param&gt;
+        protected virtual void CreateTable(ITable table)
+        {
+            Debug.Assert(table != null);
+
+            // create enumerator and check for first field
+            IEnumerator&lt;IField&gt; fieldEnumerator = table.GetEnumerator();
+            bool hasNext = fieldEnumerator.MoveNext();
+            if(!hasNext)
+                throw new ArgumentException(&quot;The table must contain at least one field.&quot;);
+
+            // create query
+            StringBuilder createTableQuery = new StringBuilder();
+            using (var sqlHelper = SqlHelper)
+                createTableQuery.AppendFormat(&quot;CREATE TABLE [{0}] (&quot;, sqlHelper.EscapeString(table.Name));
+
+            // add fields
+            while (hasNext)
+            {
+                // add field name and type
+                IField field = fieldEnumerator.Current;
+                createTableQuery.Append(&#39;[&#39;).Append(field.Name).Append(&#39;]&#39;);
+                createTableQuery.Append(&#39; &#39;).Append(GetDatabaseType(field));
+
+                // append comma if a following field exists
+                hasNext = fieldEnumerator.MoveNext();
+                if (hasNext)
+                {
+                    createTableQuery.Append(&#39;,&#39;);
+                }
+            }
+
+            // close CREATE TABLE x (...) bracket
+            createTableQuery.Append(&#39;)&#39;);
+
+            // execute query
+            try
+            {
+                using (var sqlHelper = SqlHelper)
+                    sqlHelper.ExecuteNonQuery(createTableQuery.ToString());
+            }
+            catch (Exception executeException)
+            {
+                throw new UmbracoException(String.Format(&quot;Could not create table &#39;{0}&#39;.&quot;, table), executeException);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new column in the table.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;table&quot;&gt;The table.&lt;/param&gt;
+        /// &lt;param name=&quot;field&quot;&gt;The field used to create the column.&lt;/param&gt;
+        protected virtual void CreateColumn(ITable table, IField field)
+        {
+            Debug.Assert(table != null &amp;&amp; field != null);
+
+            StringBuilder addColumnQuery = new StringBuilder();
+            using (var sqlHelper = SqlHelper)
+                addColumnQuery.AppendFormat(&quot;ALTER TABLE [{0}] ADD [{1}] {2}&quot;,
+                                        sqlHelper.EscapeString(table.Name),
+                                        sqlHelper.EscapeString(field.Name),
+                                        sqlHelper.EscapeString(GetDatabaseType(field)));
+            try
+            {
+                using (var sqlHelper = SqlHelper)
+                    sqlHelper.ExecuteNonQuery(addColumnQuery.ToString());
+            }
+            catch (Exception executeException)
+            {
+                throw new UmbracoException(String.Format(&quot;Could not create column &#39;{0}&#39; in table &#39;{1}&#39;.&quot;,
+                                                         field, table.Name), executeException);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the .Net type corresponding to the specified database data type.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dataTypeReader&quot;&gt;The data type reader.&lt;/param&gt;
+        /// &lt;returns&gt;The .Net type&lt;/returns&gt;
+        protected virtual Type GetType(IRecordsReader dataTypeReader)
+        {
+            string typeName = dataTypeReader.GetString(&quot;DataType&quot;);
+
+            switch (typeName)
+            {
+                case &quot;bit&quot;:                 return typeof(bool);
+                case &quot;tinyint&quot;:             return typeof(byte);
+                case &quot;datetime&quot;:            return typeof(DateTime);
+                // TODO: return different decimal type according to field precision
+                case &quot;decimal&quot;:             return typeof(decimal);
+                case &quot;uniqueidentifier&quot;:    return typeof(Guid);
+                case &quot;smallint&quot;:            return typeof(Int16);
+                case &quot;int&quot;:                 return typeof(Int32);
+                case &quot;bigint&quot;:              return typeof(Int64);
+                case &quot;nvarchar&quot;:            return typeof(string);
+                default:
+                    throw new ArgumentException(String.Format(&quot;Cannot convert database type &#39;{0}&#39; to a .Net type.&quot;,
+                                                              typeName));
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the database type corresponding to the field, complete with field properties.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;field&quot;&gt;The field.&lt;/param&gt;
+        /// &lt;returns&gt;The database type.&lt;/returns&gt;
+        protected virtual string GetDatabaseType(IField field)
+        {
+            StringBuilder fieldBuilder = new StringBuilder();
+
+            fieldBuilder.Append(GetDatabaseTypeName(field));
+            fieldBuilder.Append(field.HasProperty(FieldProperties.Identity) ? &quot; IDENTITY(1,1)&quot; : String.Empty);
+            fieldBuilder.Append(field.HasProperty(FieldProperties.NotNull) ? &quot; NOT NULL&quot; : &quot; NULL&quot;);
+
+            return fieldBuilder.ToString();
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the name of the database type, without field properties.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;field&quot;&gt;The field.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected virtual string GetDatabaseTypeName(IField field)
+        {
+            switch (field.DataType.FullName)
+            {
+                case &quot;System.Boolean&quot;:  return &quot;bit&quot;;
+                case &quot;System.Byte&quot;:     return &quot;tinyint&quot;;
+                case &quot;System.DateTime&quot;: return &quot;datetime&quot;;
+                case &quot;System.Decimal&quot;:  return &quot;decimal(28)&quot;;
+                case &quot;System.Double&quot;:   return &quot;decimal(15)&quot;;
+                case &quot;System.Single&quot;:   return &quot;decimal(7)&quot;;
+                case &quot;System.Guid&quot;:     return &quot;uniqueidentifier&quot;;
+                case &quot;System.Int16&quot;:    return &quot;smallint&quot;;
+                case &quot;System.Int32&quot;:    return &quot;int&quot;;
+                case &quot;System.Int64&quot;:    return &quot;bigint&quot;;;
+                case &quot;System.String&quot;:
+                    string type = &quot;nvarchar&quot;;
+                    return field.Size == 0 ? type : String.Format(&quot;{0}({1})&quot;, type, field.Size);
+                default:
+                    throw new ArgumentException(String.Format(&quot;Cannot convert &#39;{0}&#39; to a database type.&quot;, field));
+            }
+        }
+
+        #endregion
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,15,22,30,0],[23,9,23,10,0],[23,11,23,12,0],[33,9,33,10,0],[34,13,34,30,0],[35,17,35,57,0],[37,13,37,33,0],[40,20,40,45,0],[41,17,42,100,0],[43,13,43,30,0],[44,13,44,14,0],[45,17,45,48,0],[47,24,47,49,0],[48,24,56,90,0],[57,17,57,18,0],[58,21,58,42,0],[59,21,59,22,0],[60,25,60,102,0],[61,21,61,22,0],[62,17,62,18,0],[63,13,63,14,0],[65,13,65,26,0],[66,9,66,10,0],[73,9,73,10,0],[74,13,74,31,0],[75,17,75,58,0],[77,13,77,52,0],[80,13,80,34,0],[81,13,81,14,0],[82,17,82,36,0],[83,13,83,14,0],[85,13,85,14,0],[86,17,86,24,0],[86,26,86,38,0],[86,39,86,41,0],[86,42,86,47,0],[87,17,87,18,0],[89,21,89,62,0],[90,21,90,22,0],[91,25,91,52,0],[92,21,92,22,0],[93,17,93,18,0],[94,13,94,14,0],[95,9,95,10,0],[106,9,106,10,0],[107,13,107,41,0],[110,13,110,73,0],[111,13,111,55,0],[112,13,112,25,0],[113,17,113,91,0],[116,13,116,66,0],[117,20,117,45,0],[118,17,118,107,0],[121,13,121,28,0],[122,13,122,14,0],[124,17,124,56,0],[125,17,125,77,0],[126,17,126,77,0],[129,17,129,54,0],[130,17,130,29,0],[131,17,131,18,0],[132,21,132,50,0],[133,17,133,18,0],[134,13,134,14,0],[137,13,137,42,0],[141,13,141,14,0],[142,24,142,49,0],[143,21,143,76,0],[144,13,144,14,0],[145,13,145,47,0],[146,13,146,14,0],[147,17,147,117,0],[149,9,149,10,0],[157,9,157,10,0],[158,13,158,58,0],[160,13,160,64,0],[161,20,161,45,0],[162,17,165,89,0],[167,13,167,14,0],[168,24,168,49,0],[169,21,169,74,0],[170,13,170,14,0],[171,13,171,47,0],[172,13,172,14,0],[173,17,174,96,0],[176,9,176,10,0],[184,9,184,10,0],[185,13,185,68,0],[187,13,187,30,0],[189,45,189,65,0],[190,45,190,65,0],[191,45,191,69,0],[193,45,193,68,0],[194,45,194,65,0],[195,45,195,66,0],[196,45,196,66,0],[197,45,197,66,0],[198,45,198,67,0],[200,21,201,74,0],[203,9,203,10,0],[211,9,211,10,0],[212,13,212,62,0],[214,13,214,61,0],[215,13,215,112,0],[216,13,216,101,0],[218,13,218,44,0],[219,9,219,10,0],[227,9,227,10,0],[228,13,228,45,0],[230,41,230,54,0],[231,41,231,58,0],[232,41,232,59,0],[233,41,233,62,0],[234,41,234,62,0],[235,41,235,61,0],[236,41,236,67,0],[237,41,237,59,0],[238,41,238,54,0],[239,41,239,57,0],[241,21,241,46,0],[242,21,242,97,0],[244,21,244,115,0],[246,9,246,10,0]]);
+    </script>
+  </body>
+</html>

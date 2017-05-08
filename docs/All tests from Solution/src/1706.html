@@ -1,0 +1,1200 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\ContentRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Globalization;
+using System.Linq;
+using System.Xml;
+using System.Xml.Linq;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents a repository for doing CRUD operations for &lt;see cref=&quot;IContent&quot;/&gt;
+    /// &lt;/summary&gt;
+    internal class ContentRepository : RecycleBinRepository&lt;int, IContent&gt;, IContentRepository
+    {
+        private readonly IContentTypeRepository _contentTypeRepository;
+        private readonly ITemplateRepository _templateRepository;
+        private readonly ITagRepository _tagRepository;
+        private readonly CacheHelper _cacheHelper;
+        private readonly ContentPreviewRepository&lt;IContent&gt; _contentPreviewRepository;
+        private readonly ContentXmlRepository&lt;IContent&gt; _contentXmlRepository;
+
+        public ContentRepository(IDatabaseUnitOfWork work, CacheHelper cacheHelper, ILogger logger, ISqlSyntaxProvider syntaxProvider, IContentTypeRepository contentTypeRepository, ITemplateRepository templateRepository, ITagRepository tagRepository, IContentSection contentSection)
+            : base(work, cacheHelper, logger, syntaxProvider, contentSection)
+        {
+            if (contentTypeRepository == null) throw new ArgumentNullException(&quot;contentTypeRepository&quot;);
+            if (templateRepository == null) throw new ArgumentNullException(&quot;templateRepository&quot;);
+            if (tagRepository == null) throw new ArgumentNullException(&quot;tagRepository&quot;);
+            _contentTypeRepository = contentTypeRepository;
+            _templateRepository = templateRepository;
+            _tagRepository = tagRepository;
+            _cacheHelper = cacheHelper;
+            _contentPreviewRepository = new ContentPreviewRepository&lt;IContent&gt;(work, CacheHelper.CreateDisabledCacheHelper(), logger, syntaxProvider);
+            _contentXmlRepository = new ContentXmlRepository&lt;IContent&gt;(work, CacheHelper.CreateDisabledCacheHelper(), logger, syntaxProvider);
+
+            EnsureUniqueNaming = true;
+        }
+
+        public bool EnsureUniqueNaming { get; set; }
+
+        #region Overrides of RepositoryBase&lt;IContent&gt;
+
+        protected override IContent PerformGet(int id)
+        {
+            var sql = GetBaseQuery(BaseQueryType.FullSingle)
+                .Where(GetBaseWhereClause(), new { Id = id })
+                .Where&lt;DocumentDto&gt;(x =&gt; x.Newest, SqlSyntax)
+                .OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate, SqlSyntax);
+
+            var dto = Database.Fetch&lt;DocumentDto, ContentVersionDto, ContentDto, NodeDto, DocumentPublishedReadOnlyDto&gt;(SqlSyntax.SelectTop(sql, 1)).FirstOrDefault();
+
+            if (dto == null)
+                return null;
+
+            var content = CreateContentFromDto(dto, sql);
+
+            return content;
+        }
+
+        protected override IEnumerable&lt;IContent&gt; PerformGetAll(params int[] ids)
+        {
+            Func&lt;Sql, Sql&gt; translate = s =&gt;
+            {
+                if (ids.Any())
+                {
+                    s.Where(&quot;umbracoNode.id in (@ids)&quot;, new { ids });
+                }
+                //we only want the newest ones with this method
+                s.Where&lt;DocumentDto&gt;(x =&gt; x.Newest, SqlSyntax);
+                return s;
+            };
+            
+            var sqlBaseFull = GetBaseQuery(BaseQueryType.FullMultiple);
+            var sqlBaseIds = GetBaseQuery(BaseQueryType.Ids);
+
+            return ProcessQuery(translate(sqlBaseFull), new PagingSqlQuery(translate(sqlBaseIds)));
+        }
+
+        protected override IEnumerable&lt;IContent&gt; PerformGetByQuery(IQuery&lt;IContent&gt; query)
+        {
+            var sqlBaseFull = GetBaseQuery(BaseQueryType.FullMultiple);
+            var sqlBaseIds = GetBaseQuery(BaseQueryType.Ids);
+
+            Func&lt;SqlTranslator&lt;IContent&gt;, Sql&gt; translate = (translator) =&gt;
+            {
+                return translator.Translate()
+                    .Where&lt;DocumentDto&gt;(x =&gt; x.Newest, SqlSyntax)
+                    .OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate, SqlSyntax)
+                    .OrderBy&lt;NodeDto&gt;(x =&gt; x.SortOrder, SqlSyntax);
+            };
+
+            var translatorFull = new SqlTranslator&lt;IContent&gt;(sqlBaseFull, query);
+            var translatorIds = new SqlTranslator&lt;IContent&gt;(sqlBaseIds, query);
+
+            return ProcessQuery(translate(translatorFull), new PagingSqlQuery(translate(translatorIds)));
+        }
+
+        #endregion        
+
+        #region Overrides of PetaPocoRepositoryBase&lt;IContent&gt;
+
+        /// &lt;summary&gt;
+        /// Returns the base query to return Content
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;queryType&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Content queries will differ depending on what needs to be returned:
+        /// * FullSingle: When querying for a single document, this will include the Outer join to fetch the content item&#39;s published version info
+        /// * FullMultiple: When querying for multiple documents, this will exclude the Outer join to fetch the content item&#39;s published version info - this info would need to be fetched separately
+        /// * Ids: This would essentially be the same as FullMultiple however the columns specified will only return the Ids for the documents
+        /// * Count: A query to return the count for documents
+        /// &lt;/remarks&gt;
+        protected override Sql GetBaseQuery(BaseQueryType queryType)
+        {
+            var sql = new Sql();
+            sql.Select(queryType == BaseQueryType.Count ? &quot;COUNT(*)&quot; : (queryType == BaseQueryType.Ids ? &quot;cmsDocument.nodeId&quot; : &quot;*&quot;))
+                .From&lt;DocumentDto&gt;(SqlSyntax)
+                .InnerJoin&lt;ContentVersionDto&gt;(SqlSyntax)
+                .On&lt;DocumentDto, ContentVersionDto&gt;(SqlSyntax, left =&gt; left.VersionId, right =&gt; right.VersionId)
+                .InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                .On&lt;ContentVersionDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;ContentDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId);
+            //TODO: IF we want to enable querying on content type information this will need to be joined
+            //.InnerJoin&lt;ContentTypeDto&gt;(SqlSyntax)
+            //.On&lt;ContentDto, ContentTypeDto&gt;(SqlSyntax, left =&gt; left.ContentTypeId, right =&gt; right.NodeId, SqlSyntax);
+
+            if (queryType == BaseQueryType.FullSingle)
+            {
+                //The only reason we apply this left outer join is to be able to pull back the DocumentPublishedReadOnlyDto
+                //information with the entire data set, so basically this will get both the latest document and also it&#39;s published
+                //version if it has one. When performing a count or when retrieving Ids like in paging, this is unecessary 
+                //and causes huge performance overhead for the SQL server, especially when sorting the result. 
+                //We also don&#39;t include this outer join when querying for multiple entities since it is much faster to fetch this information
+                //in a separate query. For a single entity this is ok.
+
+                var sqlx = string.Format(&quot;LEFT OUTER JOIN {0} {1} ON ({1}.{2}={0}.{2} AND {1}.{3}=1)&quot;,
+                SqlSyntax.GetQuotedTableName(&quot;cmsDocument&quot;),
+                SqlSyntax.GetQuotedTableName(&quot;cmsDocument2&quot;),
+                SqlSyntax.GetQuotedColumnName(&quot;nodeId&quot;),
+                SqlSyntax.GetQuotedColumnName(&quot;published&quot;));
+
+                // cannot do this because PetaPoco does not know how to alias the table
+                //.LeftOuterJoin&lt;DocumentPublishedReadOnlyDto&gt;()
+                //.On&lt;DocumentDto, DocumentPublishedReadOnlyDto&gt;(left =&gt; left.NodeId, right =&gt; right.NodeId)
+                // so have to rely on writing our own SQL
+                sql.Append(sqlx /*, new { @published = true }*/);
+            }
+
+            sql.Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId, SqlSyntax);
+
+            return sql;
+        }
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            return GetBaseQuery(isCount ? BaseQueryType.Count : BaseQueryType.FullSingle);
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoNode.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            var list = new List&lt;string&gt;
+                           {
+                               &quot;DELETE FROM umbracoRedirectUrl WHERE contentKey IN (SELECT uniqueID FROM umbracoNode WHERE id = @Id)&quot;,
+                               &quot;DELETE FROM cmsTask WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodeNotify WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoUser2NodePermission WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoRelation WHERE parentId = @Id&quot;,
+                               &quot;DELETE FROM umbracoRelation WHERE childId = @Id&quot;,
+                               &quot;DELETE FROM cmsTagRelationship WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoDomains WHERE domainRootStructureID = @Id&quot;,
+                               &quot;DELETE FROM cmsDocument WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsPropertyData WHERE contentNodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsPreviewXml WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentVersion WHERE ContentId = @Id&quot;,
+                               &quot;DELETE FROM cmsContentXml WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM cmsContent WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoAccess WHERE nodeId = @Id&quot;,
+                               &quot;DELETE FROM umbracoNode WHERE id = @Id&quot;
+                           };
+            return list;
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { return new Guid(Constants.ObjectTypes.Document); }
+        }
+
+        #endregion
+
+        #region Overrides of VersionableRepositoryBase&lt;IContent&gt;
+
+        public void RebuildXmlStructures(Func&lt;IContent, XElement&gt; serializer, int groupSize = 200, IEnumerable&lt;int&gt; contentTypeIds = null)
+        {
+            // the previous way of doing this was to run it all in one big transaction,
+            // and to bulk-insert groups of xml rows - which works, until the transaction
+            // times out - and besides, because v7 transactions are ReadCommited, it does
+            // not bring much safety - so this reverts to updating each record individually,
+            // and it may be slower in the end, but should be more resilient.
+
+            var contentTypeIdsA = contentTypeIds == null ? new int[0] : contentTypeIds.ToArray();
+
+            Func&lt;int, Sql, Sql&gt; translate = (bId, sql) =&gt;
+            {
+                if (contentTypeIdsA.Length &gt; 0)
+                {
+                    sql.WhereIn&lt;ContentDto&gt;(x =&gt; x.ContentTypeId, contentTypeIdsA, SqlSyntax);
+                }
+
+                sql
+                    .Where&lt;NodeDto&gt;(x =&gt; x.NodeId &gt; bId &amp;&amp; x.Trashed == false, SqlSyntax)
+                    .Where&lt;DocumentDto&gt;(x =&gt; x.Published, SqlSyntax)
+                    .OrderBy&lt;NodeDto&gt;(x =&gt; x.NodeId, SqlSyntax);
+
+                return sql;
+            };
+
+            var baseId = 0;
+            
+            while (true)
+            {
+                // get the next group of nodes
+                var sqlFull = translate(baseId, GetBaseQuery(BaseQueryType.FullMultiple));
+                var sqlIds = translate(baseId, GetBaseQuery(BaseQueryType.Ids));
+
+                var xmlItems = ProcessQuery(SqlSyntax.SelectTop(sqlFull, groupSize), new PagingSqlQuery(SqlSyntax.SelectTop(sqlIds, groupSize)))
+                    .Select(x =&gt; new ContentXmlDto { NodeId = x.Id, Xml = serializer(x).ToString() })
+                    .ToList();
+
+                // no more nodes, break
+                if (xmlItems.Count == 0) break;
+
+                foreach (var xmlItem in xmlItems)
+                {
+                    try
+                    {
+                        // should happen in most cases, then it tries to insert, and it should work
+                        // unless the node has been deleted, and we just report the exception
+                        Database.InsertOrUpdate(xmlItem);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.Error&lt;MediaRepository&gt;(&quot;Could not rebuild XML for nodeId=&quot; + xmlItem.NodeId, e);
+                    }
+                }
+                baseId = xmlItems[xmlItems.Count - 1].NodeId;
+            }
+
+            //now delete the items that shouldn&#39;t be there
+            var sqlAllIds = translate(0, GetBaseQuery(BaseQueryType.Ids));
+            var allContentIds = Database.Fetch&lt;int&gt;(sqlAllIds);
+            var docObjectType = Guid.Parse(Constants.ObjectTypes.Document);
+            var xmlIdsQuery = new Sql()
+                .Select(&quot;DISTINCT cmsContentXml.nodeId&quot;)
+                .From&lt;ContentXmlDto&gt;(SqlSyntax)
+                .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+                .On&lt;ContentXmlDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId);
+
+            if (contentTypeIdsA.Length &gt; 0)
+            {
+                xmlIdsQuery.InnerJoin&lt;ContentDto&gt;(SqlSyntax)
+                    .On&lt;ContentDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                    .InnerJoin&lt;ContentTypeDto&gt;(SqlSyntax)
+                    .On&lt;ContentTypeDto, ContentDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.ContentTypeId)
+                    .WhereIn&lt;ContentDto&gt;(x =&gt; x.ContentTypeId, contentTypeIdsA, SqlSyntax);
+            }
+
+            xmlIdsQuery.Where&lt;NodeDto&gt;(dto =&gt; dto.NodeObjectType == docObjectType, SqlSyntax);
+            
+            var allXmlIds = Database.Fetch&lt;int&gt;(xmlIdsQuery);
+
+            var toRemove = allXmlIds.Except(allContentIds).ToArray();
+            if (toRemove.Length &gt; 0)
+            {
+                foreach (var idGroup in toRemove.InGroupsOf(2000))
+                {
+                    Database.Execute(&quot;DELETE FROM cmsContentXml WHERE nodeId IN (@ids)&quot;, new { ids = idGroup });
+                }                
+            }
+                
+        }
+
+        public override IEnumerable&lt;IContent&gt; GetAllVersions(int id)
+        {
+            Func&lt;Sql, Sql&gt; translate = s =&gt;
+            {
+                return s.Where(GetBaseWhereClause(), new {Id = id})
+                    .OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate, SqlSyntax);
+            };
+
+            var sqlFull = translate(GetBaseQuery(BaseQueryType.FullMultiple));
+            var sqlIds = translate(GetBaseQuery(BaseQueryType.Ids));
+            
+            return ProcessQuery(sqlFull, new PagingSqlQuery(sqlIds), true,  includeAllVersions:true);
+        }
+
+        public override IContent GetByVersion(Guid versionId)
+        {
+            var sql = GetBaseQuery(BaseQueryType.FullSingle);
+            //TODO: cmsContentVersion.VersionId has a Unique Index constraint applied, seems silly then to also add OrderByDescending since it would be impossible to return more than one.
+            sql.Where(&quot;cmsContentVersion.VersionId = @VersionId&quot;, new { VersionId = versionId });
+            sql.OrderByDescending&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate, SqlSyntax);
+
+            var dto = Database.Fetch&lt;DocumentDto, ContentVersionDto, ContentDto, NodeDto, DocumentPublishedReadOnlyDto&gt;(sql).FirstOrDefault();
+
+            if (dto == null)
+                return null;
+
+            var content = CreateContentFromDto(dto, sql);
+
+            return content;
+        }
+
+        public override void DeleteVersion(Guid versionId)
+        {
+            var sql = new Sql()
+                .Select(&quot;*&quot;)
+                .From&lt;DocumentDto&gt;(SqlSyntax)
+                .InnerJoin&lt;ContentVersionDto&gt;(SqlSyntax)
+                .On&lt;ContentVersionDto, DocumentDto&gt;(SqlSyntax, left =&gt; left.VersionId, right =&gt; right.VersionId)
+                .Where&lt;ContentVersionDto&gt;(x =&gt; x.VersionId == versionId, SqlSyntax)
+                .Where&lt;DocumentDto&gt;(x =&gt; x.Newest != true, SqlSyntax);
+            var dto = Database.Fetch&lt;DocumentDto, ContentVersionDto&gt;(sql).FirstOrDefault();
+
+            if (dto == null) return;
+
+            using (var transaction = Database.GetTransaction())
+            {
+                PerformDeleteVersion(dto.NodeId, versionId);
+
+                transaction.Complete();
+            }
+        }
+
+        public override void DeleteVersions(int id, DateTime versionDate)
+        {
+            var sql = new Sql()
+                .Select(&quot;*&quot;)
+                .From&lt;DocumentDto&gt;()
+                .InnerJoin&lt;ContentVersionDto&gt;()
+                .On&lt;ContentVersionDto, DocumentDto&gt;(left =&gt; left.VersionId, right =&gt; right.VersionId)
+                .Where&lt;ContentVersionDto&gt;(x =&gt; x.NodeId == id)
+                .Where&lt;ContentVersionDto&gt;(x =&gt; x.VersionDate &lt; versionDate)
+                .Where&lt;DocumentDto&gt;(x =&gt; x.Newest != true);
+            var list = Database.Fetch&lt;DocumentDto, ContentVersionDto&gt;(sql);
+            if (list.Any() == false) return;
+
+            using (var transaction = Database.GetTransaction())
+            {
+                foreach (var dto in list)
+                {
+                    PerformDeleteVersion(id, dto.VersionId);
+                }
+
+                transaction.Complete();
+            }
+        }
+
+        protected override void PerformDeleteVersion(int id, Guid versionId)
+        {
+            Database.Delete&lt;PreviewXmlDto&gt;(&quot;WHERE nodeId = @Id AND versionId = @VersionId&quot;, new { Id = id, VersionId = versionId });
+            Database.Delete&lt;PropertyDataDto&gt;(&quot;WHERE contentNodeId = @Id AND versionId = @VersionId&quot;, new { Id = id, VersionId = versionId });
+            Database.Delete&lt;ContentVersionDto&gt;(&quot;WHERE ContentId = @Id AND VersionId = @VersionId&quot;, new { Id = id, VersionId = versionId });
+            Database.Delete&lt;DocumentDto&gt;(&quot;WHERE nodeId = @Id AND versionId = @VersionId&quot;, new { Id = id, VersionId = versionId });
+        }
+
+        #endregion
+
+        #region Unit of Work Implementation
+
+        protected override void PersistDeletedItem(IContent entity)
+        {
+            //We need to clear out all access rules but we need to do this in a manual way since 
+            // nothing in that table is joined to a content id
+            var subQuery = new Sql()
+                .Select(&quot;umbracoAccessRule.accessId&quot;)
+                .From&lt;AccessRuleDto&gt;(SqlSyntax)
+                .InnerJoin&lt;AccessDto&gt;(SqlSyntax)
+                .On&lt;AccessRuleDto, AccessDto&gt;(SqlSyntax, left =&gt; left.AccessId, right =&gt; right.Id)
+                .Where&lt;AccessDto&gt;(dto =&gt; dto.NodeId == entity.Id);
+            Database.Execute(SqlSyntax.GetDeleteSubquery(&quot;umbracoAccessRule&quot;, &quot;accessId&quot;, subQuery));
+
+            //now let the normal delete clauses take care of everything else
+            base.PersistDeletedItem(entity);
+        }
+
+        protected override void PersistNewItem(IContent entity)
+        {
+            ((Content)entity).AddingEntity();
+
+            //ensure the default template is assigned
+            if (entity.Template == null)
+            {
+                entity.Template = entity.ContentType.DefaultTemplate;
+            }
+
+            //Ensure unique name on the same level
+            entity.Name = EnsureUniqueNodeName(entity.ParentId, entity.Name);
+
+            //Ensure that strings don&#39;t contain characters that are invalid in XML
+            entity.SanitizeEntityPropertiesForXmlStorage();
+
+            var factory = new ContentFactory(NodeObjectTypeId, entity.Id);
+            var dto = factory.BuildDto(entity);
+
+            //NOTE Should the logic below have some kind of fallback for empty parent ids ?
+            //Logic for setting Path, Level and SortOrder
+            var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = entity.ParentId });
+            var level = parent.Level + 1;
+            var maxSortOrder = Database.ExecuteScalar&lt;int&gt;(
+                &quot;SELECT coalesce(max(sortOrder),-1) FROM umbracoNode WHERE parentid = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                new { /*ParentId =*/ entity.ParentId, NodeObjectType = NodeObjectTypeId });
+            var sortOrder = maxSortOrder + 1;
+
+            //Create the (base) node data - umbracoNode
+            var nodeDto = dto.ContentVersionDto.ContentDto.NodeDto;
+            nodeDto.Path = parent.Path;
+            nodeDto.Level = short.Parse(level.ToString(CultureInfo.InvariantCulture));
+            nodeDto.SortOrder = sortOrder;
+            var o = Database.IsNew(nodeDto) ? Convert.ToInt32(Database.Insert(nodeDto)) : Database.Update(nodeDto);
+
+            //Update with new correct path
+            nodeDto.Path = string.Concat(parent.Path, &quot;,&quot;, nodeDto.NodeId);
+            nodeDto.ValidatePathWithException();
+            Database.Update(nodeDto);
+
+            //Update entity with correct values
+            entity.Id = nodeDto.NodeId; //Set Id on entity to ensure an Id is set
+            entity.Path = nodeDto.Path;
+            entity.SortOrder = sortOrder;
+            entity.Level = level;
+
+            //Assign the same permissions to it as the parent node
+            // http://issues.umbraco.org/issue/U4-2161     
+            var permissionsRepo = new PermissionRepository&lt;IContent&gt;(UnitOfWork, _cacheHelper, SqlSyntax);
+            var parentPermissions = permissionsRepo.GetPermissionsForEntity(entity.ParentId).ToArray();
+            //if there are parent permissions then assign them, otherwise leave null and permissions will become the
+            // user&#39;s default permissions.
+            if (parentPermissions.Any())
+            {
+                var userPermissions = (
+                    from perm in parentPermissions
+                    from p in perm.AssignedPermissions
+                    select new EntityPermissionSet.UserPermission(perm.UserId, p)).ToList();
+
+                permissionsRepo.ReplaceEntityPermissions(new EntityPermissionSet(entity.Id, userPermissions));
+                //flag the entity&#39;s permissions changed flag so we can track those changes.
+                //Currently only used for the cache refreshers to detect if we should refresh all user permissions cache.
+                ((Content)entity).PermissionsChanged = true;
+            }
+
+            //Create the Content specific data - cmsContent
+            var contentDto = dto.ContentVersionDto.ContentDto;
+            contentDto.NodeId = nodeDto.NodeId;
+            Database.Insert(contentDto);
+
+            //Create the first version - cmsContentVersion
+            //Assumes a new Version guid and Version date (modified date) has been set
+            var contentVersionDto = dto.ContentVersionDto;
+            contentVersionDto.NodeId = nodeDto.NodeId;
+            Database.Insert(contentVersionDto);
+
+            //Create the Document specific data for this version - cmsDocument
+            //Assumes a new Version guid has been generated
+            dto.NodeId = nodeDto.NodeId;
+            Database.Insert(dto);
+
+            //Create the PropertyData for this version - cmsPropertyData
+            var propertyFactory = new PropertyFactory(entity.ContentType.CompositionPropertyTypes.ToArray(), entity.Version, entity.Id);
+            var propertyDataDtos = propertyFactory.BuildDto(entity.Properties);
+            var keyDictionary = new Dictionary&lt;int, int&gt;();
+
+            //Add Properties
+            foreach (var propertyDataDto in propertyDataDtos)
+            {
+                var primaryKey = Convert.ToInt32(Database.Insert(propertyDataDto));
+                keyDictionary.Add(propertyDataDto.PropertyTypeId, primaryKey);
+            }
+
+            //Update Properties with its newly set Id
+            foreach (var property in entity.Properties)
+            {
+                property.Id = keyDictionary[property.PropertyTypeId];
+            }
+
+            //lastly, check if we are a creating a published version , then update the tags table
+            if (entity.Published)
+            {
+                UpdatePropertyTags(entity, _tagRepository);
+            }
+
+            // published =&gt; update published version infos, else leave it blank
+            if (entity.Published)
+            {
+                dto.DocumentPublishedReadOnlyDto = new DocumentPublishedReadOnlyDto
+                {
+                    VersionId = dto.VersionId,
+                    VersionDate = dto.UpdateDate,
+                    Newest = true,
+                    NodeId = dto.NodeId,
+                    Published = true               
+                };
+                ((Content) entity).PublishedVersionGuid = dto.VersionId;
+                ((Content) entity).PublishedDate = dto.UpdateDate;
+            }
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(IContent entity)
+        {
+            var publishedState = ((Content)entity).PublishedState;
+
+            //check if we need to make any database changes at all
+            if (entity.RequiresSaving(publishedState) == false)
+            {
+                entity.ResetDirtyProperties();
+                return;
+            }
+
+            //check if we need to create a new version
+            bool shouldCreateNewVersion = entity.ShouldCreateNewVersion(publishedState);
+            if (shouldCreateNewVersion)
+            {
+                //Updates Modified date and Version Guid
+                ((Content)entity).UpdatingEntity();
+            }
+            else
+            {
+                entity.UpdateDate = DateTime.Now;
+            }
+
+            //Ensure unique name on the same level
+            entity.Name = EnsureUniqueNodeName(entity.ParentId, entity.Name, entity.Id);
+
+            //Ensure that strings don&#39;t contain characters that are invalid in XML
+            entity.SanitizeEntityPropertiesForXmlStorage();
+
+            //Look up parent to get and set the correct Path and update SortOrder if ParentId has changed
+            if (entity.IsPropertyDirty(&quot;ParentId&quot;))
+            {
+                var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = entity.ParentId });
+                entity.Path = string.Concat(parent.Path, &quot;,&quot;, entity.Id);
+                entity.Level = parent.Level + 1;
+                var maxSortOrder =
+                    Database.ExecuteScalar&lt;int&gt;(
+                        &quot;SELECT coalesce(max(sortOrder),0) FROM umbracoNode WHERE parentid = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                        new { ParentId = entity.ParentId, NodeObjectType = NodeObjectTypeId });
+                entity.SortOrder = maxSortOrder + 1;
+
+                //Question: If we move a node, should we update permissions to inherit from the new parent if the parent has permissions assigned?
+                // if we do that, then we&#39;d need to propogate permissions all the way downward which might not be ideal for many people.
+                // Gonna just leave it as is for now, and not re-propogate permissions.
+            }
+
+            var factory = new ContentFactory(NodeObjectTypeId, entity.Id);
+            //Look up Content entry to get Primary for updating the DTO
+            var contentDto = Database.SingleOrDefault&lt;ContentDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = entity.Id });
+            factory.SetPrimaryKey(contentDto.PrimaryKey);
+            var dto = factory.BuildDto(entity);
+
+            //Updates the (base) node data - umbracoNode
+            var nodeDto = dto.ContentVersionDto.ContentDto.NodeDto;
+            nodeDto.ValidatePathWithException();
+            var o = Database.Update(nodeDto);
+
+            //Only update this DTO if the contentType has actually changed
+            if (contentDto.ContentTypeId != entity.ContentTypeId)
+            {
+                //Create the Content specific data - cmsContent
+                var newContentDto = dto.ContentVersionDto.ContentDto;
+                Database.Update(newContentDto);
+            }
+
+            //a flag that we&#39;ll use later to create the tags in the tag db table
+            var publishedStateChanged = false;
+
+            //If Published state has changed then previous versions should have their publish state reset.
+            //If state has been changed to unpublished the previous versions publish state should also be reset.
+            //if (((ICanBeDirty)entity).IsPropertyDirty(&quot;Published&quot;) &amp;&amp; (entity.Published || publishedState == PublishedState.Unpublished))
+            if (entity.ShouldClearPublishedFlagForPreviousVersions(publishedState, shouldCreateNewVersion))
+            {
+                //TODO: This perf can be improved, it could easily be UPDATE WHERE.... (one SQL call instead of many)
+                var publishedDocs = Database.Fetch&lt;DocumentDto&gt;(&quot;WHERE nodeId = @Id AND published = @IsPublished&quot;, new { Id = entity.Id, IsPublished = true });
+                foreach (var doc in publishedDocs)
+                {
+                    var docDto = doc;
+                    docDto.Published = false;
+                    Database.Update(docDto);
+                }
+
+                //this is a newly published version so we&#39;ll update the tags table too (end of this method)
+                publishedStateChanged = true;
+            }
+
+            //Look up (newest) entries by id in cmsDocument table to set newest = false
+            //TODO: This perf can be improved, it could easily be UPDATE WHERE.... (one SQL call instead of many)
+            var documentDtos = Database.Fetch&lt;DocumentDto&gt;(&quot;WHERE nodeId = @Id AND newest = @IsNewest&quot;, new { Id = entity.Id, IsNewest = true });
+            foreach (var documentDto in documentDtos)
+            {
+                var docDto = documentDto;
+                docDto.Newest = false;
+                Database.Update(docDto);
+            }
+
+            var contentVersionDto = dto.ContentVersionDto;
+            if (shouldCreateNewVersion)
+            {
+                //Create a new version - cmsContentVersion
+                //Assumes a new Version guid and Version date (modified date) has been set
+                Database.Insert(contentVersionDto);
+                //Create the Document specific data for this version - cmsDocument
+                //Assumes a new Version guid has been generated
+                Database.Insert(dto);
+            }
+            else
+            {
+                //In order to update the ContentVersion we need to retrieve its primary key id
+                var contentVerDto = Database.SingleOrDefault&lt;ContentVersionDto&gt;(&quot;WHERE VersionId = @Version&quot;, new { Version = entity.Version });
+                contentVersionDto.Id = contentVerDto.Id;
+
+                Database.Update(contentVersionDto);
+                Database.Update(dto);
+            }
+
+            //Create the PropertyData for this version - cmsPropertyData
+            var propertyFactory = new PropertyFactory(entity.ContentType.CompositionPropertyTypes.ToArray(), entity.Version, entity.Id);
+            var propertyDataDtos = propertyFactory.BuildDto(entity.Properties);
+            var keyDictionary = new Dictionary&lt;int, int&gt;();
+
+            //Add Properties
+            foreach (var propertyDataDto in propertyDataDtos)
+            {
+                if (shouldCreateNewVersion == false &amp;&amp; propertyDataDto.Id &gt; 0)
+                {
+                    Database.Update(propertyDataDto);
+                }
+                else
+                {
+                    int primaryKey = Convert.ToInt32(Database.Insert(propertyDataDto));
+                    keyDictionary.Add(propertyDataDto.PropertyTypeId, primaryKey);
+                }
+            }
+
+            //Update Properties with its newly set Id
+            if (keyDictionary.Any())
+            {
+                foreach (var property in entity.Properties)
+                {
+                    if (keyDictionary.ContainsKey(property.PropertyTypeId) == false) continue;
+
+                    property.Id = keyDictionary[property.PropertyTypeId];
+                }
+            }
+
+            //lastly, check if we are a newly published version and then update the tags table
+            if (publishedStateChanged &amp;&amp; entity.Published)
+            {
+                UpdatePropertyTags(entity, _tagRepository);
+            }
+            else if (publishedStateChanged &amp;&amp; (entity.Trashed || entity.Published == false))
+            {
+                //it&#39;s in the trash or not published remove all entity tags
+                ClearEntityTags(entity, _tagRepository);
+            }
+
+            // published =&gt; update published version infos,
+            // else if unpublished then clear published version infos
+            if (entity.Published)
+            {
+                dto.DocumentPublishedReadOnlyDto = new DocumentPublishedReadOnlyDto
+                {
+                    VersionId = dto.VersionId,
+                    VersionDate = dto.UpdateDate,
+                    Newest = true,
+                    NodeId = dto.NodeId,
+                    Published = true
+                };
+                ((Content) entity).PublishedVersionGuid = dto.VersionId;
+                ((Content) entity).PublishedDate = dto.UpdateDate;
+            }
+            else if (publishedStateChanged)
+            {
+                dto.DocumentPublishedReadOnlyDto = new DocumentPublishedReadOnlyDto
+                {
+                    VersionId = default (Guid),
+                    VersionDate = default (DateTime),
+                    Newest = false,
+                    NodeId = dto.NodeId,
+                    Published = false
+                };
+                ((Content) entity).PublishedVersionGuid = default(Guid);
+                ((Content) entity).PublishedDate = default (DateTime);
+            }
+
+            entity.ResetDirtyProperties();
+        }
+
+
+        #endregion
+
+        #region Implementation of IContentRepository
+
+        public IEnumerable&lt;IContent&gt; GetByPublishedVersion(IQuery&lt;IContent&gt; query)
+        {
+            Func&lt;SqlTranslator&lt;IContent&gt;, Sql&gt; translate = t =&gt;
+            {
+                return t.Translate()
+                    .Where&lt;DocumentDto&gt;(x =&gt; x.Published, SqlSyntax)
+                    .OrderBy&lt;NodeDto&gt;(x =&gt; x.Level, SqlSyntax)
+                    .OrderBy&lt;NodeDto&gt;(x =&gt; x.SortOrder, SqlSyntax);
+            };
+
+            // we WANT to return contents in top-down order, ie parents should come before children
+            // ideal would be pure xml &quot;document order&quot; which can be achieved with:
+            // ORDER BY substring(path, 1, len(path) - charindex(&#39;,&#39;, reverse(path))), sortOrder
+            // but that&#39;s probably an overkill - sorting by level,sortOrder should be enough
+
+            var sqlFull = GetBaseQuery(BaseQueryType.FullMultiple);
+            var translatorFull = new SqlTranslator&lt;IContent&gt;(sqlFull, query);
+            var sqlIds = GetBaseQuery(BaseQueryType.Ids);
+            var translatorIds = new SqlTranslator&lt;IContent&gt;(sqlIds, query);
+
+            return ProcessQuery(translate(translatorFull), new PagingSqlQuery(translate(translatorIds)), true);
+        }
+        
+        /// &lt;summary&gt;
+        /// This builds the Xml document used for the XML cache
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public XmlDocument BuildXmlCache()
+        {
+            //TODO: This is what we should do , but converting to use XDocument would be breaking unless we convert
+            // to XmlDocument at the end of this, but again, this would be bad for memory... though still not nearly as
+            // bad as what is happening before!
+            // We&#39;ll keep using XmlDocument for now though, but XDocument xml generation is much faster:
+            // https://blogs.msdn.microsoft.com/codejunkie/2008/10/08/xmldocument-vs-xelement-performance/
+            // I think we already have code in here to convert XDocument to XmlDocument but in case we don&#39;t here
+            // it is: https://blogs.msdn.microsoft.com/marcelolr/2009/03/13/fast-way-to-convert-xmldocument-into-xdocument/
+
+            //// Prepare an XmlDocument with an appropriate inline DTD to match
+            //// the expected content
+            //var parent = new XElement(&quot;root&quot;, new XAttribute(&quot;id&quot;, &quot;-1&quot;));
+            //var xmlDoc = new XDocument(
+            //    new XDocumentType(&quot;root&quot;, null, null, DocumentType.GenerateDtd()),
+            //    parent);
+
+            var xmlDoc = new XmlDocument();
+            var doctype = xmlDoc.CreateDocumentType(&quot;root&quot;, null, null,
+                ApplicationContext.Current.Services.ContentTypeService.GetContentTypesDtd());
+            xmlDoc.AppendChild(doctype);
+            var parent = xmlDoc.CreateElement(&quot;root&quot;);
+            var pIdAtt = xmlDoc.CreateAttribute(&quot;id&quot;);
+            pIdAtt.Value = &quot;-1&quot;;
+            parent.Attributes.Append(pIdAtt);
+            xmlDoc.AppendChild(parent);
+
+            //Ensure that only nodes that have published versions are selected
+            var sql = string.Format(@&quot;select umbracoNode.id, umbracoNode.parentID, umbracoNode.sortOrder, cmsContentXml.{0}, umbracoNode.{1} from umbracoNode
+inner join cmsContentXml on cmsContentXml.nodeId = umbracoNode.id and umbracoNode.nodeObjectType = @type
+where umbracoNode.id in (select cmsDocument.nodeId from cmsDocument where cmsDocument.published = 1)
+order by umbracoNode.{2}, umbracoNode.parentID, umbracoNode.sortOrder&quot;,
+                SqlSyntax.GetQuotedColumnName(&quot;xml&quot;),
+                SqlSyntax.GetQuotedColumnName(&quot;level&quot;),
+                SqlSyntax.GetQuotedColumnName(&quot;level&quot;));
+
+            XmlElement last = null;
+
+            //NOTE: Query creates a reader - does not load all into memory
+            foreach (var row in Database.Query&lt;dynamic&gt;(sql, new { type = new Guid(Constants.ObjectTypes.Document) }))
+            {
+                string parentId = ((int)row.parentID).ToInvariantString();
+                string xml = row.xml;
+                int sortOrder = row.sortOrder;
+
+                //if the parentid is changing
+                if (last != null &amp;&amp; last.GetAttribute(&quot;parentID&quot;) != parentId)
+                {
+                    parent = xmlDoc.GetElementById(parentId);
+                    if (parent == null)
+                    {
+                        //Need to short circuit here, if the parent is not there it means that the parent is unpublished
+                        // and therefore the child is not published either so cannot be included in the xml cache
+                        continue;
+                    }
+                }
+
+                var xmlDocFragment = xmlDoc.CreateDocumentFragment();
+                xmlDocFragment.InnerXml = xml;
+
+                last = (XmlElement)parent.AppendChild(xmlDocFragment);
+
+                // fix sortOrder - see notes in UpdateSortOrder
+                last.Attributes[&quot;sortOrder&quot;].Value = sortOrder.ToInvariantString();
+            }
+
+            return xmlDoc;
+
+        }
+
+        public int CountPublished()
+        {
+            var sql = GetBaseQuery(true).Where&lt;NodeDto&gt;(x =&gt; x.Trashed == false)
+                .Where&lt;DocumentDto&gt;(x =&gt; x.Published == true);
+            return Database.ExecuteScalar&lt;int&gt;(sql);
+        }
+
+        public void ReplaceContentPermissions(EntityPermissionSet permissionSet)
+        {
+            var repo = new PermissionRepository&lt;IContent&gt;(UnitOfWork, _cacheHelper, SqlSyntax);
+            repo.ReplaceEntityPermissions(permissionSet);
+        }
+
+        public void ClearPublished(IContent content)
+        {
+            var sql = &quot;UPDATE cmsDocument SET published=0 WHERE nodeId=@id AND published=1&quot;;
+            Database.Execute(sql, new {id = content.Id});
+        }
+
+        /// &lt;summary&gt;
+        /// Assigns a single permission to the current content item for the specified user ids
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;permission&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userIds&quot;&gt;&lt;/param&gt;        
+        public void AssignEntityPermission(IContent entity, char permission, IEnumerable&lt;int&gt; userIds)
+        {
+            var repo = new PermissionRepository&lt;IContent&gt;(UnitOfWork, _cacheHelper, SqlSyntax);
+            repo.AssignEntityPermission(entity, permission, userIds);
+        }
+
+        public IEnumerable&lt;EntityPermission&gt; GetPermissionsForEntity(int entityId)
+        {
+            var repo = new PermissionRepository&lt;IContent&gt;(UnitOfWork, _cacheHelper, SqlSyntax);
+            return repo.GetPermissionsForEntity(entityId);
+        }
+
+        /// &lt;summary&gt;
+        /// Adds/updates content/published xml
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;xml&quot;&gt;&lt;/param&gt;
+        public void AddOrUpdateContentXml(IContent content, Func&lt;IContent, XElement&gt; xml)
+        {
+            _contentXmlRepository.AddOrUpdate(new ContentXmlEntity&lt;IContent&gt;(content, xml));
+        }
+
+        /// &lt;summary&gt;
+        /// Used to remove the content xml for a content item
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        public void DeleteContentXml(IContent content)
+        {
+            _contentXmlRepository.Delete(new ContentXmlEntity&lt;IContent&gt;(content));
+        }
+
+        /// &lt;summary&gt;
+        /// Adds/updates preview xml
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;xml&quot;&gt;&lt;/param&gt;
+        public void AddOrUpdatePreviewXml(IContent content, Func&lt;IContent, XElement&gt; xml)
+        {
+            _contentPreviewRepository.AddOrUpdate(new ContentPreviewEntity&lt;IContent&gt;(content, xml));
+        }
+
+        /// &lt;summary&gt;
+        /// Gets paged content results
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;query&quot;&gt;Query to excute&lt;/param&gt;
+        /// &lt;param name=&quot;pageIndex&quot;&gt;Page number&lt;/param&gt;
+        /// &lt;param name=&quot;pageSize&quot;&gt;Page size&lt;/param&gt;
+        /// &lt;param name=&quot;totalRecords&quot;&gt;Total records query would return without paging&lt;/param&gt;
+        /// &lt;param name=&quot;orderBy&quot;&gt;Field to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderDirection&quot;&gt;Direction to order by&lt;/param&gt;
+        /// &lt;param name=&quot;orderBySystemField&quot;&gt;Flag to indicate when ordering by system field&lt;/param&gt;
+        /// &lt;param name=&quot;filter&quot;&gt;Search text filter&lt;/param&gt;
+        /// &lt;returns&gt;An Enumerable list of &lt;see cref=&quot;IContent&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IContent&gt; GetPagedResultsByQuery(IQuery&lt;IContent&gt; query, long pageIndex, int pageSize, out long totalRecords,
+            string orderBy, Direction orderDirection, bool orderBySystemField, IQuery&lt;IContent&gt; filter = null)
+        {
+
+            //NOTE: This uses the GetBaseQuery method but that does not take into account the required &#39;newest&#39; field which is 
+            // what we always require for a paged result, so we&#39;ll ensure it&#39;s included in the filter
+            
+            var filterSql = new Sql().Append(&quot;AND (cmsDocument.newest = 1)&quot;);
+            if (filter != null)
+            {
+                foreach (var filterClaus in filter.GetWhereClauses())
+                {
+                    filterSql.Append(string.Format(&quot;AND ({0})&quot;, filterClaus.Item1), filterClaus.Item2);
+                }
+            }
+            
+            Func&lt;Tuple&lt;string, object[]&gt;&gt; filterCallback = () =&gt; new Tuple&lt;string, object[]&gt;(filterSql.SQL, filterSql.Arguments);
+
+            return GetPagedResultsByQuery&lt;DocumentDto&gt;(query, pageIndex, pageSize, out totalRecords,
+                new Tuple&lt;string, string&gt;(&quot;cmsDocument&quot;, &quot;nodeId&quot;),
+                (sqlFull, pagingSqlQuery) =&gt; ProcessQuery(sqlFull, pagingSqlQuery), orderBy, orderDirection, orderBySystemField,
+                filterCallback);
+
+        }
+
+        #endregion
+
+        #region IRecycleBinRepository members
+
+        protected override int RecycleBinId
+        {
+            get { return Constants.System.RecycleBinContent; }
+        }
+
+        #endregion
+
+        protected override string GetDatabaseFieldNameForOrderBy(string orderBy)
+        {
+            //Some custom ones
+            switch (orderBy.ToUpperInvariant())
+            {
+                case &quot;NAME&quot;:
+                    return &quot;cmsDocument.text&quot;;
+                case &quot;UPDATER&quot;:
+                    //TODO: This isn&#39;t going to work very nicely because it&#39;s going to order by ID, not by letter
+                    return &quot;cmsDocument.documentUser&quot;;
+            }
+
+            return base.GetDatabaseFieldNameForOrderBy(orderBy);
+        }
+
+        /// &lt;summary&gt;
+        /// This is the underlying method that processes most queries for this repository
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;sqlFull&quot;&gt;
+        /// The FullMultiple SQL without the outer join to return all data required to create an IContent excluding it&#39;s published state data which this will query separately
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;pagingSqlQuery&quot;&gt;
+        /// The Id SQL without the outer join to just return all document ids - used to process the properties for the content item
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;withCache&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;includeAllVersions&quot;&gt;
+        /// Generally when querying for content we only want to return the most recent version of the content item, however in some cases like when 
+        /// we want to return all versions of a content item, we can&#39;t simply return the latest
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IEnumerable&lt;IContent&gt; ProcessQuery(Sql sqlFull, PagingSqlQuery pagingSqlQuery, bool withCache = false, bool includeAllVersions = false)
+        {
+            // fetch returns a list so it&#39;s ok to iterate it in this method
+            var dtos = Database.Fetch&lt;DocumentDto, ContentVersionDto, ContentDto, NodeDto&gt;(sqlFull);
+            if (dtos.Count == 0) return Enumerable.Empty&lt;IContent&gt;();
+            
+            //Go and get all of the published version data separately for this data, this is because when we are querying
+            //for multiple content items we don&#39;t include the outer join to fetch this data in the same query because
+            //it is insanely slow. Instead we just fetch the published version data separately in one query.
+
+            //we need to parse the original SQL statement and reduce the columns to just cmsDocument.nodeId so that we can use
+            // the statement to go get the published data for all of the items by using an inner join
+            var parsedOriginalSql = &quot;SELECT cmsDocument.nodeId &quot; + sqlFull.SQL.Substring(sqlFull.SQL.IndexOf(&quot;FROM&quot;, StringComparison.Ordinal));
+            //now remove everything from an Orderby clause and beyond
+            if (parsedOriginalSql.InvariantContains(&quot;ORDER BY &quot;))
+            {
+                parsedOriginalSql = parsedOriginalSql.Substring(0, parsedOriginalSql.LastIndexOf(&quot;ORDER BY &quot;, StringComparison.Ordinal));
+            }            
+
+            //order by update date DESC, if there is corrupted published flags we only want the latest!
+            var publishedSql = new Sql(@&quot;SELECT cmsDocument.nodeId, cmsDocument.published, cmsDocument.versionId, cmsDocument.updateDate, cmsDocument.newest
+FROM cmsDocument INNER JOIN cmsContentVersion ON cmsContentVersion.VersionId = cmsDocument.versionId
+WHERE cmsDocument.published = 1 AND cmsDocument.nodeId IN 
+(&quot; + parsedOriginalSql + @&quot;)
+ORDER BY cmsContentVersion.id DESC
+&quot;, sqlFull.Arguments);
+
+            //go and get the published version data, we do a Query here and not a Fetch so we are
+            //not allocating a whole list to memory just to allocate another list in memory since
+            //we are assigning this data to a keyed collection for fast lookup below
+            var publishedData = Database.Query&lt;DocumentPublishedReadOnlyDto&gt;(publishedSql);
+            var publishedDataCollection = new DocumentPublishedReadOnlyDtoCollection();
+            foreach (var publishedDto in publishedData)
+            {
+                //double check that there&#39;s no corrupt db data, there should only be a single published item
+                if (publishedDataCollection.Contains(publishedDto.NodeId) == false)
+                    publishedDataCollection.Add(publishedDto);
+            }
+
+            //This is a tuple list identifying if the content item came from the cache or not
+            var content = new List&lt;Tuple&lt;IContent, bool&gt;&gt;();
+            var defs = new DocumentDefinitionCollection(includeAllVersions);
+            var templateIds = new List&lt;int&gt;();
+            
+            //track the looked up content types, even though the content types are cached
+            // they still need to be deep cloned out of the cache and we don&#39;t want to add
+            // the overhead of deep cloning them on every item in this loop
+            var contentTypes = new Dictionary&lt;int, IContentType&gt;();
+            
+            foreach (var dto in dtos)
+            {
+                DocumentPublishedReadOnlyDto publishedDto;
+                publishedDataCollection.TryGetValue(dto.NodeId, out publishedDto);
+
+                // if the cache contains the published version, use it
+                if (withCache)
+                {
+                    var cached = RuntimeCache.GetCacheItem&lt;IContent&gt;(GetCacheIdKey&lt;IContent&gt;(dto.NodeId));
+                    //only use this cached version if the dto returned is also the publish version, they must match and be teh same version
+                    if (cached != null &amp;&amp; cached.Version == dto.VersionId &amp;&amp; cached.Published &amp;&amp; dto.Published)
+                    {
+                        content.Add(new Tuple&lt;IContent, bool&gt;(cached, true));
+                        continue;
+                    }
+                }
+
+                // else, need to fetch from the database
+                // content type repository is full-cache so OK to get each one independently
+
+                IContentType contentType;
+                if (contentTypes.ContainsKey(dto.ContentVersionDto.ContentDto.ContentTypeId))
+                {
+                    contentType = contentTypes[dto.ContentVersionDto.ContentDto.ContentTypeId];
+                }
+                else
+                {
+                    contentType = _contentTypeRepository.Get(dto.ContentVersionDto.ContentDto.ContentTypeId);
+                    contentTypes[dto.ContentVersionDto.ContentDto.ContentTypeId] = contentType;
+                }
+
+                // track the definition and if it&#39;s successfully added or updated then processed
+                if (defs.AddOrUpdate(new DocumentDefinition(dto, contentType)))
+                {
+                    // assign template
+                    if (dto.TemplateId.HasValue &amp;&amp; dto.TemplateId.Value &gt; 0)
+                        templateIds.Add(dto.TemplateId.Value);
+
+                    content.Add(new Tuple&lt;IContent, bool&gt;(ContentFactory.BuildEntity(dto, contentType, publishedDto), false));
+                }
+            }
+
+            // load all required templates in 1 query
+            var templates = _templateRepository.GetAll(templateIds.ToArray())
+                .ToDictionary(x =&gt; x.Id, x =&gt; x);
+
+            // load all properties for all documents from database in 1 query
+            var propertyData = GetPropertyCollection(pagingSqlQuery, defs);
+
+            // assign template and property data
+            foreach (var contentItem in content)
+            {
+                var cc = contentItem.Item1;
+                var fromCache = contentItem.Item2;
+
+                //if this has come from cache, we do not need to build up it&#39;s structure
+                if (fromCache) continue;
+
+                var def = defs[includeAllVersions ? (ValueType)cc.Version : cc.Id];
+
+                ITemplate template = null;
+                if (def.DocumentDto.TemplateId.HasValue)
+                    templates.TryGetValue(def.DocumentDto.TemplateId.Value, out template); // else null
+                cc.Template = template;
+                cc.Properties = propertyData[cc.Version];
+
+                //on initial construction we don&#39;t want to have dirty properties tracked
+                // http://issues.umbraco.org/issue/U4-1946
+                cc.ResetDirtyProperties(false);
+            }
+
+            return content.Select(x =&gt; x.Item1).ToArray();
+        }
+
+        /// &lt;summary&gt;
+        /// Private method to create a content object from a DocumentDto, which is used by Get and GetByVersion.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dto&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;docSql&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IContent CreateContentFromDto(DocumentDto dto, Sql docSql)
+        {
+            var contentType = _contentTypeRepository.Get(dto.ContentVersionDto.ContentDto.ContentTypeId);
+
+            var content = ContentFactory.BuildEntity(dto, contentType);
+
+            //Check if template id is set on DocumentDto, and get ITemplate if it is.
+            if (dto.TemplateId.HasValue &amp;&amp; dto.TemplateId.Value &gt; 0)
+            {
+                content.Template = _templateRepository.Get(dto.TemplateId.Value);
+            }
+
+            var docDef = new DocumentDefinition(dto, contentType);
+
+            var properties = GetPropertyCollection(docSql, new[] { docDef });
+
+            content.Properties = properties[dto.VersionId];
+
+            //on initial construction we don&#39;t want to have dirty properties tracked
+            // http://issues.umbraco.org/issue/U4-1946
+            ((Entity)content).ResetDirtyProperties(false);
+            return content;
+        }
+
+        private string EnsureUniqueNodeName(int parentId, string nodeName, int id = 0)
+        {
+            if (EnsureUniqueNaming == false)
+                return nodeName;
+
+            var sql = new Sql();
+            sql.Select(&quot;*&quot;)
+               .From&lt;NodeDto&gt;()
+               .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId &amp;&amp; x.ParentId == parentId &amp;&amp; x.Text.StartsWith(nodeName));
+
+            int uniqueNumber = 1;
+            var currentName = nodeName;
+
+            var dtos = Database.Fetch&lt;NodeDto&gt;(sql);
+            if (dtos.Any())
+            {
+                var results = dtos.OrderBy(x =&gt; x.Text, new SimilarNodeNameComparer());
+                foreach (var dto in results)
+                {
+                    if (id != 0 &amp;&amp; id == dto.NodeId) continue;
+
+                    if (dto.Text.ToLowerInvariant().Equals(currentName.ToLowerInvariant()))
+                    {
+                        currentName = nodeName + string.Format(&quot; ({0})&quot;, uniqueNumber);
+                        uniqueNumber++;
+                    }
+                }
+            }
+
+            return currentName;
+        }
+        
+        /// &lt;summary&gt;
+        /// Dispose disposable properties
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Ensure the unit of work is disposed
+        /// &lt;/remarks&gt;
+        protected override void DisposeResources()
+        {
+            _contentTypeRepository.Dispose();
+            _templateRepository.Dispose();
+            _tagRepository.Dispose();
+            _contentPreviewRepository.Dispose();
+            _contentXmlRepository.Dispose();
+        }
+
+        /// &lt;summary&gt;
+        /// A keyed collection for fast lookup when retrieving a separate list of published version data
+        /// &lt;/summary&gt;
+        private class DocumentPublishedReadOnlyDtoCollection : KeyedCollection&lt;int, DocumentPublishedReadOnlyDto&gt;
+        {
+            protected override int GetKeyForItem(DocumentPublishedReadOnlyDto item)
+            {
+                return item.NodeId;
+            }
+
+            public bool TryGetValue(int key, out DocumentPublishedReadOnlyDto val)
+            {
+                if (Dictionary == null)
+                {
+                    val = null;
+                    return false;
+                }
+                return Dictionary.TryGetValue(key, out val);
+            }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[36,15,36,78,1],[37,9,37,10,1],[38,13,38,47,1],[38,48,38,105,0],[39,13,39,44,1],[39,45,39,99,0],[40,13,40,39,1],[40,40,40,89,0],[41,13,41,60,1],[42,13,42,54,1],[43,13,43,44,1],[44,13,44,40,1],[45,13,45,151,1],[46,13,46,143,1],[48,13,48,39,1],[49,9,49,10,1],[51,42,51,46,1],[51,47,51,51,1],[56,9,56,10,1],[57,13,60,86,1],[62,13,62,167,1],[64,13,64,29,1],[65,17,65,29,1],[67,13,67,58,1],[69,13,69,28,1],[70,9,70,10,1],[73,9,73,10,1],[74,13,75,13,1],[75,13,75,14,1],[75,14,76,17,1],[76,17,76,31,1],[76,31,77,17,1],[77,17,77,18,1],[77,18,78,21,1],[78,21,78,70,1],[78,70,79,17,1],[79,17,79,18,1],[79,18,81,17,1],[81,17,81,64,1],[81,64,82,17,1],[82,17,82,26,1],[82,26,83,13,1],[83,13,83,14,1],[83,14,83,15,1],[74,13,83,15,1],[85,13,85,72,1],[86,13,86,62,1],[88,13,88,100,1],[89,9,89,10,1],[92,9,92,10,1],[93,13,93,72,1],[94,13,94,62,1],[96,13,97,13,1],[97,13,97,14,1],[97,14,98,17,1],[98,17,101,68,1],[101,68,102,13,1],[102,13,102,14,1],[102,14,102,15,1],[96,13,102,15,1],[104,13,104,82,1],[105,13,105,80,1],[107,13,107,106,1],[108,9,108,10,1],[127,9,127,10,1],[128,13,128,33,1],[129,13,136,97,1],[141,13,141,55,1],[142,13,142,14,1],[150,17,154,61,1],[160,17,160,66,1],[161,13,161,14,1],[163,13,163,86,1],[165,13,165,24,1],[166,9,166,10,1],[169,9,169,10,1],[170,13,170,91,1],[171,9,171,10,1],[174,9,174,10,1],[175,13,175,43,1],[176,9,176,10,1],[179,9,179,10,1],[180,13,198,30,1],[199,13,199,25,1],[200,9,200,10,1],[204,17,204,18,1],[204,19,204,67,1],[204,68,204,69,1],[212,9,212,10,1],[219,13,219,98,1],[221,13,222,13,1],[222,13,222,14,1],[222,14,223,17,1],[223,17,223,48,1],[223,48,224,17,1],[224,17,224,18,1],[224,18,225,21,1],[225,21,225,95,1],[225,95,226,17,1],[226,17,226,18,1],[226,18,228,17,1],[228,17,231,65,1],[231,65,233,17,1],[233,17,233,28,1],[233,28,234,13,1],[234,13,234,14,1],[234,14,234,15,1],[221,13,234,15,1],[236,13,236,28,1],[238,13,238,25,1],[239,13,239,14,1],[241,17,241,91,1],[242,17,242,81,1],[244,17,245,34,1],[245,34,245,101,1],[245,101,246,31,1],[244,17,246,31,1],[249,17,249,41,1],[249,42,249,48,1],[251,17,251,24,1],[251,26,251,37,1],[251,38,251,40,1],[251,41,251,49,1],[252,17,252,18,1],[254,21,254,22,1],[257,25,257,58,1],[258,21,258,22,1],[259,21,259,40,0],[260,21,260,22,0],[261,25,261,112,0],[262,21,262,22,0],[263,17,263,18,1],[264,17,264,62,1],[265,13,265,14,1],[268,13,268,75,1],[269,13,269,64,1],[270,13,270,76,1],[271,13,275,100,1],[277,13,277,44,1],[278,13,278,14,1],[279,17,283,92,1],[284,13,284,14,1],[286,13,286,95,1],[288,13,288,62,1],[290,13,290,70,1],[291,13,291,37,1],[292,13,292,14,1],[293,17,293,24,1],[293,26,293,37,1],[293,38,293,40,1],[293,41,293,66,1],[294,17,294,18,1],[295,21,295,113,1],[296,17,296,18,1],[297,13,297,14,1],[299,9,299,10,1],[302,9,302,10,1],[303,13,304,13,1],[304,13,304,14,1],[304,14,305,17,1],[305,17,306,90,1],[306,90,307,13,1],[307,13,307,14,1],[307,14,307,15,1],[303,13,307,15,1],[309,13,309,79,1],[310,13,310,69,1],[312,13,312,102,1],[313,9,313,10,1],[316,9,316,10,1],[317,13,317,62,1],[319,13,319,98,1],[320,13,320,85,1],[322,13,322,143,1],[324,13,324,29,1],[325,17,325,29,0],[327,13,327,58,1],[329,13,329,28,1],[330,9,330,10,1],[333,9,333,10,1],[334,13,340,71,1],[341,13,341,92,1],[343,13,343,29,1],[343,30,343,37,1],[345,20,345,63,0],[346,13,346,14,0],[347,17,347,61,0],[349,17,349,40,0],[350,13,350,14,0],[351,9,351,10,1],[354,9,354,10,1],[355,13,362,60,1],[363,13,363,76,1],[364,13,364,37,1],[364,38,364,45,1],[366,20,366,63,0],[367,13,367,14,0],[368,17,368,24,0],[368,26,368,33,0],[368,34,368,36,0],[368,37,368,41,0],[369,17,369,18,0],[370,21,370,61,0],[371,17,371,18,0],[373,17,373,40,0],[374,13,374,14,0],[375,9,375,10,1],[378,9,378,10,0],[379,13,379,133,0],[380,13,380,142,0],[381,13,381,140,0],[382,13,382,131,0],[383,9,383,10,0],[390,9,390,10,1],[393,13,398,67,1],[399,13,399,102,1],[402,13,402,45,1],[403,9,403,10,1],[406,9,406,10,1],[407,13,407,46,1],[410,13,410,41,1],[411,13,411,14,1],[412,17,412,70,1],[413,13,413,14,1],[416,13,416,78,1],[419,13,419,60,1],[421,13,421,75,1],[422,13,422,48,1],[426,13,426,110,1],[427,13,427,42,1],[428,13,430,92,1],[431,13,431,46,1],[434,13,434,68,1],[435,13,435,40,1],[436,13,436,87,1],[437,13,437,43,1],[438,13,438,116,1],[441,13,441,76,1],[442,13,442,49,1],[443,13,443,38,1],[446,13,446,40,1],[447,13,447,40,1],[448,13,448,42,1],[449,13,449,34,1],[453,13,453,107,1],[454,13,454,104,1],[457,13,457,41,1],[458,13,458,14,1],[459,17,461,31,1],[461,31,461,55,1],[461,55,462,28,1],[462,28,462,82,1],[462,82,462,93,1],[459,17,462,93,1],[464,17,464,111,1],[467,17,467,61,1],[468,13,468,14,1],[471,13,471,63,1],[472,13,472,48,1],[473,13,473,41,1],[477,13,477,59,1],[478,13,478,55,1],[479,13,479,48,1],[483,13,483,41,1],[484,13,484,34,1],[487,13,487,137,1],[488,13,488,80,1],[489,13,489,60,1],[492,13,492,20,1],[492,22,492,41,1],[492,42,492,44,1],[492,45,492,61,1],[493,13,493,14,1],[494,17,494,84,1],[495,17,495,79,1],[496,13,496,14,1],[499,13,499,20,1],[499,22,499,34,1],[499,35,499,37,1],[499,38,499,55,1],[500,13,500,14,1],[501,17,501,70,1],[502,13,502,14,1],[505,13,505,34,1],[506,13,506,14,1],[507,17,507,60,1],[508,13,508,14,1],[511,13,511,34,1],[512,13,512,14,1],[513,17,520,19,1],[521,17,521,73,1],[522,17,522,67,1],[523,13,523,14,1],[525,13,525,43,1],[526,9,526,10,1],[529,9,529,10,1],[530,13,530,67,1],[533,13,533,64,1],[534,13,534,14,1],[535,17,535,47,1],[536,17,536,24,1],[540,13,540,89,1],[541,13,541,40,1],[542,13,542,14,1],[544,17,544,52,1],[545,13,545,14,1],[547,13,547,14,1],[548,17,548,50,1],[549,13,549,14,1],[552,13,552,89,1],[555,13,555,60,1],[558,13,558,52,1],[559,13,559,14,1],[560,17,560,114,1],[561,17,561,74,1],[562,17,562,49,1],[563,17,566,96,1],[567,17,567,53,1],[572,13,572,14,1],[574,13,574,75,1],[576,13,576,113,1],[577,13,577,58,1],[578,13,578,48,1],[581,13,581,68,1],[582,13,582,49,1],[583,13,583,46,1],[586,13,586,66,1],[587,13,587,14,0],[589,17,589,70,0],[590,17,590,48,0],[591,13,591,14,0],[594,13,594,47,1],[599,13,599,108,1],[600,13,600,14,1],[602,17,602,160,1],[603,17,603,24,1],[603,26,603,33,1],[603,34,603,36,1],[603,37,603,50,1],[604,17,604,18,1],[605,21,605,38,1],[606,21,606,46,1],[607,21,607,45,1],[608,17,608,18,1],[611,17,611,46,1],[612,13,612,14,1],[616,13,616,146,1],[617,13,617,20,1],[617,22,617,37,1],[617,38,617,40,1],[617,41,617,53,1],[618,13,618,14,1],[619,17,619,42,1],[620,17,620,39,1],[621,17,621,41,1],[622,13,622,14,1],[624,13,624,59,1],[625,13,625,40,1],[626,13,626,14,1],[629,17,629,52,1],[632,17,632,38,1],[633,13,633,14,1],[635,13,635,14,1],[637,17,637,145,1],[638,17,638,57,1],[640,17,640,52,1],[641,17,641,38,1],[642,13,642,14,1],[645,13,645,137,1],[646,13,646,80,1],[647,13,647,60,1],[650,13,650,20,1],[650,22,650,41,1],[650,42,650,44,1],[650,45,650,61,1],[651,13,651,14,1],[652,17,652,79,1],[653,17,653,18,1],[654,21,654,54,1],[655,17,655,18,1],[657,17,657,18,1],[658,21,658,88,1],[659,21,659,83,1],[660,17,660,18,1],[661,13,661,14,1],[664,13,664,37,1],[665,13,665,14,1],[666,17,666,24,1],[666,26,666,38,1],[666,39,666,41,1],[666,42,666,59,1],[667,17,667,18,1],[668,21,668,85,1],[668,86,668,95,1],[670,21,670,74,1],[671,17,671,18,1],[672,13,672,14,1],[675,13,675,59,1],[676,13,676,14,1],[677,17,677,60,1],[678,13,678,14,1],[679,18,679,93,1],[680,13,680,14,1],[682,17,682,57,1],[683,13,683,14,1],[687,13,687,34,1],[688,13,688,14,1],[689,17,696,19,1],[697,17,697,73,1],[698,17,698,67,1],[699,13,699,14,1],[700,18,700,44,1],[701,13,701,14,1],[702,17,709,19,1],[710,17,710,73,1],[711,17,711,71,1],[712,13,712,14,1],[714,13,714,43,1],[715,9,715,10,1],[723,9,723,10,1],[724,13,725,13,1],[725,13,725,14,1],[725,14,726,17,1],[726,17,729,68,1],[729,68,730,13,1],[730,13,730,14,1],[730,14,730,15,1],[724,13,730,15,1],[737,13,737,68,1],[738,13,738,78,1],[739,13,739,58,1],[740,13,740,76,1],[742,13,742,112,1],[743,9,743,10,1],[750,9,750,10,0],[766,13,766,44,0],[767,13,768,94,0],[769,13,769,41,0],[770,13,770,55,0],[771,13,771,55,0],[772,13,772,33,0],[773,13,773,46,0],[774,13,774,40,0],[777,13,783,57,0],[785,13,785,36,0],[788,13,788,20,0],[788,22,788,29,0],[788,30,788,32,0],[788,33,788,118,0],[789,13,789,14,0],[790,17,790,75,0],[791,17,791,38,0],[792,17,792,47,0],[795,17,795,79,0],[796,17,796,18,0],[797,21,797,62,0],[798,21,798,40,0],[799,21,799,22,0],[802,25,802,34,0],[804,17,804,18,0],[806,17,806,70,0],[807,17,807,47,0],[809,17,809,71,0],[812,17,812,84,0],[813,13,813,14,0],[815,13,815,27,0],[817,9,817,10,0],[820,9,820,10,0],[821,13,822,63,0],[823,13,823,53,0],[824,9,824,10,0],[827,9,827,10,0],[828,13,828,96,0],[829,13,829,58,0],[830,9,830,10,0],[833,9,833,10,0],[834,13,834,93,0],[835,13,835,58,0],[836,9,836,10,0],[845,9,845,10,1],[846,13,846,96,1],[847,13,847,70,1],[848,9,848,10,1],[851,9,851,10,1],[852,13,852,96,1],[853,13,853,59,1],[854,9,854,10,1],[862,9,862,10,1],[863,13,863,93,1],[864,9,864,10,1],[871,9,871,10,1],[872,13,872,83,1],[873,9,873,10,1],[881,9,881,10,1],[882,13,882,101,1],[883,9,883,10,1],[899,9,899,10,1],[904,13,904,78,1],[905,13,905,32,1],[906,13,906,14,1],[907,17,907,24,1],[907,26,907,41,1],[907,42,907,44,1],[907,45,907,69,1],[908,17,908,18,1],[909,21,909,104,1],[910,17,910,18,1],[911,13,911,14,1],[913,13,913,66,1],[913,66,913,129,1],[913,129,913,130,1],[913,13,913,130,1],[915,13,917,46,1],[917,46,917,83,1],[917,83,918,33,1],[915,13,918,33,1],[920,9,920,10,1],[928,17,928,18,1],[928,19,928,61,1],[928,62,928,63,1],[934,9,934,10,1],[936,13,936,48,1],[939,21,939,47,1],[942,21,942,55,0],[945,13,945,65,0],[946,9,946,10,1],[964,9,964,10,1],[966,13,966,101,1],[967,13,967,33,1],[967,34,967,70,1],[975,13,975,145,1],[977,13,977,66,1],[978,13,978,14,1],[979,17,979,138,1],[980,13,980,14,1],[983,13,988,23,1],[993,13,993,92,1],[994,13,994,88,1],[995,13,995,20,1],[995,22,995,38,1],[995,39,995,41,1],[995,42,995,55,1],[996,13,996,14,1],[998,17,998,84,1],[999,21,999,63,1],[1000,13,1000,14,1],[1003,13,1003,61,1],[1004,13,1004,77,1],[1005,13,1005,47,1],[1010,13,1010,68,1],[1012,13,1012,20,1],[1012,22,1012,29,1],[1012,30,1012,32,1],[1012,33,1012,37,1],[1013,13,1013,14,1],[1015,17,1015,83,1],[1018,17,1018,31,1],[1019,17,1019,18,1],[1020,21,1020,107,1],[1022,21,1022,112,1],[1023,21,1023,22,0],[1024,25,1024,78,0],[1025,25,1025,34,0],[1027,17,1027,18,1],[1033,17,1033,94,1],[1034,17,1034,18,1],[1035,21,1035,96,1],[1036,17,1036,18,1],[1038,17,1038,18,1],[1039,21,1039,110,1],[1040,21,1040,96,1],[1041,17,1041,18,1],[1044,17,1044,80,1],[1045,17,1045,18,1],[1047,21,1047,77,1],[1048,25,1048,63,0],[1050,21,1050,127,1],[1051,17,1051,18,1],[1052,13,1052,14,1],[1055,13,1056,36,1],[1056,36,1056,40,0],[1056,40,1056,47,1],[1056,47,1056,48,0],[1056,48,1056,50,1],[1055,13,1056,50,1],[1059,13,1059,76,1],[1062,13,1062,20,1],[1062,22,1062,37,1],[1062,38,1062,40,1],[1062,41,1062,48,1],[1063,13,1063,14,1],[1064,17,1064,44,1],[1065,17,1065,51,1],[1068,17,1068,31,1],[1068,32,1068,41,0],[1070,17,1070,84,1],[1072,17,1072,43,1],[1073,17,1073,57,1],[1074,21,1074,91,0],[1075,17,1075,40,1],[1076,17,1076,58,1],[1080,17,1080,48,1],[1081,13,1081,14,1],[1083,13,1083,40,1],[1083,40,1083,47,1],[1083,47,1083,59,1],[1083,13,1083,59,1],[1084,9,1084,10,1],[1093,9,1093,10,1],[1094,13,1094,106,1],[1096,13,1096,72,1],[1099,13,1099,69,1],[1100,13,1100,14,1],[1101,17,1101,82,1],[1102,13,1102,14,1],[1104,13,1104,67,1],[1106,13,1106,78,1],[1108,13,1108,60,1],[1112,13,1112,59,1],[1113,13,1113,28,1],[1114,9,1114,10,1],[1117,9,1117,10,1],[1118,13,1118,45,1],[1119,17,1119,33,1],[1121,13,1121,33,1],[1122,13,1124,132,1],[1126,13,1126,34,1],[1127,13,1127,40,1],[1129,13,1129,53,1],[1130,13,1130,28,1],[1131,13,1131,14,1],[1132,17,1132,49,1],[1132,49,1132,55,1],[1132,55,1132,88,1],[1132,17,1132,88,1],[1133,17,1133,24,1],[1133,26,1133,33,1],[1133,34,1133,36,1],[1133,37,1133,44,1],[1134,17,1134,18,1],[1135,21,1135,53,1],[1135,54,1135,63,1],[1137,21,1137,92,1],[1138,21,1138,22,1],[1139,25,1139,88,1],[1140,25,1140,40,1],[1141,21,1141,22,1],[1142,17,1142,18,1],[1143,13,1143,14,1],[1145,13,1145,32,1],[1146,9,1146,10,1],[1155,9,1155,10,1],[1156,13,1156,46,1],[1157,13,1157,43,1],[1158,13,1158,38,1],[1159,13,1159,49,1],[1160,13,1160,45,1],[1161,9,1161,10,1],[1169,13,1169,14,1],[1170,17,1170,36,1],[1171,13,1171,14,1],[1174,13,1174,14,1],[1175,17,1175,40,1],[1176,17,1176,18,1],[1177,21,1177,32,1],[1178,21,1178,34,1],[1180,17,1180,61,1],[1181,13,1181,14,1]]);
+    </script>
+  </body>
+</html>

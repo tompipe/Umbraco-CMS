@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\PropertyEditors\GridPropertyEditor.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Examine;
+using Lucene.Net.Documents;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Core.Services;
+using UmbracoExamine;
+
+namespace Umbraco.Web.PropertyEditors
+{
+    [PropertyEditor(Core.Constants.PropertyEditors.GridAlias, &quot;Grid layout&quot;, &quot;grid&quot;, HideLabel = true, IsParameterEditor = false, ValueType = PropertyEditorValueTypes.Json, Group=&quot;rich content&quot;, Icon=&quot;icon-layout&quot;)]
+    public class GridPropertyEditor : PropertyEditor, IApplicationEventHandler
+    {        
+
+        private static void DocumentWriting(object sender, Examine.LuceneEngine.DocumentWritingEventArgs e)
+        {
+            var indexer = (BaseUmbracoIndexer)sender;
+            foreach (var field in indexer.IndexerData.UserFields)
+            {
+                if (e.Fields.ContainsKey(field.Name))
+                {
+                    if (e.Fields[field.Name].DetectIsJson())
+                    {
+                        try
+                        {
+                            var json = JsonConvert.DeserializeObject&lt;JObject&gt;(e.Fields[field.Name]);
+
+                            //check if this is formatted for grid json
+                            JToken name;
+                            JToken sections;
+                            if (json.HasValues &amp;&amp; json.TryGetValue(&quot;name&quot;, out name) &amp;&amp; json.TryGetValue(&quot;sections&quot;, out sections))
+                            {
+                                //get all values and put them into a single field (using JsonPath)
+                                var sb = new StringBuilder();
+                                foreach (var row in json.SelectTokens(&quot;$.sections[*].rows[*]&quot;))
+                                {
+                                    var rowName = row[&quot;name&quot;].Value&lt;string&gt;();
+                                    var areaVals = row.SelectTokens(&quot;$.areas[*].controls[*].value&quot;);
+
+                                    foreach (var areaVal in areaVals)
+                                    {
+                                        //TODO: If it&#39;s not a string, then it&#39;s a json formatted value - 
+                                        // we cannot really index this in a smart way since it could be &#39;anything&#39;
+                                        if (areaVal.Type == JTokenType.String)
+                                        {
+                                            var str = areaVal.Value&lt;string&gt;();
+                                            str = XmlHelper.CouldItBeXml(str) ? str.StripHtml() : str;
+                                            sb.Append(str);
+                                            sb.Append(&quot; &quot;);
+
+                                            //add the row name as an individual field
+                                            e.Document.Add(
+                                                new Field(
+                                                    string.Format(&quot;{0}.{1}&quot;, field.Name, rowName), str, Field.Store.YES, Field.Index.ANALYZED));
+                                        }
+
+                                    }
+                                }
+
+                                if (sb.Length &gt; 0)
+                                {
+                                    //First save the raw value to a raw field
+                                    e.Document.Add(
+                                        new Field(
+                                            string.Format(&quot;{0}{1}&quot;, UmbracoContentIndexer.RawFieldPrefix, field.Name),
+                                            e.Fields[field.Name], Field.Store.YES, Field.Index.NOT_ANALYZED_NO_NORMS, Field.TermVector.NO));
+
+                                    //now replace the original value with the combined/cleaned value
+                                    e.Document.RemoveField(field.Name);
+                                    e.Document.Add(
+                                        new Field(
+                                            field.Name,
+                                            sb.ToString(), Field.Store.YES, Field.Index.ANALYZED));
+                                }
+                            }
+                        }
+                        catch (InvalidCastException)
+                        {
+                            //swallow...on purpose, there&#39;s a chance that this isn&#39;t the json format we are looking for
+                            // and we don&#39;t want that to affect the website. 
+                        }
+                        catch (JsonException)
+                        {
+                            //swallow...on purpose, there&#39;s a chance that this isn&#39;t json and we don&#39;t want that to affect 
+                            // the website. 
+                        }
+                        catch (ArgumentException)
+                        {
+                            //swallow on purpose to prevent this error:
+                            // Can not add Newtonsoft.Json.Linq.JValue to Newtonsoft.Json.Linq.JObject.
+
+                        }
+                    }
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Overridden to ensure that the value is validated
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected override PropertyValueEditor CreateValueEditor()
+        {
+            var baseEditor = base.CreateValueEditor();
+            return new GridPropertyValueEditor(baseEditor);
+        }
+
+        protected override PreValueEditor CreatePreValueEditor()
+        {
+            return new GridPreValueEditor();
+        }
+
+        internal class GridPropertyValueEditor : PropertyValueEditorWrapper
+        {
+            public GridPropertyValueEditor(PropertyValueEditor wrapped)
+                : base(wrapped)
+            {
+            }
+
+        }
+
+        internal class GridPreValueEditor : PreValueEditor
+        {
+            [PreValueField(&quot;items&quot;, &quot;Grid&quot;, &quot;views/propertyeditors/grid/grid.prevalues.html&quot;, Description = &quot;Grid configuration&quot;)]
+            public string Items { get; set; }
+
+            [PreValueField(&quot;rte&quot;, &quot;Rich text editor&quot;, &quot;views/propertyeditors/rte/rte.prevalues.html&quot;, Description = &quot;Rich text editor configuration&quot;)]
+            public string Rte { get; set; }
+        }
+
+        #region Application event handler, used to bind to events on startup
+
+        private readonly GridPropertyEditorApplicationStartup _applicationStartup = new GridPropertyEditorApplicationStartup();
+
+        /// &lt;summary&gt;
+        /// we&#39;re using a sub -class because this has the logic to prevent it from executing if the application is not configured
+        /// &lt;/summary&gt;
+        private class GridPropertyEditorApplicationStartup : ApplicationEventHandler
+        {
+            /// &lt;summary&gt;
+            /// We&#39;re going to bind to the Examine events so we can ensure grid data is index nicely.
+            /// &lt;/summary&gt;        
+            protected override void ApplicationStarted(UmbracoApplicationBase umbracoApplication, ApplicationContext applicationContext)
+            {
+                foreach (var i in ExamineManager.Instance.IndexProviderCollection.OfType&lt;BaseUmbracoIndexer&gt;())
+                {
+                    i.DocumentWriting += DocumentWriting;
+                }
+            }
+        }
+
+        public void OnApplicationInitialized(UmbracoApplicationBase umbracoApplication, ApplicationContext applicationContext)
+        {
+            //wrap
+            _applicationStartup.OnApplicationInitialized(umbracoApplication, applicationContext);
+        }
+        public void OnApplicationStarting(UmbracoApplicationBase umbracoApplication, ApplicationContext applicationContext)
+        {
+            //wrap
+            _applicationStartup.OnApplicationStarting(umbracoApplication, applicationContext);
+        }
+        public void OnApplicationStarted(UmbracoApplicationBase umbracoApplication, ApplicationContext applicationContext)
+        {
+            //wrap
+            _applicationStartup.OnApplicationStarted(umbracoApplication, applicationContext);            
+        }
+        #endregion
+    }
+
+
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,9,24,10,0],[25,13,25,54,0],[26,13,26,20,0],[26,22,26,31,0],[26,32,26,34,0],[26,35,26,65,0],[27,13,27,14,0],[28,17,28,54,0],[29,17,29,18,0],[30,21,30,61,0],[31,21,31,22,0],[33,25,33,26,0],[34,29,34,101,0],[39,29,39,132,0],[40,29,40,30,0],[42,33,42,62,0],[43,33,43,40,0],[43,42,43,49,0],[43,50,43,52,0],[43,53,43,95,0],[44,33,44,34,0],[45,37,45,79,0],[46,37,46,101,0],[48,37,48,44,0],[48,46,48,57,0],[48,58,48,60,0],[48,61,48,69,0],[49,37,49,38,0],[52,41,52,79,0],[53,41,53,42,0],[54,45,54,79,0],[55,45,55,103,0],[56,45,56,60,0],[57,45,57,60,0],[60,45,62,145,0],[63,41,63,42,0],[65,37,65,38,0],[66,33,66,34,0],[68,33,68,51,0],[69,33,69,34,0],[71,37,74,141,0],[77,37,77,72,0],[78,37,81,100,0],[82,33,82,34,0],[83,29,83,30,0],[84,25,84,26,0],[85,25,85,53,0],[86,25,86,26,0],[89,25,89,26,0],[90,25,90,46,0],[91,25,91,26,0],[94,25,94,26,0],[95,25,95,50,0],[96,25,96,26,0],[100,25,100,26,0],[101,21,101,22,0],[102,17,102,18,0],[103,13,103,14,0],[104,9,104,10,0],[111,9,111,10,0],[112,13,112,55,0],[113,13,113,60,0],[114,9,114,10,0],[117,9,117,10,0],[118,13,118,45,0],[119,9,119,10,0],[124,19,124,32,0],[125,13,125,14,0],[126,13,126,14,0],[133,35,133,39,0],[133,40,133,44,0],[136,33,136,37,0],[136,38,136,42,0],[141,9,141,128,1],[152,13,152,14,0],[153,17,153,24,0],[153,26,153,31,0],[153,32,153,34,0],[153,35,153,111,0],[154,17,154,18,0],[155,21,155,58,0],[156,17,156,18,0],[157,13,157,14,0],[161,9,161,10,0],[163,13,163,98,0],[164,9,164,10,0],[166,9,166,10,0],[168,13,168,95,0],[169,9,169,10,0],[171,9,171,10,0],[173,13,173,94,0],[174,9,174,10,0]]);
+    </script>
+  </body>
+</html>

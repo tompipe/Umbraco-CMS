@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Editors\ContentTypeControllerBase.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Web.Http;
+using AutoMapper;
+using Newtonsoft.Json;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Dictionary;
+using Umbraco.Core.Exceptions;
+using Umbraco.Core.Models;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Core.Services;
+using Umbraco.Web.Models.ContentEditing;
+using Umbraco.Web.Mvc;
+using Umbraco.Web.WebApi;
+using Constants = Umbraco.Core.Constants;
+
+namespace Umbraco.Web.Editors
+{
+    /// &lt;summary&gt;
+    /// Am abstract API controller providing functionality used for dealing with content and media types
+    /// &lt;/summary&gt;
+    [PluginController(&quot;UmbracoApi&quot;)]
+    [PrefixlessBodyModelValidator]
+    public abstract class ContentTypeControllerBase : UmbracoAuthorizedJsonController
+    {
+        private ICultureDictionary _cultureDictionary;
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        protected ContentTypeControllerBase()
+            : this(UmbracoContext.Current)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;umbracoContext&quot;&gt;&lt;/param&gt;
+        protected ContentTypeControllerBase(UmbracoContext umbracoContext)
+            : base(umbracoContext)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the available composite content types for a given content type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;type&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;filterContentTypes&quot;&gt;
+        /// This is normally an empty list but if additional content type aliases are passed in, any content types containing those aliases will be filtered out
+        /// along with any content types that have matching property types that are included in the filtered content types
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;filterPropertyTypes&quot;&gt;
+        /// This is normally an empty list but if additional property type aliases are passed in, any content types that have these aliases will be filtered out.
+        /// This is required because in the case of creating/modifying a content type because new property types being added to it are not yet persisted so cannot
+        /// be looked up via the db, they need to be passed in.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;contentTypeId&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected IEnumerable&lt;Tuple&lt;EntityBasic, bool&gt;&gt; PerformGetAvailableCompositeContentTypes(int contentTypeId,
+            UmbracoObjectTypes type,
+            string[] filterContentTypes,
+            string[] filterPropertyTypes)
+        {
+            IContentTypeComposition source = null;
+
+            //below is all ported from the old doc type editor and comes with the same weaknesses /insanity / magic
+
+            IContentTypeComposition[] allContentTypes;
+
+            switch (type)
+            {
+                case UmbracoObjectTypes.DocumentType:
+                    if (contentTypeId &gt; 0)
+                    {
+                        source = Services.ContentTypeService.GetContentType(contentTypeId);
+                        if (source == null) throw new HttpResponseException(Request.CreateResponse(HttpStatusCode.NotFound));
+                    }
+                    allContentTypes = Services.ContentTypeService.GetAllContentTypes().Cast&lt;IContentTypeComposition&gt;().ToArray();
+                    break;
+
+                case UmbracoObjectTypes.MediaType:
+                    if (contentTypeId &gt; 0)
+                    {
+                        source = Services.ContentTypeService.GetMediaType(contentTypeId);
+                        if (source == null) throw new HttpResponseException(Request.CreateResponse(HttpStatusCode.NotFound));
+                    }
+                    allContentTypes = Services.ContentTypeService.GetAllMediaTypes().Cast&lt;IContentTypeComposition&gt;().ToArray();
+                    break;
+
+                case UmbracoObjectTypes.MemberType:
+                    if (contentTypeId &gt; 0)
+                    {
+                        source = Services.MemberTypeService.Get(contentTypeId);
+                        if (source == null) throw new HttpResponseException(Request.CreateResponse(HttpStatusCode.NotFound));
+                    }
+                    allContentTypes = Services.MemberTypeService.GetAll().Cast&lt;IContentTypeComposition&gt;().ToArray();
+                    break;
+
+                default:
+                    throw new ArgumentOutOfRangeException(&quot;The entity type was not a content type&quot;);
+            }
+
+            var availableCompositions = Services.ContentTypeService.GetAvailableCompositeContentTypes(source, allContentTypes, filterContentTypes, filterPropertyTypes);
+
+            var currCompositions = source == null ? new IContentTypeComposition[] { } : source.ContentTypeComposition.ToArray();
+            var compAliases = currCompositions.Select(x =&gt; x.Alias).ToArray();
+            var ancestors = availableCompositions.Ancestors.Select(x =&gt; x.Alias);
+
+            return availableCompositions.Results
+                .Select(x =&gt; new Tuple&lt;EntityBasic, bool&gt;(Mapper.Map&lt;IContentTypeComposition, EntityBasic&gt;(x.Composition), x.Allowed))
+                .Select(x =&gt;
+                {
+                    //translate the name
+                    x.Item1.Name = TranslateItem(x.Item1.Name);
+
+                    //we need to ensure that the item is enabled if it is already selected
+                    // but do not allow it if it is any of the ancestors
+                    if (compAliases.Contains(x.Item1.Alias) &amp;&amp; ancestors.Contains(x.Item1.Alias) == false)
+                    {
+                        //re-set x to be allowed (NOTE: I didn&#39;t know you could set an enumerable item in a lambda!)
+                        x = new Tuple&lt;EntityBasic, bool&gt;(x.Item1, true);
+                    }
+
+                    return x;
+                })
+                .ToList();
+        }
+
+
+        protected string TranslateItem(string text)
+        {
+            if (text == null)
+            {
+                return null;
+            }
+
+            if (text.StartsWith(&quot;#&quot;) == false)
+                return text;
+
+            text = text.Substring(1);
+            return CultureDictionary[text].IfNullOrWhiteSpace(text);
+        }
+
+        protected TContentType PerformPostSave&lt;TContentType, TContentTypeDisplay, TContentTypeSave, TPropertyType&gt;(
+            TContentTypeSave contentTypeSave,
+            Func&lt;int, TContentType&gt; getContentType,
+            Action&lt;TContentType&gt; saveContentType,
+            Action&lt;TContentTypeSave&gt; beforeCreateNew = null)
+            where TContentType : class, IContentTypeComposition
+            where TContentTypeDisplay : ContentTypeCompositionDisplay
+            where TContentTypeSave : ContentTypeSave&lt;TPropertyType&gt;
+            where TPropertyType : PropertyTypeBasic
+        {
+            var ctId = Convert.ToInt32(contentTypeSave.Id);
+            var ct = ctId &gt; 0 ? getContentType(ctId) : null;
+            if (ctId &gt; 0 &amp;&amp; ct == null) throw new HttpResponseException(HttpStatusCode.NotFound);
+
+            //Validate that there&#39;s no other ct with the same alias
+            // it in fact cannot be the same as any content type alias (member, content or media) because
+            // this would interfere with how ModelsBuilder works and also how many of the published caches
+            // works since that is based on aliases.
+            var allAliases = Services.ContentTypeService.GetAllContentTypeAliases();
+            var exists = allAliases.InvariantContains(contentTypeSave.Alias);
+            if ((exists) &amp;&amp; (ctId == 0 || ct.Alias != contentTypeSave.Alias))
+            {
+                ModelState.AddModelError(&quot;Alias&quot;, &quot;A content type, media type or member type with this alias already exists&quot;);
+            }
+
+            //now let the external validators execute
+            ValidationHelper.ValidateEditorModelWithResolver(ModelState, contentTypeSave);
+
+            if (ModelState.IsValid == false)
+            {
+                throw CreateModelStateValidationException&lt;TContentTypeSave, TContentTypeDisplay, TContentType&gt;(ctId, contentTypeSave, ct);
+            }
+
+            //filter out empty properties
+            contentTypeSave.Groups = contentTypeSave.Groups.Where(x =&gt; x.Name.IsNullOrWhiteSpace() == false).ToList();
+            foreach (var group in contentTypeSave.Groups)
+            {
+                group.Properties = group.Properties.Where(x =&gt; x.Alias.IsNullOrWhiteSpace() == false).ToList();
+            }
+
+            if (ctId &gt; 0)
+            {
+                //its an update to an existing content type
+
+                //This mapping will cause a lot of content type validation to occur which we need to deal with
+                try
+                {
+                    Mapper.Map(contentTypeSave, ct);
+                }
+                catch (Exception ex)
+                {
+                    var responseEx = CreateInvalidCompositionResponseException&lt;TContentTypeDisplay, TContentType, TContentTypeSave, TPropertyType&gt;(ex, contentTypeSave, ct, ctId);
+                    if (responseEx != null) throw responseEx;
+                }
+
+                var exResult = CreateCompositionValidationExceptionIfInvalid&lt;TContentTypeSave, TPropertyType, TContentTypeDisplay&gt;(contentTypeSave, ct);
+                if (exResult != null) throw exResult;
+
+                saveContentType(ct);
+
+                return ct;
+            }
+            else
+            {
+                if (beforeCreateNew != null)
+                {
+                    beforeCreateNew(contentTypeSave);
+                }
+
+                //check if the type is trying to allow type 0 below itself - id zero refers to the currently unsaved type
+                //always filter these 0 types out
+                var allowItselfAsChild = false;
+                if (contentTypeSave.AllowedContentTypes != null)
+                {
+                    allowItselfAsChild = contentTypeSave.AllowedContentTypes.Any(x =&gt; x == 0);
+                    contentTypeSave.AllowedContentTypes = contentTypeSave.AllowedContentTypes.Where(x =&gt; x &gt; 0).ToList();
+                }
+
+                //save as new
+
+                TContentType newCt = null;
+                try
+                {
+                    //This mapping will cause a lot of content type validation to occur which we need to deal with
+                    newCt = Mapper.Map&lt;TContentType&gt;(contentTypeSave);
+                }
+                catch (Exception ex)
+                {
+                    var responseEx = CreateInvalidCompositionResponseException&lt;TContentTypeDisplay, TContentType, TContentTypeSave, TPropertyType&gt;(ex, contentTypeSave, ct, ctId);
+                    if (responseEx != null) throw responseEx;
+                }
+
+                var exResult = CreateCompositionValidationExceptionIfInvalid&lt;TContentTypeSave, TPropertyType, TContentTypeDisplay&gt;(contentTypeSave, newCt);
+                if (exResult != null) throw exResult;
+
+                //set id to null to ensure its handled as a new type
+                contentTypeSave.Id = null;
+                contentTypeSave.CreateDate = DateTime.Now;
+                contentTypeSave.UpdateDate = DateTime.Now;
+
+                saveContentType(newCt);
+
+                //we need to save it twice to allow itself under itself.
+                if (allowItselfAsChild)
+                {
+                    //NOTE: This will throw if the composition isn&#39;t right... but it shouldn&#39;t be at this stage
+                    newCt.AddContentType(newCt);
+                    saveContentType(newCt);
+                }
+                return newCt;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Move
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;move&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;getContentType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;doMove&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected HttpResponseMessage PerformMove&lt;TContentType&gt;(
+            MoveOrCopy move,
+            Func&lt;int, TContentType&gt; getContentType,
+            Func&lt;TContentType, int, Attempt&lt;OperationStatus&lt;MoveOperationStatusType&gt;&gt;&gt; doMove)
+            where TContentType : IContentTypeComposition
+        {
+            var toMove = getContentType(move.Id);
+            if (toMove == null)
+            {
+                return Request.CreateResponse(HttpStatusCode.NotFound);
+            }
+
+            var result = doMove(toMove, move.ParentId);
+            if (result.Success)
+            {
+                var response = Request.CreateResponse(HttpStatusCode.OK);
+                response.Content = new StringContent(toMove.Path, Encoding.UTF8, &quot;application/json&quot;);
+                return response;
+            }
+
+            switch (result.Result.StatusType)
+            {
+                case MoveOperationStatusType.FailedParentNotFound:
+                    return Request.CreateResponse(HttpStatusCode.NotFound);
+                case MoveOperationStatusType.FailedCancelledByEvent:
+                    //returning an object of INotificationModel will ensure that any pending
+                    // notification messages are added to the response.
+                    return Request.CreateValidationErrorResponse(new SimpleNotificationModel());
+                case MoveOperationStatusType.FailedNotAllowedByPath:
+                    var notificationModel = new SimpleNotificationModel();
+                    notificationModel.AddErrorNotification(Services.TextService.Localize(&quot;moveOrCopy/notAllowedByPath&quot;), &quot;&quot;);
+                    return Request.CreateValidationErrorResponse(notificationModel);
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Move
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;move&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;getContentType&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;doCopy&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected HttpResponseMessage PerformCopy&lt;TContentType&gt;(
+            MoveOrCopy move,
+            Func&lt;int, TContentType&gt; getContentType,
+            Func&lt;TContentType, int, Attempt&lt;OperationStatus&lt;TContentType, MoveOperationStatusType&gt;&gt;&gt; doCopy)
+            where TContentType : IContentTypeComposition
+        {
+            var toMove = getContentType(move.Id);
+            if (toMove == null)
+            {
+                return Request.CreateResponse(HttpStatusCode.NotFound);
+            }
+
+            var result = doCopy(toMove, move.ParentId);
+            if (result.Success)
+            {
+                var copy = result.Result.Entity;
+                var response = Request.CreateResponse(HttpStatusCode.OK);
+                response.Content = new StringContent(copy.Path, Encoding.UTF8, &quot;application/json&quot;);
+                return response;
+            }
+
+            switch (result.Result.StatusType)
+            {
+                case MoveOperationStatusType.FailedParentNotFound:
+                    return Request.CreateResponse(HttpStatusCode.NotFound);
+                case MoveOperationStatusType.FailedCancelledByEvent:
+                    //returning an object of INotificationModel will ensure that any pending
+                    // notification messages are added to the response.
+                    return Request.CreateValidationErrorResponse(new SimpleNotificationModel());
+                case MoveOperationStatusType.FailedNotAllowedByPath:
+                    var notificationModel = new SimpleNotificationModel();
+                    notificationModel.AddErrorNotification(Services.TextService.Localize(&quot;moveOrCopy/notAllowedByPath&quot;), &quot;&quot;);
+                    return Request.CreateValidationErrorResponse(notificationModel);
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Validates the composition and adds errors to the model state if any are found then throws an error response if there are errors
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentTypeSave&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;composition&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private HttpResponseException CreateCompositionValidationExceptionIfInvalid&lt;TContentTypeSave, TPropertyType, TContentTypeDisplay&gt;(TContentTypeSave contentTypeSave, IContentTypeComposition composition)
+            where TContentTypeSave : ContentTypeSave&lt;TPropertyType&gt;
+            where TPropertyType : PropertyTypeBasic
+            where TContentTypeDisplay : ContentTypeCompositionDisplay
+        {
+            var validateAttempt = Services.ContentTypeService.ValidateComposition(composition);
+            if (validateAttempt == false)
+            {
+                //if it&#39;s not successful then we need to return some model state for the property aliases that
+                // are duplicated
+                var invalidPropertyAliases = validateAttempt.Result.Distinct();
+                AddCompositionValidationErrors&lt;TContentTypeSave, TPropertyType&gt;(contentTypeSave, invalidPropertyAliases);
+
+                var display = Mapper.Map&lt;TContentTypeDisplay&gt;(composition);
+                //map the &#39;save&#39; data on top
+                display = Mapper.Map(contentTypeSave, display);
+                display.Errors = ModelState.ToErrorDictionary();
+                throw new HttpResponseException(Request.CreateValidationErrorResponse(display));
+            }
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// Adds errors to the model state if any invalid aliases are found then throws an error response if there are errors
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentTypeSave&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;invalidPropertyAliases&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private void AddCompositionValidationErrors&lt;TContentTypeSave, TPropertyType&gt;(TContentTypeSave contentTypeSave, IEnumerable&lt;string&gt; invalidPropertyAliases)
+            where TContentTypeSave : ContentTypeSave&lt;TPropertyType&gt;
+            where TPropertyType : PropertyTypeBasic
+        {
+            foreach (var propertyAlias in invalidPropertyAliases)
+            {
+                //find the property relating to these
+                var prop = contentTypeSave.Groups.SelectMany(x =&gt; x.Properties).Single(x =&gt; x.Alias == propertyAlias);
+                var group = contentTypeSave.Groups.Single(x =&gt; x.Properties.Contains(prop));
+
+                var key = string.Format(&quot;Groups[{0}].Properties[{1}].Alias&quot;, group.SortOrder, prop.SortOrder);
+                ModelState.AddModelError(key, &quot;Duplicate property aliases not allowed between compositions&quot;);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// If the exception is an InvalidCompositionException create a response exception to be thrown for validation errors
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TContentTypeDisplay&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;typeparam name=&quot;TContentType&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;typeparam name=&quot;TContentTypeSave&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;typeparam name=&quot;TPropertyType&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;ex&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;contentTypeSave&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;ct&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;ctId&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private HttpResponseException CreateInvalidCompositionResponseException&lt;TContentTypeDisplay, TContentType, TContentTypeSave, TPropertyType&gt;(
+            Exception ex, TContentTypeSave contentTypeSave, TContentType ct, int ctId)
+            where TContentType : class, IContentTypeComposition
+            where TContentTypeDisplay : ContentTypeCompositionDisplay
+            where TContentTypeSave : ContentTypeSave&lt;TPropertyType&gt;
+            where TPropertyType : PropertyTypeBasic
+        {
+            InvalidCompositionException invalidCompositionException = null;
+            if (ex is AutoMapperMappingException &amp;&amp; ex.InnerException is InvalidCompositionException)
+            {
+                invalidCompositionException = (InvalidCompositionException)ex.InnerException;
+            }
+            else if (ex.InnerException is InvalidCompositionException)
+            {
+                invalidCompositionException = (InvalidCompositionException)ex;
+            }
+            if (invalidCompositionException != null)
+            {
+                AddCompositionValidationErrors&lt;TContentTypeSave, TPropertyType&gt;(contentTypeSave, invalidCompositionException.PropertyTypeAliases);
+                return CreateModelStateValidationException&lt;TContentTypeSave, TContentTypeDisplay, TContentType&gt;(ctId, contentTypeSave, ct);
+            }
+            return null;
+        }
+
+        /// &lt;summary&gt;
+        /// Used to throw the ModelState validation results when the ModelState is invalid
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;TContentTypeDisplay&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;typeparam name=&quot;TContentType&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;typeparam name=&quot;TContentTypeSave&quot;&gt;&lt;/typeparam&gt;
+        /// &lt;param name=&quot;ctId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;contentTypeSave&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;ct&quot;&gt;&lt;/param&gt;
+        private HttpResponseException CreateModelStateValidationException&lt;TContentTypeSave, TContentTypeDisplay, TContentType&gt;(int ctId, TContentTypeSave contentTypeSave, TContentType ct)
+            where TContentType : class, IContentTypeComposition
+            where TContentTypeDisplay : ContentTypeCompositionDisplay
+            where TContentTypeSave : ContentTypeSave
+        {
+            TContentTypeDisplay forDisplay;
+            if (ctId &gt; 0)
+            {
+                //Required data is invalid so we cannot continue
+                forDisplay = Mapper.Map&lt;TContentTypeDisplay&gt;(ct);
+                //map the &#39;save&#39; data on top
+                forDisplay = Mapper.Map(contentTypeSave, forDisplay);
+            }
+            else
+            {
+                //map the &#39;save&#39; data to display
+                forDisplay = Mapper.Map&lt;TContentTypeDisplay&gt;(contentTypeSave);
+            }
+
+            forDisplay.Errors = ModelState.ToErrorDictionary();
+            return new HttpResponseException(Request.CreateValidationErrorResponse(forDisplay));
+        }
+
+        private ICultureDictionary CultureDictionary
+        {
+            get
+            {
+                return
+                    _cultureDictionary ??
+                    (_cultureDictionary = CultureDictionaryFactoryResolver.Current.Factory.CreateDictionary());
+            }
+        }
+
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[38,15,38,43,0],[39,9,39,10,0],[40,9,40,10,0],[47,15,47,35,0],[48,9,48,10,0],[49,9,49,10,0],[70,9,70,10,0],[71,13,71,51,0],[77,13,77,26,0],[80,21,80,43,0],[81,21,81,22,0],[82,25,82,92,0],[83,25,83,44,0],[83,45,83,126,0],[84,21,84,22,0],[85,21,85,130,0],[86,21,86,27,0],[89,21,89,43,0],[90,21,90,22,0],[91,25,91,90,0],[92,25,92,44,0],[92,45,92,126,0],[93,21,93,22,0],[94,21,94,128,0],[95,21,95,27,0],[98,21,98,43,0],[99,21,99,22,0],[100,25,100,80,0],[101,25,101,44,0],[101,45,101,126,0],[102,21,102,22,0],[103,21,103,117,0],[104,21,104,27,0],[107,21,107,101,0],[110,13,110,169,0],[112,13,112,129,0],[113,13,113,60,0],[113,60,113,67,0],[113,67,113,79,0],[113,13,113,79,0],[114,13,114,73,0],[114,73,114,80,0],[114,80,114,82,0],[114,13,114,82,0],[116,13,117,30,0],[117,30,117,134,0],[117,134,119,17,0],[119,17,119,18,0],[119,18,121,21,0],[121,21,121,64,0],[121,64,125,21,0],[125,21,125,107,0],[125,107,126,21,0],[126,21,126,22,0],[126,22,128,25,0],[128,25,128,73,0],[128,73,129,21,0],[129,21,129,22,0],[129,22,131,21,0],[131,21,131,30,0],[131,30,132,17,0],[132,17,132,18,0],[132,18,133,27,0],[116,13,133,27,0],[134,9,134,10,0],[138,9,138,10,0],[139,13,139,30,0],[140,13,140,14,0],[141,17,141,29,0],[144,13,144,47,0],[145,17,145,29,0],[147,13,147,38,0],[148,13,148,69,0],[149,9,149,10,0],[160,9,160,10,0],[161,13,161,60,0],[162,13,162,61,0],[163,13,163,40,0],[163,41,163,98,0],[169,13,169,85,0],[170,13,170,78,0],[171,13,171,78,0],[172,13,172,14,0],[173,17,173,127,0],[174,13,174,14,0],[177,13,177,91,0],[179,13,179,45,0],[180,13,180,14,0],[181,17,181,139,0],[185,13,185,72,0],[185,72,185,108,0],[185,108,185,119,0],[185,13,185,119,0],[186,13,186,20,0],[186,22,186,31,0],[186,32,186,34,0],[186,35,186,57,0],[187,13,187,14,0],[188,17,188,64,0],[188,64,188,101,0],[188,101,188,112,0],[188,17,188,112,0],[189,13,189,14,0],[191,13,191,26,0],[192,13,192,14,0],[197,17,197,18,0],[198,21,198,53,0],[199,17,199,18,0],[200,17,200,37,0],[201,17,201,18,0],[202,21,202,179,0],[203,21,203,44,0],[203,45,203,62,0],[204,17,204,18,0],[206,17,206,153,0],[207,17,207,38,0],[207,39,207,54,0],[209,17,209,37,0],[211,17,211,27,0],[214,13,214,14,0],[215,17,215,45,0],[216,17,216,18,0],[217,21,217,54,0],[218,17,218,18,0],[222,17,222,48,0],[223,17,223,65,0],[224,17,224,18,0],[225,21,225,87,0],[225,87,225,93,0],[225,93,225,95,0],[225,21,225,95,0],[226,21,226,106,0],[226,106,226,111,0],[226,111,226,122,0],[226,21,226,122,0],[227,17,227,18,0],[231,17,231,43,0],[233,17,233,18,0],[235,21,235,71,0],[236,17,236,18,0],[237,17,237,37,0],[238,17,238,18,0],[239,21,239,179,0],[240,21,240,44,0],[240,45,240,62,0],[241,17,241,18,0],[243,17,243,156,0],[244,17,244,38,0],[244,39,244,54,0],[247,17,247,43,0],[248,17,248,59,0],[249,17,249,59,0],[251,17,251,40,0],[254,17,254,40,0],[255,17,255,18,0],[257,21,257,49,0],[258,21,258,44,0],[259,17,259,18,0],[260,17,260,30,0],[262,9,262,10,0],[276,9,276,10,0],[277,13,277,50,0],[278,13,278,32,0],[279,13,279,14,0],[280,17,280,72,0],[283,13,283,56,0],[284,13,284,32,0],[285,13,285,14,0],[286,17,286,74,0],[287,17,287,102,0],[288,17,288,33,0],[291,13,291,46,0],[294,21,294,76,0],[298,21,298,97,0],[300,21,300,75,0],[301,21,301,126,0],[302,21,302,85,0],[304,21,304,61,0],[306,9,306,10,0],[320,9,320,10,0],[321,13,321,50,0],[322,13,322,32,0],[323,13,323,14,0],[324,17,324,72,0],[327,13,327,56,0],[328,13,328,32,0],[329,13,329,14,0],[330,17,330,49,0],[331,17,331,74,0],[332,17,332,100,0],[333,17,333,33,0],[336,13,336,46,0],[339,21,339,76,0],[343,21,343,97,0],[345,21,345,75,0],[346,21,346,126,0],[347,21,347,85,0],[349,21,349,61,0],[351,9,351,10,0],[363,9,363,10,0],[364,13,364,96,0],[365,13,365,42,0],[366,13,366,14,0],[369,17,369,80,0],[370,17,370,122,0],[372,17,372,76,0],[374,17,374,64,0],[375,17,375,65,0],[376,17,376,97,0],[378,13,378,25,0],[379,9,379,10,0],[390,9,390,10,0],[391,13,391,20,0],[391,22,391,39,0],[391,40,391,42,0],[391,43,391,65,0],[392,13,392,14,0],[394,17,394,67,0],[394,67,394,79,0],[394,79,394,93,0],[394,93,394,117,0],[394,117,394,119,0],[394,17,394,119,0],[395,17,395,64,0],[395,64,395,91,0],[395,91,395,93,0],[395,17,395,93,0],[397,17,397,111,0],[398,17,398,110,0],[399,13,399,14,0],[400,9,400,10,0],[420,9,420,10,0],[421,13,421,76,0],[422,13,422,102,0],[423,13,423,14,0],[424,17,424,94,0],[425,13,425,14,0],[426,18,426,71,0],[427,13,427,14,0],[428,17,428,79,0],[429,13,429,14,0],[430,13,430,53,0],[431,13,431,14,0],[432,17,432,147,0],[433,17,433,140,0],[435,13,435,25,0],[436,9,436,10,0],[451,9,451,10,0],[453,13,453,26,0],[454,13,454,14,0],[456,17,456,66,0],[458,17,458,70,0],[459,13,459,14,0],[461,13,461,14,0],[463,17,463,79,0],[464,13,464,14,0],[466,13,466,64,0],[467,13,467,97,0],[468,9,468,10,0],[473,13,473,14,0],[474,17,476,112,0],[477,13,477,14,0]]);
+    </script>
+  </body>
+</html>

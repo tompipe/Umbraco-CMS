@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Trees\ContentTreeController.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Formatting;
+using System.Web.Http;
+using Umbraco.Core;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Services;
+using Umbraco.Web.Models.Trees;
+using Umbraco.Web.Mvc;
+using Umbraco.Web.WebApi.Filters;
+using umbraco;
+using umbraco.BusinessLogic.Actions;
+using umbraco.businesslogic;
+using umbraco.cms.businesslogic.web;
+using umbraco.interfaces;
+using Constants = Umbraco.Core.Constants;
+
+namespace Umbraco.Web.Trees
+{
+    //We will not allow the tree to render unless the user has access to any of the sections that the tree gets rendered
+    // this is not ideal but until we change permissions to be tree based (not section) there&#39;s not much else we can do here.
+    [UmbracoApplicationAuthorize(
+        Constants.Applications.Content, 
+        Constants.Applications.Media, 
+        Constants.Applications.Users,
+        Constants.Applications.Settings,
+        Constants.Applications.Developer,
+        Constants.Applications.Members)]
+    [LegacyBaseTree(typeof(loadContent))]
+    [Tree(Constants.Applications.Content, Constants.Trees.Content)]
+    [PluginController(&quot;UmbracoTrees&quot;)]
+    [CoreTree]
+    public class ContentTreeController : ContentTreeControllerBase
+    {
+       
+        protected override TreeNode CreateRootNode(FormDataCollection queryStrings)
+        {
+            var node = base.CreateRootNode(queryStrings); 
+            //if the user&#39;s start node is not default, then ensure the root doesn&#39;t have a menu
+            if (Security.CurrentUser.StartContentId != Constants.System.Root)
+            {
+                node.MenuUrl = &quot;&quot;;
+            }
+            node.Name = ui.Text(&quot;sections&quot;, Constants.Trees.Content);
+            return node;
+        }
+
+        protected override int RecycleBinId
+        {
+            get { return Constants.System.RecycleBinContent; }
+        }
+
+        protected override bool RecycleBinSmells
+        {
+            get { return Services.ContentService.RecycleBinSmells(); }
+        }
+
+        protected override int UserStartNode
+        {
+            get { return Security.CurrentUser.StartContentId; }
+        }
+        
+        /// &lt;summary&gt;
+        /// Creates a tree node for a content item based on an UmbracoEntity
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected override TreeNode GetSingleTreeNode(IUmbracoEntity e, string parentId, FormDataCollection queryStrings)
+        {
+            var entity = (UmbracoEntity) e;
+
+            var allowedUserOptions = GetAllowedUserMenuItemsForNode(e);
+            if (CanUserAccessNode(e, allowedUserOptions))
+            {
+
+                //Special check to see if it ia a container, if so then we&#39;ll hide children.
+                var isContainer = e.IsContainer();   // &amp;&amp; (queryStrings.Get(&quot;isDialog&quot;) != &quot;true&quot;);
+
+                var node = CreateTreeNode(
+                    e.Id.ToInvariantString(),
+                    parentId,
+                    queryStrings,
+                    e.Name,
+                    entity.ContentTypeIcon,
+                    entity.HasChildren &amp;&amp; (isContainer == false));
+
+                node.AdditionalData.Add(&quot;contentType&quot;, entity.ContentTypeAlias);
+
+                if (isContainer)
+                {
+                    node.AdditionalData.Add(&quot;isContainer&quot;, true);
+                    node.SetContainerStyle();
+                }
+                    
+
+                if (entity.IsPublished == false)
+                    node.SetNotPublishedStyle();
+
+                if (entity.HasPendingChanges)
+                    node.SetHasUnpublishedVersionStyle();
+
+                if (Services.PublicAccessService.IsProtected(e.Path))
+                    node.SetProtectedStyle();
+
+                return node;
+            }
+
+            return null;
+        }
+
+        protected override MenuItemCollection PerformGetMenuForNode(string id, FormDataCollection queryStrings)
+        {
+            if (id == Constants.System.Root.ToInvariantString())
+            {
+                var menu = new MenuItemCollection();
+
+                //if the user&#39;s start node is not the root then ensure the root menu is empty/doesn&#39;t exist
+                if (Security.CurrentUser.StartContentId != Constants.System.Root)
+                {
+                    return menu;
+                }
+
+                //set the default to create
+                menu.DefaultMenuAlias = ActionNew.Instance.Alias;
+
+                // we need to get the default permissions as you can&#39;t set permissions on the very root node
+                //TODO: Use the new services to get permissions
+                var nodeActions = global::umbraco.BusinessLogic.Actions.Action.FromString(
+                    UmbracoUser.GetPermissions(Constants.System.Root.ToInvariantString()))
+                                        .Select(x =&gt; new MenuItem(x));
+
+                //these two are the standard items
+                menu.Items.Add&lt;ActionNew&gt;(ui.Text(&quot;actions&quot;, ActionNew.Instance.Alias));
+                menu.Items.Add&lt;ActionSort&gt;(ui.Text(&quot;actions&quot;, ActionSort.Instance.Alias), true).ConvertLegacyMenuItem(null, &quot;content&quot;, &quot;content&quot;);
+
+                //filter the standard items
+                FilterUserAllowedMenuItems(menu, nodeActions);
+
+                if (menu.Items.Any())
+                {
+                    menu.Items.Last().SeperatorBefore = true;
+                }
+
+                // add default actions for *all* users
+                menu.Items.Add&lt;ActionRePublish&gt;(ui.Text(&quot;actions&quot;, ActionRePublish.Instance.Alias)).ConvertLegacyMenuItem(null, &quot;content&quot;, &quot;content&quot;);
+                menu.Items.Add&lt;RefreshNode, ActionRefresh&gt;(ui.Text(&quot;actions&quot;, ActionRefresh.Instance.Alias), true);
+                
+                return menu;
+            }
+
+
+            //return a normal node menu:
+            int iid;
+            if (int.TryParse(id, out iid) == false)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+            var item = Services.EntityService.Get(iid, UmbracoObjectTypes.Document);
+            if (item == null)
+            {
+                throw new HttpResponseException(HttpStatusCode.NotFound);
+            }
+
+            var nodeMenu = GetAllNodeMenuItems(item);
+            var allowedMenuItems = GetAllowedUserMenuItemsForNode(item);
+                
+            FilterUserAllowedMenuItems(nodeMenu, allowedMenuItems);
+
+            //if the media item is in the recycle bin, don&#39;t have a default menu, just show the regular menu
+            if (item.Path.Split(new[] {&#39;,&#39;}, StringSplitOptions.RemoveEmptyEntries).Contains(RecycleBinId.ToInvariantString()))
+            {
+                nodeMenu.DefaultMenuAlias = null;
+                nodeMenu.Items.Insert(2, new MenuItem(ActionRestore.Instance, ui.Text(&quot;actions&quot;, ActionRestore.Instance.Alias)));
+            }
+            else
+            {
+                //set the default to create
+                nodeMenu.DefaultMenuAlias = ActionNew.Instance.Alias;    
+            }
+            
+
+            return nodeMenu;
+        }
+
+        protected override UmbracoObjectTypes UmbracoObjectType
+        {
+            get { return UmbracoObjectTypes.Document; }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns true or false if the current user has access to the node based on the user&#39;s allowed start node (path) access
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;queryStrings&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected override bool HasPathAccess(string id, FormDataCollection queryStrings)
+        {
+            var entity = GetEntityFromId(id);
+            if (entity == null)
+            {
+                return false;
+            }
+
+            IContent content = Services.ContentService.GetById(entity.Id);
+            return Security.CurrentUser.HasPathAccess(content);
+        }
+
+        /// &lt;summary&gt;
+        /// Returns a collection of all menu items that can be on a content node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;item&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected MenuItemCollection GetAllNodeMenuItems(IUmbracoEntity item)
+        {
+            var menu = new MenuItemCollection();
+            menu.Items.Add&lt;ActionNew&gt;(ui.Text(&quot;actions&quot;, ActionNew.Instance.Alias));
+            menu.Items.Add&lt;ActionDelete&gt;(ui.Text(&quot;actions&quot;, ActionDelete.Instance.Alias));
+            
+            //need to ensure some of these are converted to the legacy system - until we upgrade them all to be angularized.
+            menu.Items.Add&lt;ActionMove&gt;(ui.Text(&quot;actions&quot;, ActionMove.Instance.Alias), true);
+            menu.Items.Add&lt;ActionCopy&gt;(ui.Text(&quot;actions&quot;, ActionCopy.Instance.Alias));
+            menu.Items.Add&lt;ActionChangeDocType&gt;(ui.Text(&quot;actions&quot;, ActionChangeDocType.Instance.Alias)).ConvertLegacyMenuItem(item, &quot;content&quot;, &quot;content&quot;);
+
+            menu.Items.Add&lt;ActionSort&gt;(ui.Text(&quot;actions&quot;, ActionSort.Instance.Alias), true).ConvertLegacyMenuItem(item, &quot;content&quot;, &quot;content&quot;);
+
+            menu.Items.Add&lt;ActionRollback&gt;(ui.Text(&quot;actions&quot;, ActionRollback.Instance.Alias)).ConvertLegacyMenuItem(item, &quot;content&quot;, &quot;content&quot;);
+            menu.Items.Add&lt;ActionAudit&gt;(ui.Text(&quot;actions&quot;, ActionAudit.Instance.Alias)).ConvertLegacyMenuItem(item, &quot;content&quot;, &quot;content&quot;);
+            menu.Items.Add&lt;ActionPublish&gt;(ui.Text(&quot;actions&quot;, ActionPublish.Instance.Alias), true).ConvertLegacyMenuItem(item, &quot;content&quot;, &quot;content&quot;);
+            menu.Items.Add&lt;ActionToPublish&gt;(ui.Text(&quot;actions&quot;, ActionToPublish.Instance.Alias)).ConvertLegacyMenuItem(item, &quot;content&quot;, &quot;content&quot;);
+            menu.Items.Add&lt;ActionAssignDomain&gt;(ui.Text(&quot;actions&quot;, ActionAssignDomain.Instance.Alias)).ConvertLegacyMenuItem(item, &quot;content&quot;, &quot;content&quot;);
+            menu.Items.Add&lt;ActionRights&gt;(ui.Text(&quot;actions&quot;, ActionRights.Instance.Alias)).ConvertLegacyMenuItem(item, &quot;content&quot;, &quot;content&quot;);
+            menu.Items.Add&lt;ActionProtect&gt;(ui.Text(&quot;actions&quot;, ActionProtect.Instance.Alias), true).ConvertLegacyMenuItem(item, &quot;content&quot;, &quot;content&quot;);
+            
+            menu.Items.Add&lt;ActionNotify&gt;(ui.Text(&quot;actions&quot;, ActionNotify.Instance.Alias), true).ConvertLegacyMenuItem(item, &quot;content&quot;, &quot;content&quot;);
+            menu.Items.Add&lt;ActionSendToTranslate&gt;(ui.Text(&quot;actions&quot;, ActionSendToTranslate.Instance.Alias)).ConvertLegacyMenuItem(item, &quot;content&quot;, &quot;content&quot;);
+
+            menu.Items.Add&lt;RefreshNode, ActionRefresh&gt;(ui.Text(&quot;actions&quot;, ActionRefresh.Instance.Alias), true);
+
+            return menu;
+        }
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[42,9,42,10,0],[43,13,43,58,0],[45,13,45,78,0],[46,13,46,14,0],[47,17,47,35,0],[48,13,48,14,0],[49,13,49,70,0],[50,13,50,25,0],[51,9,51,10,0],[55,17,55,18,0],[55,19,55,61,0],[55,62,55,63,0],[60,17,60,18,0],[60,19,60,69,0],[60,70,60,71,0],[65,17,65,18,0],[65,19,65,62,0],[65,63,65,64,0],[76,9,76,10,0],[77,13,77,44,0],[79,13,79,72,0],[80,13,80,58,0],[81,13,81,14,0],[84,17,84,51,0],[86,17,92,67,0],[94,17,94,81,0],[96,17,96,33,0],[97,17,97,18,0],[98,21,98,66,0],[99,21,99,46,0],[100,17,100,18,0],[103,17,103,49,0],[104,21,104,49,0],[106,17,106,46,0],[107,21,107,58,0],[109,17,109,70,0],[110,21,110,46,0],[112,17,112,29,0],[115,13,115,25,0],[116,9,116,10,0],[119,9,119,10,0],[120,13,120,65,0],[121,13,121,14,0],[122,17,122,53,0],[125,17,125,82,0],[126,17,126,18,0],[127,21,127,33,0],[131,17,131,66,0],[135,17,137,54,0],[137,54,137,69,0],[137,69,137,71,0],[135,17,137,71,0],[140,17,140,89,0],[141,17,141,147,0],[144,17,144,63,0],[146,17,146,38,0],[147,17,147,18,0],[148,21,148,62,0],[149,17,149,18,0],[152,17,152,151,0],[153,17,153,116,0],[155,17,155,29,0],[161,13,161,52,0],[162,13,162,14,0],[163,17,163,74,0],[165,13,165,85,0],[166,13,166,30,0],[167,13,167,14,0],[168,17,168,74,0],[171,13,171,54,0],[172,13,172,73,0],[174,13,174,68,0],[177,13,177,128,0],[178,13,178,14,0],[179,17,179,50,0],[180,17,180,130,0],[181,13,181,14,0],[183,13,183,14,0],[185,17,185,70,0],[186,13,186,14,0],[189,13,189,29,0],[190,9,190,10,0],[194,17,194,18,0],[194,19,194,54,0],[194,55,194,56,0],[204,9,204,10,0],[205,13,205,46,0],[206,13,206,32,0],[207,13,207,14,0],[208,17,208,30,0],[211,13,211,75,0],[212,13,212,64,0],[213,9,213,10,0],[221,9,221,10,0],[222,13,222,49,0],[223,13,223,85,0],[224,13,224,91,0],[227,13,227,93,0],[228,13,228,87,0],[229,13,229,155,0],[231,13,231,143,0],[233,13,233,145,0],[234,13,234,139,0],[235,13,235,149,0],[236,13,236,147,0],[237,13,237,153,0],[238,13,238,141,0],[239,13,239,149,0],[241,13,241,147,0],[242,13,242,159,0],[244,13,244,112,0],[246,13,246,25,0],[247,9,247,10,0]]);
+    </script>
+  </body>
+</html>

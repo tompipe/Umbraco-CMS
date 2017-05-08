@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\DataTypeDefinitionRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Globalization;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Events;
+using Umbraco.Core.Exceptions;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represents a repository for doing CRUD operations for &lt;see cref=&quot;DataTypeDefinition&quot;/&gt;
+    /// &lt;/summary&gt;
+    internal class DataTypeDefinitionRepository : PetaPocoRepositoryBase&lt;int, IDataTypeDefinition&gt;, IDataTypeDefinitionRepository
+    {
+        private readonly IContentTypeRepository _contentTypeRepository;
+        private readonly DataTypePreValueRepository _preValRepository;
+
+        public DataTypeDefinitionRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax,
+            IContentTypeRepository contentTypeRepository)
+            : base(work, cache, logger, sqlSyntax)
+        {
+            _contentTypeRepository = contentTypeRepository;
+            _preValRepository = new DataTypePreValueRepository(work, CacheHelper.CreateDisabledCacheHelper(), logger, sqlSyntax);
+        }
+
+        #region Overrides of RepositoryBase&lt;int,DataTypeDefinition&gt;
+
+        protected override IDataTypeDefinition PerformGet(int id)
+        {
+            return GetAll(new[] { id }).FirstOrDefault();
+        }
+
+        protected override IEnumerable&lt;IDataTypeDefinition&gt; PerformGetAll(params int[] ids)
+        {
+            var factory = new DataTypeDefinitionFactory(NodeObjectTypeId);
+            var dataTypeSql = GetBaseQuery(false);
+
+            if (ids.Any())
+            {
+                dataTypeSql.Where(&quot;umbracoNode.id in (@ids)&quot;, new { ids = ids });
+            }
+            else
+            {
+                dataTypeSql.Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId);
+            }
+
+            var dtos = Database.Fetch&lt;DataTypeDto, NodeDto&gt;(dataTypeSql);
+            return dtos.Select(factory.BuildEntity).ToArray();
+        }
+
+        protected override IEnumerable&lt;IDataTypeDefinition&gt; PerformGetByQuery(IQuery&lt;IDataTypeDefinition&gt; query)
+        {
+            var factory = new DataTypeDefinitionFactory(NodeObjectTypeId);
+
+            var sqlClause = GetBaseQuery(false);
+            var translator = new SqlTranslator&lt;IDataTypeDefinition&gt;(sqlClause, query);
+            var sql = translator.Translate();
+
+            var dtos = Database.Fetch&lt;DataTypeDto, NodeDto&gt;(sql);
+
+            return dtos.Select(factory.BuildEntity).ToArray();
+        }
+
+        /// &lt;summary&gt;
+        /// Override the delete method so that we can ensure that all related content type&#39;s are updated as part of the overall transaction
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;entity&quot;&gt;&lt;/param&gt;
+        public override void Delete(IDataTypeDefinition entity)
+        {
+            //Find ContentTypes using this IDataTypeDefinition on a PropertyType
+            var query = Query&lt;PropertyType&gt;.Builder.Where(x =&gt; x.DataTypeDefinitionId == entity.Id);
+
+            //TODO: Don&#39;t we need to be concerned about media and member types here too ?
+            var contentTypes = _contentTypeRepository.GetByQuery(query);
+
+            //Loop through the list of results and remove the PropertyTypes that references the DataTypeDefinition that is being deleted
+            foreach (var contentType in contentTypes)
+            {
+                if (contentType == null) continue;
+
+                foreach (var group in contentType.PropertyGroups)
+                {
+                    var types = @group.PropertyTypes.Where(x =&gt; x.DataTypeDefinitionId == entity.Id).ToList();
+                    foreach (var propertyType in types)
+                    {
+                        @group.PropertyTypes.Remove(propertyType);
+                    }
+                }
+
+                _contentTypeRepository.AddOrUpdate(contentType);
+            }
+
+            //call the base method to queue the deletion of this data type
+            base.Delete(entity);
+        }
+
+        #endregion
+
+        #region Overrides of PetaPocoRepositoryBase&lt;int,DataTypeDefinition&gt;
+
+        protected override Sql GetBaseQuery(bool isCount)
+        {
+            var sql = new Sql();
+            sql.Select(isCount ? &quot;COUNT(*)&quot; : &quot;*&quot;)
+               .From&lt;DataTypeDto&gt;(SqlSyntax)
+               .InnerJoin&lt;NodeDto&gt;(SqlSyntax)
+               .On&lt;DataTypeDto, NodeDto&gt;(SqlSyntax, left =&gt; left.DataTypeId, right =&gt; right.NodeId)
+               .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId);
+            return sql;
+        }
+
+        protected override string GetBaseWhereClause()
+        {
+            return &quot;umbracoNode.id = @Id&quot;;
+        }
+
+        protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+        {
+            return new List&lt;string&gt;();
+        }
+
+        protected override Guid NodeObjectTypeId
+        {
+            get { return new Guid(Constants.ObjectTypes.DataType); }
+        }
+
+        #endregion
+
+        #region Unit of Work Implementation
+
+        protected override void PersistNewItem(IDataTypeDefinition entity)
+        {
+            ((DataTypeDefinition)entity).AddingEntity();
+
+            //ensure a datatype has a unique name before creating it
+            entity.Name = EnsureUniqueNodeName(entity.Name);
+
+            //TODO: should the below be removed?
+            //Cannot add a duplicate data type
+            var exists = Database.ExecuteScalar&lt;int&gt;(@&quot;SELECT COUNT(*) FROM cmsDataType
+INNER JOIN umbracoNode ON cmsDataType.nodeId = umbracoNode.id
+WHERE umbracoNode.&quot; + SqlSyntax.GetQuotedColumnName(&quot;text&quot;) + &quot;= @name&quot;, new { name = entity.Name });
+            if (exists &gt; 0)
+            {
+                throw new DuplicateNameException(&quot;A data type with the name &quot; + entity.Name + &quot; already exists&quot;);
+            }
+
+            var factory = new DataTypeDefinitionFactory(NodeObjectTypeId);
+            var dto = factory.BuildDto(entity);
+
+            //Logic for setting Path, Level and SortOrder
+            var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = entity.ParentId });
+            int level = parent.Level + 1;
+            int sortOrder =
+                Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM umbracoNode WHERE parentID = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                                                      new { ParentId = entity.ParentId, NodeObjectType = NodeObjectTypeId });
+
+            //Create the (base) node data - umbracoNode
+            var nodeDto = dto.NodeDto;
+            nodeDto.Path = parent.Path;
+            nodeDto.Level = short.Parse(level.ToString(CultureInfo.InvariantCulture));
+            nodeDto.SortOrder = sortOrder;
+            var o = Database.IsNew(nodeDto) ? Convert.ToInt32(Database.Insert(nodeDto)) : Database.Update(nodeDto);
+
+            //Update with new correct path
+            nodeDto.Path = string.Concat(parent.Path, &quot;,&quot;, nodeDto.NodeId);
+            Database.Update(nodeDto);
+
+            //Update entity with correct values
+            entity.Id = nodeDto.NodeId; //Set Id on entity to ensure an Id is set
+            entity.Path = nodeDto.Path;
+            entity.SortOrder = sortOrder;
+            entity.Level = level;
+
+            dto.DataTypeId = nodeDto.NodeId;
+            Database.Insert(dto);
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistUpdatedItem(IDataTypeDefinition entity)
+        {
+
+            entity.Name = EnsureUniqueNodeName(entity.Name, entity.Id);
+
+            //Cannot change to a duplicate alias
+            var exists = Database.ExecuteScalar&lt;int&gt;(@&quot;SELECT COUNT(*) FROM cmsDataType
+INNER JOIN umbracoNode ON cmsDataType.nodeId = umbracoNode.id
+WHERE umbracoNode.&quot; + SqlSyntax.GetQuotedColumnName(&quot;text&quot;) + @&quot;= @name
+AND umbracoNode.id &lt;&gt; @id&quot;,
+                    new { id = entity.Id, name = entity.Name });
+            if (exists &gt; 0)
+            {
+                throw new DuplicateNameException(&quot;A data type with the name &quot; + entity.Name + &quot; already exists&quot;);
+            }
+
+            //Updates Modified date and Version Guid
+            ((DataTypeDefinition)entity).UpdatingEntity();
+
+            //Look up parent to get and set the correct Path if ParentId has changed
+            if (entity.IsPropertyDirty(&quot;ParentId&quot;))
+            {
+                var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = entity.ParentId });
+                entity.Path = string.Concat(parent.Path, &quot;,&quot;, entity.Id);
+                entity.Level = parent.Level + 1;
+                var maxSortOrder =
+                    Database.ExecuteScalar&lt;int&gt;(
+                        &quot;SELECT coalesce(max(sortOrder),0) FROM umbracoNode WHERE parentid = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                        new { ParentId = entity.ParentId, NodeObjectType = NodeObjectTypeId });
+                entity.SortOrder = maxSortOrder + 1;
+            }
+
+            var factory = new DataTypeDefinitionFactory(NodeObjectTypeId);
+            //Look up DataTypeDefinition entry to get Primary for updating the DTO
+            var dataTypeDto = Database.SingleOrDefault&lt;DataTypeDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = entity.Id });
+            factory.SetPrimaryKey(dataTypeDto.PrimaryKey);
+            var dto = factory.BuildDto(entity);
+
+            //Updates the (base) node data - umbracoNode
+            var nodeDto = dto.NodeDto;
+            Database.Update(nodeDto);
+            Database.Update(dto);
+
+            //NOTE: This is a special case, we need to clear the custom cache for pre-values here so they are not stale if devs
+            // are querying for them in the Saved event (before the distributed call cache is clearing it)
+            RuntimeCache.ClearCacheItem(GetPrefixedCacheKey(entity.Id));
+
+            entity.ResetDirtyProperties();
+        }
+
+        protected override void PersistDeletedItem(IDataTypeDefinition entity)
+        {
+            //Remove Notifications
+            Database.Delete&lt;User2NodeNotifyDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = entity.Id });
+
+            //Remove Permissions
+            Database.Delete&lt;User2NodePermissionDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = entity.Id });
+
+            //Remove associated tags
+            Database.Delete&lt;TagRelationshipDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = entity.Id });
+
+            //PropertyTypes containing the DataType being deleted
+            var propertyTypeDtos = Database.Fetch&lt;PropertyTypeDto&gt;(&quot;WHERE dataTypeId = @Id&quot;, new { Id = entity.Id });
+            //Go through the PropertyTypes and delete referenced PropertyData before deleting the PropertyType
+            foreach (var dto in propertyTypeDtos)
+            {
+                Database.Delete&lt;PropertyDataDto&gt;(&quot;WHERE propertytypeid = @Id&quot;, new { Id = dto.Id });
+                Database.Delete&lt;PropertyTypeDto&gt;(&quot;WHERE id = @Id&quot;, new { Id = dto.Id });
+            }
+
+            //Delete the pre-values
+            Database.Delete&lt;DataTypePreValueDto&gt;(&quot;WHERE datatypeNodeId = @Id&quot;, new { Id = entity.Id });
+
+            //Delete Content specific data
+            Database.Delete&lt;DataTypeDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = entity.Id });
+
+            //Delete (base) node data
+            Database.Delete&lt;NodeDto&gt;(&quot;WHERE uniqueID = @Id&quot;, new { Id = entity.Key });
+        }
+
+        #endregion
+
+        public PreValueCollection GetPreValuesCollectionByDataTypeId(int dataTypeId)
+        {
+            var collection = GetCachedPreValueCollection(dataTypeId);
+            return collection;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a specific PreValue by its Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;preValueId&quot;&gt;Id of the PreValue to retrieve the value from&lt;/param&gt;
+        /// &lt;returns&gt;PreValue as a string&lt;/returns&gt;
+        public string GetPreValueAsString(int preValueId)
+        {
+            var collections = RuntimeCache.GetCacheItemsByKeySearch&lt;PreValueCollection&gt;(CacheKeys.DataTypePreValuesCacheKey + &quot;_&quot;);
+
+            var preValue = collections.SelectMany(x =&gt; x.FormatAsDictionary().Values).FirstOrDefault(x =&gt; x.Id == preValueId);
+            if (preValue != null)
+                return preValue.Value;
+
+            var dto = Database.FirstOrDefault&lt;DataTypePreValueDto&gt;(&quot;WHERE id = @preValueId&quot;, new { preValueId });
+            if (dto == null)
+                return string.Empty;
+
+            var collection = GetCachedPreValueCollection(dto.DataTypeNodeId);
+            if (collection == null)
+                return string.Empty;
+
+            preValue = collection.FormatAsDictionary().Values.FirstOrDefault(x =&gt; x.Id == preValueId);
+            return preValue == null ? string.Empty : preValue.Value;
+        }
+
+        public void AddOrUpdatePreValues(int dataTypeId, IDictionary&lt;string, PreValue&gt; values)
+        {
+            var dtd = Get(dataTypeId);
+            if (dtd == null)
+            {
+                throw new InvalidOperationException(&quot;No data type found with id &quot; + dataTypeId);
+            }
+            AddOrUpdatePreValues(dtd, values);
+        }
+
+        public IEnumerable&lt;MoveEventInfo&lt;IDataTypeDefinition&gt;&gt; Move(IDataTypeDefinition toMove, EntityContainer container)
+        {
+            var parentId = -1;
+            if (container != null)
+            {
+                // Check on paths
+                if ((string.Format(&quot;,{0},&quot;, container.Path)).IndexOf(string.Format(&quot;,{0},&quot;, toMove.Id), StringComparison.Ordinal) &gt; -1)
+                {
+                    throw new DataOperationException&lt;MoveOperationStatusType&gt;(MoveOperationStatusType.FailedNotAllowedByPath);
+                }
+                parentId = container.Id;
+            }
+
+            //used to track all the moved entities to be given to the event
+            var moveInfo = new List&lt;MoveEventInfo&lt;IDataTypeDefinition&gt;&gt;
+            {
+                new MoveEventInfo&lt;IDataTypeDefinition&gt;(toMove, toMove.Path, parentId)
+            };
+
+            var origPath = toMove.Path;
+
+            //do the move to a new parent
+            toMove.ParentId = parentId;
+
+            //set the updated path
+            toMove.Path = string.Concat(container == null ? parentId.ToInvariantString() : container.Path, &quot;,&quot;, toMove.Id);
+
+            //schedule it for updating in the transaction
+            AddOrUpdate(toMove);
+
+            //update all descendants from the original path, update in order of level
+            var descendants = this.GetByQuery(
+                new Query&lt;IDataTypeDefinition&gt;().Where(type =&gt; type.Path.StartsWith(origPath + &quot;,&quot;)));
+
+            var lastParent = toMove;
+            foreach (var descendant in descendants.OrderBy(x =&gt; x.Level))
+            {
+                moveInfo.Add(new MoveEventInfo&lt;IDataTypeDefinition&gt;(descendant, descendant.Path, descendant.ParentId));
+
+                descendant.ParentId = lastParent.Id;
+                descendant.Path = string.Concat(lastParent.Path, &quot;,&quot;, descendant.Id);
+
+                //schedule it for updating in the transaction
+                AddOrUpdate(descendant);
+            }
+
+            return moveInfo;
+        }
+
+        public void AddOrUpdatePreValues(IDataTypeDefinition dataType, IDictionary&lt;string, PreValue&gt; values)
+        {
+            var currentVals = new DataTypePreValueDto[] { };
+            if (dataType.HasIdentity)
+            {
+                //first just get all pre-values for this data type so we can compare them to see if we need to insert or update or replace
+                var sql = new Sql().Select(&quot;*&quot;)
+                                   .From&lt;DataTypePreValueDto&gt;(SqlSyntax)
+                                   .Where&lt;DataTypePreValueDto&gt;(dto =&gt; dto.DataTypeNodeId == dataType.Id)
+                                   .OrderBy&lt;DataTypePreValueDto&gt;(dto =&gt; dto.SortOrder, SqlSyntax);
+                currentVals = Database.Fetch&lt;DataTypePreValueDto&gt;(sql).ToArray();
+            }
+
+            //already existing, need to be updated
+            var valueIds = values.Where(x =&gt; x.Value.Id &gt; 0).Select(x =&gt; x.Value.Id).ToArray();
+            var existingByIds = currentVals.Where(x =&gt; valueIds.Contains(x.Id)).ToArray();
+
+            //These ones need to be removed from the db, they no longer exist in the new values
+            var deleteById = currentVals.Where(x =&gt; valueIds.Contains(x.Id) == false);
+
+            foreach (var d in deleteById)
+            {
+                _preValRepository.Delete(new PreValueEntity
+                {
+                    Alias = d.Alias,
+                    Id = d.Id,
+                    Value = d.Value,
+                    DataType = dataType,
+                    SortOrder = d.SortOrder
+                });
+            }
+
+            var sortOrder = 1;
+
+            foreach (var pre in values)
+            {
+                var existing = existingByIds.FirstOrDefault(valueDto =&gt; valueDto.Id == pre.Value.Id);
+                if (existing != null)
+                {
+                    _preValRepository.AddOrUpdate(new PreValueEntity
+                    {
+                        //setting an id will update it
+                        Id = existing.Id,
+                        DataType = dataType,
+                        //These are the new values to update
+                        Alias = pre.Key,
+                        SortOrder = sortOrder,
+                        Value = pre.Value.Value
+                    });
+                }
+                else
+                {
+                    _preValRepository.AddOrUpdate(new PreValueEntity
+                    {
+                        Alias = pre.Key,
+                        SortOrder = sortOrder,
+                        Value = pre.Value.Value,
+                        DataType = dataType,
+                    });
+                }
+
+                sortOrder++;
+            }
+        }
+
+        private static string GetPrefixedCacheKey(int dataTypeId)
+        {
+            return CacheKeys.DataTypePreValuesCacheKey + &quot;_&quot; + dataTypeId;
+        }
+
+        private PreValueCollection GetCachedPreValueCollection(int datetypeId)
+        {
+            var key = GetPrefixedCacheKey(datetypeId);
+            return RuntimeCache.GetCacheItem&lt;PreValueCollection&gt;(key, () =&gt;
+            {
+                var dtos = Database.Fetch&lt;DataTypePreValueDto&gt;(&quot;WHERE datatypeNodeId = @Id&quot;, new { Id = datetypeId });
+                var list = dtos.Select(x =&gt; new Tuple&lt;PreValue, string, int&gt;(new PreValue(x.Id, x.Value, x.SortOrder), x.Alias, x.SortOrder)).ToList();
+                var collection = PreValueConverter.ConvertToPreValuesCollection(list);
+                return collection;
+            }, TimeSpan.FromMinutes(20), isSliding: true);
+        }
+
+        private string EnsureUniqueNodeName(string nodeName, int id = 0)
+        {
+
+
+            var sql = new Sql();
+            sql.Select(&quot;*&quot;)
+               .From&lt;NodeDto&gt;(SqlSyntax)
+               .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == NodeObjectTypeId &amp;&amp; x.Text.StartsWith(nodeName));
+
+            int uniqueNumber = 1;
+            var currentName = nodeName;
+
+            var dtos = Database.Fetch&lt;NodeDto&gt;(sql);
+            if (dtos.Any())
+            {
+                var results = dtos.OrderBy(x =&gt; x.Text, new SimilarNodeNameComparer());
+                foreach (var dto in results)
+                {
+                    if (id != 0 &amp;&amp; id == dto.NodeId) continue;
+
+                    if (dto.Text.ToLowerInvariant().Equals(currentName.ToLowerInvariant()))
+                    {
+                        currentName = nodeName + string.Format(&quot; ({0})&quot;, uniqueNumber);
+                        uniqueNumber++;
+                    }
+                }
+            }
+
+            return currentName;
+        }
+
+        /// &lt;summary&gt;
+        /// Private class to handle pre-value crud based on units of work with transactions
+        /// &lt;/summary&gt;
+        private class PreValueEntity : Entity, IAggregateRoot
+        {
+            public string Value { get; set; }
+            public string Alias { get; set; }
+            public IDataTypeDefinition DataType { get; set; }
+            public int SortOrder { get; set; }
+        }
+
+        /// &lt;summary&gt;
+        /// Private class to handle pre-value crud based on standard principles and units of work with transactions
+        /// &lt;/summary&gt;
+        private class DataTypePreValueRepository : PetaPocoRepositoryBase&lt;int, PreValueEntity&gt;
+        {
+            public DataTypePreValueRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax)
+                : base(work, cache, logger, sqlSyntax)
+            {
+            }
+
+            #region Not implemented (don&#39;t need to for the purposes of this repo)
+            protected override PreValueEntity PerformGet(int id)
+            {
+                throw new NotImplementedException();
+            }
+
+            protected override IEnumerable&lt;PreValueEntity&gt; PerformGetAll(params int[] ids)
+            {
+                throw new NotImplementedException();
+            }
+
+            protected override IEnumerable&lt;PreValueEntity&gt; PerformGetByQuery(IQuery&lt;PreValueEntity&gt; query)
+            {
+                throw new NotImplementedException();
+            }
+
+            protected override Sql GetBaseQuery(bool isCount)
+            {
+                throw new NotImplementedException();
+            }
+
+            protected override string GetBaseWhereClause()
+            {
+                throw new NotImplementedException();
+            }
+
+            protected override IEnumerable&lt;string&gt; GetDeleteClauses()
+            {
+                return new List&lt;string&gt;();
+            }
+
+            protected override Guid NodeObjectTypeId
+            {
+                get { throw new NotImplementedException(); }
+            }
+            #endregion
+
+            protected override void PersistDeletedItem(PreValueEntity entity)
+            {
+                Database.Execute(
+                    &quot;DELETE FROM cmsDataTypePreValues WHERE id=@Id&quot;,
+                    new { Id = entity.Id });
+            }
+
+            protected override void PersistNewItem(PreValueEntity entity)
+            {
+                if (entity.DataType.HasIdentity == false)
+                {
+                    throw new InvalidOperationException(&quot;Cannot insert a pre value for a data type that has no identity&quot;);
+                }
+
+                //NOTE: We used to check that the Alias was unique for the given DataTypeNodeId prevalues list, BUT
+                // in reality there is no need to check the uniqueness of this alias because the only way that this code executes is
+                // based on an IDictionary&lt;string, PreValue&gt; dictionary being passed to this repository and a dictionary
+                // must have unique aliases by definition, so there is no need for this additional check
+
+                var dto = new DataTypePreValueDto
+                {
+                    DataTypeNodeId = entity.DataType.Id,
+                    Value = entity.Value,
+                    SortOrder = entity.SortOrder,
+                    Alias = entity.Alias
+                };
+                Database.Insert(dto);
+            }
+
+            protected override void PersistUpdatedItem(PreValueEntity entity)
+            {
+                if (entity.DataType.HasIdentity == false)
+                {
+                    throw new InvalidOperationException(&quot;Cannot update a pre value for a data type that has no identity&quot;);
+                }
+
+                //NOTE: We used to check that the Alias was unique for the given DataTypeNodeId prevalues list, BUT
+                // this causes issues when sorting the pre-values (http://issues.umbraco.org/issue/U4-5670) but in reality
+                // there is no need to check the uniqueness of this alias because the only way that this code executes is
+                // based on an IDictionary&lt;string, PreValue&gt; dictionary being passed to this repository and a dictionary
+                // must have unique aliases by definition, so there is no need for this additional check
+
+                var dto = new DataTypePreValueDto
+                {
+                    DataTypeNodeId = entity.DataType.Id,
+                    Id = entity.Id,
+                    Value = entity.Value,
+                    SortOrder = entity.SortOrder,
+                    Alias = entity.Alias
+                };
+                Database.Update(dto);
+            }
+
+
+        }
+
+        internal static class PreValueConverter
+        {
+            /// &lt;summary&gt;
+            /// Converts the tuple to a pre-value collection
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;list&quot;&gt;&lt;/param&gt;
+            /// &lt;returns&gt;&lt;/returns&gt;
+            internal static PreValueCollection ConvertToPreValuesCollection(IEnumerable&lt;Tuple&lt;PreValue, string, int&gt;&gt; list)
+            {
+                //now we need to determine if they are dictionary based, otherwise they have to be array based
+                var dictionary = new Dictionary&lt;string, PreValue&gt;();
+
+                //need to check all of the keys, if there&#39;s only one and it is empty then it&#39;s an array
+                var keys = list.Select(x =&gt; x.Item2).Distinct().ToArray();
+                if (keys.Length == 1 &amp;&amp; keys[0].IsNullOrWhiteSpace())
+                {
+                    return new PreValueCollection(list.OrderBy(x =&gt; x.Item3).Select(x =&gt; x.Item1));
+                }
+
+                foreach (var item in list
+                    .OrderBy(x =&gt; x.Item3) //we&#39;ll order them first so we maintain the order index in the dictionary
+                    .GroupBy(x =&gt; x.Item2)) //group by alias
+                {
+                    if (item.Count() &gt; 1)
+                    {
+                        //if there&#39;s more than 1 item per key, then it cannot be a dictionary, just return the array
+                        return new PreValueCollection(list.OrderBy(x =&gt; x.Item3).Select(x =&gt; x.Item1));
+                    }
+
+                    dictionary.Add(item.Key, item.First().Item1);
+                }
+
+                return new PreValueCollection(dictionary);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Dispose disposable properties
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Ensure the unit of work is disposed
+        /// &lt;/remarks&gt;
+        protected override void DisposeResources()
+        {
+            _contentTypeRepository.Dispose();
+            _preValRepository.Dispose();
+        }
+    }
+
+
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[34,15,34,51,1],[35,9,35,10,1],[36,13,36,60,1],[37,13,37,130,1],[38,9,38,10,1],[43,9,43,10,1],[44,13,44,58,1],[45,9,45,10,1],[48,9,48,10,1],[49,13,49,75,1],[50,13,50,51,1],[52,13,52,27,1],[53,13,53,14,1],[54,17,54,82,1],[55,13,55,14,1],[57,13,57,14,1],[58,17,58,87,1],[59,13,59,14,1],[61,13,61,74,1],[62,13,62,63,1],[63,9,63,10,1],[66,9,66,10,1],[67,13,67,75,1],[69,13,69,49,1],[70,13,70,87,1],[71,13,71,46,1],[73,13,73,66,1],[75,13,75,63,1],[76,9,76,10,1],[83,9,83,10,1],[85,13,85,101,1],[88,13,88,73,1],[91,13,91,20,1],[91,22,91,37,1],[91,38,91,40,1],[91,41,91,53,1],[92,13,92,14,1],[93,17,93,41,1],[93,42,93,51,0],[95,17,95,24,1],[95,26,95,35,1],[95,36,95,38,1],[95,39,95,65,1],[96,17,96,18,1],[97,21,97,65,1],[97,65,97,100,1],[97,100,97,111,1],[97,21,97,111,1],[98,21,98,28,1],[98,30,98,46,1],[98,47,98,49,1],[98,50,98,55,1],[99,21,99,22,1],[100,25,100,67,1],[101,21,101,22,1],[102,17,102,18,1],[104,17,104,65,1],[105,13,105,14,1],[108,13,108,33,1],[109,9,109,10,1],[116,9,116,10,1],[117,13,117,33,1],[118,13,122,75,1],[123,13,123,24,1],[124,9,124,10,1],[127,9,127,10,1],[128,13,128,43,1],[129,9,129,10,1],[132,9,132,10,0],[133,13,133,39,0],[134,9,134,10,0],[138,17,138,18,1],[138,19,138,67,1],[138,68,138,69,1],[146,9,146,10,1],[147,13,147,57,1],[150,13,150,61,1],[154,13,156,102,1],[157,13,157,28,1],[158,13,158,14,0],[159,17,159,114,0],[162,13,162,75,1],[163,13,163,48,1],[166,13,166,110,1],[167,13,167,42,1],[168,13,170,126,1],[173,13,173,39,1],[174,13,174,40,1],[175,13,175,87,1],[176,13,176,43,1],[177,13,177,116,1],[180,13,180,76,1],[181,13,181,38,1],[184,13,184,40,1],[185,13,185,40,1],[186,13,186,42,1],[187,13,187,34,1],[189,13,189,45,1],[190,13,190,34,1],[192,13,192,43,1],[193,9,193,10,1],[196,9,196,10,1],[198,13,198,72,1],[201,13,205,65,1],[206,13,206,28,1],[207,13,207,14,0],[208,17,208,114,0],[212,13,212,59,1],[215,13,215,52,1],[216,13,216,14,1],[217,17,217,114,1],[218,17,218,74,1],[219,17,219,49,1],[220,17,223,96,1],[224,17,224,53,1],[225,13,225,14,1],[227,13,227,75,1],[229,13,229,115,1],[230,13,230,59,1],[231,13,231,48,1],[234,13,234,39,1],[235,13,235,38,1],[236,13,236,34,1],[240,13,240,73,1],[242,13,242,43,1],[243,9,243,10,1],[246,9,246,10,1],[248,13,248,95,1],[251,13,251,99,1],[254,13,254,95,1],[257,13,257,118,1],[259,13,259,20,1],[259,22,259,29,0],[259,30,259,32,1],[259,33,259,49,1],[260,13,260,14,0],[261,17,261,101,0],[262,17,262,89,0],[263,13,263,14,0],[266,13,266,104,1],[269,13,269,88,1],[272,13,272,87,1],[273,9,273,10,1],[278,9,278,10,1],[279,13,279,70,1],[280,13,280,31,1],[281,9,281,10,1],[289,9,289,10,1],[290,13,290,132,1],[292,13,292,56,1],[292,56,292,85,1],[292,85,292,107,1],[292,107,292,125,1],[292,125,292,127,1],[292,13,292,127,1],[293,13,293,34,1],[294,17,294,39,1],[296,13,296,114,1],[297,13,297,29,1],[298,17,298,37,0],[300,13,300,78,1],[301,13,301,36,1],[302,17,302,37,0],[304,13,304,83,1],[304,83,304,101,1],[304,101,304,103,1],[304,13,304,103,1],[305,13,305,69,1],[306,9,306,10,1],[309,9,309,10,0],[310,13,310,39,0],[311,13,311,29,0],[312,13,312,14,0],[313,17,313,97,0],[315,13,315,47,0],[316,9,316,10,0],[319,9,319,10,1],[320,13,320,31,1],[321,13,321,35,1],[322,13,322,14,1],[324,17,324,136,1],[325,17,325,18,0],[326,21,326,127,0],[328,17,328,41,1],[329,13,329,14,1],[332,13,335,15,1],[337,13,337,40,1],[340,13,340,40,1],[343,13,343,124,1],[346,13,346,33,1],[349,13,350,103,1],[352,13,352,37,1],[353,13,353,20,1],[353,22,353,36,1],[353,37,353,39,1],[353,40,353,65,1],[353,65,353,72,1],[353,72,353,73,1],[353,40,353,73,1],[354,13,354,14,1],[355,17,355,120,1],[357,17,357,53,1],[358,17,358,86,1],[361,17,361,41,1],[362,13,362,14,1],[364,13,364,29,1],[365,9,365,10,1],[368,9,368,10,1],[369,13,369,61,1],[370,13,370,38,1],[371,13,371,14,1],[373,17,376,99,1],[377,17,377,82,1],[378,13,378,14,1],[381,13,381,46,1],[381,46,381,60,1],[381,60,381,74,1],[381,74,381,84,1],[381,84,381,96,1],[381,13,381,96,1],[382,13,382,56,1],[382,56,382,79,1],[382,79,382,91,1],[382,13,382,91,1],[385,13,385,53,1],[385,53,385,85,1],[385,85,385,87,1],[385,13,385,87,1],[387,13,387,20,1],[387,22,387,27,1],[387,28,387,30,1],[387,31,387,41,1],[388,13,388,14,1],[389,17,396,20,1],[397,13,397,14,1],[399,13,399,31,1],[401,13,401,20,1],[401,22,401,29,1],[401,30,401,32,1],[401,33,401,39,1],[402,13,402,14,1],[403,17,403,73,1],[403,73,403,100,1],[403,100,403,102,1],[403,17,403,102,1],[404,17,404,38,1],[405,17,405,18,1],[406,21,415,24,1],[416,17,416,18,1],[418,17,418,18,1],[419,21,425,24,1],[426,17,426,18,1],[428,17,428,29,1],[429,13,429,14,1],[430,9,430,10,1],[433,9,433,10,1],[434,13,434,75,1],[435,9,435,10,1],[438,9,438,10,1],[439,13,439,55,1],[440,13,441,13,1],[441,13,441,14,1],[441,14,442,17,1],[442,17,442,119,1],[442,119,443,17,1],[443,17,443,45,1],[443,45,443,141,1],[443,141,443,152,1],[443,17,443,152,1],[443,152,444,17,1],[444,17,444,87,1],[444,87,445,17,1],[445,17,445,35,1],[445,35,446,13,1],[446,13,446,14,1],[446,14,446,59,1],[440,13,446,59,1],[447,9,447,10,1],[450,9,450,10,1],[453,13,453,33,1],[454,13,456,106,1],[458,13,458,34,1],[459,13,459,40,1],[461,13,461,53,1],[462,13,462,28,1],[463,13,463,14,1],[464,17,464,49,1],[464,49,464,55,1],[464,55,464,88,1],[464,17,464,88,1],[465,17,465,24,1],[465,26,465,33,1],[465,34,465,36,1],[465,37,465,44,1],[466,17,466,18,1],[467,21,467,53,1],[467,54,467,63,1],[469,21,469,92,0],[470,21,470,22,0],[471,25,471,88,0],[472,25,472,40,0],[473,21,473,22,0],[474,17,474,18,0],[475,13,475,14,1],[477,13,477,32,1],[478,9,478,10,1],[485,35,485,39,1],[485,40,485,44,1],[486,35,486,39,1],[486,40,486,44,1],[487,51,487,55,1],[487,56,487,60,1],[488,36,488,40,1],[488,41,488,45,1],[497,19,497,55,1],[498,13,498,14,1],[499,13,499,14,1],[503,13,503,14,0],[504,17,504,53,0],[508,13,508,14,0],[509,17,509,53,0],[513,13,513,14,0],[514,17,514,53,0],[518,13,518,14,0],[519,17,519,53,0],[523,13,523,14,0],[524,17,524,53,0],[528,13,528,14,0],[529,17,529,43,0],[530,13,530,14,0],[534,21,534,22,0],[534,23,534,59,0],[539,13,539,14,1],[540,17,542,45,1],[543,13,543,14,1],[546,13,546,14,1],[547,17,547,58,1],[548,17,548,18,0],[549,21,549,123,0],[557,17,563,19,1],[564,17,564,38,1],[565,13,565,14,1],[568,13,568,14,1],[569,17,569,58,1],[570,17,570,18,0],[571,21,571,123,0],[580,17,587,19,1],[588,17,588,38,1],[589,13,589,14,1],[602,13,602,14,1],[604,17,604,69,1],[607,17,607,45,1],[607,45,607,52,1],[607,52,607,75,1],[607,17,607,75,1],[608,17,608,70,1],[609,17,609,18,1],[610,21,610,69,1],[610,69,610,76,1],[610,76,610,90,1],[610,90,610,97,1],[610,97,610,100,1],[610,21,610,100,1],[613,17,613,24,1],[613,26,613,34,1],[613,35,613,37,1],[613,38,614,35,1],[614,35,614,42,1],[614,42,615,35,1],[615,35,615,42,1],[615,42,615,43,1],[613,38,615,43,1],[616,17,616,18,1],[617,21,617,42,1],[618,21,618,22,1],[620,25,620,73,1],[620,73,620,80,1],[620,80,620,94,1],[620,94,620,101,1],[620,101,620,104,1],[620,25,620,104,1],[623,21,623,66,1],[624,17,624,18,1],[626,17,626,59,1],[627,13,627,14,1],[637,9,637,10,1],[638,13,638,46,1],[639,13,639,41,1],[640,9,640,10,1]]);
+    </script>
+  </body>
+</html>

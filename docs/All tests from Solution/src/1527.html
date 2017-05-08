@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\MacroService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Umbraco.Core.Auditing;
+using Umbraco.Core.Events;
+using Umbraco.Core.IO;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.Repositories;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Services
+{
+    /// &lt;summary&gt;
+    /// Represents the Macro Service, which is an easy access to operations involving &lt;see cref=&quot;IMacro&quot;/&gt;
+    /// &lt;/summary&gt;
+    public class MacroService : RepositoryService, IMacroService
+    {
+
+        public MacroService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory, ILogger logger, IEventMessagesFactory eventMessagesFactory)
+            : base(provider, repositoryFactory, logger, eventMessagesFactory)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Returns an enum &lt;see cref=&quot;MacroTypes&quot;/&gt; based on the properties on the Macro
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;MacroTypes&quot;/&gt;&lt;/returns&gt;
+        internal static MacroTypes GetMacroType(IMacro macro)
+        {
+            if (string.IsNullOrEmpty(macro.XsltPath) == false)
+                return MacroTypes.Xslt;
+
+            if (string.IsNullOrEmpty(macro.ScriptPath) == false)
+            {
+                //we need to check if the file path saved is a virtual path starting with ~/Views/MacroPartials, if so then this is 
+                //a partial view macro, not a script macro
+                //we also check if the file exists in ~/App_Plugins/[Packagename]/Views/MacroPartials, if so then it is also a partial view.
+                return (macro.ScriptPath.InvariantStartsWith(SystemDirectories.MvcViews + &quot;/MacroPartials/&quot;)
+                        || (Regex.IsMatch(macro.ScriptPath, &quot;~/App_Plugins/.+?/Views/MacroPartials&quot;, RegexOptions.Compiled | RegexOptions.IgnoreCase)))
+                           ? MacroTypes.PartialView
+                           : MacroTypes.Script;
+            }
+
+            if (string.IsNullOrEmpty(macro.ControlType) == false &amp;&amp; macro.ControlType.InvariantContains(&quot;.ascx&quot;))
+                return MacroTypes.UserControl;
+
+            if (string.IsNullOrEmpty(macro.ControlType) == false &amp;&amp; string.IsNullOrEmpty(macro.ControlAssembly) == false)
+                return MacroTypes.CustomControl;
+
+            return MacroTypes.Unknown;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an &lt;see cref=&quot;IMacro&quot;/&gt; object by its alias
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;Alias to retrieve an &lt;see cref=&quot;IMacro&quot;/&gt; for&lt;/param&gt;
+        /// &lt;returns&gt;An &lt;see cref=&quot;IMacro&quot;/&gt; object&lt;/returns&gt;
+        public IMacro GetByAlias(string alias)
+        {
+            using (var repository = RepositoryFactory.CreateMacroRepository(UowProvider.GetUnitOfWork()))
+            {
+                var q = new Query&lt;IMacro&gt;();
+                q.Where(macro =&gt; macro.Alias == alias);
+                return repository.GetByQuery(q).FirstOrDefault();
+            }
+        }
+
+        ///// &lt;summary&gt;
+        ///// Gets a list all available &lt;see cref=&quot;IMacro&quot;/&gt; objects
+        ///// &lt;/summary&gt;
+        ///// &lt;param name=&quot;aliases&quot;&gt;Optional array of aliases to limit the results&lt;/param&gt;
+        ///// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;IMacro&quot;/&gt; objects&lt;/returns&gt;
+        //public IEnumerable&lt;IMacro&gt; GetAll(params string[] aliases)
+        //{
+        //    using (var repository = RepositoryFactory.CreateMacroRepository(UowProvider.GetUnitOfWork()))
+        //    {
+        //        if (aliases.Any())
+        //        {
+        //            return GetAllByAliases(repository, aliases);
+        //        }
+
+        //        return repository.GetAll();
+        //    }
+        //}
+
+        public IEnumerable&lt;IMacro&gt; GetAll(params int[] ids)
+        {
+            using (var repository = RepositoryFactory.CreateMacroRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetAll(ids);
+            }
+        }
+
+        public IMacro GetById(int id)
+        {
+            using (var repository = RepositoryFactory.CreateMacroRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.Get(id);
+            }
+        }
+
+        //private IEnumerable&lt;IMacro&gt; GetAllByAliases(IMacroRepository repo, IEnumerable&lt;string&gt; aliases)
+        //{
+        //    foreach (var alias in aliases)
+        //    {
+        //        var q = new Query&lt;IMacro&gt;();
+        //        q.Where(macro =&gt; macro.Alias == alias);
+        //        yield return repo.GetByQuery(q).FirstOrDefault();
+        //    }
+        //}
+
+        /// &lt;summary&gt;
+        /// Deletes an &lt;see cref=&quot;IMacro&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;macro&quot;&gt;&lt;see cref=&quot;IMacro&quot;/&gt; to delete&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the user deleting the macro&lt;/param&gt;
+        public void Delete(IMacro macro, int userId = 0)
+        {
+			if (Deleting.IsRaisedEventCancelled(new DeleteEventArgs&lt;IMacro&gt;(macro), this))
+				return;
+
+			var uow = UowProvider.GetUnitOfWork();
+			using (var repository = RepositoryFactory.CreateMacroRepository(uow))
+			{
+				repository.Delete(macro);
+				uow.Commit();
+
+				Deleted.RaiseEvent(new DeleteEventArgs&lt;IMacro&gt;(macro, false), this);
+			}
+
+			Audit(AuditType.Delete, &quot;Delete Macro performed by user&quot;, userId, -1);
+        }
+
+        /// &lt;summary&gt;
+        /// Saves an &lt;see cref=&quot;IMacro&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;macro&quot;&gt;&lt;see cref=&quot;IMacro&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional Id of the user deleting the macro&lt;/param&gt;
+        public void Save(IMacro macro, int userId = 0)
+        {
+            if (Saving.IsRaisedEventCancelled(new SaveEventArgs&lt;IMacro&gt;(macro), this))
+                return;
+
+            if (string.IsNullOrWhiteSpace(macro.Name))
+            {
+                throw new ArgumentException(&quot;Cannot save macro with empty name.&quot;);
+            }
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateMacroRepository(uow))
+            {
+                repository.AddOrUpdate(macro);
+                uow.Commit();
+
+                Saved.RaiseEvent(new SaveEventArgs&lt;IMacro&gt;(macro, false), this);
+            }
+
+            Audit(AuditType.Save, &quot;Save Macro performed by user&quot;, userId, -1);
+        }
+
+        ///// &lt;summary&gt;
+        ///// Gets a list all available &lt;see cref=&quot;IMacroPropertyType&quot;/&gt; plugins
+        ///// &lt;/summary&gt;
+        ///// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;IMacroPropertyType&quot;/&gt; objects&lt;/returns&gt;
+        //public IEnumerable&lt;IMacroPropertyType&gt; GetMacroPropertyTypes()
+        //{
+        //    return MacroPropertyTypeResolver.Current.MacroPropertyTypes;
+        //}
+
+        ///// &lt;summary&gt;
+        ///// Gets an &lt;see cref=&quot;IMacroPropertyType&quot;/&gt; by its alias
+        ///// &lt;/summary&gt;
+        ///// &lt;param name=&quot;alias&quot;&gt;Alias to retrieve an &lt;see cref=&quot;IMacroPropertyType&quot;/&gt; for&lt;/param&gt;
+        ///// &lt;returns&gt;An &lt;see cref=&quot;IMacroPropertyType&quot;/&gt; object&lt;/returns&gt;
+        //public IMacroPropertyType GetMacroPropertyTypeByAlias(string alias)
+        //{
+        //    return MacroPropertyTypeResolver.Current.MacroPropertyTypes.FirstOrDefault(x =&gt; x.Alias == alias);
+        //}
+
+        private void Audit(AuditType type, string message, int userId, int objectId)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var auditRepo = RepositoryFactory.CreateAuditRepository(uow))
+            {
+                auditRepo.AddOrUpdate(new AuditItem(objectId, message, type, userId));
+                uow.Commit();
+            }
+        }
+
+        #region Event Handlers
+        /// &lt;summary&gt;
+        /// Occurs before Delete
+        /// &lt;/summary&gt;
+		public static event TypedEventHandler&lt;IMacroService, DeleteEventArgs&lt;IMacro&gt;&gt; Deleting;
+
+        /// &lt;summary&gt;
+        /// Occurs after Delete
+        /// &lt;/summary&gt;
+		public static event TypedEventHandler&lt;IMacroService, DeleteEventArgs&lt;IMacro&gt;&gt; Deleted;
+
+        /// &lt;summary&gt;
+        /// Occurs before Save
+        /// &lt;/summary&gt;
+		public static event TypedEventHandler&lt;IMacroService, SaveEventArgs&lt;IMacro&gt;&gt; Saving;
+
+        /// &lt;summary&gt;
+        /// Occurs after Save
+        /// &lt;/summary&gt;
+		public static event TypedEventHandler&lt;IMacroService, SaveEventArgs&lt;IMacro&gt;&gt; Saved;
+        #endregion
+
+        
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,15,24,78,1],[25,9,25,10,1],[26,9,26,10,1],[33,9,33,10,0],[34,13,34,63,0],[35,17,35,40,0],[37,13,37,65,0],[38,13,38,14,0],[42,17,45,48,0],[48,13,48,114,0],[49,17,49,47,0],[51,13,51,122,0],[52,17,52,49,0],[54,13,54,39,0],[55,9,55,10,0],[63,9,63,10,1],[64,20,64,105,1],[65,13,65,14,1],[66,17,66,45,1],[67,17,67,56,1],[68,17,68,66,1],[70,9,70,10,1],[91,9,91,10,1],[92,20,92,105,1],[93,13,93,14,1],[94,17,94,47,1],[96,9,96,10,1],[99,9,99,10,1],[100,20,100,105,1],[101,13,101,14,1],[102,17,102,43,1],[104,9,104,10,1],[122,9,122,10,1],[123,4,123,82,1],[124,5,124,12,0],[126,4,126,42,1],[127,11,127,72,1],[128,4,128,5,1],[129,5,129,30,1],[130,5,130,18,1],[132,5,132,73,1],[133,4,133,5,1],[135,4,135,74,1],[136,9,136,10,1],[144,9,144,10,1],[145,13,145,87,1],[146,17,146,24,0],[148,13,148,55,1],[149,13,149,14,1],[150,17,150,83,1],[153,13,153,51,1],[154,20,154,81,1],[155,13,155,14,1],[156,17,156,47,1],[157,17,157,30,1],[159,17,159,81,1],[160,13,160,14,1],[162,13,162,79,1],[163,9,163,10,1],[185,9,185,10,1],[186,13,186,51,1],[187,20,187,80,1],[188,13,188,14,1],[189,17,189,87,1],[190,17,190,30,1],[191,13,191,14,1],[192,9,192,10,1]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Routing\PublishedContentRequest.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Globalization;
+using System.Web;
+using System.Web.Security;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Core.Models;
+
+using umbraco;
+using umbraco.cms.businesslogic.web;
+using RenderingEngine = Umbraco.Core.RenderingEngine;
+
+namespace Umbraco.Web.Routing
+{
+    /// &lt;summary&gt;
+    /// Represents a request for one specified Umbraco IPublishedContent to be rendered
+    /// by one specified template, using one specified Culture and RenderingEngine.
+    /// &lt;/summary&gt;
+    public class PublishedContentRequest
+    {
+        private bool _readonly;
+        private bool _readonlyUri;
+
+        /// &lt;summary&gt;
+        /// Triggers before the published content request is prepared.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;When the event triggers, no preparation has been done. It is still possible to
+        /// modify the request&#39;s Uri property, for example to restore its original, public-facing value
+        /// that might have been modified by an in-between equipement such as a load-balancer.&lt;/remarks&gt;
+	    public static event EventHandler&lt;EventArgs&gt; Preparing;
+
+        /// &lt;summary&gt;
+        /// Triggers once the published content request has been prepared, but before it is processed.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;When the event triggers, preparation is done ie domain, culture, document, template,
+        /// rendering engine, etc. have been setup. It is then possible to change anything, before
+        /// the request is actually processed and rendered by Umbraco.&lt;/remarks&gt;
+        public static event EventHandler&lt;EventArgs&gt; Prepared;
+
+        // the engine that does all the processing
+        // because in order to keep things clean and separated,
+        // the content request is just a data holder
+        private readonly PublishedContentRequestEngine _engine;
+
+        // the cleaned up uri
+        // the cleaned up Uri has no virtual directory, no trailing slash, no .aspx extension, etc.
+        private Uri _uri;
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the &lt;see cref=&quot;PublishedContentRequest&quot;/&gt; class with a specific Uri and routing context.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;uri&quot;&gt;The request &lt;c&gt;Uri&lt;/c&gt;.&lt;/param&gt;
+        /// &lt;param name=&quot;routingContext&quot;&gt;A routing context.&lt;/param&gt;
+        /// &lt;param name=&quot;getRolesForLogin&quot;&gt;A callback method to return the roles for the provided login name when required&lt;/param&gt;
+        /// &lt;param name=&quot;routingConfig&quot;&gt;&lt;/param&gt;
+        public PublishedContentRequest(Uri uri, RoutingContext routingContext, IWebRoutingSection routingConfig, Func&lt;string, IEnumerable&lt;string&gt;&gt; getRolesForLogin)
+        {
+            if (uri == null) throw new ArgumentNullException(&quot;uri&quot;);
+            if (routingContext == null) throw new ArgumentNullException(&quot;routingContext&quot;);
+
+            Uri = uri;
+            RoutingContext = routingContext;
+            GetRolesForLogin = getRolesForLogin;
+
+            _engine = new PublishedContentRequestEngine(
+                routingConfig,
+                this);
+
+            RenderingEngine = RenderingEngine.Unknown;
+        }
+
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        [Obsolete(&quot;Use the constructor specifying all dependencies instead&quot;)]
+        public PublishedContentRequest(Uri uri, RoutingContext routingContext)
+            : this(uri, routingContext, UmbracoConfig.For.UmbracoSettings().WebRouting, s =&gt; Roles.Provider.GetRolesForUser(s))
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the engine associated to the request.
+        /// &lt;/summary&gt;
+        internal PublishedContentRequestEngine Engine { get { return _engine; } }
+
+        /// &lt;summary&gt;
+        /// Prepares the request.
+        /// &lt;/summary&gt;
+        public void Prepare()
+        {
+            _engine.PrepareRequest();
+        }
+
+        /// &lt;summary&gt;
+        /// Called to configure the request
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This public method is legacy, Prepare() has been made public now which should be used and ensures the domains are assigned and
+        /// if a public content item is already assigned Prepare() now ensures that the finders are not executed.
+        /// &lt;/remarks&gt;
+        [Obsolete(&quot;Use Prepare() instead which configures the request and wires up everything correctly&quot;)]
+        public void ConfigureRequest()
+        {
+            _engine.ConfigureRequest();
+        }
+
+        /// &lt;summary&gt;
+        /// Updates the request when there is no template to render the content.
+        /// &lt;/summary&gt;
+        internal void UpdateOnMissingTemplate()
+        {
+            var __readonly = _readonly;
+            _readonly = false;
+            _engine.UpdateRequestOnMissingTemplate();
+            _readonly = __readonly;
+        }
+
+        /// &lt;summary&gt;
+        /// Triggers the Preparing event.
+        /// &lt;/summary&gt;
+	    internal void OnPreparing()
+        {
+            var handler = Preparing;
+            if (handler != null) handler(this, EventArgs.Empty);
+            _readonlyUri = true;
+        }
+
+        /// &lt;summary&gt;
+        /// Triggers the Prepared event.
+        /// &lt;/summary&gt;
+        internal void OnPrepared()
+        {
+            var handler = Prepared;
+            if (handler != null) handler(this, EventArgs.Empty);
+
+            if (HasPublishedContent == false)
+                Is404 = true; // safety
+
+            _readonly = true;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the cleaned up Uri used for routing.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;The cleaned up Uri has no virtual directory, no trailing slash, no .aspx extension, etc.&lt;/remarks&gt;
+        public Uri Uri
+        {
+            get
+            {
+                return _uri;
+            }
+            set
+            {
+                if (_readonlyUri)
+                    throw new InvalidOperationException(&quot;Cannot modify Uri after Preparing has triggered.&quot;);
+                _uri = value;
+            }
+        }
+
+        private void EnsureWriteable()
+        {
+            if (_readonly)
+                throw new InvalidOperationException(&quot;Cannot modify a PublishedContentRequest once it is read-only.&quot;);
+        }
+
+        #region PublishedContent
+
+        /// &lt;summary&gt;
+        /// The requested IPublishedContent, if any, else &lt;c&gt;null&lt;/c&gt;.
+        /// &lt;/summary&gt;
+        private IPublishedContent _publishedContent;
+
+        /// &lt;summary&gt;
+        /// The initial requested IPublishedContent, if any, else &lt;c&gt;null&lt;/c&gt;.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;The initial requested content is the content that was found by the finders,
+        /// before anything such as 404, redirect... took place.&lt;/remarks&gt;
+        private IPublishedContent _initialPublishedContent;
+
+        /// &lt;summary&gt;
+        /// Gets or sets the requested content.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Setting the requested content clears &lt;c&gt;Template&lt;/c&gt;.&lt;/remarks&gt;
+        public IPublishedContent PublishedContent
+        {
+            get { return _publishedContent; }
+            set
+            {
+                EnsureWriteable();
+                _publishedContent = value;
+                IsInternalRedirectPublishedContent = false;
+                TemplateModel = null;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Sets the requested content, following an internal redirect.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;content&quot;&gt;The requested content.&lt;/param&gt;
+        /// &lt;remarks&gt;Depending on &lt;c&gt;UmbracoSettings.InternalRedirectPreservesTemplate&lt;/c&gt;, will
+        /// preserve or reset the template, if any.&lt;/remarks&gt;
+        public void SetInternalRedirectPublishedContent(IPublishedContent content)
+        {
+            if (content == null) throw new ArgumentNullException(&quot;content&quot;);
+            EnsureWriteable();
+
+            // unless a template has been set already by the finder,
+            // template should be null at that point. 
+
+            // IsInternalRedirect if IsInitial, or already IsInternalRedirect
+            var isInternalRedirect = IsInitialPublishedContent || IsInternalRedirectPublishedContent;
+
+            // redirecting to self
+            if (content.Id == PublishedContent.Id) // neither can be null
+            {
+                // no need to set PublishedContent, we&#39;re done
+                IsInternalRedirectPublishedContent = isInternalRedirect;
+                return;
+            }
+
+            // else
+
+            // save
+            var template = _template;
+            var renderingEngine = RenderingEngine;
+
+            // set published content - this resets the template, and sets IsInternalRedirect to false
+            PublishedContent = content;
+            IsInternalRedirectPublishedContent = isInternalRedirect;
+
+            // must restore the template if it&#39;s an internal redirect &amp; the config option is set
+            if (isInternalRedirect &amp;&amp; UmbracoConfig.For.UmbracoSettings().WebRouting.InternalRedirectPreservesTemplate)
+            {
+                // restore
+                _template = template;
+                RenderingEngine = renderingEngine;
+            }
+        }
+
+        /// &lt;summary&gt;
+		/// Gets the initial requested content.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;The initial requested content is the content that was found by the finders,
+		/// before anything such as 404, redirect... took place.&lt;/remarks&gt;
+		public IPublishedContent InitialPublishedContent { get { return _initialPublishedContent; } }
+
+        /// &lt;summary&gt;
+        /// Gets value indicating whether the current published content is the initial one.
+        /// &lt;/summary&gt;
+        public bool IsInitialPublishedContent
+        {
+            get
+            {
+                return _initialPublishedContent != null &amp;&amp; _initialPublishedContent == _publishedContent;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Indicates that the current PublishedContent is the initial one.
+        /// &lt;/summary&gt;
+        public void SetIsInitialPublishedContent()
+        {
+            EnsureWriteable();
+
+            // note: it can very well be null if the initial content was not found
+            _initialPublishedContent = _publishedContent;
+            IsInternalRedirectPublishedContent = false;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets a value indicating whether the current published content has been obtained
+        /// from the initial published content following internal redirections exclusively.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Used by PublishedContentRequestEngine.FindTemplate() to figure out whether to
+        /// apply the internal redirect or not, when content is not the initial content.&lt;/remarks&gt;
+        public bool IsInternalRedirectPublishedContent { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether the content request has a content.
+        /// &lt;/summary&gt;
+        public bool HasPublishedContent
+        {
+            get { return PublishedContent != null; }
+        }
+
+        #endregion
+
+        #region Template
+
+        /// &lt;summary&gt;
+        /// The template model, if any, else &lt;c&gt;null&lt;/c&gt;.
+        /// &lt;/summary&gt;
+        private ITemplate _template;
+
+        /// &lt;summary&gt;
+        /// Gets or sets the template model to use to display the requested content.
+        /// &lt;/summary&gt;
+        internal ITemplate TemplateModel
+        {
+            get
+            {
+                return _template;
+            }
+
+            set
+            {
+                _template = value;
+                RenderingEngine = RenderingEngine.Unknown; // reset
+
+                if (_template != null)
+                    RenderingEngine = _engine.FindTemplateRenderingEngine(_template.Alias);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the alias of the template to use to display the requested content.
+        /// &lt;/summary&gt;
+        public string TemplateAlias
+        {
+            get
+            {
+                return _template == null ? null : _template.Alias;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Tries to set the template to use to display the requested content.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;The alias of the template.&lt;/param&gt;
+        /// &lt;returns&gt;A value indicating whether a valid template with the specified alias was found.&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// &lt;para&gt;Successfully setting the template does refresh &lt;c&gt;RenderingEngine&lt;/c&gt;.&lt;/para&gt;
+        /// &lt;para&gt;If setting the template fails, then the previous template (if any) remains in place.&lt;/para&gt;
+        /// &lt;/remarks&gt;
+        public bool TrySetTemplate(string alias)
+        {
+            EnsureWriteable();
+
+            if (string.IsNullOrWhiteSpace(alias))
+            {
+                TemplateModel = null;
+                return true;
+            }
+
+            // NOTE - can we stil get it with whitespaces in it due to old legacy bugs?
+            alias = alias.Replace(&quot; &quot;, &quot;&quot;);
+
+            var model = ApplicationContext.Current.Services.FileService.GetTemplate(alias);
+            if (model == null)
+                return false;
+
+            TemplateModel = model;
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Sets the template to use to display the requested content.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;template&quot;&gt;The template.&lt;/param&gt;
+        /// &lt;remarks&gt;Setting the template does refresh &lt;c&gt;RenderingEngine&lt;/c&gt;.&lt;/remarks&gt;
+        public void SetTemplate(ITemplate template)
+        {
+            EnsureWriteable();
+            TemplateModel = template;
+        }
+
+        /// &lt;summary&gt;
+        /// Resets the template.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;The &lt;c&gt;RenderingEngine&lt;/c&gt; becomes unknown.&lt;/remarks&gt;
+	    public void ResetTemplate()
+        {
+            EnsureWriteable();
+            TemplateModel = null;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether the content request has a template.
+        /// &lt;/summary&gt;
+        public bool HasTemplate
+        {
+            get { return _template != null; }
+        }
+
+        #endregion
+
+        #region Domain and Culture
+
+        [Obsolete(&quot;Do not use this property, use the non-legacy UmbracoDomain property instead&quot;)]
+        public Domain Domain
+        {
+            get { return new Domain(UmbracoDomain); }
+        }
+
+        //TODO: Should we publicize the setter now that we are using a non-legacy entity??
+        /// &lt;summary&gt;
+        /// Gets or sets the content request&#39;s domain.
+        /// &lt;/summary&gt;
+        public IDomain UmbracoDomain { get; internal set; }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the content request&#39;s domain Uri.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;The &lt;c&gt;Domain&lt;/c&gt; may contain &quot;example.com&quot; whereas the &lt;c&gt;Uri&lt;/c&gt; will be fully qualified eg &quot;http://example.com/&quot;.&lt;/remarks&gt;
+        public Uri DomainUri { get; internal set; }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether the content request has a domain.
+        /// &lt;/summary&gt;
+        public bool HasDomain
+        {
+            get { return UmbracoDomain != null; }
+        }
+
+        private CultureInfo _culture;
+
+        /// &lt;summary&gt;
+        /// Gets or sets the content request&#39;s culture.
+        /// &lt;/summary&gt;
+        public CultureInfo Culture
+        {
+            get { return _culture; }
+            set
+            {
+                EnsureWriteable();
+                _culture = value;
+            }
+        }
+
+        // note: do we want to have an ordered list of alternate cultures,
+        // to allow for fallbacks when doing dictionnary lookup and such?
+
+        #endregion
+
+        #region Rendering
+
+        /// &lt;summary&gt;
+        /// Gets or sets whether the rendering engine is MVC or WebForms.
+        /// &lt;/summary&gt;
+        public RenderingEngine RenderingEngine { get; internal set; }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Gets or sets the current RoutingContext.
+        /// &lt;/summary&gt;
+        public RoutingContext RoutingContext { get; private set; }
+
+        internal Func&lt;string, IEnumerable&lt;string&gt;&gt; GetRolesForLogin { get; private set; }
+
+        /// &lt;summary&gt;
+        /// The &quot;umbraco page&quot; object.
+        /// &lt;/summary&gt;
+        private page _umbracoPage;
+
+        /// &lt;summary&gt;
+        /// Gets or sets the &quot;umbraco page&quot; object.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This value is only used for legacy/webforms code.
+        /// &lt;/remarks&gt;
+        internal page UmbracoPage
+        {
+            get
+            {
+                if (_umbracoPage == null)
+                    throw new InvalidOperationException(&quot;The UmbracoPage object has not been initialized yet.&quot;);
+
+                return _umbracoPage;
+            }
+            set { _umbracoPage = value; }
+        }
+
+        #region Status
+
+        /// &lt;summary&gt;
+        /// Gets or sets a value indicating whether the requested content could not be found.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;This is set in the &lt;c&gt;PublishedContentRequestBuilder&lt;/c&gt;.&lt;/remarks&gt;
+        public bool Is404 { get; internal set; }
+
+        /// &lt;summary&gt;
+        /// Indicates that the requested content could not be found.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;This is for public access, in custom content finders or &lt;c&gt;Prepared&lt;/c&gt; event handlers,
+        /// where we want to allow developers to indicate a request is 404 but not to cancel it.&lt;/remarks&gt;
+        public void SetIs404()
+        {
+            EnsureWriteable();
+            Is404 = true;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether the content request triggers a redirect (permanent or not).
+        /// &lt;/summary&gt;
+        public bool IsRedirect { get { return string.IsNullOrWhiteSpace(RedirectUrl) == false; } }
+
+        /// &lt;summary&gt;
+        /// Gets or sets a value indicating whether the redirect is permanent.
+        /// &lt;/summary&gt;
+        public bool IsRedirectPermanent { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the url to redirect to, when the content request triggers a redirect.
+        /// &lt;/summary&gt;
+        public string RedirectUrl { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Indicates that the content request should trigger a redirect (302).
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;url&quot;&gt;The url to redirect to.&lt;/param&gt;
+        /// &lt;remarks&gt;Does not actually perform a redirect, only registers that the response should
+        /// redirect. Redirect will or will not take place in due time.&lt;/remarks&gt;
+        public void SetRedirect(string url)
+        {
+            EnsureWriteable();
+            RedirectUrl = url;
+            IsRedirectPermanent = false;
+        }
+
+        /// &lt;summary&gt;
+        /// Indicates that the content request should trigger a permanent redirect (301).
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;url&quot;&gt;The url to redirect to.&lt;/param&gt;
+        /// &lt;remarks&gt;Does not actually perform a redirect, only registers that the response should
+        /// redirect. Redirect will or will not take place in due time.&lt;/remarks&gt;
+        public void SetRedirectPermanent(string url)
+        {
+            EnsureWriteable();
+            RedirectUrl = url;
+            IsRedirectPermanent = true;
+        }
+
+        /// &lt;summary&gt;
+        /// Indicates that the content requet should trigger a redirect, with a specified status code.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;url&quot;&gt;The url to redirect to.&lt;/param&gt;
+        /// &lt;param name=&quot;status&quot;&gt;The status code (300-308).&lt;/param&gt;
+        /// &lt;remarks&gt;Does not actually perform a redirect, only registers that the response should
+        /// redirect. Redirect will or will not take place in due time.&lt;/remarks&gt;
+        public void SetRedirect(string url, int status)
+        {
+            EnsureWriteable();
+
+            if (status &lt; 300 || status &gt; 308)
+                throw new ArgumentOutOfRangeException(&quot;status&quot;, &quot;Valid redirection status codes 300-308.&quot;);
+
+            RedirectUrl = url;
+            IsRedirectPermanent = (status == 301 || status == 308);
+            if (status != 301 &amp;&amp; status != 302) // default redirect statuses
+                ResponseStatusCode = status;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the content request http response status code.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Does not actually set the http response status code, only registers that the response
+        /// should use the specified code. The code will or will not be used, in due time.&lt;/remarks&gt;
+        public int ResponseStatusCode { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the content request http response status description.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Does not actually set the http response status description, only registers that the response
+        /// should use the specified description. The description will or will not be used, in due time.&lt;/remarks&gt;
+        public string ResponseStatusDescription { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Sets the http response status code, along with an optional associated description.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;code&quot;&gt;The http status code.&lt;/param&gt;
+        /// &lt;param name=&quot;description&quot;&gt;The description.&lt;/param&gt;
+        /// &lt;remarks&gt;Does not actually set the http response status code and description, only registers that
+        /// the response should use the specified code and description. The code and description will or will
+        /// not be used, in due time.&lt;/remarks&gt;
+        public void SetResponseStatus(int code, string description = null)
+        {
+            EnsureWriteable();
+
+            // .Status is deprecated
+            // .SubStatusCode is IIS 7+ internal, ignore
+            ResponseStatusCode = code;
+            ResponseStatusDescription = description;
+        }
+
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Gets or sets the &lt;c&gt;System.Web.HttpCacheability&lt;/c&gt;
+        /// &lt;/summary&gt;
+        // Note: we used to set a default value here but that would then be the default
+        // for ALL requests, we shouldn&#39;t overwrite it though if people are using [OutputCache] for example
+        // see: https://our.umbraco.org/forum/using-umbraco-and-getting-started/79715-output-cache-in-umbraco-752
+        internal HttpCacheability Cacheability { get; set; }
+
+        /// &lt;summary&gt;
+        /// Gets or sets a list of Extensions to append to the Response.Cache object
+        /// &lt;/summary&gt;
+        private List&lt;string&gt; _cacheExtensions = new List&lt;string&gt;();
+        internal List&lt;string&gt; CacheExtensions
+        {
+            get { return _cacheExtensions; }
+            set { _cacheExtensions = value; }
+        }
+        
+        /// &lt;summary&gt;
+        /// Gets or sets a dictionary of Headers to append to the Response object
+        /// &lt;/summary&gt;
+        private Dictionary&lt;string, string&gt; _headers = new Dictionary&lt;string, string&gt;();
+        internal Dictionary&lt;string, string&gt; Headers
+        {
+            get { return _headers; }
+            set { _headers = value; }
+        }
+
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[59,9,59,165,1],[60,9,60,10,1],[61,13,61,29,1],[61,30,61,69,0],[62,13,62,40,1],[62,41,62,91,0],[64,13,64,23,1],[65,13,65,45,1],[66,13,66,49,1],[68,13,70,23,1],[72,13,72,55,1],[73,9,73,10,1],[78,15,78,94,1],[78,94,78,127,0],[78,127,78,128,1],[78,15,78,128,1],[79,9,79,10,1],[80,9,80,10,1],[85,61,85,62,1],[85,63,85,78,1],[85,79,85,80,1],[91,9,91,10,0],[92,13,92,38,0],[93,9,93,10,0],[104,9,104,10,0],[105,13,105,40,0],[106,9,106,10,0],[112,9,112,10,0],[113,13,113,40,0],[114,13,114,31,0],[115,13,115,54,0],[116,13,116,36,0],[117,9,117,10,0],[123,9,123,10,0],[124,13,124,37,0],[125,13,125,33,0],[125,34,125,65,0],[126,13,126,33,0],[127,9,127,10,0],[133,9,133,10,0],[134,13,134,36,0],[135,13,135,33,0],[135,34,135,65,0],[137,13,137,46,0],[138,17,138,30,0],[140,13,140,30,0],[141,9,141,10,0],[150,13,150,14,1],[151,17,151,29,1],[152,13,152,14,1],[154,13,154,14,1],[155,17,155,34,1],[156,21,156,109,0],[157,17,157,30,1],[158,13,158,14,1],[162,9,162,10,1],[163,13,163,27,1],[164,17,164,118,0],[165,9,165,10,1],[187,17,187,18,1],[187,19,187,44,1],[187,45,187,46,1],[189,13,189,14,1],[190,17,190,35,1],[191,17,191,43,1],[192,17,192,60,1],[193,17,193,38,1],[194,13,194,14,1],[204,9,204,10,0],[205,13,205,33,0],[205,34,205,77,0],[206,13,206,31,0],[212,13,212,102,0],[215,13,215,51,0],[216,13,216,14,0],[218,17,218,73,0],[219,17,219,24,0],[225,13,225,38,0],[226,13,226,51,0],[229,13,229,40,0],[230,13,230,69,0],[233,13,233,120,0],[234,13,234,14,0],[236,17,236,38,0],[237,17,237,51,0],[238,13,238,14,0],[239,9,239,10,0],[246,58,246,59,0],[246,60,246,92,0],[246,93,246,94,0],[254,13,254,14,0],[255,17,255,106,0],[256,13,256,14,0],[263,9,263,10,1],[264,13,264,31,1],[267,13,267,58,1],[268,13,268,56,1],[269,9,269,10,1],[277,58,277,62,0],[277,63,277,75,1],[284,17,284,18,1],[284,19,284,51,1],[284,52,284,53,1],[302,13,302,14,0],[303,17,303,34,0],[304,13,304,14,0],[307,13,307,14,1],[308,17,308,35,1],[309,17,309,59,1],[311,17,311,39,1],[312,21,312,92,1],[313,13,313,14,1],[322,13,322,14,1],[323,17,323,67,1],[324,13,324,14,1],[337,9,337,10,0],[338,13,338,31,0],[340,13,340,50,0],[341,13,341,14,0],[342,17,342,38,0],[343,17,343,29,0],[347,13,347,44,0],[349,13,349,92,0],[350,13,350,31,0],[351,17,351,30,0],[353,13,353,35,0],[354,13,354,25,0],[355,9,355,10,0],[363,9,363,10,0],[364,13,364,31,0],[365,13,365,38,0],[366,9,366,10,0],[373,9,373,10,0],[374,13,374,31,0],[375,13,375,34,0],[376,9,376,10,0],[383,17,383,18,1],[383,19,383,44,1],[383,45,383,46,1],[393,17,393,18,1],[393,19,393,52,1],[393,53,393,54,1],[400,40,400,44,1],[400,45,400,58,1],[406,32,406,36,1],[406,37,406,50,1],[413,17,413,18,1],[413,19,413,48,1],[413,49,413,50,1],[423,17,423,18,1],[423,19,423,35,1],[423,36,423,37,1],[425,13,425,14,1],[426,17,426,35,1],[427,17,427,34,1],[428,13,428,14,1],[441,50,441,54,1],[441,55,441,68,1],[448,48,448,52,1],[448,53,448,65,1],[450,71,450,75,0],[450,76,450,88,1],[466,13,466,14,1],[467,17,467,42,1],[468,21,468,113,0],[470,17,470,37,1],[471,13,471,14,1],[472,17,472,18,1],[472,19,472,40,1],[472,41,472,42,1],[481,29,481,33,0],[481,34,481,47,0],[489,9,489,10,0],[490,13,490,31,0],[491,13,491,26,0],[492,9,492,10,0],[497,38,497,39,1],[497,40,497,95,1],[497,96,497,97,1],[502,43,502,47,0],[502,48,502,60,1],[507,37,507,41,1],[507,42,507,54,1],[516,9,516,10,1],[517,13,517,31,1],[518,13,518,31,1],[519,13,519,41,1],[520,9,520,10,1],[529,9,529,10,0],[530,13,530,31,0],[531,13,531,31,0],[532,13,532,40,0],[533,9,533,10,0],[543,9,543,10,0],[544,13,544,31,0],[546,13,546,46,0],[547,17,547,108,0],[549,13,549,31,0],[550,13,550,68,0],[551,13,551,48,0],[552,17,552,45,0],[553,9,553,10,0],[560,41,560,45,0],[560,46,560,58,0],[567,51,567,55,0],[567,56,567,68,0],[578,9,578,10,0],[579,13,579,31,0],[583,13,583,39,0],[584,13,584,53,0],[585,9,585,10,0],[595,50,595,54,0],[595,55,595,59,0],[600,9,600,68,1],[603,17,603,18,0],[603,19,603,43,0],[603,44,603,45,0],[604,17,604,18,0],[604,19,604,44,0],[604,45,604,46,0],[610,9,610,88,1],[613,17,613,18,0],[613,19,613,35,0],[613,36,613,37,0],[614,17,614,18,0],[614,19,614,36,0],[614,37,614,38,0]]);
+    </script>
+  </body>
+</html>

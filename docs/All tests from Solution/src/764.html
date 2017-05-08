@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\BaseRest\RestExtensionMethodInfo.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Reflection;
+using System.Xml;
+using System.IO;
+
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Configuration.BaseRest;
+using Umbraco.Core.IO;
+using umbraco.cms.businesslogic.member;
+
+namespace Umbraco.Web.BaseRest
+{
+    [Obsolete(&quot;Umbraco /base is obsoleted, use WebApi (UmbracoApiController) instead for all REST based logic&quot;)]
+	class RestExtensionMethodInfo
+	{
+		#region Utilities
+
+		static readonly char[] Split = new[] { &#39;,&#39; };
+
+		static string[] SplitString(string s)
+		{
+		    return string.IsNullOrWhiteSpace(s) 
+                ? new string[] { } 
+                : s.ToLower().Split(Split, StringSplitOptions.RemoveEmptyEntries);
+		}
+
+	    static string GetAttribute(XmlNode node, string name)
+		{
+            if (node == null)
+                throw new ArgumentNullException(&quot;node&quot;);
+	        var attributes = node.Attributes;
+            if (attributes == null)
+                throw new ArgumentException(@&quot;Node has no Attributes collection.&quot;, &quot;node&quot;); 
+			var attribute = attributes[name];
+			return attribute == null ? null : attribute.Value;
+		}
+
+		#endregion
+
+		private RestExtensionMethodInfo()
+		{
+			Exists = false;
+		}
+
+		private RestExtensionMethodInfo(bool allowAll, string allowGroup, string allowType, string allowMember, bool returnXml, MethodInfo method)
+		{
+			Exists = true;
+			_allowAll = allowAll;
+			_allowGroups = SplitString(allowGroup);
+			_allowTypes = SplitString(allowType);
+			_allowMembers = SplitString(allowMember);
+			ReturnXml = returnXml;
+			_method = method;
+		}
+
+		static readonly RestExtensionMethodInfo MissingMethod = new RestExtensionMethodInfo();
+		static readonly Dictionary&lt;string, RestExtensionMethodInfo&gt; Cache = new Dictionary&lt;string, RestExtensionMethodInfo&gt;();
+
+	    readonly bool _allowAll;
+	    readonly string[] _allowGroups;
+	    readonly string[] _allowTypes;
+	    readonly string[] _allowMembers;
+	    readonly MethodInfo _method;
+
+		public bool Exists { get; private set; }
+		public bool ReturnXml { get; private set; }
+
+		#region Discovery
+
+		// gets a RestExtensionMethodInfo matching extensionAlias and methodName
+		// by looking everywhere (configuration, attributes, legacy attributes)
+		// returns MissingMethod (ie .Exists == false) if not found
+		//
+		public static RestExtensionMethodInfo GetMethod(string extensionAlias, string methodName, int paramsCount)
+		{
+            // note - legacy does not support paramsCount
+
+			return GetFromConfiguration(extensionAlias, methodName, paramsCount)
+				?? GetFromAttribute(extensionAlias, methodName, paramsCount)
+				?? MissingMethod;
+		}
+        
+		// gets a RestExtensionMethodInfo matching extensionAlias and methodName
+		// by looking at the configuration file
+		// returns null if not found
+		//
+		static RestExtensionMethodInfo GetFromConfiguration(string extensionAlias, string methodName, int paramsCount)
+		{
+            var config = UmbracoConfig.For.BaseRestExtensions();
+
+			var configExtension = config.Items[extensionAlias];
+			if (configExtension == null)
+				return null; // does not exist
+
+			var configMethod = configExtension[methodName];
+			if (configMethod == null)
+				return null; // does not exist
+
+			MethodInfo method = null;
+			try
+			{
+				var parts = configExtension.Type.Split(&#39;,&#39;);
+				if (parts.Length &gt; 2)
+                    throw new Exception(string.Format(&quot;Failed to load extension &#39;{0}&#39;, invalid type.&quot;, configExtension.Type));
+
+				var assembly = parts.Length == 1 ? Assembly.GetExecutingAssembly() : Assembly.Load(parts[1]);
+				var type = assembly.GetType(parts[0]);
+
+			    if (type == null)
+			        throw new Exception(string.Format(&quot;Could not get type \&quot;{0}\&quot;.&quot;, parts[0]));
+                
+                var methods = type.GetMethods()
+			                      .Where(m =&gt; m.Name == methodName)
+			                      .Where(m =&gt; m.GetParameters().Count() == paramsCount)
+                                  .ToArray();
+
+			    if (methods.Length &gt; 1)
+			        throw new Exception(string.Format(&quot;Method \&quot;{0}\&quot; has many overloads with same number of parameters.&quot;, methodName));
+
+                if (methods.Length &gt; 0)
+                {
+                    method = methods[0];
+                    if (!method.IsPublic || !method.IsStatic)
+                        throw new Exception(string.Format(&quot;Method \&quot;{0}\&quot; has to be public and static.&quot;, methodName));
+                }
+			}
+			catch (Exception e)
+			{
+				throw new Exception(string.Format(&quot;Failed to load extension &#39;{0}&#39;, see inner exception.&quot;, configExtension.Type), e);
+			}
+
+			if (method == null)
+				return null; // does not exist
+
+			var info = new RestExtensionMethodInfo(configMethod.AllowAll,
+				configMethod.AllowGroup, configMethod.AllowType, configMethod.AllowMember,
+				configMethod.ReturnXml,
+				method);
+
+			return info;
+		}
+
+		// gets a RestExtensionMethodInfo matching extensionAlias and methodName
+		// by looking for the attributes
+		// returns null if not found
+		//
+		static RestExtensionMethodInfo GetFromAttribute(string extensionAlias, string methodName, int paramsCount)
+		{
+			// here we can cache because any change would trigger an app restart
+
+		    var cacheKey = string.Format(&quot;{0}.{1}[{2}]&quot;, extensionAlias, methodName, paramsCount);
+			lock (Cache)
+			{
+				// if it&#39;s in the cache, return
+				if (Cache.ContainsKey(cacheKey))
+					return Cache[cacheKey];
+			}
+
+			// find an extension with that alias, then find a method with that name,
+			// which has been properly marked with the attribute, and use the attribute
+			// properties to setup a RestExtensionMethodInfo
+            //
+            // note: the extension may be implemented by more than one class
+
+			var extensions = PluginManager.Current.ResolveRestExtensions()
+                .Where(type =&gt; type.GetCustomAttribute&lt;RestExtensionAttribute&gt;(false).Alias == extensionAlias);
+
+			RestExtensionMethodInfo info = null;
+
+            foreach (var extension in extensions) // foreach classes with extension alias
+            {
+                var methods = extension.GetMethods()
+                                  .Where(m =&gt; m.Name == methodName)
+                                  .Where(m =&gt; m.GetParameters().Count() == paramsCount)
+                                  .ToArray();
+
+                if (methods.Length == 0) continue; // not implementing the method = ignore
+
+                if (methods.Length &gt; 1)
+                    throw new Exception(string.Format(&quot;Method \&quot;{0}\&quot; has many overloads with same number of parameters.&quot;, methodName));
+
+                var method = methods[0];
+                if (!method.IsPublic || !method.IsStatic)
+                    throw new Exception(string.Format(&quot;Method \&quot;{0}\&quot; has to be public and static.&quot;, methodName));
+
+                var attribute = method.GetCustomAttributes(typeof(RestExtensionMethodAttribute), false).Cast&lt;RestExtensionMethodAttribute&gt;().SingleOrDefault();
+                if (attribute == null) continue; // method has not attribute = ignore
+
+                // got it!
+                info = new RestExtensionMethodInfo(attribute.AllowAll,
+                                                   attribute.AllowGroup, attribute.AllowType, attribute.AllowMember,
+                                                   attribute.ReturnXml,
+                                                   method);
+
+                // cache
+                lock (Cache)
+                {
+                    Cache[cacheKey] = info;
+                }
+
+                // got it, no need to look any further
+                break;
+            }
+
+			return info;
+		}
+
+		#endregion
+
+		#region Invoke
+
+		public bool CanBeInvokedByCurrentMember
+		{
+			get
+			{
+				if (_allowAll)
+					return true;
+
+				var member = Member.GetCurrentMember();
+
+				if (member == null)
+					return false;
+
+				var allowed = false;
+
+				if (_allowGroups.Length &gt; 0)
+				{
+					// note - assuming these are equivalent
+					//var groups = member.Groups.Values.Cast&lt;MemberGroup&gt;().Select(group =&gt; group.Text);
+					var groups = System.Web.Security.Roles.GetRolesForUser(member.LoginName);
+					allowed = groups.Select(s =&gt; s.ToLower()).Intersect(_allowGroups).Any();
+				}
+
+				if (!allowed &amp;&amp; _allowTypes.Length &gt; 0)
+				{
+					allowed = _allowTypes.Contains(member.ContentType.Alias);
+				}
+
+				if (!allowed &amp;&amp; _allowMembers.Length &gt; 0)
+				{
+					allowed = _allowMembers.Contains(member.Id.ToString(CultureInfo.InvariantCulture));
+				}
+
+				return allowed;
+			}
+		}
+
+		public string Invoke(string[] parameters)
+		{
+			try
+			{
+				if (!_method.IsPublic || !_method.IsStatic)
+				{
+					// ensure that method is static public
+					return &quot;&lt;error&gt;Method has to be public and static&lt;/error&gt;&quot;;
+				}
+
+				// ensure we have the right number of parameters
+				if (_method.GetParameters().Length != parameters.Length)
+				{
+					return &quot;&lt;error&gt;Not Enough parameters in url&lt;/error&gt;&quot;;
+				}
+
+				// invoke
+
+				object response;
+
+				if (_method.GetParameters().Length == 0)
+				{
+					response = _method.Invoke(null, null); // invoke with null as parameters as there are none
+				}
+				else
+				{
+					var methodParams = new object[parameters.Length];
+
+					var i = 0;
+
+					foreach (var pInfo in _method.GetParameters())
+					{
+						var myType = Type.GetType(pInfo.ParameterType.ToString());
+                        if (myType == null) throw new Exception(&quot;Failed to get type.&quot;);
+						methodParams[(i)] = Convert.ChangeType(parameters[i], myType);
+						i++;
+					}
+
+					response = _method.Invoke(null, methodParams);
+				}
+
+				// this is legacy and could probably be improved
+				if (response != null)
+				{
+					switch (_method.ReturnType.ToString())
+					{
+						case &quot;System.Xml.XPath.XPathNodeIterator&quot;:
+							return ((System.Xml.XPath.XPathNodeIterator)response).Current.OuterXml;
+						case &quot;System.Xml.Linq.XDocument&quot;:
+							return response.ToString();
+						case &quot;System.Xml.XmlDocument&quot;:
+							var xmlDoc = (XmlDocument)response;
+							var sw = new StringWriter();
+							var xw = new XmlTextWriter(sw);
+							xmlDoc.WriteTo(xw);
+							return sw.ToString();
+						default:
+							var strResponse = response.ToString();
+
+							if (ReturnXml)
+							{
+								// do a quick &quot;is this html?&quot; check... if it is add CDATA... 
+								if (strResponse.Contains(&quot;&lt;&quot;) || strResponse.Contains(&quot;&gt;&quot;))
+									strResponse = &quot;&lt;![CDATA[&quot; + strResponse + &quot;]]&gt;&quot;;
+								return &quot;&lt;value&gt;&quot; + strResponse + &quot;&lt;/value&gt;&quot;;
+							}
+					        
+                            return strResponse;
+					}
+				}
+			    
+                return ReturnXml ? &quot;&lt;error&gt;Null value returned&lt;/error&gt;&quot; : string.Empty;
+			}
+			catch (Exception ex)
+			{
+				//Overall exception handling... 
+				return &quot;&lt;error&gt;&lt;![CDATA[MESSAGE:\n&quot; + ex.Message + &quot;\n\nSTACKTRACE:\n&quot; + ex.StackTrace + &quot;\n\nINNEREXCEPTION:\n&quot; + ex.InnerException + &quot;]]&gt;&lt;/error&gt;&quot;;
+			}
+		}
+
+		#endregion
+	}
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,3,22,48,0],[25,3,25,4,0],[26,7,28,83,0],[29,3,29,4,0],[32,3,32,4,0],[33,13,33,30,0],[34,17,34,57,0],[35,10,35,43,0],[36,13,36,36,0],[37,17,37,92,0],[38,4,38,37,0],[39,4,39,54,0],[40,3,40,4,0],[44,3,44,36,0],[45,3,45,4,0],[46,4,46,19,0],[47,3,47,4,0],[49,3,49,141,0],[50,3,50,4,0],[51,4,51,18,0],[52,4,52,25,0],[53,4,53,43,0],[54,4,54,41,0],[55,4,55,45,0],[56,4,56,26,0],[57,4,57,21,0],[58,3,58,4,0],[60,3,60,89,0],[61,3,61,121,0],[69,24,69,28,0],[69,29,69,41,0],[70,27,70,31,0],[70,32,70,44,0],[79,3,79,4,0],[82,4,84,22,0],[85,3,85,4,0],[92,3,92,4,0],[93,13,93,65,0],[95,4,95,55,0],[96,4,96,32,0],[97,5,97,17,0],[99,4,99,51,0],[100,4,100,29,0],[101,5,101,17,0],[103,4,103,29,0],[105,4,105,5,0],[106,5,106,49,0],[107,5,107,26,0],[108,21,108,127,0],[110,5,110,98,0],[111,5,111,43,0],[113,8,113,25,0],[114,12,114,88,0],[116,17,117,38,0],[117,38,117,58,0],[117,58,118,38,0],[118,38,118,78,0],[118,78,119,46,0],[116,17,119,46,0],[121,8,121,31,0],[122,12,122,128,0],[124,17,124,40,0],[125,17,125,18,0],[126,21,126,41,0],[127,21,127,62,0],[128,25,128,119,0],[129,17,129,18,0],[130,4,130,5,0],[131,4,131,23,0],[132,4,132,5,0],[133,5,133,121,0],[136,4,136,23,0],[137,5,137,17,0],[139,4,142,13,0],[144,4,144,16,0],[145,3,145,4,0],[152,3,152,4,0],[155,7,155,93,0],[156,4,156,16,0],[157,4,157,5,0],[159,5,159,37,0],[160,6,160,29,0],[161,4,161,5,0],[169,4,170,32,0],[170,32,170,110,0],[170,110,170,112,0],[169,4,170,112,0],[172,4,172,40,0],[174,13,174,20,0],[174,22,174,35,0],[174,36,174,38,0],[174,39,174,49,0],[175,13,175,14,0],[176,17,177,47,0],[177,47,177,67,0],[177,67,178,47,0],[178,47,178,87,0],[178,87,179,46,0],[176,17,179,46,0],[181,17,181,41,0],[181,42,181,51,0],[183,17,183,40,0],[184,21,184,137,0],[186,17,186,41,0],[187,17,187,58,0],[188,21,188,115,0],[190,17,190,160,0],[191,17,191,39,0],[191,40,191,49,0],[194,17,197,60,0],[200,17,200,29,0],[201,17,201,18,0],[202,21,202,44,0],[203,17,203,18,0],[206,17,206,23,0],[209,4,209,16,0],[210,3,210,4,0],[219,4,219,5,0],[220,5,220,19,0],[221,6,221,18,0],[223,5,223,44,0],[225,5,225,24,0],[226,6,226,19,0],[228,5,228,25,0],[230,5,230,33,0],[231,5,231,6,0],[234,6,234,79,0],[235,6,235,35,0],[235,35,235,46,0],[235,46,235,78,0],[235,6,235,78,0],[236,5,236,6,0],[238,5,238,44,0],[239,5,239,6,0],[240,6,240,63,0],[241,5,241,6,0],[243,5,243,46,0],[244,5,244,6,0],[245,6,245,89,0],[246,5,246,6,0],[248,5,248,20,0],[249,4,249,5,0],[253,3,253,4,0],[255,4,255,5,0],[256,5,256,48,0],[257,5,257,6,0],[259,6,259,65,0],[263,5,263,61,0],[264,5,264,6,0],[265,6,265,59,0],[272,5,272,45,0],[273,5,273,6,0],[274,6,274,44,0],[275,5,275,6,0],[277,5,277,6,0],[278,6,278,55,0],[280,6,280,16,0],[282,6,282,13,0],[282,15,282,24,0],[282,25,282,27,0],[282,28,282,51,0],[283,6,283,7,0],[284,7,284,65,0],[285,25,285,44,0],[285,45,285,88,0],[286,7,286,69,0],[287,7,287,11,0],[288,6,288,7,0],[290,6,290,52,0],[291,5,291,6,0],[294,5,294,26,0],[295,5,295,6,0],[296,6,296,44,0],[299,8,299,79,0],[301,8,301,35,0],[303,8,303,43,0],[304,8,304,36,0],[305,8,305,39,0],[306,8,306,27,0],[307,8,307,29,0],[309,8,309,46,0],[311,8,311,22,0],[312,8,312,9,0],[314,9,314,68,0],[315,10,315,58,0],[316,9,316,53,0],[319,29,319,48,0],[323,17,323,88,0],[325,4,325,24,0],[326,4,326,5,0],[328,5,328,154,0],[330,3,330,4,0]]);
+    </script>
+  </body>
+</html>

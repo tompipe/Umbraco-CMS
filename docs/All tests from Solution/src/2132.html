@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Logging\ParallelForwardingAppender.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using log4net.Core;
+using log4net.Util;
+using System;
+using System.Collections.Concurrent;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Umbraco.Core.Logging
+{
+    /// &lt;summary&gt;
+    /// An asynchronous appender based on &lt;see cref=&quot;BlockingCollection{T}&quot;/&gt;
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// Borrowed from https://github.com/cjbhaines/Log4Net.Async - will reference Nuget packages directly in v8
+    /// &lt;/remarks&gt;
+    public class ParallelForwardingAppender : AsyncForwardingAppenderBase, IDisposable
+    {
+        #region Private Members
+
+        private const int DefaultBufferSize = 1000;
+        private BlockingCollection&lt;LoggingEventContext&gt; _loggingEvents;
+        private CancellationTokenSource _loggingCancelationTokenSource;
+        private CancellationToken _loggingCancelationToken;
+        private Task _loggingTask;
+        private Double _shutdownFlushTimeout = 2;
+        private TimeSpan _shutdownFlushTimespan = TimeSpan.FromSeconds(2);
+        private static readonly Type ThisType = typeof(ParallelForwardingAppender);
+        private volatile bool shutDownRequested;
+        private int? bufferSize = DefaultBufferSize;
+
+        #endregion Private Members
+
+        #region Properties
+
+        /// &lt;summary&gt;
+        /// Gets or sets the number of LoggingEvents that will be buffered.  Set to null for unlimited.
+        /// &lt;/summary&gt;
+        public override int? BufferSize
+        {
+            get { return bufferSize; }
+            set { bufferSize = value; }
+        }
+
+        public int BufferEntryCount
+        {
+            get
+            {
+                if (_loggingEvents == null) return 0;
+                return _loggingEvents.Count;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the time period in which the system will wait for appenders to flush before canceling the background task.
+        /// &lt;/summary&gt;
+        public Double ShutdownFlushTimeout
+        {
+            get
+            {
+                return _shutdownFlushTimeout;
+            }
+            set
+            {
+                _shutdownFlushTimeout = value;
+            }
+        }
+
+        protected override string InternalLoggerName
+        {
+            get
+            {
+                {
+                    return &quot;ParallelForwardingAppender&quot;;
+                }
+            }
+        }
+
+        #endregion Properties
+
+        #region Startup
+
+        public override void ActivateOptions()
+        {
+            base.ActivateOptions();
+            _shutdownFlushTimespan = TimeSpan.FromSeconds(_shutdownFlushTimeout);
+            StartForwarding();
+        }
+
+        private void StartForwarding()
+        {
+            if (shutDownRequested)
+            {
+                return;
+            }
+            //Create a collection which will block the thread and wait for new entries
+            //if the collection is empty
+            if (BufferSize.HasValue &amp;&amp; BufferSize &gt; 0)
+            {
+                _loggingEvents = new BlockingCollection&lt;LoggingEventContext&gt;(BufferSize.Value);
+            }
+            else
+            {
+                //No limit on the number of events.
+                _loggingEvents = new BlockingCollection&lt;LoggingEventContext&gt;();
+            }
+            //The cancellation token is used to cancel a running task gracefully.
+            _loggingCancelationTokenSource = new CancellationTokenSource();
+            _loggingCancelationToken = _loggingCancelationTokenSource.Token;
+            _loggingTask = new Task(SubscriberLoop, _loggingCancelationToken);
+            _loggingTask.Start();
+        }
+
+        #endregion Startup
+
+        #region Shutdown
+
+        private void CompleteSubscriberTask()
+        {
+            shutDownRequested = true;
+            if (_loggingEvents == null || _loggingEvents.IsAddingCompleted)
+            {
+                return;
+            }
+            //Don&#39;t allow more entries to be added.
+            _loggingEvents.CompleteAdding();
+            //Allow some time to flush
+            Thread.Sleep(_shutdownFlushTimespan);
+            if (!_loggingTask.IsCompleted &amp;&amp; !_loggingCancelationToken.IsCancellationRequested)
+            {
+                _loggingCancelationTokenSource.Cancel();
+                //Wait here so that the error logging messages do not get into a random order.
+                //Don&#39;t pass the cancellation token because we are not interested
+                //in catching the OperationCanceledException that results.
+                _loggingTask.Wait();
+            }
+            if (!_loggingEvents.IsCompleted)
+            {
+                ForwardInternalError(&quot;The buffer was not able to be flushed before timeout occurred.&quot;, null, ThisType);
+            }
+        }
+
+        protected override void OnClose()
+        {
+            CompleteSubscriberTask();
+            base.OnClose();
+        }
+
+        #endregion Shutdown
+
+        #region Appending
+
+        protected override void Append(LoggingEvent loggingEvent)
+        {
+            if (_loggingEvents == null || _loggingEvents.IsAddingCompleted || loggingEvent == null)
+            {
+                return;
+            }
+
+            loggingEvent.Fix = Fix;
+            //In the case where blocking on a full collection, and the task is subsequently completed, the cancellation token
+            //will prevent the entry from attempting to add to the completed collection which would result in an exception.
+            _loggingEvents.Add(new LoggingEventContext(loggingEvent, HttpContext), _loggingCancelationToken);
+        }
+
+        protected override void Append(LoggingEvent[] loggingEvents)
+        {
+            if (_loggingEvents == null || _loggingEvents.IsAddingCompleted || loggingEvents == null)
+            {
+                return;
+            }
+
+            foreach (var loggingEvent in loggingEvents)
+            {
+                Append(loggingEvent);
+            }
+        }
+
+        #endregion Appending
+
+        #region Forwarding
+
+        /// &lt;summary&gt;
+        /// Iterates over a BlockingCollection containing LoggingEvents.
+        /// &lt;/summary&gt;
+        private void SubscriberLoop()
+        {
+            Thread.CurrentThread.Name = String.Format(&quot;{0} ParallelForwardingAppender Subscriber Task&quot;, Name);
+            //The task will continue in a blocking loop until
+            //the queue is marked as adding completed, or the task is canceled.
+            try
+            {
+                //This call blocks until an item is available or until adding is completed
+                foreach (var entry in _loggingEvents.GetConsumingEnumerable(_loggingCancelationToken))
+                {
+                    HttpContext = entry.HttpContext;
+                    ForwardLoggingEvent(entry.LoggingEvent, ThisType);
+                }
+            }
+            catch (OperationCanceledException ex)
+            {
+                //The thread was canceled before all entries could be forwarded and the collection completed.
+                ForwardInternalError(&quot;Subscriber task was canceled before completion.&quot;, ex, ThisType);
+                //Cancellation is called in the CompleteSubscriberTask so don&#39;t call that again.
+            }
+            catch (ThreadAbortException ex)
+            {
+                //Thread abort may occur on domain unload.
+                ForwardInternalError(&quot;Subscriber task was aborted.&quot;, ex, ThisType);
+                //Cannot recover from a thread abort so complete the task.
+                CompleteSubscriberTask();
+                //The exception is swallowed because we don&#39;t want the client application
+                //to halt due to a logging issue.
+            }
+            catch (Exception ex)
+            {
+                //On exception, try to log the exception
+                ForwardInternalError(&quot;Subscriber task error in forwarding loop.&quot;, ex, ThisType);
+                //Any error in the loop is going to be some sort of extenuating circumstance from which we
+                //probably cannot recover anyway.   Complete subscribing.
+                CompleteSubscriberTask();
+            }
+        }
+
+        #endregion Forwarding
+
+        #region IDisposable Implementation
+
+        private bool _disposed = false;
+
+        //Implement IDisposable.
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!_disposed)
+            {
+                if (disposing)
+                {
+                    if (_loggingTask != null)
+                    {
+                        if (!(_loggingTask.IsCanceled || _loggingTask.IsCompleted || _loggingTask.IsFaulted))
+                        {
+                            try
+                            {
+                                CompleteSubscriberTask();
+                            }
+                            catch (Exception ex)
+                            {
+                                LogLog.Error(ThisType, &quot;Exception Completing Subscriber Task in Dispose Method&quot;, ex);
+                            }
+                        }
+                        try
+                        {
+                            _loggingTask.Dispose();
+                        }
+                        catch (Exception ex)
+                        {
+                            LogLog.Error(ThisType, &quot;Exception Disposing Logging Task&quot;, ex);
+                        }
+                        finally
+                        {
+                            _loggingTask = null;
+                        }
+                    }
+                    if (_loggingEvents != null)
+                    {
+                        try
+                        {
+                            _loggingEvents.Dispose();
+                        }
+                        catch (Exception ex)
+                        {
+                            LogLog.Error(ThisType, &quot;Exception Disposing BlockingCollection&quot;, ex);
+                        }
+                        finally
+                        {
+                            _loggingEvents = null;
+                        }
+                    }
+                    if (_loggingCancelationTokenSource != null)
+                    {
+                        try
+                        {
+                            _loggingCancelationTokenSource.Dispose();
+                        }
+                        catch (Exception ex)
+                        {
+                            LogLog.Error(ThisType, &quot;Exception Disposing CancellationTokenSource&quot;, ex);
+                        }
+                        finally
+                        {
+                            _loggingCancelationTokenSource = null;
+                        }
+                    }
+                }
+                _disposed = true;
+            }
+        }
+
+        // Use C# destructor syntax for finalization code.
+        ~ParallelForwardingAppender()
+        {
+            // Simply call Dispose(false).
+            Dispose(false);
+        }
+
+        #endregion IDisposable Implementation
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,9,25,50,1],[26,9,26,75,1],[27,9,27,84,1],[29,9,29,53,1],[40,17,40,18,1],[40,19,40,37,1],[40,38,40,39,1],[41,17,41,18,1],[41,19,41,38,1],[41,39,41,40,1],[47,13,47,14,1],[48,17,48,44,1],[48,45,48,54,0],[49,17,49,45,1],[50,13,50,14,1],[59,13,59,14,0],[60,17,60,46,0],[61,13,61,14,0],[63,13,63,14,0],[64,17,64,47,0],[65,13,65,14,0],[71,13,71,14,1],[72,17,72,18,1],[73,21,73,57,1],[75,13,75,14,1],[83,9,83,10,1],[84,13,84,36,1],[85,13,85,82,1],[86,13,86,31,1],[87,9,87,10,1],[90,9,90,10,1],[91,13,91,35,1],[92,13,92,14,0],[93,17,93,24,0],[97,13,97,55,1],[98,13,98,14,1],[99,17,99,96,1],[100,13,100,14,1],[102,13,102,14,0],[104,17,104,80,0],[105,13,105,14,0],[107,13,107,76,1],[108,13,108,77,1],[109,13,109,79,1],[110,13,110,34,1],[111,9,111,10,1],[118,9,118,10,1],[119,13,119,38,1],[120,13,120,76,1],[121,13,121,14,0],[122,17,122,24,0],[125,13,125,45,1],[127,13,127,50,1],[128,13,128,96,1],[129,13,129,14,1],[130,17,130,57,1],[134,17,134,37,1],[135,13,135,14,1],[136,13,136,45,1],[137,13,137,14,1],[138,17,138,120,1],[139,13,139,14,1],[140,9,140,10,1],[143,9,143,10,1],[144,13,144,38,1],[145,13,145,28,1],[146,9,146,10,1],[153,9,153,10,1],[154,13,154,100,1],[155,13,155,14,0],[156,17,156,24,0],[159,13,159,36,1],[162,13,162,110,1],[163,9,163,10,1],[166,9,166,10,0],[167,13,167,101,0],[168,13,168,14,0],[169,17,169,24,0],[172,13,172,20,0],[172,22,172,38,0],[172,39,172,41,0],[172,42,172,55,0],[173,13,173,14,0],[174,17,174,38,0],[175,13,175,14,0],[176,9,176,10,0],[186,9,186,10,1],[187,13,187,111,1],[191,13,191,14,1],[193,17,193,24,1],[193,26,193,35,1],[193,36,193,38,1],[193,39,193,102,1],[194,17,194,18,1],[195,21,195,53,1],[196,21,196,71,1],[197,17,197,18,1],[198,13,198,14,1],[199,13,199,50,1],[200,13,200,14,1],[202,17,202,103,1],[204,13,204,14,1],[205,13,205,44,0],[206,13,206,14,0],[208,17,208,84,0],[210,17,210,42,0],[213,13,213,14,0],[214,13,214,33,0],[215,13,215,14,0],[217,17,217,97,0],[220,17,220,42,0],[221,13,221,14,0],[222,9,222,10,1],[228,9,228,40,1],[232,9,232,10,1],[233,13,233,27,1],[234,13,234,39,1],[235,9,235,10,1],[238,9,238,10,1],[239,13,239,28,1],[240,13,240,14,1],[241,17,241,31,1],[242,17,242,18,1],[243,21,243,46,1],[244,21,244,22,1],[245,25,245,110,1],[246,25,246,26,0],[248,29,248,30,0],[249,33,249,58,0],[250,29,250,30,0],[251,29,251,49,0],[252,29,252,30,0],[253,33,253,118,0],[254,29,254,30,0],[255,25,255,26,0],[257,25,257,26,1],[258,29,258,52,1],[259,25,259,26,1],[260,25,260,45,0],[261,25,261,26,0],[262,29,262,92,0],[263,25,263,26,0],[265,25,265,26,1],[266,29,266,49,1],[267,25,267,26,1],[268,21,268,22,1],[269,21,269,48,1],[270,21,270,22,1],[272,25,272,26,1],[273,29,273,54,1],[274,25,274,26,1],[275,25,275,45,0],[276,25,276,26,0],[277,29,277,98,0],[278,25,278,26,0],[280,25,280,26,1],[281,29,281,51,1],[282,25,282,26,1],[283,21,283,22,1],[284,21,284,64,1],[285,21,285,22,1],[287,25,287,26,1],[288,29,288,70,1],[289,25,289,26,1],[290,25,290,45,0],[291,25,291,26,0],[292,29,292,103,0],[293,25,293,26,0],[295,25,295,26,1],[296,29,296,67,1],[297,25,297,26,1],[298,21,298,22,1],[299,17,299,18,1],[300,17,300,34,1],[301,13,301,14,1],[302,9,302,10,1],[306,9,306,10,1],[306,9,306,10,1],[308,13,308,28,1],[309,9,309,10,1],[309,9,309,10,1]]);
+    </script>
+  </body>
+</html>

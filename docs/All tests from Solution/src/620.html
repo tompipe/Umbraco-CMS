@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\umbraco.presentation\umbraco\webservices\MediaUploader.ashx.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.IO;
+using System.Linq;
+using System.Web;
+using System.Web.Configuration;
+using System.Web.Script.Serialization;
+using System.Web.Security;
+using System.Web.UI;
+using System.Xml;
+using System.Xml.Serialization;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using umbraco.BasePages;
+using umbraco.BusinessLogic;
+using umbraco.businesslogic.Exceptions;
+using umbraco.cms.businesslogic.media;
+using Umbraco.Core;
+using Umbraco.Core.Security;
+
+namespace umbraco.presentation.umbraco.webservices
+{
+    [Obsolete(&quot;This should no longer be used, use the WebApi methods to upload media&quot;)]
+    public class MediaUploader : IHttpHandler
+    {
+        protected User AuthenticatedUser { get; set; }
+
+        public bool IsReusable
+        {
+            get { return false; }
+        }
+
+        public void ProcessRequest(HttpContext context)
+        {
+            MediaResponse response = null;
+
+            var action = context.Request[&quot;action&quot;];
+
+            if (IsValidRequest(context) &amp;&amp; !string.IsNullOrEmpty(action))
+            {
+                switch (action.ToLower())
+                {
+                    case &quot;config&quot;:
+                        response = ProcessConfigRequest(context);
+                        break;
+                    case &quot;folderlist&quot;:
+                        response = ProcessFolderListRequest(context);
+                        break;
+                    case &quot;upload&quot;:
+                        response = ProcessUploadRequest(context);
+                        break;
+                }
+            }
+
+            // Set success flag
+            if (response != null)
+                response.success = true;
+            else
+                response = new MediaResponse { success = false };
+
+            context.Response.Clear();
+            context.Response.Charset = &quot;UTF-8&quot;;
+            context.Response.Cache.SetCacheability(HttpCacheability.NoCache);
+            context.Response.Cache.SetAllowResponseInBrowserHistory(true);
+
+            var format = context.Request[&quot;format&quot;];
+            switch (format)
+            {
+                case &quot;json&quot;:
+                    // Format as JSON 
+                    // Weirdly, this should be set to text/html to make it respond as json according to:
+                    // http://stackoverflow.com/questions/6934393/resource-interpreted-as-document-but-transferred-with-mime-type-application-jso
+                    context.Response.ContentType = @&quot;text/html&quot;;
+
+                    context.Response.Write(new JavaScriptSerializer().Serialize(response));
+
+                    break;
+                default:
+                    // Format as XML
+                    context.Response.ContentType = @&quot;text/xml&quot;;
+
+                    var serializer = new XmlSerializer(response.GetType());
+                    serializer.Serialize(context.Response.OutputStream, response);
+
+                    break;
+            }
+            
+
+            context.Response.End();
+        }
+
+        public ConfigResponse ProcessConfigRequest(HttpContext context)
+        {
+            return new ConfigResponse
+            {
+                displayName = new User(context.Request[&quot;username&quot;]).Name,
+                umbracoPath = VirtualPathUtility.ToAbsolute(GlobalSettings.Path),
+                maxRequestLength = GetMaxRequestLength()
+            };
+        }
+
+        public FolderListResponse ProcessFolderListRequest(HttpContext context)
+        {
+            var response = new FolderListResponse
+            {
+                folder = new FolderListItem()
+            };
+
+            var startMediaId = AuthenticatedUser.StartMediaId;
+            if (startMediaId &lt; 1)
+            {
+                response.folder.id = -1;
+                response.folder.name = &quot;Media&quot;;
+
+                CreateMediaTree(Media.GetRootMedias(), response.folder);
+            }
+            else
+            {
+                var root = new Media(startMediaId);
+
+                response.folder.id = root.Id;
+                response.folder.name = root.Text;
+
+                CreateMediaTree(root.Children, response.folder);
+            }
+
+            return response;
+        }
+
+        public UploadResponse ProcessUploadRequest(HttpContext context)
+        {
+            int parentNodeId;
+            if (int.TryParse(context.Request[&quot;parentNodeId&quot;], out parentNodeId) &amp;&amp; context.Request.Files.Count &gt; 0)
+            {
+                try
+                {
+                    var parentNode = new Media(parentNodeId);
+                    // Check FilePath
+                    if (!string.IsNullOrEmpty(context.Request[&quot;path&quot;]))
+                    {
+                        var pathParts = context.Request[&quot;path&quot;].Trim(&#39;/&#39;).Split(&#39;/&#39;);
+                        
+                        foreach (var pathPart in pathParts.Where(part =&gt; string.IsNullOrWhiteSpace(part) == false))
+                                parentNode = GetOrCreateFolder(parentNode, pathPart);
+
+                        parentNodeId = parentNode.Id;
+                    }
+
+                    // Check whether to replace existing
+                    bool parsed;
+                    var replaceExisting = (context.Request[&quot;replaceExisting&quot;] == &quot;1&quot; || (bool.TryParse(context.Request[&quot;replaceExisting&quot;], out parsed) &amp;&amp; parsed));
+
+                    // loop through uploaded files
+                    for (var j = 0; j &lt; context.Request.Files.Count; j++)
+                    {
+                        // get the current file
+                        var uploadFile = context.Request.Files[j];
+
+                        //Are we allowed to upload this?
+                        var ext = uploadFile.FileName.Substring(uploadFile.FileName.LastIndexOf(&#39;.&#39;) + 1).ToLower();
+                        if (UmbracoConfig.For.UmbracoSettings().Content.DisallowedUploadFiles.Contains(ext))
+                        {
+                            LogHelper.Warn&lt;MediaUploader&gt;(&quot;Cannot upload file &quot; + uploadFile.FileName + &quot;, it is not approved in `disallowedUploadFiles` in ~/config/UmbracoSettings.config&quot;);
+                            continue;
+                        }
+
+                        using (var inputStream = uploadFile.InputStream)
+                        {
+                            // if there was a file uploded
+                            if (uploadFile.ContentLength &gt; 0)
+                            {
+                                // Ensure we get the filename without the path in IE in intranet mode 
+                                // http://stackoverflow.com/questions/382464/httppostedfile-filename-different-from-ie
+                                var fileName = uploadFile.FileName;
+                                if (fileName.LastIndexOf(@&quot;\&quot;) &gt; 0)
+                                    fileName = fileName.Substring(fileName.LastIndexOf(@&quot;\&quot;) + 1);
+
+                                fileName = Umbraco.Core.IO.IOHelper.SafeFileName(fileName);
+
+                                var postedMediaFile = new PostedMediaFile
+                                {
+                                    FileName = fileName,
+                                    DisplayName = context.Request[&quot;name&quot;],
+                                    ContentType = uploadFile.ContentType,
+                                    ContentLength = uploadFile.ContentLength,
+                                    InputStream = inputStream,
+                                    ReplaceExisting = replaceExisting
+                                };
+
+                                // Get concrete MediaFactory
+                                var factory = MediaFactory.GetMediaFactory(parentNodeId, postedMediaFile, AuthenticatedUser);
+
+                                // Handle media Item
+                                var media = factory.HandleMedia(parentNodeId, postedMediaFile, AuthenticatedUser);
+                            }
+                        }
+                    }
+
+                    var scripts = new ClientTools(new Page());
+                    scripts.SyncTree(parentNode.Path, true);
+
+                    // log succes
+                    LogHelper.Info&lt;MediaUploader&gt;(string.Format(&quot;Success uploading to parent {0}&quot;, parentNodeId));
+                }
+                catch (Exception e)
+                {
+                    // log error
+                    LogHelper.Error&lt;MediaUploader&gt;(string.Format(&quot;Error uploading to parent {0}&quot;, parentNodeId), e);
+                }
+            }
+            else
+            {
+                // log error
+                LogHelper.Warn&lt;MediaUploader&gt;(string.Format(&quot;Parent node id is in incorrect format: {0}&quot;, parentNodeId));
+            }
+            
+            return new UploadResponse();
+        }
+
+        #region Helper Methods
+
+        private bool IsValidRequest(HttpContext context)
+        {
+            // check for secure connection
+            if (GlobalSettings.UseSSL &amp;&amp; !context.Request.IsSecureConnection)
+                throw new UserAuthorizationException(&quot;This installation requires a secure connection (via SSL). Please update the URL to include https://&quot;);
+
+            var username = context.Request[&quot;username&quot;];
+            var password = context.Request[&quot;password&quot;];
+            var ticket = context.Request[&quot;ticket&quot;];
+
+            var isValid = false;
+
+            if (!string.IsNullOrEmpty(username) &amp;&amp; !string.IsNullOrEmpty(password))
+            {
+                var mp = MembershipProviderExtensions.GetUsersMembershipProvider();
+                if (mp != null &amp;&amp; mp.ValidateUser(username, password))
+                {
+                    var user = new User(username);
+                    isValid = user.Applications.Any(app =&gt; app.alias == Constants.Applications.Media);
+
+                    if (isValid)
+                        AuthenticatedUser = user;
+                }
+            }
+            else if (!string.IsNullOrEmpty(username) &amp;&amp; !string.IsNullOrEmpty(ticket))
+            {
+                var t = FormsAuthentication.Decrypt(ticket);
+                var user = new User(username);
+
+                if (t != null)
+                isValid = user.LoginName.ToLower() == t.Name.ToLower() &amp;&amp; user.Applications.Any(app =&gt; app.alias == Constants.Applications.Media);
+
+                if (isValid)
+                    AuthenticatedUser = user;
+            }
+            else
+            {
+                var usr = User.GetCurrent();
+                
+                if (BasePage.ValidateUserContextID(BasePage.umbracoUserContextID) &amp;&amp; usr != null)
+                {
+                    //The user is valid based on their cookies, but is the request valid? We need to validate
+                    // against CSRF here. We&#39;ll do this by ensuring that the request contains a token which will
+                    // be equal to the decrypted version of the current user&#39;s user context id.
+                    var token = context.Request[&quot;__reqver&quot;];
+                    if (token.IsNullOrWhiteSpace() == false)
+                    {
+                        //try decrypting it
+                        try
+                        {
+                            var decrypted = token.DecryptWithMachineKey();
+                            //now check if it matches
+                            if (decrypted == BasePage.umbracoUserContextID)
+                            {
+                                isValid = true;
+                                AuthenticatedUser = usr;
+                            }
+                        }
+                        catch
+                        {
+                           //couldn&#39;t decrypt, so it&#39;s invalid
+                        }
+                        
+                    }
+                }
+            }
+
+            return isValid;
+        }
+
+        private void CreateMediaTree(IEnumerable&lt;Media&gt; nodes, FolderListItem folder)
+        {
+            foreach (var media in nodes.Where(media =&gt; media != null &amp;&amp; media.ContentType != null &amp;&amp; media.ContentType.Alias == Constants.Conventions.MediaTypes.Folder))
+            {
+                var subFolder = new FolderListItem
+                {
+                    id = media.Id,
+                    name = media.Text
+                };
+
+                if (media.HasChildren)
+                {
+                    CreateMediaTree(media.Children, subFolder);
+                }
+
+                folder.folders.Add(subFolder);
+            }
+        }
+
+        private int GetMaxRequestLength()
+        {
+            var appSetting = Convert.ToInt32(ConfigurationManager.AppSettings[&quot;DesktopMediaUploaderMaxRequestLength&quot;]);
+            if (appSetting &gt; 0)
+                return appSetting;
+
+            var configXml = new XmlDocument { PreserveWhitespace = true };
+            configXml.Load(HttpContext.Current.Server.MapPath(&quot;/web.config&quot;));
+
+            var requestLimitsNode = configXml.SelectSingleNode(&quot;//configuration/system.webServer/security/requestFiltering/requestLimits&quot;);
+            if (requestLimitsNode != null)
+            {
+                if (requestLimitsNode.Attributes != null &amp;&amp; requestLimitsNode.Attributes[&quot;maxAllowedContentLength&quot;] != null)
+                {
+                    var maxAllowedContentLength = Convert.ToInt32(requestLimitsNode.Attributes[&quot;maxAllowedContentLength&quot;].Value);
+                    if (maxAllowedContentLength &gt; 0)
+                        return maxAllowedContentLength;
+                }
+            }
+
+            var httpRuntime = ConfigurationManager.GetSection(&quot;system.web/httpRuntime&quot;) as HttpRuntimeSection;
+
+            return httpRuntime == null ? 4096 : httpRuntime.MaxRequestLength;
+        }
+
+        private Media GetOrCreateFolder(Media parent, string name)
+        {
+            var children = parent.Id == -1 ? Media.GetRootMedias() : parent.Children;
+            if (children.Length &gt; 0)
+            {
+                foreach (var node in children.Where(node =&gt; node.Text.ToLower() == name.ToLower()))
+                {
+                    return node;
+                }
+            }
+
+            var media = Media.MakeNew(name, MediaType.GetByAlias(Constants.Conventions.MediaTypes.Folder), User.GetUser(0), parent.Id);
+            media.sortOrder = 0;
+            media.Save();
+
+            return media;
+        }
+
+        #endregion
+    }
+
+    public class MediaResponse
+    {
+        [XmlAttribute]
+        public bool success { get; set; }
+    }
+
+    [XmlRoot(&quot;response&quot;)]
+    public class ConfigResponse : MediaResponse
+    {
+        public string displayName { get; set; }
+        public string umbracoPath { get; set; }
+        public int maxRequestLength { get; set; }
+    }
+
+    [XmlRoot(&quot;response&quot;)]
+    public class FolderListResponse : MediaResponse
+    {
+        public FolderListItem folder { get; set; }
+    }
+
+    [XmlType(&quot;folder&quot;)]
+    public class FolderListItem
+    {
+        [XmlAttribute]
+        public int id { get; set; }
+
+        [XmlAttribute]
+        public string name { get; set; }
+
+        [XmlElement(&quot;folder&quot;)]
+        public List&lt;FolderListItem&gt; folders { get; set; }
+
+        public FolderListItem()
+        {
+            folders = new List&lt;FolderListItem&gt;();
+        }
+    }
+
+    [XmlRoot(&quot;response&quot;)]
+    public class UploadResponse : MediaResponse
+    { }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[27,44,27,48,0],[27,49,27,53,0],[31,17,31,18,0],[31,19,31,32,0],[31,33,31,34,0],[35,9,35,10,0],[36,13,36,43,0],[38,13,38,52,0],[40,13,40,74,0],[41,13,41,14,0],[42,17,42,42,0],[45,25,45,66,0],[46,25,46,31,0],[48,25,48,70,0],[49,25,49,31,0],[51,25,51,66,0],[52,25,52,31,0],[54,13,54,14,0],[57,13,57,34,0],[58,17,58,41,0],[60,17,60,66,0],[62,13,62,38,0],[63,13,63,48,0],[64,13,64,78,0],[65,13,65,75,0],[67,13,67,52,0],[68,13,68,28,0],[74,21,74,65,0],[76,21,76,92,0],[78,21,78,27,0],[81,21,81,64,0],[83,21,83,76,0],[84,21,84,83,0],[86,21,86,27,0],[90,13,90,36,0],[91,9,91,10,0],[94,9,94,10,0],[95,13,100,15,0],[101,9,101,10,0],[104,9,104,10,0],[105,13,108,15,0],[110,13,110,63,0],[111,13,111,34,0],[112,13,112,14,0],[113,17,113,41,0],[114,17,114,48,0],[116,17,116,73,0],[117,13,117,14,0],[119,13,119,14,0],[120,17,120,52,0],[122,17,122,46,0],[123,17,123,50,0],[125,17,125,65,0],[126,13,126,14,0],[128,13,128,29,0],[129,9,129,10,0],[132,9,132,10,0],[134,13,134,116,0],[135,13,135,14,0],[137,17,137,18,0],[138,21,138,62,0],[140,21,140,72,0],[141,21,141,22,0],[142,25,142,86,0],[144,25,144,32,0],[144,34,144,46,0],[144,47,144,49,0],[144,50,144,74,0],[144,74,144,114,0],[144,114,144,115,0],[144,50,144,115,0],[145,33,145,86,0],[147,25,147,54,0],[148,21,148,22,0],[152,21,152,164,0],[155,26,155,35,0],[155,37,155,68,0],[155,70,155,73,0],[156,21,156,22,0],[158,25,158,67,0],[161,25,161,117,0],[162,25,162,109,0],[163,25,163,26,0],[164,29,164,191,0],[165,29,165,38,0],[168,32,168,72,0],[169,25,169,26,0],[171,29,171,62,0],[172,29,172,30,0],[175,33,175,68,0],[176,33,176,68,0],[177,37,177,99,0],[179,33,179,92,0],[181,33,189,35,0],[192,33,192,126,0],[195,33,195,115,0],[196,29,196,30,0],[197,25,197,26,0],[198,21,198,22,0],[200,21,200,63,0],[201,21,201,61,0],[204,21,204,115,0],[205,17,205,18,0],[206,17,206,36,0],[207,17,207,18,0],[209,21,209,117,0],[210,17,210,18,0],[211,13,211,14,0],[213,13,213,14,0],[215,17,215,122,0],[216,13,216,14,0],[218,13,218,41,0],[219,9,219,10,0],[224,9,224,10,0],[226,13,226,78,0],[227,17,227,157,0],[229,13,229,56,0],[230,13,230,56,0],[231,13,231,52,0],[233,13,233,33,0],[235,13,235,84,0],[236,13,236,14,0],[237,17,237,84,0],[238,17,238,71,0],[239,17,239,18,0],[240,21,240,51,0],[241,21,241,60,0],[241,60,241,101,0],[241,101,241,103,0],[241,21,241,103,0],[243,21,243,33,0],[244,25,244,50,0],[245,17,245,18,0],[246,13,246,14,0],[247,18,247,87,0],[248,13,248,14,0],[249,17,249,61,0],[250,17,250,47,0],[252,17,252,31,0],[253,17,253,104,0],[253,104,253,145,0],[253,145,253,147,0],[253,17,253,147,0],[255,17,255,29,0],[256,21,256,46,0],[257,13,257,14,0],[259,13,259,14,0],[260,17,260,45,0],[262,17,262,98,0],[263,17,263,18,0],[267,21,267,61,0],[268,21,268,61,0],[269,21,269,22,0],[272,25,272,26,0],[273,29,273,75,0],[275,29,275,76,0],[276,29,276,30,0],[277,33,277,48,0],[278,33,278,57,0],[279,29,279,30,0],[280,25,280,26,0],[281,25,281,30,0],[282,25,282,26,0],[284,25,284,26,0],[286,21,286,22,0],[287,17,287,18,0],[288,13,288,14,0],[290,13,290,28,0],[291,9,291,10,0],[294,9,294,10,0],[295,13,295,20,0],[295,22,295,31,0],[295,32,295,34,0],[295,35,295,56,0],[295,56,295,168,0],[295,168,295,169,0],[295,35,295,169,0],[296,13,296,14,0],[297,17,301,19,0],[303,17,303,39,0],[304,17,304,18,0],[305,21,305,64,0],[306,17,306,18,0],[308,17,308,47,0],[309,13,309,14,0],[310,9,310,10,0],[313,9,313,10,0],[314,13,314,120,0],[315,13,315,32,0],[316,17,316,35,0],[318,13,318,75,0],[319,13,319,79,0],[321,13,321,140,0],[322,13,322,43,0],[323,13,323,14,0],[324,17,324,125,0],[325,17,325,18,0],[326,21,326,130,0],[327,21,327,53,0],[328,25,328,56,0],[329,17,329,18,0],[330,13,330,14,0],[332,13,332,111,0],[334,13,334,78,0],[335,9,335,10,0],[338,9,338,10,0],[339,13,339,86,0],[340,13,340,37,0],[341,13,341,14,0],[342,17,342,24,0],[342,26,342,34,0],[342,35,342,37,0],[342,38,342,61,0],[342,61,342,98,0],[342,98,342,99,0],[342,38,342,99,0],[343,17,343,18,0],[344,21,344,33,0],[346,13,346,14,0],[348,13,348,136,0],[349,13,349,33,0],[350,13,350,26,0],[352,13,352,26,0],[353,9,353,10,0],[361,31,361,35,0],[361,36,361,40,0],[367,37,367,41,0],[367,42,367,46,0],[368,37,368,41,0],[368,42,368,46,0],[369,39,369,43,0],[369,44,369,48,0],[375,40,375,44,0],[375,45,375,49,0],[382,25,382,29,0],[382,30,382,34,0],[385,30,385,34,0],[385,35,385,39,0],[388,47,388,51,0],[388,52,388,56,0],[390,9,390,32,0],[391,9,391,10,0],[392,13,392,50,0],[393,9,393,10,0]]);
+    </script>
+  </body>
+</html>

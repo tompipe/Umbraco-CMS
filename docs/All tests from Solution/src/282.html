@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\TestHelpers\BaseDatabaseFactoryTest.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Configuration;
+using System.Data.SqlServerCe;
+using System.IO;
+using System.Web.Routing;
+using System.Xml;
+using NUnit.Framework;
+using SQLCE4Umbraco;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models.PublishedContent;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Mappers;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Core.Publishing;
+using Umbraco.Core.Services;
+using Umbraco.Web;
+using Umbraco.Web.PublishedCache;
+using Umbraco.Web.PublishedCache.XmlPublishedCache;
+using Umbraco.Web.Security;
+using umbraco.BusinessLogic;
+using Umbraco.Core.Events;
+
+namespace Umbraco.Tests.TestHelpers
+{
+    /// &lt;summary&gt;
+    /// Provides a base class for Umbraco application tests that require a database.
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;Can provide a SqlCE database populated with the Umbraco schema. The database should be accessed
+    /// through the &lt;see cref=&quot;DefaultDatabaseFactory&quot;/&gt;.&lt;/remarks&gt;
+    [TestFixture, RequiresSTA]
+    public abstract class BaseDatabaseFactoryTest : BaseUmbracoApplicationTest
+    {
+        //This is used to indicate that this is the first test to run in the test session, if so, we always
+        //ensure a new database file is used.
+        private static volatile bool _firstRunInTestSession = true;
+        private static readonly object Locker = new object();
+        private bool _firstTestInFixture = true;
+
+        //Used to flag if its the first test in the current session
+        private bool _isFirstRunInTestSession;
+        //Used to flag if its the first test in the current fixture
+        private bool _isFirstTestInFixture;
+
+        private ApplicationContext _appContext;
+
+        private string _dbPath;
+        //used to store (globally) the pre-built db with schema and initial data
+        private static byte[] _dbBytes;
+        private DefaultDatabaseFactory _dbFactory;
+
+        [SetUp]
+        public override void Initialize()
+        {
+            InitializeFirstRunFlags();
+
+            var path = TestHelper.CurrentAssemblyDirectory;
+            AppDomain.CurrentDomain.SetData(&quot;DataDirectory&quot;, path);
+
+            _dbFactory = new DefaultDatabaseFactory(
+                GetDbConnectionString(),
+                GetDbProviderName(),
+                Logger);
+            _dbFactory.ResetForTests();
+
+            base.Initialize();
+
+            using (ProfilingLogger.TraceDuration&lt;BaseDatabaseFactoryTest&gt;(&quot;init&quot;))
+            {
+                //TODO: Somehow make this faster - takes 5s +
+
+                DatabaseContext.Initialize(_dbFactory.ProviderName, _dbFactory.ConnectionString);
+                CreateSqlCeDatabase();
+                InitializeDatabase();
+
+                //ensure the configuration matches the current version for tests
+                SettingsForTests.ConfigurationStatus = UmbracoVersion.GetSemanticVersion().ToSemanticString();
+            }
+        }
+
+        protected override ApplicationContext CreateApplicationContext()
+        {
+            var repositoryFactory = new RepositoryFactory(CacheHelper, Logger, SqlSyntax, SettingsForTests.GenerateMockSettings());
+
+            var evtMsgs = new TransientMessagesFactory();
+            _appContext = new ApplicationContext(
+                //assign the db context
+                new DatabaseContext(_dbFactory, Logger, SqlSyntax, GetDbProviderName()),
+                //assign the service context
+                new ServiceContext(repositoryFactory, new PetaPocoUnitOfWorkProvider(_dbFactory), new FileUnitOfWorkProvider(), new PublishingStrategy(evtMsgs, Logger), CacheHelper, Logger, evtMsgs),
+                CacheHelper,
+                ProfilingLogger)
+            {
+                IsReady = true
+            };
+            return _appContext;
+        }
+
+        protected virtual ISqlSyntaxProvider SqlSyntax
+        {
+            get { return GetSyntaxProvider(); }
+        }
+
+        /// &lt;summary&gt;
+        /// The database behavior to use for the test/fixture
+        /// &lt;/summary&gt;
+        protected DatabaseBehavior DatabaseTestBehavior
+        {
+            get
+            {
+                var att = GetType().GetCustomAttribute&lt;DatabaseTestBehaviorAttribute&gt;(false);
+                return att != null ? att.Behavior : DatabaseBehavior.NoDatabasePerFixture;
+            }
+        }
+
+        protected virtual ISqlSyntaxProvider GetSyntaxProvider()
+        {
+            return new SqlCeSyntaxProvider();
+        }
+
+        protected virtual string GetDbProviderName()
+        {
+            return &quot;System.Data.SqlServerCe.4.0&quot;;
+        }
+
+        /// &lt;summary&gt;
+        /// Get the db conn string
+        /// &lt;/summary&gt;
+        protected virtual string GetDbConnectionString()
+        {
+            return @&quot;Datasource=|DataDirectory|UmbracoPetaPocoTests.sdf;Flush Interval=1;&quot;;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates the SqlCe database if required
+        /// &lt;/summary&gt;
+        protected virtual void CreateSqlCeDatabase()
+        {
+            if (DatabaseTestBehavior == DatabaseBehavior.NoDatabasePerFixture)
+                return;
+
+            var path = TestHelper.CurrentAssemblyDirectory;
+
+            //Get the connectionstring settings from config
+            var settings = ConfigurationManager.ConnectionStrings[Core.Configuration.GlobalSettings.UmbracoConnectionName];
+            ConfigurationManager.AppSettings.Set(
+                Core.Configuration.GlobalSettings.UmbracoConnectionName,
+                GetDbConnectionString());
+
+            _dbPath = string.Concat(path, &quot;\\UmbracoPetaPocoTests.sdf&quot;);
+
+            //create a new database file if
+            // - is the first test in the session
+            // - the database file doesn&#39;t exist
+            // - NewDbFileAndSchemaPerTest
+            // - _isFirstTestInFixture + DbInitBehavior.NewDbFileAndSchemaPerFixture
+
+            //if this is the first test in the session, always ensure a new db file is created
+            if (_isFirstRunInTestSession || File.Exists(_dbPath) == false
+                || (DatabaseTestBehavior == DatabaseBehavior.NewDbFileAndSchemaPerTest || DatabaseTestBehavior == DatabaseBehavior.EmptyDbFilePerTest)
+                || (_isFirstTestInFixture &amp;&amp; DatabaseTestBehavior == DatabaseBehavior.NewDbFileAndSchemaPerFixture))
+            {
+
+                using (ProfilingLogger.TraceDuration&lt;BaseDatabaseFactoryTest&gt;(&quot;Remove database file&quot;))
+                {
+                    RemoveDatabaseFile(ex =&gt;
+                    {
+                        //if this doesn&#39;t work we have to make sure everything is reset! otherwise
+                        // well run into issues because we&#39;ve already set some things up
+                        TearDown();
+                        throw ex;
+                    });
+                }
+
+                //Create the Sql CE database
+                using (ProfilingLogger.TraceDuration&lt;BaseDatabaseFactoryTest&gt;(&quot;Create database file&quot;))
+                {
+                    if (DatabaseTestBehavior != DatabaseBehavior.EmptyDbFilePerTest &amp;&amp; _dbBytes != null)
+                    {
+                        File.WriteAllBytes(_dbPath, _dbBytes);
+                    }
+                    else
+                    {
+                        using (var engine = new SqlCeEngine(settings.ConnectionString))
+                        {
+                            engine.CreateDatabase();
+                        }
+                    }
+                }
+
+            }
+
+        }
+
+        /// &lt;summary&gt;
+        /// sets up resolvers before resolution is frozen
+        /// &lt;/summary&gt;
+        protected override void FreezeResolution()
+        {
+            PropertyEditorResolver.Current = new PropertyEditorResolver(
+                new ActivatorServiceProvider(), Logger,
+                () =&gt; PluginManager.Current.ResolvePropertyEditors(),
+                ApplicationContext.ApplicationCache.RuntimeCache);
+
+            DataTypesResolver.Current = new DataTypesResolver(
+                new ActivatorServiceProvider(), Logger,
+                () =&gt; PluginManager.Current.ResolveDataTypes());
+
+            MappingResolver.Current = new MappingResolver(
+                new ActivatorServiceProvider(), Logger,
+               () =&gt; PluginManager.Current.ResolveAssignedMapperTypes());
+
+            if (PropertyValueConvertersResolver.HasCurrent == false)
+                PropertyValueConvertersResolver.Current = new PropertyValueConvertersResolver(new ActivatorServiceProvider(), Logger);
+
+            if (PublishedContentModelFactoryResolver.HasCurrent == false)
+                PublishedContentModelFactoryResolver.Current = new PublishedContentModelFactoryResolver();
+
+            base.FreezeResolution();
+        }
+
+        /// &lt;summary&gt;
+        /// Creates the tables and data for the database
+        /// &lt;/summary&gt;
+        protected virtual void InitializeDatabase()
+        {
+            if (DatabaseTestBehavior == DatabaseBehavior.NoDatabasePerFixture || DatabaseTestBehavior == DatabaseBehavior.EmptyDbFilePerTest)
+                return;
+
+            //create the schema and load default data if:
+            // - is the first test in the session
+            // - NewDbFileAndSchemaPerTest
+            // - _isFirstTestInFixture + DbInitBehavior.NewDbFileAndSchemaPerFixture
+
+            if (_dbBytes == null &amp;&amp;
+                (_isFirstRunInTestSession
+                || DatabaseTestBehavior == DatabaseBehavior.NewDbFileAndSchemaPerTest
+                || (_isFirstTestInFixture &amp;&amp; DatabaseTestBehavior == DatabaseBehavior.NewDbFileAndSchemaPerFixture)))
+            {
+
+                var schemaHelper = new DatabaseSchemaHelper(DatabaseContext.Database, Logger, SqlSyntax);
+                //Create the umbraco database and its base data
+                schemaHelper.CreateDatabaseSchema(false, ApplicationContext);
+
+                //close the connections, we&#39;re gonna read this baby in as a byte array so we don&#39;t have to re-initialize the
+                // damn db for each test
+                CloseDbConnections();
+
+                _dbBytes = File.ReadAllBytes(_dbPath);
+            }
+        }
+
+        [TestFixtureTearDown]
+        public void FixtureTearDown()
+        {
+            RemoveDatabaseFile();
+        }
+
+        [TearDown]
+        public override void TearDown()
+        {
+            using (ProfilingLogger.TraceDuration&lt;BaseDatabaseFactoryTest&gt;(&quot;teardown&quot;))
+            {
+                _isFirstTestInFixture = false; //ensure this is false before anything!
+
+                if (DatabaseTestBehavior == DatabaseBehavior.NewDbFileAndSchemaPerTest)
+                {
+                    RemoveDatabaseFile();
+                }
+
+                AppDomain.CurrentDomain.SetData(&quot;DataDirectory&quot;, null);
+
+                SqlSyntaxContext.SqlSyntaxProvider = null;
+            }
+
+            base.TearDown();
+        }
+
+        private void CloseDbConnections()
+        {
+            //Ensure that any database connections from a previous test is disposed.
+            //This is really just double safety as its also done in the TearDown.
+            if (ApplicationContext != null &amp;&amp; DatabaseContext != null &amp;&amp; DatabaseContext.Database != null)
+                DatabaseContext.Database.Dispose();
+            SqlCeContextGuardian.CloseBackgroundConnection();
+        }
+
+        private void InitializeFirstRunFlags()
+        {
+            //this needs to be thread-safe
+            _isFirstRunInTestSession = false;
+            if (_firstRunInTestSession)
+            {
+                lock (Locker)
+                {
+                    if (_firstRunInTestSession)
+                    {
+                        _isFirstRunInTestSession = true; //set the flag
+                        _firstRunInTestSession = false;
+                    }
+                }
+            }
+            if (_firstTestInFixture == false) return;
+
+            lock (Locker)
+            {
+                if (_firstTestInFixture == false) return;
+
+                _isFirstTestInFixture = true; //set the flag
+                _firstTestInFixture = false;
+            }
+        }
+
+        private void RemoveDatabaseFile(Action&lt;Exception&gt; onFail = null)
+        {
+            CloseDbConnections();
+            var path = TestHelper.CurrentAssemblyDirectory;
+            try
+            {
+                string filePath = string.Concat(path, &quot;\\UmbracoPetaPocoTests.sdf&quot;);
+                if (File.Exists(filePath))
+                {
+                    File.Delete(filePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Error&lt;BaseDatabaseFactoryTest&gt;(&quot;Could not remove the old database file&quot;, ex);
+
+                //We will swallow this exception! That&#39;s because a sub class might require further teardown logic.
+                if (onFail != null)
+                    onFail(ex);
+            }
+        }
+
+        protected ServiceContext ServiceContext
+        {
+            get { return ApplicationContext.Services; }
+        }
+
+        protected DatabaseContext DatabaseContext
+        {
+            get { return ApplicationContext.DatabaseContext; }
+        }
+
+        protected UmbracoContext GetUmbracoContext(string url, int templateId, RouteData routeData = null, bool setSingleton = false)
+        {
+            var cache = new PublishedContentCache();
+
+            cache.GetXmlDelegate = (context, preview) =&gt;
+                {
+                    var doc = new XmlDocument();
+                    doc.LoadXml(GetXmlContent(templateId));
+                    return doc;
+                };
+
+            PublishedContentCache.UnitTesting = true;
+
+            var httpContext = GetHttpContextFactory(url, routeData).HttpContext;
+            var ctx = new UmbracoContext(
+                httpContext,
+                ApplicationContext,
+                new PublishedCaches(cache, new PublishedMediaCache(ApplicationContext)),
+                new WebSecurity(httpContext, ApplicationContext));
+
+            if (setSingleton)
+            {
+                UmbracoContext.Current = ctx;
+            }
+
+            return ctx;
+        }
+
+        protected FakeHttpContextFactory GetHttpContextFactory(string url, RouteData routeData = null)
+        {
+            var factory = routeData != null
+                            ? new FakeHttpContextFactory(url, routeData)
+                            : new FakeHttpContextFactory(url);
+
+
+            //set the state helper
+            StateHelper.HttpContext = factory.HttpContext;
+
+            return factory;
+        }
+
+        protected virtual string GetXmlContent(int templateId)
+        {
+            return @&quot;&lt;?xml version=&quot;&quot;1.0&quot;&quot; encoding=&quot;&quot;utf-8&quot;&quot;?&gt;
+&lt;!DOCTYPE root[
+&lt;!ELEMENT Home ANY&gt;
+&lt;!ATTLIST Home id ID #REQUIRED&gt;
+&lt;!ELEMENT CustomDocument ANY&gt;
+&lt;!ATTLIST CustomDocument id ID #REQUIRED&gt;
+]&gt;
+&lt;root id=&quot;&quot;-1&quot;&quot;&gt;
+	&lt;Home id=&quot;&quot;1046&quot;&quot; parentID=&quot;&quot;-1&quot;&quot; level=&quot;&quot;1&quot;&quot; writerID=&quot;&quot;0&quot;&quot; creatorID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1044&quot;&quot; template=&quot;&quot;&quot; + templateId + @&quot;&quot;&quot; sortOrder=&quot;&quot;1&quot;&quot; createDate=&quot;&quot;2012-06-12T14:13:17&quot;&quot; updateDate=&quot;&quot;2012-07-20T18:50:43&quot;&quot; nodeName=&quot;&quot;Home&quot;&quot; urlName=&quot;&quot;home&quot;&quot; writerName=&quot;&quot;admin&quot;&quot; creatorName=&quot;&quot;admin&quot;&quot; path=&quot;&quot;-1,1046&quot;&quot; isDoc=&quot;&quot;&quot;&quot;&gt;
+		&lt;content&gt;&lt;![CDATA[]]&gt;&lt;/content&gt;
+		&lt;umbracoUrlAlias&gt;&lt;![CDATA[this/is/my/alias, anotheralias]]&gt;&lt;/umbracoUrlAlias&gt;
+		&lt;umbracoNaviHide&gt;1&lt;/umbracoNaviHide&gt;
+		&lt;Home id=&quot;&quot;1173&quot;&quot; parentID=&quot;&quot;1046&quot;&quot; level=&quot;&quot;2&quot;&quot; writerID=&quot;&quot;0&quot;&quot; creatorID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1044&quot;&quot; template=&quot;&quot;&quot; + templateId + @&quot;&quot;&quot; sortOrder=&quot;&quot;2&quot;&quot; createDate=&quot;&quot;2012-07-20T18:06:45&quot;&quot; updateDate=&quot;&quot;2012-07-20T19:07:31&quot;&quot; nodeName=&quot;&quot;Sub1&quot;&quot; urlName=&quot;&quot;sub1&quot;&quot; writerName=&quot;&quot;admin&quot;&quot; creatorName=&quot;&quot;admin&quot;&quot; path=&quot;&quot;-1,1046,1173&quot;&quot; isDoc=&quot;&quot;&quot;&quot;&gt;
+			&lt;content&gt;&lt;![CDATA[&lt;div&gt;This is some content&lt;/div&gt;]]&gt;&lt;/content&gt;
+			&lt;umbracoUrlAlias&gt;&lt;![CDATA[page2/alias, 2ndpagealias]]&gt;&lt;/umbracoUrlAlias&gt;
+			&lt;Home id=&quot;&quot;1174&quot;&quot; parentID=&quot;&quot;1173&quot;&quot; level=&quot;&quot;3&quot;&quot; writerID=&quot;&quot;0&quot;&quot; creatorID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1044&quot;&quot; template=&quot;&quot;&quot; + templateId + @&quot;&quot;&quot; sortOrder=&quot;&quot;2&quot;&quot; createDate=&quot;&quot;2012-07-20T18:07:54&quot;&quot; updateDate=&quot;&quot;2012-07-20T19:10:27&quot;&quot; nodeName=&quot;&quot;Sub2&quot;&quot; urlName=&quot;&quot;sub2&quot;&quot; writerName=&quot;&quot;admin&quot;&quot; creatorName=&quot;&quot;admin&quot;&quot; path=&quot;&quot;-1,1046,1173,1174&quot;&quot; isDoc=&quot;&quot;&quot;&quot;&gt;
+				&lt;content&gt;&lt;![CDATA[]]&gt;&lt;/content&gt;
+				&lt;umbracoUrlAlias&gt;&lt;![CDATA[only/one/alias]]&gt;&lt;/umbracoUrlAlias&gt;
+				&lt;creatorName&gt;&lt;![CDATA[Custom data with same property name as the member name]]&gt;&lt;/creatorName&gt;
+			&lt;/Home&gt;
+			&lt;Home id=&quot;&quot;1176&quot;&quot; parentID=&quot;&quot;1173&quot;&quot; level=&quot;&quot;3&quot;&quot; writerID=&quot;&quot;0&quot;&quot; creatorID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1044&quot;&quot; template=&quot;&quot;&quot; + templateId + @&quot;&quot;&quot; sortOrder=&quot;&quot;3&quot;&quot; createDate=&quot;&quot;2012-07-20T18:08:08&quot;&quot; updateDate=&quot;&quot;2012-07-20T19:10:52&quot;&quot; nodeName=&quot;&quot;Sub 3&quot;&quot; urlName=&quot;&quot;sub-3&quot;&quot; writerName=&quot;&quot;admin&quot;&quot; creatorName=&quot;&quot;admin&quot;&quot; path=&quot;&quot;-1,1046,1173,1176&quot;&quot; isDoc=&quot;&quot;&quot;&quot;&gt;
+				&lt;content&gt;&lt;![CDATA[]]&gt;&lt;/content&gt;
+			&lt;/Home&gt;
+			&lt;CustomDocument id=&quot;&quot;1177&quot;&quot; parentID=&quot;&quot;1173&quot;&quot; level=&quot;&quot;3&quot;&quot; writerID=&quot;&quot;0&quot;&quot; creatorID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1234&quot;&quot; template=&quot;&quot;&quot; + templateId + @&quot;&quot;&quot; sortOrder=&quot;&quot;4&quot;&quot; createDate=&quot;&quot;2012-07-16T15:26:59&quot;&quot; updateDate=&quot;&quot;2012-07-18T14:23:35&quot;&quot; nodeName=&quot;&quot;custom sub 1&quot;&quot; urlName=&quot;&quot;custom-sub-1&quot;&quot; writerName=&quot;&quot;admin&quot;&quot; creatorName=&quot;&quot;admin&quot;&quot; path=&quot;&quot;-1,1046,1173,1177&quot;&quot; isDoc=&quot;&quot;&quot;&quot; /&gt;
+			&lt;CustomDocument id=&quot;&quot;1178&quot;&quot; parentID=&quot;&quot;1173&quot;&quot; level=&quot;&quot;3&quot;&quot; writerID=&quot;&quot;0&quot;&quot; creatorID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1234&quot;&quot; template=&quot;&quot;&quot; + templateId + @&quot;&quot;&quot; sortOrder=&quot;&quot;4&quot;&quot; createDate=&quot;&quot;2012-07-16T15:26:59&quot;&quot; updateDate=&quot;&quot;2012-07-16T14:23:35&quot;&quot; nodeName=&quot;&quot;custom sub 2&quot;&quot; urlName=&quot;&quot;custom-sub-2&quot;&quot; writerName=&quot;&quot;admin&quot;&quot; creatorName=&quot;&quot;admin&quot;&quot; path=&quot;&quot;-1,1046,1173,1178&quot;&quot; isDoc=&quot;&quot;&quot;&quot; /&gt;
+		&lt;/Home&gt;
+		&lt;Home id=&quot;&quot;1175&quot;&quot; parentID=&quot;&quot;1046&quot;&quot; level=&quot;&quot;2&quot;&quot; writerID=&quot;&quot;0&quot;&quot; creatorID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1044&quot;&quot; template=&quot;&quot;&quot; + templateId + @&quot;&quot;&quot; sortOrder=&quot;&quot;3&quot;&quot; createDate=&quot;&quot;2012-07-20T18:08:01&quot;&quot; updateDate=&quot;&quot;2012-07-20T18:49:32&quot;&quot; nodeName=&quot;&quot;Sub 2&quot;&quot; urlName=&quot;&quot;sub-2&quot;&quot; writerName=&quot;&quot;admin&quot;&quot; creatorName=&quot;&quot;admin&quot;&quot; path=&quot;&quot;-1,1046,1175&quot;&quot; isDoc=&quot;&quot;&quot;&quot;&gt;&lt;content&gt;&lt;![CDATA[]]&gt;&lt;/content&gt;
+		&lt;/Home&gt;
+	&lt;/Home&gt;
+	&lt;CustomDocument id=&quot;&quot;1172&quot;&quot; parentID=&quot;&quot;-1&quot;&quot; level=&quot;&quot;1&quot;&quot; writerID=&quot;&quot;0&quot;&quot; creatorID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1234&quot;&quot; template=&quot;&quot;&quot; + templateId + @&quot;&quot;&quot; sortOrder=&quot;&quot;2&quot;&quot; createDate=&quot;&quot;2012-07-16T15:26:59&quot;&quot; updateDate=&quot;&quot;2012-07-18T14:23:35&quot;&quot; nodeName=&quot;&quot;Test&quot;&quot; urlName=&quot;&quot;test-page&quot;&quot; writerName=&quot;&quot;admin&quot;&quot; creatorName=&quot;&quot;admin&quot;&quot; path=&quot;&quot;-1,1172&quot;&quot; isDoc=&quot;&quot;&quot;&quot; /&gt;
+&lt;/root&gt;&quot;;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[40,9,40,68,1],[41,9,41,62,1],[42,9,42,49,1],[58,9,58,10,1],[59,13,59,39,1],[61,13,61,60,1],[62,13,62,68,1],[64,13,67,25,1],[68,13,68,40,1],[70,13,70,31,1],[72,13,72,83,1],[73,13,73,14,1],[76,17,76,98,1],[77,17,77,39,1],[78,17,78,38,1],[81,17,81,111,1],[82,13,82,14,1],[83,9,83,10,1],[86,9,86,10,1],[87,13,87,132,1],[89,13,89,58,1],[90,13,99,15,1],[100,13,100,32,1],[101,9,101,10,1],[105,17,105,18,1],[105,19,105,46,1],[105,47,105,48,1],[114,13,114,14,1],[115,17,115,94,1],[116,17,116,91,1],[117,13,117,14,1],[121,9,121,10,1],[122,13,122,46,1],[123,9,123,10,1],[126,9,126,10,1],[127,13,127,50,1],[128,9,128,10,1],[134,9,134,10,1],[135,13,135,92,1],[136,9,136,10,1],[142,9,142,10,1],[143,13,143,79,1],[144,17,144,24,1],[146,13,146,60,1],[149,13,149,124,1],[150,13,152,42,1],[154,13,154,73,1],[163,13,165,117,1],[166,13,166,14,1],[168,17,168,103,1],[169,17,169,18,1],[170,21,171,21,1],[171,21,171,22,0],[171,22,174,25,1],[174,25,174,36,0],[174,36,175,25,1],[175,25,175,34,0],[175,34,176,24,1],[170,21,176,24,1],[177,17,177,18,1],[180,17,180,103,1],[181,17,181,18,1],[182,21,182,105,1],[183,21,183,22,1],[184,25,184,63,1],[185,21,185,22,1],[187,21,187,22,1],[188,32,188,87,1],[189,25,189,26,1],[190,29,190,53,1],[191,25,191,26,1],[192,21,192,22,1],[193,17,193,18,1],[195,13,195,14,1],[197,9,197,10,1],[203,9,203,10,1],[204,13,206,23,1],[206,23,206,69,1],[206,69,207,67,1],[204,13,207,67,1],[209,13,211,23,1],[211,23,211,63,0],[211,63,211,65,1],[209,13,211,65,1],[213,13,215,22,1],[215,22,215,72,1],[215,72,215,74,1],[213,13,215,74,1],[217,13,217,69,1],[218,17,218,135,1],[220,13,220,74,1],[221,17,221,107,1],[223,13,223,37,1],[224,9,224,10,1],[230,9,230,10,1],[231,13,231,142,1],[232,17,232,24,1],[239,13,242,118,1],[243,13,243,14,1],[245,17,245,106,1],[247,17,247,78,1],[251,17,251,38,1],[253,17,253,55,1],[254,13,254,14,1],[255,9,255,10,1],[259,9,259,10,1],[260,13,260,34,1],[261,9,261,10,1],[265,9,265,10,1],[266,13,266,87,1],[267,13,267,14,1],[268,17,268,47,1],[270,17,270,88,1],[271,17,271,18,1],[272,21,272,42,1],[273,17,273,18,1],[275,17,275,72,1],[277,17,277,59,1],[278,13,278,14,1],[280,13,280,29,1],[281,9,281,10,1],[284,9,284,10,1],[287,13,287,107,1],[288,17,288,52,1],[289,13,289,62,1],[290,9,290,10,1],[293,9,293,10,1],[295,13,295,46,1],[296,13,296,40,1],[297,13,297,14,1],[298,17,298,30,1],[299,17,299,18,1],[300,21,300,48,1],[301,21,301,22,1],[302,25,302,57,1],[303,25,303,56,1],[304,21,304,22,1],[305,17,305,18,1],[306,13,306,14,1],[307,13,307,46,1],[307,47,307,54,1],[309,13,309,26,1],[310,13,310,14,1],[311,17,311,50,1],[311,51,311,58,0],[313,17,313,46,1],[314,17,314,45,1],[315,13,315,14,1],[316,9,316,10,1],[319,9,319,10,1],[320,13,320,34,1],[321,13,321,60,1],[323,13,323,14,1],[324,17,324,85,1],[325,17,325,43,1],[326,17,326,18,1],[327,21,327,43,1],[328,17,328,18,1],[329,13,329,14,1],[330,13,330,33,0],[331,13,331,14,0],[332,17,332,104,0],[335,17,335,36,0],[336,21,336,32,0],[337,13,337,14,0],[338,9,338,10,1],[342,17,342,18,1],[342,19,342,54,1],[342,55,342,56,1],[347,17,347,18,1],[347,19,347,61,1],[347,62,347,63,1],[351,9,351,10,1],[352,13,352,53,1],[354,13,355,17,1],[355,17,355,18,1],[355,18,356,21,1],[356,21,356,49,1],[356,49,357,21,1],[357,21,357,60,1],[357,60,358,21,1],[358,21,358,32,1],[358,32,359,17,1],[359,17,359,18,1],[359,18,359,19,1],[354,13,359,19,1],[361,13,361,54,1],[363,13,363,81,1],[364,13,368,67,1],[370,13,370,30,1],[371,13,371,14,1],[372,17,372,46,1],[373,13,373,14,1],[375,13,375,24,1],[376,9,376,10,1],[379,9,379,10,1],[380,13,382,63,1],[386,13,386,59,1],[388,13,388,28,1],[389,9,389,10,1],[392,9,392,10,0],[393,13,423,10,0],[424,9,424,10,0]]);
+    </script>
+  </body>
+</html>

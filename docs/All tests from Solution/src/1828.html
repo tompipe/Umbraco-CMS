@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Migrations\Upgrades\TargetVersionSeven\AlterCmsMacroPropertyTable.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Linq;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Persistence.DatabaseModelDefinitions;
+using Umbraco.Core.Persistence.Migrations.Syntax.Delete.DefaultConstraint;
+using Umbraco.Core.Persistence.Migrations.Syntax.Delete.Expressions;
+using Umbraco.Core.Persistence.Migrations.Syntax.Execute;
+using Umbraco.Core.Persistence.Migrations.Syntax.Execute.Expressions;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.PropertyEditors;
+
+namespace Umbraco.Core.Persistence.Migrations.Upgrades.TargetVersionSeven
+{
+    /// &lt;summary&gt;
+    /// We are removing the cmsMacroPropertyType which the cmsMacroProperty references and the cmsMacroProperty.macroPropertyType column
+    /// needs to be changed to editorAlias, we&#39;ll do this by removing the constraint,changing the macroPropertyType to the new 
+    /// editorAlias column (and maintaing data so we can reference it)
+    /// &lt;/summary&gt;
+    [Migration(&quot;7.0.0&quot;, 6, GlobalSettings.UmbracoMigrationName)]
+    public class AlterCmsMacroPropertyTable : MigrationBase
+    {
+        public AlterCmsMacroPropertyTable(ISqlSyntaxProvider sqlSyntax, ILogger logger) : base(sqlSyntax, logger)
+        {
+        }
+
+        public override void Up()
+        {
+            //now that the controlId column is renamed and now a string we need to convert
+            if (Context == null || Context.Database == null) return;
+            
+            //var cpt = SqlSyntaxContext.SqlSyntaxProvider.GetConstraintsPerTable(Context.Database);
+            //var di = SqlSyntaxContext.SqlSyntaxProvider.GetDefinedIndexes(Context.Database);
+
+            if (Context.CurrentDatabaseProvider != DatabaseProviders.SqlServer)
+            {
+                Delete.DefaultConstraint().OnTable(&quot;cmsMacroProperty&quot;).OnColumn(&quot;macroPropertyHidden&quot;);
+            }
+            else
+            {
+                //If we are on SQLServer, we need to delete default constraints by name, older versions of umbraco did not name these default constraints
+                // consistently so we need to look up the constraint name to delete, this only pertains to SQL Server and this issue:
+                // http://issues.umbraco.org/issue/U4-4133
+                var sqlServerSyntaxProvider = new SqlServerSyntaxProvider();
+                var defaultConstraints = sqlServerSyntaxProvider.GetDefaultConstraintsPerColumn(Context.Database).Distinct();
+
+                //lookup the constraint we want to delete, normally would be called &quot;DF_cmsMacroProperty_macroPropertyHidden&quot; but 
+                // we cannot be sure with really old versions
+                var constraint = defaultConstraints
+                    .SingleOrDefault(x =&gt; x.Item1 == &quot;cmsMacroProperty&quot; &amp;&amp; x.Item2 == &quot;macroPropertyHidden&quot;);
+                if (constraint != null)
+                {
+                    Execute.Sql(string.Format(&quot;ALTER TABLE [{0}] DROP CONSTRAINT [{1}]&quot;, &quot;cmsMacroProperty&quot;, constraint.Item3));
+                }
+            }
+
+            Delete.Column(&quot;macroPropertyHidden&quot;).FromTable(&quot;cmsMacroProperty&quot;);
+
+            if (Context.CurrentDatabaseProvider == DatabaseProviders.MySql)
+            {
+                Delete.ForeignKey().FromTable(&quot;cmsMacroProperty&quot;).ForeignColumn(&quot;macroPropertyType&quot;).ToTable(&quot;cmsMacroPropertyType&quot;).PrimaryColumn(&quot;id&quot;);
+            }
+            else
+            {
+                //Before we try to delete this constraint, we&#39;ll see if it exists first, some older schemas never had it and some older schema&#39;s had this named
+                // differently than the default.
+
+                var keyConstraints = SqlSyntax.GetConstraintsPerColumn(Context.Database).Distinct();
+                var constraint = keyConstraints
+                    .SingleOrDefault(x =&gt; x.Item1 == &quot;cmsMacroProperty&quot; &amp;&amp; x.Item2 == &quot;macroPropertyType&quot; &amp;&amp; x.Item3.InvariantStartsWith(&quot;PK_&quot;) == false);
+                if (constraint != null)
+                {
+                    Delete.ForeignKey(constraint.Item3).OnTable(&quot;cmsMacroProperty&quot;);
+                }
+            }
+            
+            Alter.Table(&quot;cmsMacroProperty&quot;).AddColumn(&quot;editorAlias&quot;).AsString(255).NotNullable().WithDefaultValue(&quot;&quot;);
+
+            //we need to get the data and create the migration scripts before we change the actual schema bits below!
+            var list = Context.Database.Fetch&lt;dynamic&gt;(&quot;SELECT * FROM cmsMacroPropertyType&quot;);
+            foreach (var item in list)
+            {
+
+                var alias = item.macroPropertyTypeAlias;
+                //check if there&#39;s a map created 
+                var newAlias = (string)LegacyParameterEditorAliasConverter.GetNewAliasFromLegacyAlias(alias);
+                if (newAlias.IsNullOrWhiteSpace() == false)
+                {
+                    alias = newAlias;
+                }
+
+                //update the table with the alias, the current macroPropertyType will contain the original id
+                Update.Table(&quot;cmsMacroProperty&quot;).Set(new { editorAlias = alias }).Where(new { macroPropertyType = item.id });
+            }
+
+            //drop the column now
+            Delete.Column(&quot;macroPropertyType&quot;).FromTable(&quot;cmsMacroProperty&quot;);
+
+            //drop the default constraint
+            Delete.DefaultConstraint().OnTable(&quot;cmsMacroProperty&quot;).OnColumn(&quot;editorAlias&quot;);
+        }
+
+        public override void Down()
+        {
+            throw new DataLossException(&quot;Cannot downgrade from a version 7 database to a prior version, the database schema has already been modified&quot;);
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[23,91,23,114,0],[24,9,24,10,0],[25,9,25,10,0],[28,9,28,10,0],[30,13,30,61,0],[30,62,30,69,0],[35,13,35,80,0],[36,13,36,14,0],[37,17,37,104,0],[38,13,38,14,0],[40,13,40,14,0],[44,17,44,77,0],[45,17,45,126,0],[49,17,50,43,0],[50,43,50,108,0],[50,108,50,110,0],[49,17,50,110,0],[51,17,51,40,0],[52,17,52,18,0],[53,21,53,129,0],[54,17,54,18,0],[55,13,55,14,0],[57,13,57,80,0],[59,13,59,76,0],[60,13,60,14,0],[61,17,61,154,0],[62,13,62,14,0],[64,13,64,14,0],[68,17,68,101,0],[69,17,70,43,0],[70,43,70,153,0],[70,153,70,155,0],[69,17,70,155,0],[71,17,71,40,0],[72,17,72,18,0],[73,21,73,85,0],[74,17,74,18,0],[75,13,75,14,0],[77,13,77,119,0],[80,13,80,94,0],[81,13,81,20,0],[81,22,81,30,0],[81,31,81,33,0],[81,34,81,38,0],[82,13,82,14,0],[84,17,84,57,0],[86,17,86,110,0],[87,17,87,60,0],[88,17,88,18,0],[89,21,89,38,0],[90,17,90,18,0],[93,17,93,126,0],[94,13,94,14,0],[97,13,97,78,0],[100,13,100,92,0],[101,9,101,10,0],[104,9,104,10,0],[105,13,105,153,0]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\WebApi\Binders\MemberBinder.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Net;
+using System.Web.Http;
+using System.Web.Http.Controllers;
+using System.Web.Http.ModelBinding;
+using System.Web.Security;
+using AutoMapper;
+using Umbraco.Core;
+using Umbraco.Core.Models;
+using Umbraco.Core.Security;
+using Umbraco.Core.Services;
+using Umbraco.Web.Models.ContentEditing;
+using Umbraco.Web.WebApi.Filters;
+using System.Linq;
+using Umbraco.Core.Models.Membership;
+using Umbraco.Web;
+
+namespace Umbraco.Web.WebApi.Binders
+{
+    internal class MemberBinder : ContentItemBaseBinder&lt;IMember, MemberSave&gt;
+    {
+        public MemberBinder(ApplicationContext applicationContext)
+            : base(applicationContext)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Constructor
+        /// &lt;/summary&gt;
+        public MemberBinder()
+            : this(ApplicationContext.Current)
+        {
+        }
+
+        protected override ContentItemValidationHelper&lt;IMember, MemberSave&gt; GetValidationHelper()
+        {
+            return new MemberValidationHelper();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns an IMember instance used to bind values to and save (depending on the membership scenario)
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected override IMember GetExisting(MemberSave model)
+        {
+            var scenario = ApplicationContext.Services.MemberService.GetMembershipScenario();
+            var provider = Core.Security.MembershipProviderExtensions.GetMembersMembershipProvider();
+            switch (scenario)
+            {
+                case MembershipScenario.NativeUmbraco:
+                    return GetExisting(model.Key);
+                case MembershipScenario.CustomProviderWithUmbracoLink:
+                case MembershipScenario.StandaloneCustomProvider:
+                default:
+                    var membershipUser = provider.GetUser(model.Key, false);
+                    if (membershipUser == null)
+                    {
+                        throw new InvalidOperationException(&quot;Could not find member with key &quot; + model.Key);
+                    }
+
+                    //TODO: Support this scenario!
+                    //if (scenario == MembershipScenario.CustomProviderWithUmbracoLink)
+                    //{
+                    //    //if there&#39;s a &#39;Member&#39; type then we should be able to just go get it from the db since it was created with a link
+                    //    // to our data.
+                    //    var memberType = ApplicationContext.Services.MemberTypeService.GetMemberType(Constants.Conventions.MemberTypes.Member);
+                    //    if (memberType != null)
+                    //    {
+                    //        var existing = GetExisting(model.Key);
+                    //        FilterContentTypeProperties(existing.ContentType, existing.ContentType.PropertyTypes.Select(x =&gt; x.Alias).ToArray());
+                    //    }    
+                    //}
+
+                    //generate a member for a generic membership provider
+                    //NOTE: We don&#39;t care about the password here, so just generate something
+                    //var member = MemberService.CreateGenericMembershipProviderMember(model.Name, model.Email, model.Username, Guid.NewGuid().ToString(&quot;N&quot;));                    
+
+                    //var convertResult = membershipUser.ProviderUserKey.TryConvertTo&lt;Guid&gt;();
+                    //if (convertResult.Success == false)
+                    //{
+                    //    throw new InvalidOperationException(&quot;Only membership providers that store a GUID as their ProviderUserKey are supported&quot; + model.Key);
+                    //}
+                    //member.Key = convertResult.Result;
+
+                    var member = Mapper.Map&lt;MembershipUser, IMember&gt;(membershipUser);
+
+                    return member;
+            }
+        }
+
+        private IMember GetExisting(Guid key)
+        {
+            var member = ApplicationContext.Services.MemberService.GetByKey(key);
+            if (member == null)
+            {
+                throw new InvalidOperationException(&quot;Could not find member with key &quot; + key);
+            }
+
+            var standardProps = Constants.Conventions.Member.GetStandardPropertyTypeStubs();
+
+            //remove all membership properties, these values are set with the membership provider.
+            var exclude = standardProps.Select(x =&gt; x.Value.Alias).ToArray();
+
+            foreach (var remove in exclude)
+            {
+                member.Properties.Remove(remove);
+            }
+            return member;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an instance of IMember used when creating a member
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Depending on whether a custom membership provider is configured this will return different results.
+        /// &lt;/remarks&gt;
+        protected override IMember CreateNew(MemberSave model)
+        {
+            var provider = Core.Security.MembershipProviderExtensions.GetMembersMembershipProvider();
+
+            if (provider.IsUmbracoMembershipProvider())
+            {
+                var contentType = ApplicationContext.Services.MemberTypeService.Get(model.ContentTypeAlias);
+                if (contentType == null)
+                {
+                    throw new InvalidOperationException(&quot;No member type found wth alias &quot; + model.ContentTypeAlias);
+                }
+
+                //remove all membership properties, these values are set with the membership provider.
+                FilterMembershipProviderProperties(contentType);
+
+                //return the new member with the details filled in
+                return new Member(model.Name, model.Email, model.Username, model.Password.NewPassword, contentType);
+            }
+            else
+            {
+                //A custom membership provider is configured
+
+                //NOTE: Below we are assigning the password to just a new GUID because we are not actually storing the password, however that
+                // field is mandatory in the database so we need to put something there.
+
+                //If the default Member type exists, we&#39;ll use that to create the IMember - that way we can associate the custom membership
+                // provider to our data - eventually we can support editing custom properties with a custom provider.
+                var memberType = ApplicationContext.Services.MemberTypeService.Get(Constants.Conventions.MemberTypes.DefaultAlias);
+                if (memberType != null)
+                {
+                    FilterContentTypeProperties(memberType, memberType.PropertyTypes.Select(x =&gt; x.Alias).ToArray());
+                    return new Member(model.Name, model.Email, model.Username, Guid.NewGuid().ToString(&quot;N&quot;), memberType);
+                }
+
+                //generate a member for a generic membership provider
+                var member = MemberService.CreateGenericMembershipProviderMember(model.Name, model.Email, model.Username, Guid.NewGuid().ToString(&quot;N&quot;));
+                //we&#39;ll just remove all properties here otherwise we&#39;ll end up with validation errors, we don&#39;t want to persist any property data anyways
+                // in this case.
+                FilterContentTypeProperties(member.ContentType, member.ContentType.PropertyTypes.Select(x =&gt; x.Alias).ToArray());
+                return member;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This will remove all of the special membership provider properties which were required to display the property editors
+        /// for editing - but the values have been mapped back ot the MemberSave object directly - we don&#39;t want to keep these properties
+        /// on the IMember because they will attempt to be persisted which we don&#39;t want since they might not even exist.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentType&quot;&gt;&lt;/param&gt;
+        private void FilterMembershipProviderProperties(IContentTypeBase contentType)
+        {
+            var defaultProps = Constants.Conventions.Member.GetStandardPropertyTypeStubs();
+            //remove all membership properties, these values are set with the membership provider.
+            var exclude = defaultProps.Select(x =&gt; x.Value.Alias).ToArray();
+            FilterContentTypeProperties(contentType, exclude);
+        }
+
+        private void FilterContentTypeProperties(IContentTypeBase contentType, IEnumerable&lt;string&gt; exclude)
+        {
+            //remove all properties based on the exclusion list
+            foreach (var remove in exclude)
+            {
+                if (contentType.PropertyTypeExists(remove))
+                {
+                    contentType.RemovePropertyType(remove);
+                }
+            }
+        }
+
+        protected override ContentItemDto&lt;IMember&gt; MapFromPersisted(MemberSave model)
+        {
+            return Mapper.Map&lt;IMember, ContentItemDto&lt;IMember&gt;&gt;(model.PersistedContent);
+        }
+
+        /// &lt;summary&gt;
+        /// Custom validation helper so that we can exclude the Member.StandardPropertyTypeStubs from being validating for existence
+        /// &lt;/summary&gt;
+        internal class MemberValidationHelper : ContentItemValidationHelper&lt;IMember, MemberSave&gt;
+        {
+            /// &lt;summary&gt;
+            /// We need to manually validate a few things here like email and login to make sure they are valid and aren&#39;t duplicates
+            /// &lt;/summary&gt;
+            /// &lt;param name=&quot;postedItem&quot;&gt;&lt;/param&gt;
+            /// &lt;param name=&quot;actionContext&quot;&gt;&lt;/param&gt;
+            /// &lt;returns&gt;&lt;/returns&gt;           
+            protected override bool ValidatePropertyData(ContentItemBasic&lt;ContentPropertyBasic, IMember&gt; postedItem, HttpActionContext actionContext)
+            {
+                var memberSave = (MemberSave)postedItem;
+
+                if (memberSave.Username.IsNullOrWhiteSpace())
+                {
+                    actionContext.ModelState.AddPropertyError(
+                            new ValidationResult(&quot;Invalid user name&quot;, new[] { &quot;value&quot; }),
+                            string.Format(&quot;{0}login&quot;, Constants.PropertyEditors.InternalGenericPropertiesPrefix));    
+                }
+
+                if (memberSave.Email.IsNullOrWhiteSpace() || new EmailAddressAttribute().IsValid(memberSave.Email) == false)
+                {
+                    actionContext.ModelState.AddPropertyError(
+                            new ValidationResult(&quot;Invalid email&quot;, new[] { &quot;value&quot; }),
+                            string.Format(&quot;{0}email&quot;, Constants.PropertyEditors.InternalGenericPropertiesPrefix));    
+                }
+
+                //default provider!
+                var membershipProvider = Core.Security.MembershipProviderExtensions.GetMembersMembershipProvider();
+
+                var validEmail = ValidateUniqueEmail(memberSave, membershipProvider, actionContext);
+                if (validEmail == false)
+                {
+                    actionContext.ModelState.AddPropertyError(
+                        new ValidationResult(&quot;Email address is already in use&quot;, new[] { &quot;value&quot; }),
+                        string.Format(&quot;{0}email&quot;, Constants.PropertyEditors.InternalGenericPropertiesPrefix));
+                }
+
+                var validLogin = ValidateUniqueLogin(memberSave, membershipProvider, actionContext);
+                if (validLogin == false)
+                {
+                    actionContext.ModelState.AddPropertyError(
+                        new ValidationResult(&quot;Username is already in use&quot;, new[] { &quot;value&quot; }),
+                        string.Format(&quot;{0}login&quot;, Constants.PropertyEditors.InternalGenericPropertiesPrefix));
+                }
+
+                return base.ValidatePropertyData(postedItem, actionContext);
+            }
+
+            protected override bool ValidateProperties(ContentItemBasic&lt;ContentPropertyBasic, IMember&gt; postedItem, HttpActionContext actionContext)
+            {
+                var propertiesToValidate = postedItem.Properties.ToList();
+                var defaultProps = Constants.Conventions.Member.GetStandardPropertyTypeStubs();
+                var exclude = defaultProps.Select(x =&gt; x.Value.Alias).ToArray();
+                foreach (var remove in exclude)
+                {
+                    propertiesToValidate.RemoveAll(property =&gt; property.Alias == remove);
+                }
+
+                return ValidateProperties(propertiesToValidate.ToArray(), postedItem.PersistedContent.Properties.ToArray(), actionContext);
+            }
+
+            internal bool ValidateUniqueLogin(MemberSave contentItem, MembershipProvider membershipProvider, HttpActionContext actionContext)
+            {
+                if (contentItem == null) throw new ArgumentNullException(&quot;contentItem&quot;);
+                if (membershipProvider == null) throw new ArgumentNullException(&quot;membershipProvider&quot;);
+
+                int totalRecs;
+                var existingByName = membershipProvider.FindUsersByName(contentItem.Username.Trim(), 0, int.MaxValue, out totalRecs);
+                switch (contentItem.Action)
+                {
+                    case ContentSaveAction.Save:
+
+                        //ok, we&#39;re updating the member, we need to check if they are changing their login and if so, does it exist already ?
+                        if (contentItem.PersistedContent.Username.InvariantEquals(contentItem.Username.Trim()) == false)
+                        {
+                            //they are changing their login name
+                            if (existingByName.Cast&lt;MembershipUser&gt;().Select(x =&gt; x.UserName)
+                                .Any(x =&gt; x == contentItem.Username.Trim()))
+                            {
+                                //the user cannot use this login
+                                return false;
+                            }
+                        }
+                        break;
+                    case ContentSaveAction.SaveNew:
+                        //check if the user&#39;s login already exists
+                        if (existingByName.Cast&lt;MembershipUser&gt;().Select(x =&gt; x.UserName)
+                            .Any(x =&gt; x == contentItem.Username.Trim()))
+                        {
+                            //the user cannot use this login
+                            return false;
+                        }
+                        break;
+                    default:
+                        //we don&#39;t support this for members
+                        throw new HttpResponseException(HttpStatusCode.NotFound);
+                }
+
+                return true;
+            }
+
+            internal bool ValidateUniqueEmail(MemberSave contentItem, MembershipProvider membershipProvider, HttpActionContext actionContext)
+            {
+                if (contentItem == null) throw new ArgumentNullException(&quot;contentItem&quot;);
+                if (membershipProvider == null) throw new ArgumentNullException(&quot;membershipProvider&quot;);
+
+                if (membershipProvider.RequiresUniqueEmail == false)
+                {
+                    return true;
+                }
+
+                int totalRecs;
+                var existingByEmail = membershipProvider.FindUsersByEmail(contentItem.Email.Trim(), 0, int.MaxValue, out totalRecs);
+                switch (contentItem.Action)
+                {
+                    case ContentSaveAction.Save:
+                        //ok, we&#39;re updating the member, we need to check if they are changing their email and if so, does it exist already ?
+                        if (contentItem.PersistedContent.Email.InvariantEquals(contentItem.Email.Trim()) == false)
+                        {
+                            //they are changing their email
+                            if (existingByEmail.Cast&lt;MembershipUser&gt;().Select(x =&gt; x.Email)
+                                               .Any(x =&gt; x.InvariantEquals(contentItem.Email.Trim())))
+                            {
+                                //the user cannot use this email
+                                return false;
+                            }
+                        }
+                        break;
+                    case ContentSaveAction.SaveNew:
+                        //check if the user&#39;s email already exists
+                        if (existingByEmail.Cast&lt;MembershipUser&gt;().Select(x =&gt; x.Email)
+                                           .Any(x =&gt; x.InvariantEquals(contentItem.Email.Trim())))
+                        {
+                            //the user cannot use this email
+                            return false;
+                        }
+                        break;
+                    default:
+                        //we don&#39;t support this for members
+                        throw new HttpResponseException(HttpStatusCode.NotFound);
+                }
+
+                return true;
+            }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,15,25,39,0],[26,9,26,10,0],[27,9,27,10,0],[33,15,33,47,0],[34,9,34,10,0],[35,9,35,10,0],[38,9,38,10,0],[39,13,39,49,0],[40,9,40,10,0],[48,9,48,10,0],[49,13,49,94,0],[50,13,50,102,0],[51,13,51,30,0],[54,21,54,51,0],[58,21,58,77,0],[59,21,59,48,0],[60,21,60,22,0],[61,25,61,108,0],[88,21,88,86,0],[90,21,90,35,0],[92,9,92,10,0],[95,9,95,10,0],[96,13,96,82,0],[97,13,97,32,0],[98,13,98,14,0],[99,17,99,94,0],[102,13,102,93,0],[105,13,105,53,0],[105,53,105,66,0],[105,66,105,78,0],[105,13,105,78,0],[107,13,107,20,0],[107,22,107,32,0],[107,33,107,35,0],[107,36,107,43,0],[108,13,108,14,0],[109,17,109,50,0],[110,13,110,14,0],[111,13,111,27,0],[112,9,112,10,0],[123,9,123,10,0],[124,13,124,102,0],[126,13,126,56,0],[127,13,127,14,0],[128,17,128,109,0],[129,17,129,41,0],[130,17,130,18,0],[131,21,131,117,0],[135,17,135,65,0],[138,17,138,117,0],[141,13,141,14,0],[149,17,149,132,0],[150,17,150,40,0],[151,17,151,18,0],[152,21,152,98,0],[152,98,152,105,0],[152,105,152,118,0],[152,21,152,118,0],[153,21,153,122,0],[157,17,157,153,0],[160,17,160,110,0],[160,110,160,117,0],[160,117,160,130,0],[160,17,160,130,0],[161,17,161,31,0],[163,9,163,10,0],[172,9,172,10,0],[173,13,173,92,0],[175,13,175,52,0],[175,52,175,65,0],[175,65,175,77,0],[175,13,175,77,0],[176,13,176,63,0],[177,9,177,10,0],[180,9,180,10,0],[182,13,182,20,0],[182,22,182,32,0],[182,33,182,35,0],[182,36,182,43,0],[183,13,183,14,0],[184,17,184,60,0],[185,17,185,18,0],[186,21,186,60,0],[187,17,187,18,0],[188,13,188,14,0],[189,9,189,10,0],[192,9,192,10,0],[193,13,193,89,0],[194,9,194,10,0],[208,13,208,14,0],[209,17,209,57,0],[211,17,211,62,0],[212,17,212,18,0],[213,21,215,115,0],[216,17,216,18,0],[218,17,218,125,0],[219,17,219,18,0],[220,21,222,115,0],[223,17,223,18,0],[226,17,226,116,0],[228,17,228,101,0],[229,17,229,41,0],[230,17,230,18,0],[231,21,233,111,0],[234,17,234,18,0],[236,17,236,101,0],[237,17,237,41,0],[238,17,238,18,0],[239,21,241,111,0],[242,17,242,18,0],[244,17,244,77,0],[245,13,245,14,0],[248,13,248,14,0],[249,17,249,75,0],[250,17,250,96,0],[251,17,251,56,0],[251,56,251,69,0],[251,69,251,81,0],[251,17,251,81,0],[252,17,252,24,0],[252,26,252,36,0],[252,37,252,39,0],[252,40,252,47,0],[253,17,253,18,0],[254,21,254,64,0],[254,64,254,88,0],[254,88,254,90,0],[254,21,254,90,0],[255,17,255,18,0],[257,17,257,140,0],[258,13,258,14,0],[261,13,261,14,0],[262,17,262,41,0],[262,42,262,89,0],[263,17,263,48,0],[263,49,263,103,0],[266,17,266,134,0],[267,17,267,44,0],[272,25,272,121,0],[273,25,273,26,0],[275,29,275,83,0],[275,83,275,93,0],[275,93,276,43,0],[276,43,276,75,0],[276,75,276,77,0],[275,29,276,77,0],[277,29,277,30,0],[279,33,279,46,0],[281,25,281,26,0],[282,25,282,31,0],[285,25,285,79,0],[285,79,285,89,0],[285,89,286,39,0],[286,39,286,71,0],[286,71,286,73,0],[285,25,286,73,0],[287,25,287,26,0],[289,29,289,42,0],[291,25,291,31,0],[294,25,294,82,0],[297,17,297,29,0],[298,13,298,14,0],[301,13,301,14,0],[302,17,302,41,0],[302,42,302,89,0],[303,17,303,48,0],[303,49,303,103,0],[305,17,305,69,0],[306,17,306,18,0],[307,21,307,33,0],[311,17,311,133,0],[312,17,312,44,0],[316,25,316,115,0],[317,25,317,26,0],[319,29,319,84,0],[319,84,319,91,0],[319,91,320,58,0],[320,58,320,101,0],[320,101,320,103,0],[319,29,320,103,0],[321,29,321,30,0],[323,33,323,46,0],[325,25,325,26,0],[326,25,326,31,0],[329,25,329,80,0],[329,80,329,87,0],[329,87,330,54,0],[330,54,330,97,0],[330,97,330,99,0],[329,25,330,99,0],[331,25,331,26,0],[333,29,333,42,0],[335,25,335,31,0],[338,25,338,82,0],[341,17,341,29,0],[342,13,342,14,0]]);
+    </script>
+  </body>
+</html>

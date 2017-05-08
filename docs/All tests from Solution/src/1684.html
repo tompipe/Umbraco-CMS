@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\DatabaseModelDefinitions\DefinitionFactory.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Data;
+using System.Linq;
+using System.Reflection;
+using Umbraco.Core.Persistence.DatabaseAnnotations;
+using Umbraco.Core.Persistence.SqlSyntax;
+
+namespace Umbraco.Core.Persistence.DatabaseModelDefinitions
+{
+    internal static class DefinitionFactory
+    {
+        public static TableDefinition GetTableDefinition(ISqlSyntaxProvider syntaxProvider, Type modelType)
+        {
+            //Looks for PetaPoco&#39;s TableNameAtribute for the name of the table
+            //If no attribute is set we use the name of the Type as the default convention
+            var tableNameAttribute = modelType.FirstAttribute&lt;TableNameAttribute&gt;();
+            string tableName = tableNameAttribute == null ? modelType.Name : tableNameAttribute.Value;
+
+            var tableDefinition = new TableDefinition {Name = tableName};
+            var objProperties = modelType.GetProperties().ToList();
+            foreach (var propertyInfo in objProperties)
+            {
+                //If current property has an IgnoreAttribute then skip it
+                var ignoreAttribute = propertyInfo.FirstAttribute&lt;IgnoreAttribute&gt;();
+                if (ignoreAttribute != null) continue;
+
+                //If current property has a ResultColumnAttribute then skip it
+                var resultColumnAttribute = propertyInfo.FirstAttribute&lt;ResultColumnAttribute&gt;();
+                if (resultColumnAttribute != null) continue;
+
+                //Looks for ColumnAttribute with the name of the column, which would exist with ExplicitColumns
+                //Otherwise use the name of the property itself as the default convention
+                var columnAttribute = propertyInfo.FirstAttribute&lt;ColumnAttribute&gt;();
+                string columnName = columnAttribute != null ? columnAttribute.Name : propertyInfo.Name;
+                var columnDefinition = GetColumnDefinition(syntaxProvider, modelType, propertyInfo, columnName, tableName);
+                tableDefinition.Columns.Add(columnDefinition);
+
+                //Creates a foreignkey definition and adds it to the collection on the table definition
+                var foreignKeyAttributes = propertyInfo.MultipleAttribute&lt;ForeignKeyAttribute&gt;();
+                if (foreignKeyAttributes != null)
+                {
+                    foreach (var foreignKeyAttribute in foreignKeyAttributes)
+                    {
+                        var foreignKeyDefinition = GetForeignKeyDefinition(modelType, propertyInfo, foreignKeyAttribute, columnName, tableName);
+                        tableDefinition.ForeignKeys.Add(foreignKeyDefinition);
+                    }
+                }
+
+                //Creates an index definition and adds it to the collection on the table definition
+                 var indexAttribute = propertyInfo.FirstAttribute&lt;IndexAttribute&gt;();
+                 if (indexAttribute != null)
+                 {
+                     var indexDefinition = GetIndexDefinition(modelType, propertyInfo, indexAttribute, columnName, tableName);
+                     tableDefinition.Indexes.Add(indexDefinition);
+                 }
+            }
+
+            return tableDefinition;
+        }
+
+        public static ColumnDefinition GetColumnDefinition(ISqlSyntaxProvider syntaxProvider, Type modelType, PropertyInfo propertyInfo, string columnName, string tableName)
+        {
+            var definition = new ColumnDefinition{ Name = columnName, TableName = tableName, ModificationType = ModificationType.Create };
+
+            //Look for specific Null setting attributed a column
+            var nullSettingAttribute = propertyInfo.FirstAttribute&lt;NullSettingAttribute&gt;();
+            if (nullSettingAttribute != null)
+            {
+                definition.IsNullable = nullSettingAttribute.NullSetting == NullSettings.Null;
+            }
+
+            //Look for specific DbType attributed a column
+            var databaseTypeAttribute = propertyInfo.FirstAttribute&lt;SpecialDbTypeAttribute&gt;();
+            if (databaseTypeAttribute != null)
+            {
+                definition.HasSpecialDbType = true;
+                definition.DbType = databaseTypeAttribute.DatabaseType;
+            }
+            else
+            {
+                definition.PropertyType = propertyInfo.PropertyType;
+            }
+
+            //Look for Primary Key for the current column
+            var primaryKeyColumnAttribute = propertyInfo.FirstAttribute&lt;PrimaryKeyColumnAttribute&gt;();
+            if (primaryKeyColumnAttribute != null)
+            {
+                string primaryKeyName = string.IsNullOrEmpty(primaryKeyColumnAttribute.Name)
+                                            ? string.Format(&quot;PK_{0}&quot;, tableName)
+                                            : primaryKeyColumnAttribute.Name;
+
+                definition.IsPrimaryKey = true;
+                definition.IsIdentity = primaryKeyColumnAttribute.AutoIncrement;
+                definition.IsIndexed = primaryKeyColumnAttribute.Clustered;
+                definition.PrimaryKeyName = primaryKeyName;
+                definition.PrimaryKeyColumns = primaryKeyColumnAttribute.OnColumns ?? string.Empty;
+                definition.Seeding = primaryKeyColumnAttribute.IdentitySeed;
+            }
+
+            //Look for Size/Length of DbType
+            var lengthAttribute = propertyInfo.FirstAttribute&lt;LengthAttribute&gt;();
+            if (lengthAttribute != null)
+            {
+                definition.Size = lengthAttribute.Length;
+            }
+
+            //Look for Constraint for the current column
+            var constraintAttribute = propertyInfo.FirstAttribute&lt;ConstraintAttribute&gt;();
+            if (constraintAttribute != null)
+            {
+                //Special case for MySQL as it can&#39;t have multiple default DateTime values, which 
+                //is what the umbracoServer table definition is trying to create
+                if (syntaxProvider is MySqlSyntaxProvider &amp;&amp; definition.TableName == &quot;umbracoServer&quot; &amp;&amp;
+                        definition.TableName.ToLowerInvariant() == &quot;lastNotifiedDate&quot;.ToLowerInvariant())
+                    return definition;
+
+                definition.ConstraintName = constraintAttribute.Name ?? string.Empty;
+                definition.DefaultValue = constraintAttribute.Default ?? string.Empty;
+            }
+
+            return definition;
+        }
+
+        public static ForeignKeyDefinition GetForeignKeyDefinition(Type modelType, PropertyInfo propertyInfo,
+                                                                   ForeignKeyAttribute attribute, string columnName, string tableName)
+        {
+            var referencedTable = attribute.Type.FirstAttribute&lt;TableNameAttribute&gt;();
+            var referencedPrimaryKey = attribute.Type.FirstAttribute&lt;PrimaryKeyAttribute&gt;();
+
+            string referencedColumn = string.IsNullOrEmpty(attribute.Column)
+                                          ? referencedPrimaryKey.Value
+                                          : attribute.Column;
+
+            string foreignKeyName = string.IsNullOrEmpty(attribute.Name)
+                                        ? string.Format(&quot;FK_{0}_{1}_{2}&quot;, tableName, referencedTable.Value, referencedColumn)
+                                        : attribute.Name;
+
+            var definition = new ForeignKeyDefinition
+                                 {
+                                     Name = foreignKeyName,
+                                     ForeignTable = tableName,
+                                     PrimaryTable = referencedTable.Value
+                                 };
+            definition.ForeignColumns.Add(columnName);
+            definition.PrimaryColumns.Add(referencedColumn);
+
+            return definition;
+        }
+
+        public static IndexDefinition GetIndexDefinition(Type modelType, PropertyInfo propertyInfo, IndexAttribute attribute, string columnName, string tableName)
+        {
+            string indexName = string.IsNullOrEmpty(attribute.Name)
+                                   ? string.Format(&quot;IX_{0}_{1}&quot;, tableName, columnName)
+                                   : attribute.Name;
+
+            var definition = new IndexDefinition
+                                 {
+                                     Name = indexName,
+                                     IndexType = attribute.IndexType,
+                                     ColumnName = columnName,
+                                     TableName = tableName,
+                                     IsClustered = attribute.IndexType == IndexTypes.Clustered,
+                                     IsUnique = attribute.IndexType == IndexTypes.UniqueNonClustered
+                                 };
+
+            if (string.IsNullOrEmpty(attribute.ForColumns) == false)
+            {
+                var columns = attribute.ForColumns.Split(&#39;,&#39;).Select(p =&gt; p.Trim());
+                foreach (var column in columns)
+                {
+                    definition.Columns.Add(new IndexColumnDefinition {Name = column, Direction = Direction.Ascending});
+                }
+            }
+            return definition;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[13,9,13,10,1],[16,13,16,85,1],[17,13,17,103,1],[19,13,19,74,1],[20,13,20,68,1],[21,13,21,20,1],[21,22,21,38,1],[21,39,21,41,1],[21,42,21,55,1],[22,13,22,14,1],[24,17,24,86,1],[25,17,25,45,1],[25,46,25,55,1],[28,17,28,98,1],[29,17,29,51,1],[29,52,29,61,1],[33,17,33,86,1],[34,17,34,104,1],[35,17,35,124,1],[36,17,36,63,1],[39,17,39,98,1],[40,17,40,50,1],[41,17,41,18,1],[42,21,42,28,1],[42,30,42,53,1],[42,54,42,56,1],[42,57,42,77,1],[43,21,43,22,1],[44,25,44,145,1],[45,25,45,79,1],[46,21,46,22,1],[47,17,47,18,1],[50,18,50,85,1],[51,18,51,45,1],[52,18,52,19,1],[53,22,53,127,1],[54,22,54,67,1],[55,18,55,19,1],[56,13,56,14,1],[58,13,58,36,1],[59,9,59,10,1],[62,9,62,10,1],[63,13,63,139,1],[66,13,66,92,1],[67,13,67,46,1],[68,13,68,14,1],[69,17,69,95,1],[70,13,70,14,1],[73,13,73,95,1],[74,13,74,47,1],[75,13,75,14,1],[76,17,76,52,1],[77,17,77,72,1],[78,13,78,14,1],[80,13,80,14,1],[81,17,81,69,1],[82,13,82,14,1],[85,13,85,102,1],[86,13,86,51,1],[87,13,87,14,1],[88,17,90,78,1],[92,17,92,48,1],[93,17,93,81,1],[94,17,94,76,1],[95,17,95,60,1],[96,17,96,100,1],[97,17,97,77,1],[98,13,98,14,1],[101,13,101,82,1],[102,13,102,41,1],[103,13,103,14,1],[104,17,104,58,1],[105,13,105,14,1],[108,13,108,90,1],[109,13,109,45,1],[110,13,110,14,1],[113,17,114,106,1],[115,21,115,39,0],[117,17,117,86,1],[118,17,118,87,1],[119,13,119,14,1],[121,13,121,31,1],[122,9,122,10,1],[126,9,126,10,1],[127,13,127,87,1],[128,13,128,93,1],[130,13,132,62,1],[134,13,136,58,1],[138,13,143,36,1],[144,13,144,55,1],[145,13,145,61,1],[147,13,147,31,1],[148,9,148,10,1],[151,9,151,10,1],[152,13,154,53,1],[156,13,164,36,1],[166,13,166,69,1],[167,13,167,14,1],[168,17,168,75,1],[168,75,168,83,1],[168,83,168,85,1],[168,17,168,85,1],[169,17,169,24,1],[169,26,169,36,1],[169,37,169,39,1],[169,40,169,47,1],[170,17,170,18,1],[171,21,171,120,1],[172,17,172,18,1],[173,13,173,14,1],[174,13,174,31,1],[175,9,175,10,1]]);
+    </script>
+  </body>
+</html>

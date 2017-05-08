@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Security\Identity\GetUserSecondsMiddleWare.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Diagnostics;
+using System.Globalization;
+using System.Threading.Tasks;
+using Microsoft.Owin;
+using Microsoft.Owin.Logging;
+using Microsoft.Owin.Security.Cookies;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Configuration.UmbracoSettings;
+
+namespace Umbraco.Web.Security.Identity
+{
+    /// &lt;summary&gt;
+    /// Custom middleware to return the remaining seconds the user has before they are logged out
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// This is quite a custom request because in most situations we just want to return the seconds and don&#39;t want
+    /// to renew the auth ticket, however if KeepUserLoggedIn is true, then we do want to renew the auth ticket for
+    /// this request!
+    /// &lt;/remarks&gt;
+    internal class GetUserSecondsMiddleWare : OwinMiddleware
+    {
+        private readonly UmbracoBackOfficeCookieAuthOptions _authOptions;
+        private readonly ISecuritySection _security;
+        private readonly ILogger _logger;
+
+        public GetUserSecondsMiddleWare(
+            OwinMiddleware next,
+            UmbracoBackOfficeCookieAuthOptions authOptions,
+            ISecuritySection security,
+            ILogger logger)
+            : base(next)
+        {
+            if (authOptions == null) throw new ArgumentNullException(&quot;authOptions&quot;);
+            if (logger == null) throw new ArgumentNullException(&quot;logger&quot;);
+            _authOptions = authOptions;
+            _security = security;
+            _logger = logger;
+        }
+
+        public override async Task Invoke(IOwinContext context)
+        {
+            var request = context.Request;
+            var response = context.Response;
+            
+            if (request.Uri.Scheme.InvariantStartsWith(&quot;http&quot;)
+                &amp;&amp; request.Uri.AbsolutePath.InvariantEquals(
+                    string.Format(&quot;{0}/backoffice/UmbracoApi/Authentication/GetRemainingTimeoutSeconds&quot;, GlobalSettings.Path)))
+            {
+                var cookie = _authOptions.CookieManager.GetRequestCookie(context, _security.AuthCookieName);
+                if (cookie.IsNullOrWhiteSpace() == false)
+                {
+                    var ticket = _authOptions.TicketDataFormat.Unprotect(cookie);
+                    if (ticket != null)
+                    {
+                        var remainingSeconds = ticket.Properties.ExpiresUtc.HasValue
+                            ? (ticket.Properties.ExpiresUtc.Value - _authOptions.SystemClock.UtcNow).TotalSeconds
+                            : 0;
+
+                        response.ContentType = &quot;application/json; charset=utf-8&quot;;
+                        response.StatusCode = 200;
+                        response.Headers.Add(&quot;Cache-Control&quot;, new[] { &quot;no-cache&quot; });
+                        response.Headers.Add(&quot;Pragma&quot;, new[] { &quot;no-cache&quot; });
+                        response.Headers.Add(&quot;Expires&quot;, new[] { &quot;-1&quot; });
+                        response.Headers.Add(&quot;Date&quot;, new[] { _authOptions.SystemClock.UtcNow.ToString(&quot;R&quot;) });
+
+                        //Ok, so here we need to check if we want to process/renew the auth ticket for each 
+                        // of these requests. If that is the case, the user will really never be logged out until they
+                        // close their browser (there will be edge cases of that, especially when debugging)
+                        if (_security.KeepUserLoggedIn)
+                        {
+                            var currentUtc = _authOptions.SystemClock.UtcNow;
+                            var issuedUtc = ticket.Properties.IssuedUtc;
+                            var expiresUtc = ticket.Properties.ExpiresUtc;
+
+                            if (expiresUtc.HasValue &amp;&amp; issuedUtc.HasValue)
+                            {
+                                var timeElapsed = currentUtc.Subtract(issuedUtc.Value);
+                                var timeRemaining = expiresUtc.Value.Subtract(currentUtc);
+
+                                //if it&#39;s time to renew, then do it
+                                if (timeRemaining &lt; timeElapsed)
+                                {
+                                    ticket.Properties.IssuedUtc = currentUtc;
+                                    var timeSpan = expiresUtc.Value.Subtract(issuedUtc.Value);
+                                    ticket.Properties.ExpiresUtc = currentUtc.Add(timeSpan);
+
+                                    var cookieValue = _authOptions.TicketDataFormat.Protect(ticket);
+
+                                    var cookieOptions = _authOptions.CreateRequestCookieOptions(context, ticket);
+
+                                    _authOptions.CookieManager.AppendResponseCookie(
+                                        context,
+                                        _authOptions.CookieName,
+                                        cookieValue,
+                                        cookieOptions);
+
+                                    remainingSeconds = (ticket.Properties.ExpiresUtc.Value - currentUtc).TotalSeconds;
+                                }
+                            }                            
+                        }
+                        else if (remainingSeconds &lt;= 30)
+                        {
+                            //NOTE: We are using 30 seconds because that is what is coded into angular to force logout to give some headway in
+                            // the timeout process.
+
+                            _logger.WriteCore(TraceEventType.Information, 0,
+                                string.Format(&quot;User logged will be logged out due to timeout: {0}, IP Address: {1}&quot;, ticket.Identity.Name, request.RemoteIpAddress),
+                                null, null);
+                        }
+
+                        await response.WriteAsync(remainingSeconds.ToString(CultureInfo.InvariantCulture));
+                        return;
+                    }
+                }
+                response.StatusCode = 401;
+            }
+            else if (Next != null)
+            {
+                await Next.Invoke(context);
+            }
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[33,15,33,25,0],[34,9,34,10,0],[35,13,35,37,0],[35,38,35,85,0],[36,13,36,32,0],[36,33,36,75,0],[37,13,37,40,0],[38,13,38,34,0],[39,13,39,30,0],[40,9,40,10,0],[43,9,43,10,0],[44,13,44,43,0],[45,13,45,45,0],[47,13,49,128,0],[50,13,50,14,0],[51,17,51,109,0],[52,17,52,58,0],[53,17,53,18,0],[54,21,54,82,0],[55,21,55,40,0],[56,21,56,22,0],[57,25,59,33,0],[61,25,61,82,0],[62,25,62,51,0],[63,25,63,85,0],[64,25,64,78,0],[65,25,65,73,0],[66,25,66,111,0],[71,25,71,56,0],[72,25,72,26,0],[73,29,73,78,0],[74,29,74,73,0],[75,29,75,75,0],[77,29,77,75,0],[78,29,78,30,0],[79,33,79,88,0],[80,33,80,91,0],[83,33,83,65,0],[84,33,84,34,0],[85,37,85,78,0],[86,37,86,95,0],[87,37,87,93,0],[89,37,89,101,0],[91,37,91,114,0],[93,37,97,56,0],[99,37,99,119,0],[100,33,100,34,0],[101,29,101,30,0],[102,25,102,26,0],[103,30,103,57,0],[104,25,104,26,0],[108,29,110,45,0],[111,25,111,26,0],[113,25,113,108,0],[114,25,114,32,0],[116,17,116,18,0],[117,17,117,43,0],[118,13,118,14,0],[119,18,119,35,0],[120,13,120,14,0],[121,17,121,44,0],[122,13,122,14,0],[123,9,123,10,0]]);
+    </script>
+  </body>
+</html>

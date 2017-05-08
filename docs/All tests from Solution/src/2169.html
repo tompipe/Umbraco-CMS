@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Dynamics\DynamicInstanceHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Dynamic;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Logging;
+
+namespace Umbraco.Core.Dynamics
+{
+	/// &lt;summary&gt;
+	/// A helper class to try invoke members, find properties, etc...
+	/// &lt;/summary&gt;
+	internal class DynamicInstanceHelper
+	{
+
+		internal class TryInvokeMemberResult
+		{
+			public object ObjectResult { get; private set; }
+			public TryInvokeMemberSuccessReason Reason { get; private set; }
+
+			public TryInvokeMemberResult(object result, TryInvokeMemberSuccessReason reason)
+			{
+				ObjectResult = result;
+				Reason = reason;
+			}
+		}
+
+		internal enum TryInvokeMemberSuccessReason
+		{
+			FoundProperty,
+			FoundMethod,
+			FoundExtensionMethod
+		}
+
+	    /// &lt;summary&gt;
+	    /// Attempts to invoke a member based on the dynamic instance
+	    /// &lt;/summary&gt;
+	    /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+	    /// &lt;param name=&quot;runtimeCache&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;thisObject&quot;&gt;The object instance to invoke the extension method for&lt;/param&gt;
+	    /// &lt;param name=&quot;binder&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;args&quot;&gt;&lt;/param&gt;
+	    /// &lt;returns&gt;&lt;/returns&gt;
+	    /// &lt;remarks&gt;
+	    /// First tries to find a property with the binder name, if that fails it will try to find a static or instance method
+	    /// on the object that matches the binder name
+	    /// &lt;/remarks&gt;
+	    public static Attempt&lt;TryInvokeMemberResult&gt; TryInvokeMember&lt;T&gt;(IRuntimeCacheProvider runtimeCache, T thisObject, InvokeMemberBinder binder, object[] args)
+		{
+            return TryInvokeMember&lt;T&gt;(runtimeCache, thisObject, binder, args, null);
+		}
+
+	    /// &lt;summary&gt;
+	    /// Attempts to invoke a member based on the dynamic instance
+	    /// &lt;/summary&gt;
+	    /// &lt;typeparam name=&quot;T&quot;&gt;&lt;/typeparam&gt;
+	    /// &lt;param name=&quot;runtimeCache&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;thisObject&quot;&gt;The object instance to invoke the extension method for&lt;/param&gt;
+	    /// &lt;param name=&quot;binder&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;args&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;findExtensionMethodsOnTypes&quot;&gt;The types to scan for extension methods &lt;/param&gt;
+	    /// &lt;returns&gt;&lt;/returns&gt;
+	    /// &lt;remarks&gt;
+	    /// First tries to find a property with the binder name, if that fails it will try to find a static or instance method
+	    /// on the object that matches the binder name, if that fails it will then attempt to invoke an extension method
+	    /// based on the binder name and the extension method types to scan.
+	    /// &lt;/remarks&gt;
+	    public static Attempt&lt;TryInvokeMemberResult&gt; TryInvokeMember&lt;T&gt;(
+            IRuntimeCacheProvider runtimeCache,
+            T thisObject, 
+			InvokeMemberBinder binder, 
+			object[] args, 
+			IEnumerable&lt;Type&gt; findExtensionMethodsOnTypes)
+		{
+			//TODO: We MUST cache the result here, it is very expensive to keep finding extension methods!
+			object result;
+			try
+			{
+				//Property?
+				result = typeof(T).InvokeMember(binder.Name,
+				                                BindingFlags.Instance |
+				                                BindingFlags.Public |
+				                                BindingFlags.GetProperty,
+				                                null,
+				                                thisObject,
+				                                args);
+				return Attempt.Succeed(new TryInvokeMemberResult(result, TryInvokeMemberSuccessReason.FoundProperty));
+			}
+			catch (MissingMethodException)
+			{
+				try
+				{
+					//Static or Instance Method?
+					result = typeof(T).InvokeMember(binder.Name,
+					                                BindingFlags.Instance |
+					                                BindingFlags.Public |
+					                                BindingFlags.Static |
+					                                BindingFlags.InvokeMethod,
+					                                null,
+					                                thisObject,
+					                                args);
+					return Attempt.Succeed(new TryInvokeMemberResult(result, TryInvokeMemberSuccessReason.FoundMethod));
+				}
+				catch (MissingMethodException)
+				{
+					if (findExtensionMethodsOnTypes != null)
+					{
+						try
+						{
+                            result = FindAndExecuteExtensionMethod(runtimeCache, thisObject, args, binder.Name, findExtensionMethodsOnTypes);
+							return Attempt.Succeed(new TryInvokeMemberResult(result, TryInvokeMemberSuccessReason.FoundExtensionMethod));
+						}
+						catch (TargetInvocationException ext)
+						{
+							//don&#39;t log here, we return this exception because the caller may need to do something specific when
+							//this exception occurs.
+						    var mresult = new TryInvokeMemberResult(null, TryInvokeMemberSuccessReason.FoundExtensionMethod);
+							return Attempt&lt;TryInvokeMemberResult&gt;.Fail(mresult, ext);
+						}
+						catch (Exception ex)
+						{
+                            var sb = new StringBuilder();
+                            sb.AppendFormat(&quot;An error occurred finding and executing extension method \&quot;{0}\&quot; &quot;, binder.Name);
+                            sb.AppendFormat(&quot;for type \&quot;{0}\&quot;. &quot;, typeof (T));
+                            sb.Append(&quot;Types searched for extension methods were &quot;);
+                            sb.Append(string.Join(&quot;, &quot;, findExtensionMethodsOnTypes));
+                            sb.Append(&quot;.&quot;);
+							LogHelper.Error&lt;DynamicInstanceHelper&gt;(sb.ToString(), ex);
+                            var mresult = new TryInvokeMemberResult(null, TryInvokeMemberSuccessReason.FoundExtensionMethod);
+                            return Attempt&lt;TryInvokeMemberResult&gt;.Fail(mresult, ex);
+						}	
+					}
+					return Attempt&lt;TryInvokeMemberResult&gt;.Fail();
+				}
+			}
+			catch (Exception ex)
+			{
+				LogHelper.Error&lt;DynamicInstanceHelper&gt;(&quot;An unhandled exception occurred in method TryInvokeMember&quot;, ex);
+				return Attempt&lt;TryInvokeMemberResult&gt;.Fail(ex);
+			}
+		}
+
+	    /// &lt;summary&gt;
+	    /// Attempts to find an extension method that matches the name and arguments based on scanning the Type&#39;s passed in
+	    /// to the findMethodsOnTypes parameter
+	    /// &lt;/summary&gt;
+	    /// &lt;param name=&quot;runtimeCache&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;thisObject&quot;&gt;The instance object to execute the extension method for&lt;/param&gt;
+	    /// &lt;param name=&quot;args&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;name&quot;&gt;&lt;/param&gt;
+	    /// &lt;param name=&quot;findMethodsOnTypes&quot;&gt;&lt;/param&gt;
+	    /// &lt;returns&gt;&lt;/returns&gt;
+	    internal static object FindAndExecuteExtensionMethod&lt;T&gt;(
+            IRuntimeCacheProvider runtimeCache,
+            T thisObject, 
+			object[] args, 
+			string name, 
+			IEnumerable&lt;Type&gt; findMethodsOnTypes)
+		{
+			object result = null;
+			
+			//find known extension methods that match the first type in the list
+			MethodInfo toExecute = null;
+			foreach (var t in findMethodsOnTypes)
+			{
+                toExecute = ExtensionMethodFinder.FindExtensionMethod(runtimeCache, t, args, name, false);
+				if (toExecute != null)
+					break;
+			}
+
+			if (toExecute != null)
+			{
+				var genericArgs = (new[] { (object)thisObject }).Concat(args);
+
+                // else we&#39;d get an exception w/ message &quot;Late bound operations cannot
+                // be performed on types or methods for which ContainsGenericParameters is true.&quot;
+                // because MakeGenericMethod must be used to obtain an actual method that can run
+                if (toExecute.ContainsGenericParameters)
+                    throw new InvalidOperationException(&quot;Method contains generic parameters, something&#39;s wrong.&quot;);
+                
+				result = toExecute.Invoke(null, genericArgs.ToArray());	
+			}
+			else
+			{
+				throw new MissingMethodException(typeof(T).FullName, name);
+			}			
+			return result;
+		}
+
+	}
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[21,33,21,37,1],[21,38,21,50,1],[22,49,22,53,1],[22,54,22,66,1],[24,4,24,84,1],[25,4,25,5,1],[26,5,26,27,1],[27,5,27,21,1],[28,4,28,5,1],[52,3,52,4,0],[53,13,53,85,0],[54,3,54,4,0],[77,3,77,4,1],[81,4,81,5,1],[83,5,89,43,1],[90,5,90,107,1],[92,4,92,34,1],[93,4,93,5,1],[95,5,95,6,1],[97,6,104,44,1],[105,6,105,106,0],[107,5,107,35,1],[108,5,108,6,1],[109,6,109,46,1],[110,6,110,7,1],[112,7,112,8,1],[113,29,113,142,1],[114,8,114,117,1],[116,7,116,44,0],[117,7,117,8,0],[120,11,120,108,0],[121,8,121,65,0],[123,7,123,27,0],[124,7,124,8,0],[125,29,125,58,0],[126,29,126,127,0],[127,29,127,79,0],[128,29,128,85,0],[129,29,129,87,0],[130,29,130,44,0],[131,8,131,66,0],[132,29,132,126,0],[133,29,133,85,0],[136,6,136,51,0],[139,4,139,24,0],[140,4,140,5,0],[141,5,141,109,0],[142,5,142,52,0],[144,3,144,4,1],[162,3,162,4,1],[163,4,163,25,1],[166,4,166,32,1],[167,4,167,11,1],[167,13,167,18,1],[167,19,167,21,1],[167,22,167,40,1],[168,4,168,5,1],[169,17,169,107,1],[170,5,170,27,1],[171,6,171,12,1],[172,4,172,5,1],[174,4,174,26,1],[175,4,175,5,1],[176,5,176,67,1],[181,17,181,57,1],[182,21,182,115,0],[184,5,184,60,1],[185,4,185,5,1],[187,4,187,5,0],[188,5,188,64,0],[190,4,190,18,1],[191,3,191,4,1]]);
+    </script>
+  </body>
+</html>

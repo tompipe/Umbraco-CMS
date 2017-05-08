@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Security\UmbracoBackOfficeIdentity.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.Serialization;
+using System.Security.Claims;
+using System.Security.Principal;
+using System.Web;
+using System.Web.Security;
+using Microsoft.AspNet.Identity;
+using Newtonsoft.Json;
+using Umbraco.Core.Configuration;
+
+namespace Umbraco.Core.Security
+{
+
+    /// &lt;summary&gt;
+    /// A custom user identity for the Umbraco backoffice
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// This inherits from FormsIdentity for backwards compatibility reasons since we still support the forms auth cookie, in v8 we can
+    /// change over to &#39;pure&#39; asp.net identity and just inherit from ClaimsIdentity.
+    /// &lt;/remarks&gt;
+    [Serializable]
+    public class UmbracoBackOfficeIdentity : FormsIdentity
+    {
+        public static UmbracoBackOfficeIdentity FromClaimsIdentity(ClaimsIdentity identity)
+        {
+            foreach (var t in RequiredBackOfficeIdentityClaimTypes)
+            {
+                //if the identity doesn&#39;t have the claim, or the claim value is null
+                if (identity.HasClaim(x =&gt; x.Type == t) == false || identity.HasClaim(x =&gt; x.Type == t &amp;&amp; x.Value.IsNullOrWhiteSpace()))
+                {
+                    throw new InvalidOperationException(&quot;Cannot create a &quot; + typeof(UmbracoBackOfficeIdentity) + &quot; from &quot; + typeof(ClaimsIdentity) + &quot; since the required claim &quot; + t + &quot; is missing&quot;);
+                }
+            }
+
+            var username = identity.GetUserName();
+            var session = identity.FindFirstValue(Constants.Security.SessionIdClaimType);
+            var startContentId = identity.FindFirstValue(Constants.Security.StartContentNodeIdClaimType);            
+            var startMediaId = identity.FindFirstValue(Constants.Security.StartMediaNodeIdClaimType);
+
+            var culture = identity.FindFirstValue(ClaimTypes.Locality);
+            var id = identity.FindFirstValue(ClaimTypes.NameIdentifier);            
+            var realName = identity.FindFirstValue(ClaimTypes.GivenName);
+
+            if (username == null || startContentId == null || startMediaId == null 
+                || culture == null || id == null 
+                || realName == null || session == null)
+                throw new InvalidOperationException(&quot;Cannot create a &quot; + typeof(UmbracoBackOfficeIdentity) + &quot; from &quot; + typeof(ClaimsIdentity) + &quot; since there are missing required claims&quot;);
+
+            int startContentIdAsInt;
+            int startMediaIdAsInt;
+            if (int.TryParse(startContentId, out startContentIdAsInt) == false || int.TryParse(startMediaId, out startMediaIdAsInt) == false)
+            {
+                throw new InvalidOperationException(&quot;Cannot create a &quot; + typeof(UmbracoBackOfficeIdentity) + &quot; from &quot; + typeof(ClaimsIdentity) + &quot; since the data is not formatted correctly&quot;);
+            }
+
+            var roles = identity.FindAll(x =&gt; x.Type == DefaultRoleClaimType).Select(role =&gt; role.Value).ToList();
+            var allowedApps = identity.FindAll(x =&gt; x.Type == Constants.Security.AllowedApplicationsClaimType).Select(app =&gt; app.Value).ToList();
+
+            var userData = new UserData(session)
+            {
+                SessionId = session,
+                AllowedApplications = allowedApps.ToArray(),
+                Culture = culture,
+                Id = id,
+                Roles = roles.ToArray(),
+                Username = username,
+                RealName = realName,
+                StartContentNode = startContentIdAsInt,
+                StartMediaNode = startMediaIdAsInt
+            };
+
+            return new UmbracoBackOfficeIdentity(identity, userData);
+        }
+
+        /// &lt;summary&gt;
+        /// Create a back office identity based on user data
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;userdata&quot;&gt;&lt;/param&gt;
+        public UmbracoBackOfficeIdentity(UserData userdata)
+            //This just creates a temp/fake ticket
+            : base(new FormsAuthenticationTicket(userdata.Username, true, 10))
+        {
+            if (userdata == null) throw new ArgumentNullException(&quot;userdata&quot;);
+            UserData = userdata;
+            AddUserDataClaims();
+        }
+
+        /// &lt;summary&gt;
+        /// Create a back office identity based on an existing claims identity
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;claimsIdentity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;userdata&quot;&gt;&lt;/param&gt;
+        public UmbracoBackOfficeIdentity(ClaimsIdentity claimsIdentity, UserData userdata)
+            //This just creates a temp/fake ticket
+            : base(new FormsAuthenticationTicket(userdata.Username, true, 10))
+        {
+            if (claimsIdentity == null) throw new ArgumentNullException(&quot;claimsIdentity&quot;);
+            if (userdata == null) throw new ArgumentNullException(&quot;userdata&quot;);
+
+            if (claimsIdentity is FormsIdentity)
+            {
+                //since it&#39;s a forms auth ticket, it is from a cookie so add that claim
+                AddClaim(new Claim(ClaimTypes.CookiePath, &quot;/&quot;, ClaimValueTypes.String, Issuer, Issuer, this));
+            }
+
+            _currentIssuer = claimsIdentity.AuthenticationType;
+            UserData = userdata;
+            AddExistingClaims(claimsIdentity);
+            Actor = claimsIdentity;
+            AddUserDataClaims();
+        }
+
+        /// &lt;summary&gt;
+        /// Create a new identity from a forms auth ticket
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ticket&quot;&gt;&lt;/param&gt;
+        public UmbracoBackOfficeIdentity(FormsAuthenticationTicket ticket)
+            : base(ticket)
+        {
+            //since it&#39;s a forms auth ticket, it is from a cookie so add that claim
+            AddClaim(new Claim(ClaimTypes.CookiePath, &quot;/&quot;, ClaimValueTypes.String, Issuer, Issuer, this));
+
+            UserData = JsonConvert.DeserializeObject&lt;UserData&gt;(ticket.UserData);
+            AddUserDataClaims();
+        }
+
+        /// &lt;summary&gt;
+        /// Used for cloning
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;identity&quot;&gt;&lt;/param&gt;
+        private UmbracoBackOfficeIdentity(UmbracoBackOfficeIdentity identity)
+            : base(identity)
+        {
+            if (identity.Actor != null)
+            {
+                _currentIssuer = identity.AuthenticationType;
+                AddExistingClaims(identity);
+                Actor = identity.Clone();
+            }
+
+            UserData = identity.UserData;
+            AddUserDataClaims();
+        }
+
+        public const string Issuer = &quot;UmbracoBackOffice&quot;;
+        private readonly string _currentIssuer = Issuer;
+
+        /// &lt;summary&gt;
+        /// Used during ctor to add existing claims from an existing ClaimsIdentity
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;claimsIdentity&quot;&gt;&lt;/param&gt;
+        private void AddExistingClaims(ClaimsIdentity claimsIdentity)
+        {
+            foreach (var claim in claimsIdentity.Claims)
+            {
+                //In one special case we will replace a claim if it exists already and that is the 
+                // Forms auth claim for name which automatically gets added
+                TryRemoveClaim(FindFirst(x =&gt; x.Type == claim.Type &amp;&amp; x.Issuer == &quot;Forms&quot;));
+
+                AddClaim(claim);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the required claim types for a back office identity
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This does not incude the role claim type or allowed apps type since that is a collection and in theory could be empty
+        /// &lt;/remarks&gt;
+        public static IEnumerable&lt;string&gt; RequiredBackOfficeIdentityClaimTypes
+        {
+            get
+            {
+                return new[]
+                {
+                    ClaimTypes.NameIdentifier, //id
+                    ClaimTypes.Name,  //username
+                    ClaimTypes.GivenName, 
+                    Constants.Security.StartContentNodeIdClaimType,
+                    Constants.Security.StartMediaNodeIdClaimType, 
+                    ClaimTypes.Locality, 
+                    Constants.Security.SessionIdClaimType
+                };
+            }
+        } 
+
+        /// &lt;summary&gt;
+        /// Adds claims based on the UserData data
+        /// &lt;/summary&gt;
+        private void AddUserDataClaims()
+        {
+            //This is the id that &#39;identity&#39; uses to check for the user id
+            if (HasClaim(x =&gt; x.Type == ClaimTypes.NameIdentifier) == false)
+                AddClaim(new Claim(ClaimTypes.NameIdentifier, UserData.Id.ToString(), ClaimValueTypes.Integer32, Issuer, Issuer, this));
+
+            if (HasClaim(x =&gt; x.Type == ClaimTypes.Name) == false)
+                AddClaim(new Claim(ClaimTypes.Name, UserData.Username, ClaimValueTypes.String, Issuer, Issuer, this));
+
+            if (HasClaim(x =&gt; x.Type == ClaimTypes.GivenName) == false)
+                AddClaim(new Claim(ClaimTypes.GivenName, UserData.RealName, ClaimValueTypes.String, Issuer, Issuer, this));
+
+            if (HasClaim(x =&gt; x.Type == Constants.Security.StartContentNodeIdClaimType) == false)
+                AddClaim(new Claim(Constants.Security.StartContentNodeIdClaimType, StartContentNode.ToInvariantString(), ClaimValueTypes.Integer32, Issuer, Issuer, this));
+
+            if (HasClaim(x =&gt; x.Type == Constants.Security.StartMediaNodeIdClaimType) == false)
+                AddClaim(new Claim(Constants.Security.StartMediaNodeIdClaimType, StartMediaNode.ToInvariantString(), ClaimValueTypes.Integer32, Issuer, Issuer, this));
+
+            if (HasClaim(x =&gt; x.Type == ClaimTypes.Locality) == false)
+                AddClaim(new Claim(ClaimTypes.Locality, Culture, ClaimValueTypes.String, Issuer, Issuer, this));
+
+            if (HasClaim(x =&gt; x.Type == Constants.Security.SessionIdClaimType) == false &amp;&amp; SessionId.IsNullOrWhiteSpace() == false)
+            {
+                AddClaim(new Claim(Constants.Security.SessionIdClaimType, SessionId, ClaimValueTypes.String, Issuer, Issuer, this));
+
+                //The security stamp claim is also required... this is because this claim type is hard coded 
+                // by the SecurityStampValidator, see: https://katanaproject.codeplex.com/workitem/444
+                if (HasClaim(x =&gt; x.Type == Microsoft.AspNet.Identity.Constants.DefaultSecurityStampClaimType) == false)
+                {
+                    AddClaim(new Claim(Microsoft.AspNet.Identity.Constants.DefaultSecurityStampClaimType, SessionId, ClaimValueTypes.String, Issuer, Issuer, this));
+                }
+            }
+
+            //Add each app as a separate claim
+            if (HasClaim(x =&gt; x.Type == Constants.Security.AllowedApplicationsClaimType) == false)
+            {
+                foreach (var application in AllowedApplications)
+                {
+                    AddClaim(new Claim(Constants.Security.AllowedApplicationsClaimType, application, ClaimValueTypes.String, Issuer, Issuer, this));    
+                }
+            }
+
+            //Claims are added by the ClaimsIdentityFactory because our UserStore supports roles, however this identity might
+            // not be made with that factory if it was created with a FormsAuthentication ticket so perform the check
+            if (HasClaim(x =&gt; x.Type == DefaultRoleClaimType) == false)
+            {
+                //manually add them based on the UserData
+                foreach (var roleName in UserData.Roles)
+                {
+                    AddClaim(new Claim(RoleClaimType, roleName, ClaimValueTypes.String, Issuer, Issuer, this));
+                }
+            }
+
+            
+            
+        }
+
+        protected internal UserData UserData { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Gets the type of authenticated identity.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;
+        /// The type of authenticated identity. This property always returns &quot;UmbracoBackOffice&quot;.
+        /// &lt;/returns&gt;
+        public override string AuthenticationType
+        {
+            get { return _currentIssuer; }
+        }
+
+        public int StartContentNode
+        {
+            get { return UserData.StartContentNode; }
+        }
+
+        public int StartMediaNode
+        {
+            get { return UserData.StartMediaNode; }
+        }
+
+        public string[] AllowedApplications
+        {
+            get { return UserData.AllowedApplications; }
+        }
+
+        public object Id
+        {
+            get { return UserData.Id; }
+        }
+
+        public string RealName
+        {
+            get { return UserData.RealName; }
+        }
+
+        public string Username
+        {
+            get { return UserData.Username; }
+        }
+
+        public string Culture
+        {
+            get { return UserData.Culture; }
+        }
+
+        public string SessionId
+        {
+            get { return UserData.SessionId; }
+        }
+
+        public string[] Roles
+        {
+            get { return UserData.Roles; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a copy of the current &lt;see cref=&quot;T:UmbracoBackOfficeIdentity&quot;/&gt; instance.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;
+        /// A copy of the current &lt;see cref=&quot;T:UmbracoBackOfficeIdentity&quot;/&gt; instance.
+        /// &lt;/returns&gt;
+        public override ClaimsIdentity Clone()
+        {
+            return new UmbracoBackOfficeIdentity(this);
+        }
+
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[27,9,27,10,1],[28,13,28,20,1],[28,22,28,27,1],[28,28,28,30,1],[28,31,28,67,1],[29,13,29,14,1],[31,17,31,44,1],[31,44,31,55,1],[31,55,31,92,1],[31,92,31,135,1],[31,135,31,137,1],[31,17,31,137,1],[32,17,32,18,1],[33,21,33,200,1],[35,13,35,14,1],[37,13,37,51,1],[38,13,38,90,1],[39,13,39,106,1],[40,13,40,102,1],[42,13,42,72,1],[43,13,43,73,1],[44,13,44,74,1],[46,13,48,56,1],[49,17,49,190,0],[53,13,53,142,1],[54,13,54,14,0],[55,17,55,192,0],[58,13,58,47,1],[58,47,58,77,1],[58,77,58,94,1],[58,94,58,104,1],[58,104,58,115,1],[58,13,58,115,1],[59,13,59,53,1],[59,53,59,110,1],[59,110,59,126,1],[59,126,59,135,1],[59,135,59,146,1],[59,13,59,146,1],[61,13,72,15,1],[74,13,74,70,1],[75,9,75,10,1],[83,15,83,79,1],[84,9,84,10,1],[85,13,85,34,1],[85,35,85,79,0],[86,13,86,33,1],[87,13,87,33,1],[88,9,88,10,1],[97,15,97,79,1],[98,9,98,10,1],[99,13,99,40,1],[99,41,99,91,0],[100,13,100,34,1],[100,35,100,79,0],[102,13,102,49,1],[103,13,103,14,0],[105,17,105,111,0],[106,13,106,14,0],[108,13,108,64,1],[109,13,109,33,1],[110,13,110,47,1],[111,13,111,36,1],[112,13,112,33,1],[113,9,113,10,1],[120,15,120,27,1],[121,9,121,10,1],[123,13,123,107,1],[125,13,125,81,1],[126,13,126,33,1],[127,9,127,10,1],[134,15,134,29,1],[135,9,135,10,1],[136,13,136,40,1],[137,13,137,14,0],[138,17,138,62,0],[139,17,139,45,0],[140,17,140,42,0],[141,13,141,14,0],[143,13,143,42,1],[144,13,144,33,1],[145,9,145,10,1],[148,9,148,57,1],[148,9,148,57,1],[148,9,148,57,1],[148,9,148,57,1],[155,9,155,10,1],[156,13,156,20,1],[156,22,156,31,1],[156,32,156,34,1],[156,35,156,56,1],[157,13,157,14,1],[160,17,160,47,1],[160,47,160,90,1],[160,90,160,93,1],[160,17,160,93,1],[162,17,162,33,1],[163,13,163,14,1],[164,9,164,10,1],[175,13,175,14,1],[176,17,185,19,1],[186,13,186,14,1],[193,9,193,10,1],[195,13,195,31,1],[195,31,195,66,1],[195,66,195,77,1],[195,13,195,77,1],[196,17,196,137,1],[198,13,198,31,1],[198,31,198,56,1],[198,56,198,67,1],[198,13,198,67,1],[199,17,199,119,0],[201,13,201,31,1],[201,31,201,61,1],[201,61,201,72,1],[201,13,201,72,1],[202,17,202,124,1],[204,13,204,31,1],[204,31,204,87,1],[204,87,204,98,1],[204,13,204,98,1],[205,17,205,172,1],[207,13,207,31,1],[207,31,207,85,1],[207,85,207,96,1],[207,13,207,96,1],[208,17,208,168,1],[210,13,210,31,1],[210,31,210,60,1],[210,60,210,71,1],[210,13,210,71,1],[211,17,211,113,1],[213,13,213,31,1],[213,31,213,78,1],[213,78,213,132,1],[213,13,213,132,1],[214,13,214,14,1],[215,17,215,133,1],[219,17,219,35,1],[219,35,219,110,1],[219,110,219,121,1],[219,17,219,121,1],[220,17,220,18,1],[221,21,221,165,1],[222,17,222,18,1],[223,13,223,14,1],[226,13,226,31,1],[226,31,226,88,1],[226,88,226,99,1],[226,13,226,99,1],[227,13,227,14,1],[228,17,228,24,1],[228,26,228,41,1],[228,42,228,44,1],[228,45,228,64,1],[229,17,229,18,1],[230,21,230,149,1],[231,17,231,18,1],[232,13,232,14,1],[236,13,236,31,1],[236,31,236,61,1],[236,61,236,72,1],[236,13,236,72,1],[237,13,237,14,1],[239,17,239,24,1],[239,26,239,38,1],[239,39,239,41,1],[239,42,239,56,1],[240,17,240,18,1],[241,21,241,112,1],[242,17,242,18,1],[243,13,243,14,1],[247,9,247,10,1],[249,48,249,52,1],[249,53,249,65,1],[259,17,259,18,1],[259,19,259,41,1],[259,42,259,43,1],[264,17,264,18,1],[264,19,264,52,1],[264,53,264,54,1],[269,17,269,18,1],[269,19,269,50,1],[269,51,269,52,1],[274,17,274,18,1],[274,19,274,55,1],[274,56,274,57,1],[279,17,279,18,1],[279,19,279,38,1],[279,39,279,40,1],[284,17,284,18,1],[284,19,284,44,1],[284,45,284,46,1],[289,17,289,18,1],[289,19,289,44,1],[289,45,289,46,1],[294,17,294,18,1],[294,19,294,43,1],[294,44,294,45,1],[299,17,299,18,1],[299,19,299,45,1],[299,46,299,47,1],[304,17,304,18,1],[304,19,304,41,1],[304,42,304,43,1],[314,9,314,10,1],[315,13,315,56,1],[316,9,316,10,1]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\Packager\PackageInstance\utill.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Data;
+using System.Collections;
+using System.Collections.Generic;
+
+using System.Configuration;
+using System.Web;
+using System.Web.Security;
+using System.Web.UI;
+using System.Web.UI.WebControls;
+using System.Web.UI.WebControls.WebParts;
+using System.Web.UI.HtmlControls;
+
+using System.IO;
+using System.Xml;
+
+using umbraco.cms.businesslogic.template;
+using umbraco.cms.businesslogic.web;
+using umbraco.cms.businesslogic.macro;
+using ICSharpCode.SharpZipLib.Zip;
+using Umbraco.Core;
+using Umbraco.Core.IO;
+
+namespace umbraco.cms.businesslogic.packager
+{
+    /// &lt;summary&gt;
+    /// A utillity class for working with packager data.
+    /// It provides basic methods for adding new items to a package manifest, moving files and other misc.
+    /// &lt;/summary&gt;
+    public class utill
+    {
+
+        /// &lt;summary&gt;
+        /// Creates a package manifest containing name, license, version and other meta data.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;pack&quot;&gt;The packinstance.&lt;/param&gt;
+        /// &lt;param name=&quot;doc&quot;&gt;The xml document.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static XmlNode PackageInfo(PackageInstance pack, XmlDocument doc)
+        {
+
+            XmlNode info = doc.CreateElement(&quot;info&quot;);
+
+            //Package info
+            XmlNode package = doc.CreateElement(&quot;package&quot;);
+            package.AppendChild(CreateNode(&quot;name&quot;, pack.Name, doc));
+            package.AppendChild(CreateNode(&quot;version&quot;, pack.Version, doc));
+            package.AppendChild(CreateNode(&quot;iconUrl&quot;, pack.IconUrl, doc));
+
+            XmlNode license = CreateNode(&quot;license&quot;, pack.License, doc);
+            license.Attributes.Append(CreateAttribute(&quot;url&quot;, pack.LicenseUrl, doc));
+            package.AppendChild(license);
+
+            package.AppendChild(CreateNode(&quot;url&quot;, pack.Url, doc));
+
+            XmlNode requirements = doc.CreateElement(&quot;requirements&quot;);
+            //NOTE: The defaults are 3.0.0 - I&#39;m just leaving that here since that&#39;s the way it&#39;s been //SD
+            requirements.AppendChild(CreateNode(&quot;major&quot;, pack.UmbracoVersion == null ? &quot;3&quot; : pack.UmbracoVersion.Major.ToInvariantString(), doc));
+            requirements.AppendChild(CreateNode(&quot;minor&quot;, pack.UmbracoVersion == null ? &quot;0&quot; : pack.UmbracoVersion.Minor.ToInvariantString(), doc));
+            requirements.AppendChild(CreateNode(&quot;patch&quot;, pack.UmbracoVersion == null ? &quot;0&quot; : pack.UmbracoVersion.Build.ToInvariantString(), doc));
+            if (pack.UmbracoVersion != null)
+            {                
+                requirements.Attributes.Append(CreateAttribute(&quot;type&quot;, &quot;strict&quot;, doc));
+            }
+            package.AppendChild(requirements);
+            info.AppendChild(package);
+
+            //Author
+            XmlNode author = CreateNode(&quot;author&quot;, &quot;&quot;, doc);
+            author.AppendChild(CreateNode(&quot;name&quot;, pack.Author, doc));
+            author.AppendChild(CreateNode(&quot;website&quot;, pack.AuthorUrl, doc));
+            info.AppendChild(author);
+
+            info.AppendChild(CreateNode(&quot;readme&quot;, &quot;&lt;![CDATA[&quot; + pack.Readme + &quot;]]&gt;&quot;, doc));
+
+            return info;
+        }
+
+
+        /// &lt;summary&gt;
+        /// Converts an umbraco template to a package xml node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;templateId&quot;&gt;The template id.&lt;/param&gt;
+        /// &lt;param name=&quot;doc&quot;&gt;The xml doc.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static XmlNode Template(int templateId, XmlDocument doc)
+        {
+
+            Template tmpl = new Template(templateId);
+
+            XmlNode template = doc.CreateElement(&quot;Template&quot;);
+            template.AppendChild(CreateNode(&quot;Name&quot;, tmpl.Text, doc));
+            template.AppendChild(CreateNode(&quot;Alias&quot;, tmpl.Alias, doc));
+
+            if (tmpl.MasterTemplate != 0)
+            {
+                template.AppendChild(CreateNode(&quot;Master&quot;, new Template(tmpl.MasterTemplate).Alias, doc));
+            }
+            template.AppendChild(CreateNode(&quot;Design&quot;, &quot;&lt;![CDATA[&quot; + tmpl.Design + &quot;]]&gt;&quot;, doc));
+
+            return template;
+        }
+
+        /// &lt;summary&gt;
+        /// Converts a umbraco stylesheet to a package xml node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;name&quot;&gt;The name of the stylesheet.&lt;/param&gt;
+        /// &lt;param name=&quot;includeProperties&quot;&gt;if set to &lt;c&gt;true&lt;/c&gt; [incluce properties].&lt;/param&gt;
+        /// &lt;param name=&quot;doc&quot;&gt;The doc.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static XmlNode Stylesheet(string name, bool includeProperties, XmlDocument doc)
+        {
+            if (doc == null) throw new ArgumentNullException(&quot;doc&quot;);
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException(&quot;Value cannot be null or whitespace.&quot;, &quot;name&quot;);
+
+            if (ApplicationContext.Current == null)
+                throw new NullReferenceException(&quot;ApplicationContext is null&quot;);
+            var fileService = ApplicationContext.Current.Services.FileService;
+
+            var sts = fileService.GetStylesheetByName(name);
+            var stylesheet = doc.CreateElement(&quot;Stylesheet&quot;);
+            stylesheet.AppendChild(CreateNode(&quot;Name&quot;, sts.Alias, doc));
+            stylesheet.AppendChild(CreateNode(&quot;FileName&quot;, sts.Name, doc));
+            stylesheet.AppendChild(CreateNode(&quot;Content&quot;, &quot;&lt;![CDATA[&quot; + sts.Content + &quot;]]&gt;&quot;, doc));
+            if (includeProperties)
+            {
+                var properties = doc.CreateElement(&quot;Properties&quot;);
+                foreach (var ssP in sts.Properties)
+                {
+                    var property = doc.CreateElement(&quot;Property&quot;);
+                    property.AppendChild(CreateNode(&quot;Name&quot;, ssP.Name, doc));
+                    property.AppendChild(CreateNode(&quot;Alias&quot;, ssP.Alias, doc));
+                    property.AppendChild(CreateNode(&quot;Value&quot;, ssP.Value, doc));
+                }
+                stylesheet.AppendChild(properties);
+            }
+            return stylesheet;
+        }
+
+        /// &lt;summary&gt;
+        /// Converts a macro to a package xml node
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;macroId&quot;&gt;The macro id.&lt;/param&gt;
+        /// &lt;param name=&quot;appendFile&quot;&gt;if set to &lt;c&gt;true&lt;/c&gt; [append file].&lt;/param&gt;
+        /// &lt;param name=&quot;packageDirectory&quot;&gt;The package directory.&lt;/param&gt;
+        /// &lt;param name=&quot;doc&quot;&gt;The doc.&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static XmlNode Macro(int macroId, bool appendFile, string packageDirectory, XmlDocument doc)
+        {
+
+            Macro mcr = new Macro(macroId);
+
+            if (appendFile)
+            {
+                if (!string.IsNullOrEmpty(mcr.Xslt))
+                    AppendFileToManifest(IOHelper.ResolveUrl(SystemDirectories.Xslt) + &quot;/&quot; + mcr.Xslt, packageDirectory, doc);
+                if (!string.IsNullOrEmpty(mcr.ScriptingFile))
+                    AppendFileToManifest(IOHelper.ResolveUrl(SystemDirectories.MacroScripts) + &quot;/&quot; + mcr.ScriptingFile, packageDirectory, doc);
+
+                if (!string.IsNullOrEmpty(mcr.Type))
+                    AppendFileToManifest(mcr.Type, packageDirectory, doc);
+            }
+
+            return mcr.ToXml(doc);
+        }
+
+
+        /// &lt;summary&gt;
+        /// Appends a file to package manifest and copies the file to the correct folder.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;path&quot;&gt;The path.&lt;/param&gt;
+        /// &lt;param name=&quot;packageDirectory&quot;&gt;The package directory.&lt;/param&gt;
+        /// &lt;param name=&quot;doc&quot;&gt;The doc.&lt;/param&gt;
+        public static void AppendFileToManifest(string path, string packageDirectory, XmlDocument doc)
+        {
+
+            if (!path.StartsWith(&quot;~/&quot;) &amp;&amp; !path.StartsWith(&quot;/&quot;))
+                path = &quot;~/&quot; + path;
+
+            string serverPath = IOHelper.MapPath(path);
+
+            if (System.IO.File.Exists(serverPath))
+            {
+
+                AppendFileXml(path, packageDirectory, doc);
+
+            }
+            else if (System.IO.Directory.Exists(serverPath))
+            {
+
+                ProcessDirectory(path, packageDirectory, doc);
+            }
+        }
+
+
+
+        //Process files in directory and add them to package
+        private static void ProcessDirectory(string path, string packageDirectory, XmlDocument doc)
+        {
+            string serverPath = IOHelper.MapPath(path);
+            if (System.IO.Directory.Exists(serverPath))
+            {
+
+                System.IO.DirectoryInfo di = new System.IO.DirectoryInfo(serverPath);
+
+                foreach (System.IO.FileInfo file in di.GetFiles())
+                {
+                    AppendFileXml(path + &quot;/&quot; + file.Name, packageDirectory, doc);
+                }
+
+                foreach (System.IO.DirectoryInfo dir in di.GetDirectories())
+                {
+                    ProcessDirectory(path + &quot;/&quot; + dir.Name, packageDirectory, doc);
+                }
+            }
+        }
+
+        private static void AppendFileXml(string path, string packageDirectory, XmlDocument doc)
+        {
+
+            string serverPath = IOHelper.MapPath(path);
+
+            string orgPath = path.Substring(0, (path.LastIndexOf(&#39;/&#39;)));
+            string orgName = path.Substring((path.LastIndexOf(&#39;/&#39;) + 1));
+            string newFileName = orgName;
+
+            if (System.IO.File.Exists(packageDirectory + &quot;/&quot; + orgName))
+            {
+                string fileGuid = System.Guid.NewGuid().ToString();
+                newFileName = fileGuid + &quot;_&quot; + newFileName;
+            }
+
+            //Copy file to directory for zipping...
+            System.IO.File.Copy(serverPath, packageDirectory + &quot;/&quot; + newFileName, true);
+
+            //Append file info to files xml node
+            XmlNode files = doc.SelectSingleNode(&quot;/umbPackage/files&quot;);
+
+            XmlNode file = doc.CreateElement(&quot;file&quot;);
+            file.AppendChild(CreateNode(&quot;guid&quot;, newFileName, doc));
+            file.AppendChild(CreateNode(&quot;orgPath&quot;, orgPath == &quot;&quot; ? &quot;/&quot; : orgPath, doc));
+            file.AppendChild(CreateNode(&quot;orgName&quot;, orgName, doc));
+
+            files.AppendChild(file);
+        }
+
+        /// &lt;summary&gt;
+        /// Determines whether the file is in the package manifest
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;guid&quot;&gt;The GUID.&lt;/param&gt;
+        /// &lt;param name=&quot;doc&quot;&gt;The doc.&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// 	&lt;c&gt;true&lt;/c&gt; if [is file in manifest]; otherwise, &lt;c&gt;false&lt;/c&gt;.
+        /// &lt;/returns&gt;
+        public static bool IsFileInManifest(string guid, XmlDocument doc)
+        {
+            return false;
+        }
+
+        private static XmlNode CreateNode(string name, string value, XmlDocument doc)
+        {
+            var node = doc.CreateElement(name);
+            node.InnerXml = value;
+            return node;
+        }
+
+        private static XmlAttribute CreateAttribute(string name, string value, XmlDocument doc)
+        {
+            var attribute = doc.CreateAttribute(name);
+            attribute.Value = value;
+            return attribute;
+        }
+
+        /// &lt;summary&gt;
+        /// Zips the package.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Path&quot;&gt;The path.&lt;/param&gt;
+        /// &lt;param name=&quot;savePath&quot;&gt;The save path.&lt;/param&gt;
+        public static void ZipPackage(string Path, string savePath)
+        {
+            string OutPath = savePath;
+
+            ArrayList ar = GenerateFileList(Path);
+            // generate file list
+            // find number of chars to remove from orginal file path
+            int TrimLength = (Directory.GetParent(Path)).ToString().Length;
+
+            TrimLength += 1;
+
+            //remove &#39;\&#39;
+            FileStream ostream;
+
+            byte[] obuffer;
+
+            ZipOutputStream oZipStream = new ZipOutputStream(System.IO.File.Create(OutPath));
+            // create zip stream
+
+
+            oZipStream.SetLevel(9);
+            // 9 = maximum compression level
+            ZipEntry oZipEntry;
+
+            foreach (string Fil in ar) // for each file, generate a zipentry
+            {
+                oZipEntry = new ZipEntry(Fil.Remove(0, TrimLength));
+                oZipStream.PutNextEntry(oZipEntry);
+
+
+                if (!Fil.EndsWith(@&quot;/&quot;)) // if a file ends with &#39;/&#39; its a directory
+                {
+                    ostream = File.OpenRead(Fil);
+
+                    obuffer = new byte[ostream.Length];
+
+                    // byte buffer
+                    ostream.Read(obuffer, 0, obuffer.Length);
+
+                    oZipStream.Write(obuffer, 0, obuffer.Length);
+                    ostream.Close();
+                }
+            }
+            oZipStream.Finish();
+            oZipStream.Close();
+            oZipStream.Dispose();
+            oZipStream = null;
+
+            oZipEntry = null;
+
+
+            ostream = null;
+            ar.Clear();
+            ar = null;
+        }
+
+        private static ArrayList GenerateFileList(string Dir)
+        {
+            ArrayList mid = new ArrayList();
+
+            bool Empty = true;
+
+            foreach (string file in Directory.GetFiles(Dir)) // add each file in directory
+            {
+                mid.Add(file);
+                Empty = false;
+            }
+
+            if (Empty)
+            {
+                if (Directory.GetDirectories(Dir).Length == 0) // if directory is completely empty, add it
+                {
+                    mid.Add(Dir + @&quot;/&quot;);
+                }
+            }
+
+            foreach (string dirs in Directory.GetDirectories(Dir)) // do this recursively
+            {
+                foreach (object obj in GenerateFileList(dirs))
+                {
+                    mid.Add(obj);
+                }
+            }
+            return mid;  // return file list
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[40,9,40,10,0],[42,13,42,54,0],[45,13,45,60,0],[46,13,46,69,0],[47,13,47,75,0],[48,13,48,75,0],[50,13,50,72,0],[51,13,51,85,0],[52,13,52,42,0],[54,13,54,67,0],[56,13,56,70,0],[58,13,58,147,0],[59,13,59,147,0],[60,13,60,147,0],[61,13,61,45,0],[62,13,62,14,0],[63,17,63,88,0],[64,13,64,14,0],[65,13,65,47,0],[66,13,66,39,0],[69,13,69,60,0],[70,13,70,70,0],[71,13,71,76,0],[72,13,72,38,0],[74,13,74,92,0],[76,13,76,25,0],[77,9,77,10,0],[87,9,87,10,0],[89,13,89,54,0],[91,13,91,62,0],[92,13,92,70,0],[93,13,93,72,0],[95,13,95,42,0],[96,13,96,14,0],[97,17,97,106,0],[98,13,98,14,0],[99,13,99,96,0],[101,13,101,29,0],[102,9,102,10,0],[112,9,112,10,0],[113,13,113,29,0],[113,30,113,69,0],[114,13,114,49,0],[114,50,114,125,0],[116,13,116,52,0],[117,17,117,80,0],[118,13,118,79,0],[120,13,120,61,0],[121,13,121,62,0],[122,13,122,72,0],[123,13,123,75,0],[124,13,124,99,0],[125,13,125,35,0],[126,13,126,14,0],[127,17,127,66,0],[128,17,128,24,0],[128,26,128,33,0],[128,34,128,36,0],[128,37,128,51,0],[129,17,129,18,0],[130,21,130,66,0],[131,21,131,77,0],[132,21,132,79,0],[133,21,133,79,0],[134,17,134,18,0],[135,17,135,52,0],[136,13,136,14,0],[137,13,137,31,0],[138,9,138,10,0],[149,9,149,10,0],[151,13,151,44,0],[153,13,153,28,0],[154,13,154,14,0],[155,17,155,53,0],[156,21,156,127,0],[157,17,157,62,0],[158,21,158,144,0],[160,17,160,53,0],[161,21,161,75,0],[162,13,162,14,0],[164,13,164,35,0],[165,9,165,10,0],[175,9,175,10,0],[177,13,177,65,0],[178,17,178,36,0],[180,13,180,56,0],[182,13,182,51,0],[183,13,183,14,0],[185,17,185,60,0],[187,13,187,14,0],[188,18,188,61,0],[189,13,189,14,0],[191,17,191,63,0],[192,13,192,14,0],[193,9,193,10,0],[199,9,199,10,0],[200,13,200,56,0],[201,13,201,56,0],[202,13,202,14,0],[204,17,204,86,0],[206,17,206,24,0],[206,26,206,49,0],[206,50,206,52,0],[206,53,206,66,0],[207,17,207,18,0],[208,21,208,82,0],[209,17,209,18,0],[211,17,211,24,0],[211,26,211,53,0],[211,54,211,56,0],[211,57,211,76,0],[212,17,212,18,0],[213,21,213,84,0],[214,17,214,18,0],[215,13,215,14,0],[216,9,216,10,0],[219,9,219,10,0],[221,13,221,56,0],[223,13,223,73,0],[224,13,224,74,0],[225,13,225,42,0],[227,13,227,73,0],[228,13,228,14,0],[229,17,229,68,0],[230,17,230,60,0],[231,13,231,14,0],[234,13,234,89,0],[237,13,237,71,0],[239,13,239,54,0],[240,13,240,68,0],[241,13,241,89,0],[242,13,242,67,0],[244,13,244,37,0],[245,9,245,10,0],[256,9,256,10,0],[257,13,257,26,0],[258,9,258,10,0],[261,9,261,10,0],[262,13,262,48,0],[263,13,263,35,0],[264,13,264,25,0],[265,9,265,10,0],[268,9,268,10,0],[269,13,269,55,0],[270,13,270,37,0],[271,13,271,30,0],[272,9,272,10,0],[280,9,280,10,0],[281,13,281,39,0],[283,13,283,51,0],[286,13,286,76,0],[288,13,288,29,0],[295,13,295,94,0],[299,13,299,36,0],[303,13,303,20,0],[303,22,303,32,0],[303,33,303,35,0],[303,36,303,38,0],[304,13,304,14,0],[305,17,305,69,0],[306,17,306,52,0],[309,17,309,41,0],[310,17,310,18,0],[311,21,311,50,0],[313,21,313,56,0],[316,21,316,62,0],[318,21,318,66,0],[319,21,319,37,0],[320,17,320,18,0],[321,13,321,14,0],[322,13,322,33,0],[323,13,323,32,0],[324,13,324,34,0],[325,13,325,31,0],[327,13,327,30,0],[330,13,330,28,0],[331,13,331,24,0],[332,13,332,23,0],[333,9,333,10,0],[336,9,336,10,0],[337,13,337,45,0],[339,13,339,31,0],[341,13,341,20,0],[341,22,341,33,0],[341,34,341,36,0],[341,37,341,60,0],[342,13,342,14,0],[343,17,343,31,0],[344,17,344,31,0],[345,13,345,14,0],[347,13,347,23,0],[348,13,348,14,0],[349,17,349,63,0],[350,17,350,18,0],[351,21,351,41,0],[352,17,352,18,0],[353,13,353,14,0],[355,13,355,20,0],[355,22,355,33,0],[355,34,355,36,0],[355,37,355,66,0],[356,13,356,14,0],[357,17,357,24,0],[357,26,357,36,0],[357,37,357,39,0],[357,40,357,62,0],[358,17,358,18,0],[359,21,359,34,0],[360,17,360,18,0],[361,13,361,14,0],[362,13,362,24,0],[363,9,363,10,0]]);
+    </script>
+  </body>
+</html>

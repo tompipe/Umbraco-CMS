@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\HealthCheck\Checks\Security\HttpsCheck.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Web;
+using Umbraco.Core.IO;
+using Umbraco.Core.Services;
+using Umbraco.Web.HealthCheck.Checks.Config;
+
+namespace Umbraco.Web.HealthCheck.Checks.Security
+{
+    [HealthCheck(
+        &quot;EB66BB3B-1BCD-4314-9531-9DA2C1D6D9A7&quot;,
+        &quot;HTTPS Configuration&quot;,
+        Description = &quot;Checks if your site is configured to work over HTTPS and if the Umbraco related configuration for that is correct.&quot;,
+        Group = &quot;Security&quot;)]
+    public class HttpsCheck : HealthCheck
+    {
+        private readonly ILocalizedTextService _textService;
+
+        private const string FixHttpsSettingAction = &quot;fixHttpsSetting&quot;;
+
+        public HttpsCheck(HealthCheckContext healthCheckContext) : base(healthCheckContext)
+        {
+            _textService = healthCheckContext.ApplicationContext.Services.TextService;
+        }
+
+        /// &lt;summary&gt;
+        /// Get the status for this health check
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override IEnumerable&lt;HealthCheckStatus&gt; GetStatus()
+        {
+            //return the statuses
+            return new[] { CheckIfCurrentSchemeIsHttps(), CheckHttpsConfigurationSetting(), CheckForValidCertificate() };
+        }
+
+        /// &lt;summary&gt;
+        /// Executes the action and returns it&#39;s status
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;action&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public override HealthCheckStatus ExecuteAction(HealthCheckAction action)
+        {
+            switch (action.Alias)
+            {
+                case FixHttpsSettingAction:
+                    return FixHttpsSetting();
+                default:
+                    throw new InvalidOperationException(&quot;HttpsCheck action requested is either not executable or does not exist&quot;);
+            }
+        }
+
+        private HealthCheckStatus CheckForValidCertificate()
+        {
+            var message = string.Empty;
+            var success = false;
+            var url = HealthCheckContext.HttpContext.Request.Url;
+
+            // Attempt to access the site over HTTPS to see if it HTTPS is supported 
+            // and a valid certificate has been configured
+            var address = string.Format(&quot;https://{0}:{1}&quot;, url.Host.ToLower(), url.Port);
+            var request = (HttpWebRequest)WebRequest.Create(address);
+            request.Method = &quot;HEAD&quot;;
+
+            try
+            {
+                var response = (HttpWebResponse)request.GetResponse();
+                success = response.StatusCode == HttpStatusCode.OK;
+            }
+            catch (Exception ex)
+            {
+                var exception = ex as WebException;
+                if (exception != null)
+                {
+                    message = exception.Status == WebExceptionStatus.TrustFailure
+                        ? _textService.Localize(&quot;healthcheck/httpsCheckInvalidCertificate&quot;, new [] { exception.Message })
+                        : _textService.Localize(&quot;healthcheck/httpsCheckInvalidUrl&quot;, new [] { address, exception.Message });
+                }
+                else
+                {
+                    message = _textService.Localize(&quot;healthcheck/httpsCheckInvalidUrl&quot;, new[] { address, ex.Message });
+                }
+            }
+
+            var actions = new List&lt;HealthCheckAction&gt;();
+
+            if (success)
+                message = _textService.Localize(&quot;healthcheck/httpsCheckValidCertificate&quot;);
+
+            return
+                new HealthCheckStatus(message)
+                {
+                    ResultType = success ? StatusResultType.Success : StatusResultType.Error,
+                    Actions = actions
+                };
+        }
+
+        private HealthCheckStatus CheckIfCurrentSchemeIsHttps()
+        {
+            var uri = HttpContext.Current.Request.Url;
+            var success = uri.Scheme == &quot;https&quot;;
+
+            var actions = new List&lt;HealthCheckAction&gt;();
+
+            return
+                new HealthCheckStatus(_textService.Localize(&quot;healthcheck/httpsCheckIsCurrentSchemeHttps&quot;, new[] { success ? string.Empty : &quot;not&quot; }))
+                {
+                    ResultType = success ? StatusResultType.Success : StatusResultType.Error,
+                    Actions = actions
+                };
+        }
+
+        private HealthCheckStatus CheckHttpsConfigurationSetting()
+        {
+            var httpsSettingEnabled = Core.Configuration.GlobalSettings.UseSSL;
+            var uri = HttpContext.Current.Request.Url;
+            var actions = new List&lt;HealthCheckAction&gt;();
+
+            string resultMessage;
+            StatusResultType resultType;
+            if (uri.Scheme != &quot;https&quot;)
+            {
+                resultMessage = _textService.Localize(&quot;healthcheck/httpsCheckConfigurationRectifyNotPossible&quot;);
+                resultType = StatusResultType.Info;
+            }
+            else
+            {
+                if (httpsSettingEnabled == false)
+                    actions.Add(new HealthCheckAction(FixHttpsSettingAction, Id)
+                    {
+                        Name = _textService.Localize(&quot;healthcheck/httpsCheckEnableHttpsButton&quot;),
+                        Description = _textService.Localize(&quot;healthcheck/httpsCheckEnableHttpsDescription&quot;)
+                    });
+
+                resultMessage = _textService.Localize(&quot;healthcheck/httpsCheckConfigurationCheckResult&quot;,
+                    new[] {httpsSettingEnabled.ToString(), httpsSettingEnabled ? string.Empty : &quot;not&quot;});
+                resultType = httpsSettingEnabled ? StatusResultType.Success: StatusResultType.Error;
+            }
+            
+            return
+                new HealthCheckStatus(resultMessage)
+                {
+                    ResultType = resultType,
+                    Actions = actions
+                };
+        }
+
+        private HealthCheckStatus FixHttpsSetting()
+        {
+            var configFile = IOHelper.MapPath(&quot;~/Web.config&quot;);
+            const string xPath = &quot;/configuration/appSettings/add[@key=&#39;umbracoUseSSL&#39;]/@value&quot;;
+            var configurationService = new ConfigurationService(configFile, xPath);
+            var updateConfigFile = configurationService.UpdateConfigFile(&quot;true&quot;);
+
+            if (updateConfigFile.Success)
+            {
+                return
+                    new HealthCheckStatus(_textService.Localize(&quot;healthcheck/httpsCheckEnableHttpsSuccess&quot;))
+                    {
+                        ResultType = StatusResultType.Success
+                    };
+            }
+
+            return
+                new HealthCheckStatus(_textService.Localize(&quot;healthcheck/httpsCheckEnableHttpsError&quot;, new [] { updateConfigFile.Result }))
+                {
+                    ResultType = StatusResultType.Error
+                };
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[22,68,22,92,0],[23,9,23,10,0],[24,13,24,87,0],[25,9,25,10,0],[32,9,32,10,0],[34,13,34,122,0],[35,9,35,10,0],[43,9,43,10,0],[44,13,44,34,0],[47,21,47,46,0],[49,21,49,131,0],[51,9,51,10,0],[54,9,54,10,0],[55,13,55,40,0],[56,13,56,33,0],[57,13,57,66,0],[61,13,61,90,0],[62,13,62,70,0],[63,13,63,37,0],[66,13,66,14,0],[67,17,67,71,0],[68,17,68,68,0],[69,13,69,14,0],[70,13,70,33,0],[71,13,71,14,0],[72,17,72,52,0],[73,17,73,39,0],[74,17,74,18,0],[75,21,77,124,0],[78,17,78,18,0],[80,17,80,18,0],[81,21,81,120,0],[82,17,82,18,0],[83,13,83,14,0],[85,13,85,57,0],[87,13,87,25,0],[88,17,88,91,0],[90,13,95,19,0],[96,9,96,10,0],[99,9,99,10,0],[100,13,100,55,0],[101,13,101,49,0],[103,13,103,57,0],[105,13,110,19,0],[111,9,111,10,0],[114,9,114,10,0],[115,13,115,80,0],[116,13,116,55,0],[117,13,117,57,0],[121,13,121,39,0],[122,13,122,14,0],[123,17,123,112,0],[124,17,124,52,0],[125,13,125,14,0],[127,13,127,14,0],[128,17,128,50,0],[129,21,133,24,0],[135,17,136,105,0],[137,17,137,101,0],[138,13,138,14,0],[140,13,145,19,0],[146,9,146,10,0],[149,9,149,10,0],[150,13,150,63,0],[152,13,152,84,0],[153,13,153,82,0],[155,13,155,42,0],[156,13,156,14,0],[157,17,161,23,0],[164,13,168,19,0],[169,9,169,10,0]]);
+    </script>
+  </body>
+</html>

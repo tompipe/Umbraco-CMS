@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Services\LocalizationService.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Umbraco.Core.Auditing;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Events;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Persistence;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+
+namespace Umbraco.Core.Services
+{
+    /// &lt;summary&gt;
+    /// Represents the Localization Service, which is an easy access to operations involving &lt;see cref=&quot;Language&quot;/&gt; and &lt;see cref=&quot;DictionaryItem&quot;/&gt;
+    /// &lt;/summary&gt;
+    public class LocalizationService : RepositoryService, ILocalizationService
+    {
+        
+
+        public LocalizationService(IDatabaseUnitOfWorkProvider provider, RepositoryFactory repositoryFactory, ILogger logger, IEventMessagesFactory eventMessagesFactory)
+            : base(provider, repositoryFactory, logger, eventMessagesFactory)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Adds or updates a translation for a dictionary item and language
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;item&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;language&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;value&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This does not save the item, that needs to be done explicitly
+        /// &lt;/remarks&gt;
+        public void AddOrUpdateDictionaryValue(IDictionaryItem item, ILanguage language, string value)
+        {
+            if (item == null) throw new ArgumentNullException(&quot;item&quot;);
+            if (language == null) throw new ArgumentNullException(&quot;language&quot;);
+
+            var existing = item.Translations.FirstOrDefault(x =&gt; x.Language.Id == language.Id);
+            if (existing != null)
+            {
+                existing.Value = value;
+            }
+            else
+            {
+                item.Translations = new List&lt;IDictionaryTranslation&gt;(item.Translations)
+                {
+                    new DictionaryTranslation(language, value)
+                };
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Creates and saves a new dictionary item and assigns a value to all languages if defaultValue is specified.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;key&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;defaultValue&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public IDictionaryItem CreateDictionaryItemWithIdentity(string key, Guid? parentId, string defaultValue = null)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateDictionaryRepository(uow))
+            {
+                //validate the parent
+                if (parentId.HasValue &amp;&amp; parentId.Value != Guid.Empty)
+                {
+                    var parent = GetDictionaryItemById(parentId.Value);
+                    if (parent == null)
+                    {
+                        throw new ArgumentException(&quot;No parent dictionary item was found with id &quot; + parentId.Value);
+                    }
+                }
+
+                var item = new DictionaryItem(parentId, key);
+
+                if (defaultValue.IsNullOrWhiteSpace() == false)
+                {
+                    var langs = GetAllLanguages();
+                    var translations = langs.Select(language =&gt; new DictionaryTranslation(language, defaultValue))
+                        .Cast&lt;IDictionaryTranslation&gt;()
+                        .ToList();
+
+                    item.Translations = translations;
+                }
+
+                if (SavingDictionaryItem.IsRaisedEventCancelled(new SaveEventArgs&lt;IDictionaryItem&gt;(item), this))
+                    return item;
+
+                repository.AddOrUpdate(item);
+                uow.Commit();
+
+                //ensure the lazy Language callback is assigned
+                EnsureDictionaryItemLanguageCallback(item);
+
+                SavedDictionaryItem.RaiseEvent(new SaveEventArgs&lt;IDictionaryItem&gt;(item), this);
+
+                return item;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a &lt;see cref=&quot;IDictionaryItem&quot;/&gt; by its &lt;see cref=&quot;Int32&quot;/&gt; id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IDictionaryItem&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IDictionaryItem&quot;/&gt;&lt;/returns&gt;
+        public IDictionaryItem GetDictionaryItemById(int id)
+        {
+            using (var repository = RepositoryFactory.CreateDictionaryRepository(UowProvider.GetUnitOfWork()))
+            {
+                var item = repository.Get(id);
+                //ensure the lazy Language callback is assigned
+                EnsureDictionaryItemLanguageCallback(item);
+                return item;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a &lt;see cref=&quot;IDictionaryItem&quot;/&gt; by its &lt;see cref=&quot;Guid&quot;/&gt; id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;IDictionaryItem&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;DictionaryItem&quot;/&gt;&lt;/returns&gt;
+        public IDictionaryItem GetDictionaryItemById(Guid id)
+        {
+            using (var repository = RepositoryFactory.CreateDictionaryRepository(UowProvider.GetUnitOfWork()))
+            {
+                var item = repository.Get(id);
+                //ensure the lazy Language callback is assigned
+                EnsureDictionaryItemLanguageCallback(item);
+                return item;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a &lt;see cref=&quot;IDictionaryItem&quot;/&gt; by its key
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;key&quot;&gt;Key of the &lt;see cref=&quot;IDictionaryItem&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;IDictionaryItem&quot;/&gt;&lt;/returns&gt;
+        public IDictionaryItem GetDictionaryItemByKey(string key)
+        {
+            using (var repository = RepositoryFactory.CreateDictionaryRepository(UowProvider.GetUnitOfWork()))
+            {
+                var item = repository.Get(key);
+                //ensure the lazy Language callback is assigned
+                EnsureDictionaryItemLanguageCallback(item);
+                return item;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a list of children for a &lt;see cref=&quot;IDictionaryItem&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;Id of the parent&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;IDictionaryItem&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IDictionaryItem&gt; GetDictionaryItemChildren(Guid parentId)
+        {
+            using (var repository = RepositoryFactory.CreateDictionaryRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IDictionaryItem&gt;.Builder.Where(x =&gt; x.ParentId == parentId);
+                var items = repository.GetByQuery(query).ToArray();
+                //ensure the lazy Language callback is assigned
+                items.ForEach(EnsureDictionaryItemLanguageCallback);
+                return items;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a list of descendants for a &lt;see cref=&quot;IDictionaryItem&quot;/&gt;
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;parentId&quot;&gt;Id of the parent, null will return all dictionary items&lt;/param&gt;
+        /// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;IDictionaryItem&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IDictionaryItem&gt; GetDictionaryItemDescendants(Guid? parentId)
+        {
+            using (var repository = RepositoryFactory.CreateDictionaryRepository(UowProvider.GetUnitOfWork()))
+            {
+                var items = repository.GetDictionaryItemDescendants(parentId).ToArray();
+                //ensure the lazy Language callback is assigned
+                items.ForEach(EnsureDictionaryItemLanguageCallback);
+                return items;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the root/top &lt;see cref=&quot;IDictionaryItem&quot;/&gt; objects
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;IDictionaryItem&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;IDictionaryItem&gt; GetRootDictionaryItems()
+        {
+            using (var repository = RepositoryFactory.CreateDictionaryRepository(UowProvider.GetUnitOfWork()))
+            {
+                var query = Query&lt;IDictionaryItem&gt;.Builder.Where(x =&gt; x.ParentId == null);
+                var items = repository.GetByQuery(query).ToArray();
+                //ensure the lazy Language callback is assigned
+                items.ForEach(EnsureDictionaryItemLanguageCallback);
+                return items;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Checks if a &lt;see cref=&quot;IDictionaryItem&quot;/&gt; with given key exists
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;key&quot;&gt;Key of the &lt;see cref=&quot;IDictionaryItem&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;True if a &lt;see cref=&quot;IDictionaryItem&quot;/&gt; exists, otherwise false&lt;/returns&gt;
+        public bool DictionaryItemExists(string key)
+        {
+            using (var repository = RepositoryFactory.CreateDictionaryRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.Get(key) != null;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a &lt;see cref=&quot;IDictionaryItem&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dictionaryItem&quot;&gt;&lt;see cref=&quot;IDictionaryItem&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the user saving the dictionary item&lt;/param&gt;
+        public void Save(IDictionaryItem dictionaryItem, int userId = 0)
+        {
+            if (SavingDictionaryItem.IsRaisedEventCancelled(new SaveEventArgs&lt;IDictionaryItem&gt;(dictionaryItem), this))
+                return;
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateDictionaryRepository(uow))
+            {
+                repository.AddOrUpdate(dictionaryItem);
+                uow.Commit();
+                //ensure the lazy Language callback is assigned
+                EnsureDictionaryItemLanguageCallback(dictionaryItem);
+            }
+
+            SavedDictionaryItem.RaiseEvent(new SaveEventArgs&lt;IDictionaryItem&gt;(dictionaryItem, false), this);
+
+            Audit(AuditType.Save, &quot;Save DictionaryItem performed by user&quot;, userId, dictionaryItem.Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes a &lt;see cref=&quot;IDictionaryItem&quot;/&gt; object and its related translations
+        /// as well as its children.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dictionaryItem&quot;&gt;&lt;see cref=&quot;IDictionaryItem&quot;/&gt; to delete&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the user deleting the dictionary item&lt;/param&gt;
+        public void Delete(IDictionaryItem dictionaryItem, int userId = 0)
+        {
+            if (DeletingDictionaryItem.IsRaisedEventCancelled(new DeleteEventArgs&lt;IDictionaryItem&gt;(dictionaryItem), this))
+                return;
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateDictionaryRepository(uow))
+            {
+                //NOTE: The recursive delete is done in the repository
+                repository.Delete(dictionaryItem);
+                uow.Commit();
+            }
+
+            DeletedDictionaryItem.RaiseEvent(new DeleteEventArgs&lt;IDictionaryItem&gt;(dictionaryItem, false), this);
+
+            Audit(AuditType.Delete, &quot;Delete DictionaryItem performed by user&quot;, userId, dictionaryItem.Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a &lt;see cref=&quot;Language&quot;/&gt; by its id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the &lt;see cref=&quot;Language&quot;/&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;Language&quot;/&gt;&lt;/returns&gt;
+        public ILanguage GetLanguageById(int id)
+        {
+            using (var repository = RepositoryFactory.CreateLanguageRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.Get(id);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a &lt;see cref=&quot;Language&quot;/&gt; by its culture code
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;cultureName&quot;&gt;Culture Name - also refered to as the Friendly name&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;Language&quot;/&gt;&lt;/returns&gt;
+        public ILanguage GetLanguageByCultureCode(string cultureName)
+        {
+            using (var repository = RepositoryFactory.CreateLanguageRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetByCultureName(cultureName);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets a &lt;see cref=&quot;Language&quot;/&gt; by its iso code
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;isoCode&quot;&gt;Iso Code of the language (ie. en-US)&lt;/param&gt;
+        /// &lt;returns&gt;&lt;see cref=&quot;Language&quot;/&gt;&lt;/returns&gt;
+        public ILanguage GetLanguageByIsoCode(string isoCode)
+        {
+            using (var repository = RepositoryFactory.CreateLanguageRepository(UowProvider.GetUnitOfWork()))
+            {
+                return repository.GetByIsoCode(isoCode);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all available languages
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;An enumerable list of &lt;see cref=&quot;ILanguage&quot;/&gt; objects&lt;/returns&gt;
+        public IEnumerable&lt;ILanguage&gt; GetAllLanguages()
+        {
+            using (var repository = RepositoryFactory.CreateLanguageRepository(UowProvider.GetUnitOfWork()))
+            {
+                var languages = repository.GetAll();
+                return languages;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Saves a &lt;see cref=&quot;ILanguage&quot;/&gt; object
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;language&quot;&gt;&lt;see cref=&quot;ILanguage&quot;/&gt; to save&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the user saving the language&lt;/param&gt;
+        public void Save(ILanguage language, int userId = 0)
+        {
+            if (SavingLanguage.IsRaisedEventCancelled(new SaveEventArgs&lt;ILanguage&gt;(language), this))
+                return;
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateLanguageRepository(uow))
+            {
+                repository.AddOrUpdate(language);
+                uow.Commit();
+            }
+
+            SavedLanguage.RaiseEvent(new SaveEventArgs&lt;ILanguage&gt;(language, false), this);
+
+            Audit(AuditType.Save, &quot;Save Language performed by user&quot;, userId, language.Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes a &lt;see cref=&quot;ILanguage&quot;/&gt; by removing it (but not its usages) from the db
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;language&quot;&gt;&lt;see cref=&quot;ILanguage&quot;/&gt; to delete&lt;/param&gt;
+        /// &lt;param name=&quot;userId&quot;&gt;Optional id of the user deleting the language&lt;/param&gt;
+        public void Delete(ILanguage language, int userId = 0)
+        {
+            if (DeletingLanguage.IsRaisedEventCancelled(new DeleteEventArgs&lt;ILanguage&gt;(language), this))
+                return;
+
+            var uow = UowProvider.GetUnitOfWork();
+            using (var repository = RepositoryFactory.CreateLanguageRepository(uow))
+            {
+                //NOTE: There isn&#39;t any constraints in the db, so possible references aren&#39;t deleted
+                repository.Delete(language);
+                uow.Commit();
+            }
+
+            DeletedLanguage.RaiseEvent(new DeleteEventArgs&lt;ILanguage&gt;(language, false), this);
+
+            Audit(AuditType.Delete, &quot;Delete Language performed by user&quot;, userId, language.Id);
+        }
+
+        private void Audit(AuditType type, string message, int userId, int objectId)
+        {
+            var uow = UowProvider.GetUnitOfWork();
+            using (var auditRepo = RepositoryFactory.CreateAuditRepository(uow))
+            {
+                auditRepo.AddOrUpdate(new AuditItem(objectId, message, type, userId));
+                uow.Commit();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// This is here to take care of a hack - the DictionaryTranslation model contains an ILanguage reference which we don&#39;t want but 
+        /// we cannot remove it because it would be a large breaking change, so we need to make sure it&#39;s resolved lazily. This is because
+        /// if developers have a lot of dictionary items and translations, the caching and cloning size gets much much larger because of 
+        /// the large object graphs. So now we don&#39;t cache or clone the attached ILanguage
+        /// &lt;/summary&gt;
+        private void EnsureDictionaryItemLanguageCallback(IDictionaryItem d)
+        {
+            var item = d as DictionaryItem;
+            if (item == null) return;
+
+            item.GetLanguage = GetLanguageById;
+            foreach (var trans in item.Translations.OfType&lt;DictionaryTranslation&gt;())
+            {
+                trans.GetLanguage = GetLanguageById;
+            }
+        }
+
+        #region Event Handlers
+        /// &lt;summary&gt;
+        /// Occurs before Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;ILocalizationService, DeleteEventArgs&lt;ILanguage&gt;&gt; DeletingLanguage;
+
+        /// &lt;summary&gt;
+        /// Occurs after Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;ILocalizationService, DeleteEventArgs&lt;ILanguage&gt;&gt; DeletedLanguage;
+
+        /// &lt;summary&gt;
+        /// Occurs before Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;ILocalizationService, DeleteEventArgs&lt;IDictionaryItem&gt;&gt; DeletingDictionaryItem;
+
+        /// &lt;summary&gt;
+        /// Occurs after Delete
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;ILocalizationService, DeleteEventArgs&lt;IDictionaryItem&gt;&gt; DeletedDictionaryItem;
+
+        /// &lt;summary&gt;
+        /// Occurs before Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;ILocalizationService, SaveEventArgs&lt;IDictionaryItem&gt;&gt; SavingDictionaryItem;
+
+        /// &lt;summary&gt;
+        /// Occurs after Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;ILocalizationService, SaveEventArgs&lt;IDictionaryItem&gt;&gt; SavedDictionaryItem;
+
+        /// &lt;summary&gt;
+        /// Occurs before Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;ILocalizationService, SaveEventArgs&lt;ILanguage&gt;&gt; SavingLanguage;
+
+        /// &lt;summary&gt;
+        /// Occurs after Save
+        /// &lt;/summary&gt;
+        public static event TypedEventHandler&lt;ILocalizationService, SaveEventArgs&lt;ILanguage&gt;&gt; SavedLanguage;
+        #endregion
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[24,15,24,78,1],[25,9,25,10,1],[26,9,26,10,1],[39,9,39,10,0],[40,13,40,30,0],[40,31,40,71,0],[41,13,41,34,0],[41,35,41,79,0],[43,13,43,66,0],[43,66,43,94,0],[43,94,43,96,0],[43,13,43,96,0],[44,13,44,34,0],[45,13,45,14,0],[46,17,46,40,0],[47,13,47,14,0],[49,13,49,14,0],[50,17,53,19,0],[54,13,54,14,0],[55,9,55,10,0],[65,9,65,10,1],[66,13,66,51,1],[67,20,67,86,1],[68,13,68,14,1],[70,17,70,71,1],[71,17,71,18,0],[72,21,72,72,0],[73,21,73,40,0],[74,21,74,22,0],[75,25,75,118,0],[77,17,77,18,0],[79,17,79,62,1],[81,17,81,64,1],[82,17,82,18,1],[83,21,83,51,1],[84,21,84,65,1],[84,65,84,114,1],[84,114,86,35,1],[84,21,86,35,1],[88,21,88,54,1],[89,17,89,18,1],[91,17,91,113,1],[92,21,92,33,0],[94,17,94,46,1],[95,17,95,30,1],[98,17,98,60,1],[100,17,100,96,1],[102,17,102,29,1],[104,9,104,10,1],[112,9,112,10,1],[113,20,113,110,1],[114,13,114,14,1],[115,17,115,47,1],[117,17,117,60,1],[118,17,118,29,1],[120,9,120,10,1],[128,9,128,10,1],[129,20,129,110,1],[130,13,130,14,1],[131,17,131,47,1],[133,17,133,60,1],[134,17,134,29,1],[136,9,136,10,1],[144,9,144,10,1],[145,20,145,110,1],[146,13,146,14,1],[147,17,147,48,1],[149,17,149,60,1],[150,17,150,29,1],[152,9,152,10,1],[160,9,160,10,1],[161,20,161,110,1],[162,13,162,14,1],[163,17,163,95,1],[164,17,164,68,1],[166,17,166,69,1],[167,17,167,30,1],[169,9,169,10,1],[177,9,177,10,1],[178,20,178,110,1],[179,13,179,14,1],[180,17,180,89,1],[182,17,182,69,1],[183,17,183,30,1],[185,9,185,10,1],[192,9,192,10,1],[193,20,193,110,1],[194,13,194,14,1],[195,17,195,91,1],[196,17,196,68,1],[198,17,198,69,1],[199,17,199,30,1],[201,9,201,10,1],[209,9,209,10,1],[210,20,210,110,1],[211,13,211,14,1],[212,17,212,52,1],[214,9,214,10,1],[222,9,222,10,1],[223,13,223,119,1],[224,17,224,24,0],[226,13,226,51,1],[227,20,227,86,1],[228,13,228,14,1],[229,17,229,56,1],[230,17,230,30,1],[232,17,232,70,1],[233,13,233,14,1],[235,13,235,109,1],[237,13,237,103,1],[238,9,238,10,1],[247,9,247,10,1],[248,13,248,123,1],[249,17,249,24,0],[251,13,251,51,1],[252,20,252,86,1],[253,13,253,14,1],[255,17,255,51,1],[256,17,256,30,1],[257,13,257,14,1],[259,13,259,113,1],[261,13,261,107,1],[262,9,262,10,1],[270,9,270,10,1],[271,20,271,108,1],[272,13,272,14,1],[273,17,273,43,1],[275,9,275,10,1],[283,9,283,10,1],[284,20,284,108,1],[285,13,285,14,1],[286,17,286,65,1],[288,9,288,10,1],[296,9,296,10,1],[297,20,297,108,1],[298,13,298,14,1],[299,17,299,57,1],[301,9,301,10,1],[308,9,308,10,1],[309,20,309,108,1],[310,13,310,14,1],[311,17,311,53,1],[312,17,312,34,1],[314,9,314,10,1],[322,9,322,10,1],[323,13,323,101,1],[324,17,324,24,0],[326,13,326,51,1],[327,20,327,84,1],[328,13,328,14,1],[329,17,329,50,1],[330,17,330,30,1],[331,13,331,14,1],[333,13,333,91,1],[335,13,335,91,1],[336,9,336,10,1],[344,9,344,10,1],[345,13,345,105,1],[346,17,346,24,0],[348,13,348,51,1],[349,20,349,84,1],[350,13,350,14,1],[352,17,352,45,1],[353,17,353,30,1],[354,13,354,14,1],[356,13,356,95,1],[358,13,358,95,1],[359,9,359,10,1],[362,9,362,10,1],[363,13,363,51,1],[364,20,364,80,1],[365,13,365,14,1],[366,17,366,87,1],[367,17,367,30,1],[368,13,368,14,1],[369,9,369,10,1],[378,9,378,10,1],[379,13,379,44,1],[380,13,380,30,1],[380,31,380,38,1],[382,13,382,48,1],[383,13,383,20,1],[383,22,383,31,1],[383,32,383,34,1],[383,35,383,84,1],[384,13,384,14,1],[385,17,385,53,1],[386,13,386,14,1],[387,9,387,10,1]]);
+    </script>
+  </body>
+</html>

@@ -1,0 +1,1413 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\umbraco.cms\businesslogic\member\Member.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Data;
+using System.Diagnostics;
+using System.Globalization;
+using System.Runtime.CompilerServices;
+using System.Web;
+using System.Xml;
+using Umbraco.Core;
+using Umbraco.Core.Cache;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+using Umbraco.Core.Persistence.Querying;
+using umbraco.cms.businesslogic.cache;
+using umbraco.BusinessLogic;
+using umbraco.DataLayer;
+using System.Web.Security;
+using System.Text;
+using System.Security.Cryptography;
+using System.Linq;
+using Umbraco.Core.Security;
+
+namespace umbraco.cms.businesslogic.member
+{
+    /// &lt;summary&gt;
+    /// The Member class represents a member of the public website (not to be confused with umbraco users)
+    /// 
+    /// Members are used when creating communities and collaborative applications using umbraco, or if there are a 
+    /// need for identifying or authentifying the visitor. (extranets, protected/private areas of the public website)
+    /// 
+    /// Inherits generic datafields from it&#39;s baseclass content.
+    /// &lt;/summary&gt;
+    [Obsolete(&quot;Use the MemberService and the Umbraco.Core.Models.Member models instead&quot;)]
+    public class Member : Content
+    {
+        #region Constants and static members
+        public static readonly string UmbracoMemberProviderName = Constants.Conventions.Member.UmbracoMemberProviderName;
+        public static readonly string UmbracoRoleProviderName = Constants.Conventions.Member.UmbracoRoleProviderName;
+        public static readonly Guid _objectType = new Guid(Constants.ObjectTypes.Member);
+
+        // zb-00004 #29956 : refactor cookies names &amp; handling
+
+        private const string _sQLOptimizedMany = @&quot;	
+			select 
+	            umbracoNode.id, umbracoNode.uniqueId, umbracoNode.level, 
+	            umbracoNode.parentId, umbracoNode.path, umbracoNode.sortOrder, umbracoNode.createDate, 
+	            umbracoNode.nodeUser, umbracoNode.text, 
+	            cmsMember.Email, cmsMember.LoginName, cmsMember.Password
+            from umbracoNode 
+            inner join cmsContent on cmsContent.nodeId = umbracoNode.id
+            inner join cmsMember on  cmsMember.nodeId = cmsContent.nodeId
+			where umbracoNode.nodeObjectType = @nodeObjectType AND {0}			
+			order by {1}&quot;;
+
+        #endregion
+
+        #region Private members
+
+        private Hashtable _groups = null;
+        protected internal IMember MemberItem;
+
+        #endregion
+
+        #region Constructors
+
+        internal Member(IMember member)
+            : base(member)
+        {
+            SetupNode(member);
+        }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the Member class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Identifier&lt;/param&gt;
+        public Member(int id) : base(id) { }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the Member class.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Identifier&lt;/param&gt;
+        public Member(Guid id) : base(id) { }
+
+        /// &lt;summary&gt;
+        /// Initializes a new instance of the Member class, with an option to only initialize 
+        /// the data used by the tree in the umbraco console.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Identifier&lt;/param&gt;
+        /// &lt;param name=&quot;noSetup&quot;&gt;&lt;/param&gt;
+        public Member(int id, bool noSetup) : base(id, noSetup) { }
+
+        public Member(Guid id, bool noSetup) : base(id, noSetup) { }
+
+        #endregion
+
+        #region Static methods
+        /// &lt;summary&gt;
+        /// A list of all members in the current umbraco install
+        /// 
+        /// Note: is ressource intensive, use with care.
+        /// &lt;/summary&gt;
+        public static Member[] GetAll
+        {
+            get
+            {
+                return GetAllAsList().ToArray();
+            }
+        }
+
+        public static IEnumerable&lt;Member&gt; GetAllAsList()
+        {
+            int totalRecs;
+            return ApplicationContext.Current.Services.MemberService.GetAll(0, int.MaxValue, out totalRecs)
+                .Select(x =&gt; new Member(x))
+                .ToArray();
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieves a list of members thats not start with a-z
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;array of members&lt;/returns&gt;
+        public static Member[] getAllOtherMembers()
+        {
+
+            //NOTE: This hasn&#39;t been ported to the new service layer because it is an edge case, it is only used to render the tree nodes but in v7 we plan on 
+            // changing how the members are shown and not having to worry about letters.
+
+            var ids = new List&lt;int&gt;();
+
+            using (var sqlHelper = Application.SqlHelper)
+            using (var dr = sqlHelper.ExecuteReader(
+                                        string.Format(_sQLOptimizedMany.Trim(), &quot;LOWER(SUBSTRING(text, 1, 1)) NOT IN (&#39;a&#39;,&#39;b&#39;,&#39;c&#39;,&#39;d&#39;,&#39;e&#39;,&#39;f&#39;,&#39;g&#39;,&#39;h&#39;,&#39;i&#39;,&#39;j&#39;,&#39;k&#39;,&#39;l&#39;,&#39;m&#39;,&#39;n&#39;,&#39;o&#39;,&#39;p&#39;,&#39;q&#39;,&#39;r&#39;,&#39;s&#39;,&#39;t&#39;,&#39;u&#39;,&#39;v&#39;,&#39;w&#39;,&#39;x&#39;,&#39;y&#39;,&#39;z&#39;)&quot;, &quot;umbracoNode.text&quot;),
+                                            sqlHelper.CreateParameter(&quot;@nodeObjectType&quot;, Member._objectType)))
+            {
+
+                while (dr.Read())
+                {
+                    ids.Add(dr.GetInt(&quot;id&quot;));
+                }
+            }
+
+            if (ids.Any())
+            {
+                return ApplicationContext.Current.Services.MemberService.GetAllMembers(ids.ToArray())
+                    .Select(x =&gt; new Member(x))
+                    .ToArray();
+            }
+
+            return new Member[] { };
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieves a list of members by the first letter in their name.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;letter&quot;&gt;The first letter&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public static Member[] getMemberFromFirstLetter(char letter)
+        {
+            int totalRecs;
+
+            return ApplicationContext.Current.Services.MemberService.FindMembersByDisplayName(
+                letter.ToString(CultureInfo.InvariantCulture), 0, int.MaxValue, out totalRecs, StringPropertyMatchType.StartsWith)
+                                     .Select(x =&gt; new Member(x))
+                                     .ToArray();
+        }
+
+        public static Member[] GetMemberByName(string usernameToMatch, bool matchByNameInsteadOfLogin)
+        {
+            int totalRecs;
+            if (matchByNameInsteadOfLogin)
+            {
+                var found = ApplicationContext.Current.Services.MemberService.FindMembersByDisplayName(
+                    usernameToMatch, 0, int.MaxValue, out totalRecs, StringPropertyMatchType.StartsWith);
+                return found.Select(x =&gt; new Member(x)).ToArray();
+            }
+            else
+            {
+                var found = ApplicationContext.Current.Services.MemberService.FindByUsername(
+                    usernameToMatch, 0, int.MaxValue, out totalRecs, StringPropertyMatchType.StartsWith);
+                return found.Select(x =&gt; new Member(x)).ToArray();
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new member
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Name&quot;&gt;Membername&lt;/param&gt;
+        /// &lt;param name=&quot;mbt&quot;&gt;Member type&lt;/param&gt;
+        /// &lt;param name=&quot;u&quot;&gt;The umbraco usercontext&lt;/param&gt;
+        /// &lt;returns&gt;The new member&lt;/returns&gt;
+        public static Member MakeNew(string Name, MemberType mbt, User u)
+        {
+            return MakeNew(Name, &quot;&quot;, &quot;&quot;, mbt, u);
+        }
+
+
+        /// &lt;summary&gt;
+        /// Creates a new member
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Name&quot;&gt;Membername&lt;/param&gt;
+        /// &lt;param name=&quot;mbt&quot;&gt;Member type&lt;/param&gt;
+        /// &lt;param name=&quot;u&quot;&gt;The umbraco usercontext&lt;/param&gt;
+        /// &lt;param name=&quot;Email&quot;&gt;The email of the user&lt;/param&gt;
+        /// &lt;returns&gt;The new member&lt;/returns&gt;
+        public static Member MakeNew(string Name, string Email, MemberType mbt, User u)
+        {
+            return MakeNew(Name, &quot;&quot;, Email, mbt, u);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new member
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;Name&quot;&gt;Membername&lt;/param&gt;
+        /// &lt;param name=&quot;mbt&quot;&gt;Member type&lt;/param&gt;
+        /// &lt;param name=&quot;u&quot;&gt;The umbraco usercontext&lt;/param&gt;
+        /// &lt;param name=&quot;Email&quot;&gt;The email of the user&lt;/param&gt;
+        /// &lt;returns&gt;The new member&lt;/returns&gt;
+        public static Member MakeNew(string Name, string LoginName, string Email, MemberType mbt, User u)
+        {
+            if (mbt == null) throw new ArgumentNullException(&quot;mbt&quot;);
+            var loginName = (string.IsNullOrEmpty(LoginName) == false) ? LoginName : Name;
+
+            var provider = MembershipProviderExtensions.GetMembersMembershipProvider();
+
+            //NOTE: This check is ONLY for backwards compatibility, this check shouldn&#39;t really be here it is up to the Membership provider
+            // logic to deal with this but it was here before so we can&#39;t really change that.
+            // Test for e-mail
+            if (Email != &quot;&quot; &amp;&amp; GetMemberFromEmail(Email) != null &amp;&amp; provider.RequiresUniqueEmail)
+                throw new Exception(string.Format(&quot;Duplicate Email! A member with the e-mail {0} already exists&quot;, Email));
+            if (GetMemberFromLoginName(loginName) != null)
+                throw new Exception(string.Format(&quot;Duplicate User name! A member with the user name {0} already exists&quot;, loginName));
+
+            var model = ApplicationContext.Current.Services.MemberService.CreateMemberWithIdentity(
+                loginName, Email.ToLower(), Name, mbt.MemberTypeItem);
+
+            //The content object will only have the &#39;WasCancelled&#39; flag set to &#39;True&#39; if the &#39;Saving&#39; event has been cancelled, so we return null.
+            if (((Entity)model).WasCancelled)
+                return null;
+
+            var legacy = new Member(model);
+            var e = new NewEventArgs();
+
+            legacy.OnNew(e);
+
+            legacy.Save();
+
+            return legacy;
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a member given the loginname
+        /// 
+        /// Used when authentifying the Member
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;loginName&quot;&gt;The unique Loginname&lt;/param&gt;
+        /// &lt;returns&gt;The member with the specified loginname - null if no Member with the login exists&lt;/returns&gt;
+        public static Member GetMemberFromLoginName(string loginName)
+        {
+            Mandate.ParameterNotNullOrEmpty(loginName, &quot;loginName&quot;);
+
+            var found = ApplicationContext.Current.Services.MemberService.GetByUsername(loginName);
+            if (found == null) return null;
+
+            return new Member(found);
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a Member given an email, the first if there multiple members with same email
+        /// 
+        /// Used when authentifying the Member
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;email&quot;&gt;The email of the member&lt;/param&gt;
+        /// &lt;returns&gt;The member with the specified email - null if no Member with the email exists&lt;/returns&gt;
+        public static Member GetMemberFromEmail(string email)
+        {
+            if (string.IsNullOrEmpty(email))
+                return null;
+
+            var found = ApplicationContext.Current.Services.MemberService.GetByEmail(email);
+            if (found == null) return null;
+
+            return new Member(found);
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve Members given an email
+        /// 
+        /// Used when authentifying a Member
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;email&quot;&gt;The email of the member(s)&lt;/param&gt;
+        /// &lt;returns&gt;The members with the specified email&lt;/returns&gt;
+        public static Member[] GetMembersFromEmail(string email)
+        {
+            if (string.IsNullOrEmpty(email))
+                return null;
+
+            int totalRecs;
+            var found = ApplicationContext.Current.Services.MemberService.FindByEmail(
+                email, 0, int.MaxValue, out totalRecs, StringPropertyMatchType.Exact);
+
+            return found.Select(x =&gt; new Member(x)).ToArray();
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a Member given the credentials
+        /// 
+        /// Used when authentifying the member
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;loginName&quot;&gt;Member login&lt;/param&gt;
+        /// &lt;param name=&quot;password&quot;&gt;Member password&lt;/param&gt;
+        /// &lt;returns&gt;The member with the credentials - null if none exists&lt;/returns&gt;
+        [Obsolete(&quot;Use the MembershipProvider methods to validate a member&quot;)]
+        public static Member GetMemberFromLoginNameAndPassword(string loginName, string password)
+        {
+            if (IsMember(loginName))
+            {
+                var provider = MembershipProviderExtensions.GetMembersMembershipProvider();
+
+                // validate user via provider
+                if (provider.ValidateUser(loginName, password))
+                {
+                    return GetMemberFromLoginName(loginName);
+                }
+                else
+                {
+                    LogHelper.Debug&lt;Member&gt;(&quot;Incorrect login/password attempt or member is locked out or not approved (&quot; + loginName + &quot;)&quot;, true);
+                    return null;
+                }
+            }
+            else
+            {
+                LogHelper.Debug&lt;Member&gt;(&quot;No member with loginname: &quot; + loginName + &quot; Exists&quot;, true);
+                return null;
+            }
+        }
+
+        [Obsolete(&quot;This method will not work if the password format is encrypted since the encryption that is performed is not static and a new value will be created each time the same string is encrypted&quot;)]
+        public static Member GetMemberFromLoginAndEncodedPassword(string loginName, string password)
+        {
+            using (var sqlHelper = Application.SqlHelper)
+            {
+                var o = sqlHelper.ExecuteScalar&lt;object&gt;(
+                    &quot;select nodeID from cmsMember where LoginName = @loginName and Password = @password&quot;,
+                    sqlHelper.CreateParameter(&quot;loginName&quot;, loginName),
+                    sqlHelper.CreateParameter(&quot;password&quot;, password));
+
+                if (o == null)
+                    return null;
+
+                int tmpId;
+                if (!int.TryParse(o.ToString(), out tmpId))
+                    return null;
+
+                return new Member(tmpId);
+            }
+        }
+
+        [Obsolete(&quot;Use MembershipProviderExtensions.IsUmbracoMembershipProvider instead&quot;)]
+        public static bool InUmbracoMemberMode()
+        {
+            var provider = MembershipProviderExtensions.GetMembersMembershipProvider();
+            return provider.IsUmbracoMembershipProvider();
+        }
+
+        public static bool IsUsingUmbracoRoles()
+        {
+            return Roles.Provider.Name == UmbracoRoleProviderName;
+        }
+
+
+        /// &lt;summary&gt;
+        /// Helper method - checks if a Member with the LoginName exists
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;loginName&quot;&gt;Member login&lt;/param&gt;
+        /// &lt;returns&gt;True if the member exists&lt;/returns&gt;
+        public static bool IsMember(string loginName)
+        {
+            Mandate.ParameterNotNullOrEmpty(loginName, &quot;loginName&quot;);
+            return ApplicationContext.Current.Services.MemberService.Exists(loginName);
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes all members of the membertype specified
+        /// 
+        /// Used when a membertype is deleted
+        /// 
+        /// Use with care
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;dt&quot;&gt;The membertype which are being deleted&lt;/param&gt;
+        public static void DeleteFromType(MemberType dt)
+        {
+            ApplicationContext.Current.Services.MemberService.DeleteMembersOfType(dt.Id);
+        }
+
+        #endregion
+
+        #region Public Properties
+
+        public override int sortOrder
+        {
+            get
+            {
+                return MemberItem == null ? base.sortOrder : MemberItem.SortOrder;
+            }
+            set
+            {
+                if (MemberItem == null)
+                {
+                    base.sortOrder = value;
+                }
+                else
+                {
+                    MemberItem.SortOrder = value;
+                }
+            }
+        }
+
+        public override int Level
+        {
+            get
+            {
+                return MemberItem == null ? base.Level : MemberItem.Level;
+            }
+            set
+            {
+                if (MemberItem == null)
+                {
+                    base.Level = value;
+                }
+                else
+                {
+                    MemberItem.Level = value;
+                }
+            }
+        }
+
+        public override int ParentId
+        {
+            get
+            {
+                return MemberItem == null ? base.ParentId : MemberItem.ParentId;
+            }
+        }
+
+        public override string Path
+        {
+            get
+            {
+                return MemberItem == null ? base.Path : MemberItem.Path;
+            }
+            set
+            {
+                if (MemberItem == null)
+                {
+                    base.Path = value;
+                }
+                else
+                {
+                    MemberItem.Path = value;
+                }
+            }
+        }
+
+        [Obsolete(&quot;Obsolete, Use Name property on Umbraco.Core.Models.Content&quot;, false)]
+        public override string Text
+        {
+            get
+            {
+                return MemberItem.Name;
+            }
+            set
+            {
+                value = value.Trim();
+                MemberItem.Name = value;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// The members password, used when logging in on the public website
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Do not use this property, use GetPassword and ChangePassword instead, if using ChangePassword ensure that the password is encrypted or hashed based on the active membership provider&quot;)]
+        public string Password
+        {
+            get
+            {
+                return MemberItem.RawPasswordValue;
+            }
+            set
+            {
+                // We need to use the provider for this in order for hashing, etc. support
+                // To write directly to the db use the ChangePassword method
+                // this is not pretty but nessecary due to a design flaw (the membership provider should have been a part of the cms project)
+                var helper = new MemberShipHelper();
+                var provider = MembershipProviderExtensions.GetMembersMembershipProvider();
+                MemberItem.RawPasswordValue = helper.EncodePassword(value, provider.PasswordFormat);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// The loginname of the member, used when logging in
+        /// &lt;/summary&gt;
+        public string LoginName
+        {
+            get
+            {
+                return MemberItem.Username;
+            }
+            set
+            {
+                if (string.IsNullOrEmpty(value))
+                    throw new ArgumentException(&quot;The loginname must be different from an empty string&quot;, &quot;LoginName&quot;);
+                if (value.Contains(&quot;,&quot;))
+                    throw new ArgumentException(&quot;The parameter &#39;LoginName&#39; must not contain commas.&quot;);
+                MemberItem.Username = value;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// A list of groups the member are member of
+        /// &lt;/summary&gt;
+        public Hashtable Groups
+        {
+            get
+            {
+                if (_groups == null)
+                    PopulateGroups();
+                return _groups;
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// The members email
+        /// &lt;/summary&gt;
+        public string Email
+        {
+            get
+            {
+                return MemberItem.Email.IsNullOrWhiteSpace() ? string.Empty : MemberItem.Email.ToLower();
+            }
+            set
+            {
+                MemberItem.Email = value == null ? &quot;&quot; : value.ToLower();
+            }
+        }
+        #endregion
+
+        #region Public Methods
+
+        [Obsolete(&quot;Obsolete&quot;, false)]
+        protected override void setupNode()
+        {
+            if (Id == -1)
+            {
+                base.setupNode();
+                return;
+            }
+
+            var content = ApplicationContext.Current.Services.MemberService.GetById(Id);
+
+            if (content == null)
+                throw new ArgumentException(string.Format(&quot;No Member exists with id &#39;{0}&#39;&quot;, Id));
+
+            SetupNode(content);
+        }
+
+        private void SetupNode(IMember content)
+        {
+            MemberItem = content;
+            //Also need to set the ContentBase item to this one so all the propery values load from it
+            ContentBase = MemberItem;
+
+            //Setting private properties from IContentBase replacing CMSNode.setupNode() / CMSNode.PopulateCMSNodeFromReader()
+            base.PopulateCMSNodeFromUmbracoEntity(MemberItem, _objectType);
+
+            //If the version is empty we update with the latest version from the current IContent.
+            if (Version == Guid.Empty)
+                Version = MemberItem.Version;
+        }
+
+        /// &lt;summary&gt;
+        /// Used to persist object changes to the database
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;raiseEvents&quot;&gt;&lt;/param&gt;
+        public void Save(bool raiseEvents)
+        {
+            var provider = MembershipProviderExtensions.GetMembersMembershipProvider();
+            //Due to backwards compatibility with this API we need to check for duplicate emails here if required.
+            // This check should not be done here, as this logic is based on the MembershipProvider            
+            var requireUniqueEmail = provider.RequiresUniqueEmail;
+            //check if there&#39;s anyone with this email in the db that isn&#39;t us
+            var membersFromEmail = GetMembersFromEmail(Email);
+            if (requireUniqueEmail &amp;&amp; membersFromEmail != null &amp;&amp; membersFromEmail.Any(x =&gt; x.Id != Id))
+            {
+                throw new Exception(string.Format(&quot;Duplicate Email! A member with the e-mail {0} already exists&quot;, Email));
+            }
+
+            var e = new SaveEventArgs();
+            if (raiseEvents)
+            {
+                FireBeforeSave(e);
+            }
+
+            foreach (var property in GenericProperties)
+            {
+                MemberItem.SetValue(property.PropertyType.Alias, property.Value);
+            }
+
+            if (e.Cancel == false)
+            {
+                ApplicationContext.Current.Services.MemberService.Save(MemberItem, raiseEvents);
+
+                //base.VersionDate = MemberItem.UpdateDate;
+
+                base.Save();
+
+                if (raiseEvents)
+                {
+                    FireAfterSave(e);
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Used to persist object changes to the database. In Version3.0 it&#39;s just a stub for future compatibility
+        /// &lt;/summary&gt;
+        public override void Save()
+        {
+            Save(true);
+        }
+
+        /// &lt;summary&gt;
+        /// Xmlrepresentation of a member
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;xd&quot;&gt;The xmldocument context&lt;/param&gt;
+        /// &lt;param name=&quot;Deep&quot;&gt;Recursive - should always be set to false&lt;/param&gt;
+        /// &lt;returns&gt;A the xmlrepresentation of the current member&lt;/returns&gt;
+        public override XmlNode ToXml(XmlDocument xd, bool Deep)
+        {
+            var x = base.ToXml(xd, Deep);
+            if (x.Attributes != null &amp;&amp; x.Attributes[&quot;loginName&quot;] == null)
+            {
+                x.Attributes.Append(XmlHelper.AddAttribute(xd, &quot;loginName&quot;, LoginName));
+            }
+            if (x.Attributes != null &amp;&amp; x.Attributes[&quot;email&quot;] == null)
+            {
+                x.Attributes.Append(XmlHelper.AddAttribute(xd, &quot;email&quot;, Email));
+            }
+            if (x.Attributes != null &amp;&amp; x.Attributes[&quot;key&quot;] == null)
+            {
+                x.Attributes.Append(XmlHelper.AddAttribute(xd, &quot;key&quot;, UniqueId.ToString()));
+            }
+            return x;
+        }
+
+        /// &lt;summary&gt;
+        /// Deltes the current member
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Obsolete, Use Umbraco.Core.Services.MemberService.Delete()&quot;, false)]
+        public override void delete()
+        {
+            var e = new DeleteEventArgs();
+            FireBeforeDelete(e);
+
+            if (!e.Cancel)
+            {
+                if (MemberItem != null)
+                {
+                    ApplicationContext.Current.Services.MemberService.Delete(MemberItem);
+                }
+                else
+                {
+                    var member = ApplicationContext.Current.Services.MemberService.GetById(Id);
+                    ApplicationContext.Current.Services.MemberService.Delete(member);
+                }
+
+                // Delete all content and cmsnode specific data!
+                base.delete();
+
+                FireAfterDelete(e);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Sets the password for the user - ensure it is encrypted or hashed based on the active membership provider - you must 
+        /// call Save() after using this method
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;newPassword&quot;&gt;&lt;/param&gt;
+        public void ChangePassword(string newPassword)
+        {
+            MemberItem.RawPasswordValue = newPassword;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the currently stored password - this may be encrypted or hashed string depending on the active membership provider
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public string GetPassword()
+        {
+            return MemberItem.RawPasswordValue;
+        }
+
+        /// &lt;summary&gt;
+        /// Adds the member to group with the specified id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;GroupId&quot;&gt;The id of the group which the member is being added to&lt;/param&gt;
+        [MethodImpl(MethodImplOptions.Synchronized)]
+        public void AddGroup(int GroupId)
+        {
+            var e = new AddGroupEventArgs();
+            e.GroupId = GroupId;
+            FireBeforeAddGroup(e);
+
+            if (!e.Cancel)
+            {
+                using (var sqlHelper = Application.SqlHelper)
+                {
+                    var parameters = new IParameter[] { sqlHelper.CreateParameter(&quot;@id&quot;, Id),
+                                                             sqlHelper.CreateParameter(&quot;@groupId&quot;, GroupId) };
+                    bool exists = sqlHelper.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(member) FROM cmsMember2MemberGroup WHERE member = @id AND memberGroup = @groupId&quot;,
+                                                               parameters) &gt; 0;
+                    if (!exists)
+                        sqlHelper.ExecuteNonQuery(&quot;INSERT INTO cmsMember2MemberGroup (member, memberGroup) values (@id, @groupId)&quot;,
+                                                  parameters);
+                }
+
+                PopulateGroups();
+
+                FireAfterAddGroup(e);
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Removes the member from the MemberGroup specified
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;GroupId&quot;&gt;The MemberGroup from which the Member is removed&lt;/param&gt;
+        public void RemoveGroup(int GroupId)
+        {
+            var e = new RemoveGroupEventArgs();
+            e.GroupId = GroupId;
+            FireBeforeRemoveGroup(e);
+
+            if (!e.Cancel)
+            {
+                using (var sqlHelper = Application.SqlHelper)
+                    sqlHelper.ExecuteNonQuery(
+                    &quot;delete from cmsMember2MemberGroup where member = @id and Membergroup = @groupId&quot;,
+                    sqlHelper.CreateParameter(&quot;@id&quot;, Id), sqlHelper.CreateParameter(&quot;@groupId&quot;, GroupId));
+                PopulateGroups();
+                FireAfterRemoveGroup(e);
+            }
+        }
+        #endregion
+
+        #region Protected methods
+        protected override XmlNode generateXmlWithoutSaving(XmlDocument xd)
+        {
+            XmlNode node = xd.CreateNode(XmlNodeType.Element, &quot;node&quot;, &quot;&quot;);
+            XmlPopulate(xd, ref node, false);
+            node.Attributes.Append(xmlHelper.addAttribute(xd, &quot;loginName&quot;, LoginName));
+            node.Attributes.Append(xmlHelper.addAttribute(xd, &quot;email&quot;, Email));
+            return node;
+        }
+
+        #endregion
+
+        #region Private methods
+
+        private void PopulateGroups()
+        {
+            var temp = new Hashtable();
+
+            using (var sqlHelper = Application.SqlHelper)
+            using (var dr = sqlHelper.ExecuteReader(
+                &quot;select memberGroup from cmsMember2MemberGroup where member = @id&quot;,
+                sqlHelper.CreateParameter(&quot;@id&quot;, Id)))
+            {
+                while (dr.Read())
+                    temp.Add(dr.GetInt(&quot;memberGroup&quot;),
+                        new MemberGroup(dr.GetInt(&quot;memberGroup&quot;)));
+            }
+            _groups = temp;
+        }
+
+        private static string GetCacheKey(int id)
+        {
+            return string.Format(&quot;{0}{1}&quot;, CacheKeys.MemberBusinessLogicCacheKey, id);
+        }
+
+        [Obsolete(&quot;Only use .NET Membership APIs to handle state now&quot;, true)]
+        static void ClearMemberState()
+        {
+            // zb-00004 #29956 : refactor cookies names &amp; handling
+            StateHelper.Cookies.Member.Clear();
+            FormsAuthentication.SignOut();
+        }
+
+        #endregion
+
+        #region MemberHandle functions
+
+        /// &lt;summary&gt;
+        /// Method is used when logging a member in.
+        /// 
+        /// Adds the member to the cache of logged in members
+        /// 
+        /// Uses cookiebased recognition
+        /// 
+        /// Can be used in the runtime
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;m&quot;&gt;The member to log in&lt;/param&gt;
+        [Obsolete(&quot;Use Membership APIs and FormsAuthentication to handle member login&quot;)]
+        public static void AddMemberToCache(Member m)
+        {
+
+            if (m != null)
+            {
+                var e = new AddToCacheEventArgs();
+                m.FireBeforeAddToCache(e);
+
+                if (!e.Cancel)
+                {
+                    // Add cookie with member-id, guid and loginname
+                    // zb-00035 #29931 : cleanup member state management
+                    // NH 4.7.1: We&#39;ll no longer use legacy cookies to handle Umbraco Members
+                    //SetMemberState(m);
+
+                    FormsAuthentication.SetAuthCookie(m.LoginName, true);
+
+                    //cache the member
+                    var cachedMember = ApplicationContext.Current.ApplicationCache.RuntimeCache.GetCacheItem&lt;Member&gt;(
+                        GetCacheKey(m.Id),
+                        timeout: TimeSpan.FromMinutes(30),
+                        getCacheItem: () =&gt;
+                      {
+                            // Debug information
+                            HttpContext.Current.Trace.Write(&quot;member&quot;,
+                                                          string.Format(&quot;Member added to cache: {0}/{1} ({2})&quot;,
+                                                                        m.Text, m.LoginName, m.Id));
+
+                          return m;
+                      });
+
+                    m.FireAfterAddToCache(e);
+                }
+            }
+
+        }
+
+        // zb-00035 #29931 : remove old cookie code
+        /// &lt;summary&gt;
+        /// Method is used when logging a member in.
+        /// 
+        /// Adds the member to the cache of logged in members
+        /// 
+        /// Uses cookie or session based recognition
+        /// 
+        /// Can be used in the runtime
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;m&quot;&gt;The member to log in&lt;/param&gt;
+        /// &lt;param name=&quot;UseSession&quot;&gt;create a persistent cookie&lt;/param&gt;
+        /// &lt;param name=&quot;TimespanForCookie&quot;&gt;Has no effect&lt;/param&gt;
+        [Obsolete(&quot;Use the membership api and FormsAuthentication to log users in, this method is no longer used anymore&quot;)]
+        public static void AddMemberToCache(Member m, bool UseSession, TimeSpan TimespanForCookie)
+        {
+            if (m != null)
+            {
+                var e = new AddToCacheEventArgs();
+                m.FireBeforeAddToCache(e);
+
+                if (!e.Cancel)
+                {
+                    // zb-00035 #29931 : cleanup member state management
+                    // NH 4.7.1: We&#39;ll no longer use Umbraco legacy cookies to handle members
+                    //SetMemberState(m, UseSession, TimespanForCookie.TotalDays);
+
+                    FormsAuthentication.SetAuthCookie(m.LoginName, !UseSession);
+
+                    //cache the member
+                    var cachedMember = ApplicationContext.Current.ApplicationCache.RuntimeCache.GetCacheItem&lt;Member&gt;(
+                        GetCacheKey(m.Id),
+                        timeout: TimeSpan.FromMinutes(30),
+                        getCacheItem: () =&gt;
+                      {
+                            // Debug information
+                            HttpContext.Current.Trace.Write(&quot;member&quot;,
+                                                          string.Format(&quot;Member added to cache: {0}/{1} ({2})&quot;,
+                                                                        m.Text, m.LoginName, m.Id));
+
+                          return m;
+                      });
+
+                    m.FireAfterAddToCache(e);
+                }
+
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Removes the member from the cache
+        /// 
+        /// Can be used in the public website
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;m&quot;&gt;Member to remove&lt;/param&gt;
+        [Obsolete(&quot;Obsolete, use the RemoveMemberFromCache(int NodeId) instead&quot;, false)]
+        public static void RemoveMemberFromCache(Member m)
+        {
+            RemoveMemberFromCache(m.Id);
+        }
+
+        /// &lt;summary&gt;
+        /// Removes the member from the cache
+        /// 
+        /// Can be used in the public website
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;NodeId&quot;&gt;Node Id of the member to remove&lt;/param&gt;
+        [Obsolete(&quot;Member cache is automatically cleared when members are updated&quot;)]
+        public static void RemoveMemberFromCache(int NodeId)
+        {
+            ApplicationContext.Current.ApplicationCache.RuntimeCache.ClearCacheItem(GetCacheKey(NodeId));
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes the member cookie from the browser 
+        /// 
+        /// Can be used in the public website
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;m&quot;&gt;Member&lt;/param&gt;
+        [Obsolete(&quot;Obsolete, use the ClearMemberFromClient(int NodeId) instead&quot;, false)]
+        public static void ClearMemberFromClient(Member m)
+        {
+
+            if (m != null)
+                ClearMemberFromClient(m.Id);
+            else
+            {
+                // If the member doesn&#39;t exists as an object, we&#39;ll just make sure that cookies are cleared
+                // zb-00035 #29931 : cleanup member state management
+                ClearMemberState();
+            }
+
+            FormsAuthentication.SignOut();
+        }
+
+        /// &lt;summary&gt;
+        /// Deletes the member cookie from the browser 
+        /// 
+        /// Can be used in the public website
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;NodeId&quot;&gt;The Node id of the member to clear&lt;/param&gt;
+        [Obsolete(&quot;Use FormsAuthentication.SignOut instead&quot;)]
+        public static void ClearMemberFromClient(int NodeId)
+        {
+            // zb-00035 #29931 : cleanup member state management
+            // NH 4.7.1: We&#39;ll no longer use legacy Umbraco cookies to handle members
+            // ClearMemberState();
+
+            FormsAuthentication.SignOut();
+
+            RemoveMemberFromCache(NodeId);
+
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a collection of members in the cache
+        /// 
+        /// Can be used from the public website
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;A collection of cached members&lt;/returns&gt;
+        public static Hashtable CachedMembers()
+        {
+            var h = new Hashtable();
+
+            var items = ApplicationContext.Current.ApplicationCache.RuntimeCache.GetCacheItemsByKeySearch&lt;Member&gt;(
+                CacheKeys.MemberBusinessLogicCacheKey);
+            foreach (var i in items)
+            {
+                h.Add(i.Id, i);
+            }
+            return h;
+        }
+
+        /// &lt;summary&gt;
+        /// Retrieve a member from the cache
+        /// 
+        /// Can be used from the public website
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;Id of the member&lt;/param&gt;
+        /// &lt;returns&gt;If the member is cached it returns the member - else null&lt;/returns&gt;
+        public static Member GetMemberFromCache(int id)
+        {
+            Hashtable members = CachedMembers();
+            if (members.ContainsKey(id))
+                return (Member)members[id];
+            else
+                return null;
+        }
+
+        /// &lt;summary&gt;
+        /// An indication if the current visitor is logged in
+        /// 
+        /// Can be used from the public website
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;True if the the current visitor is logged in&lt;/returns&gt;
+        [Obsolete(&quot;Use the standard ASP.Net procedures for hanlding FormsAuthentication, simply check the HttpContext.User and HttpContext.User.Identity.IsAuthenticated to determine if a member is logged in or not&quot;)]
+        public static bool IsLoggedOn()
+        {
+            return HttpContext.Current.User != null &amp;&amp; HttpContext.Current.User.Identity.IsAuthenticated;
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the current visitors memberid
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;The current visitors members id, if the visitor is not logged in it returns 0&lt;/returns&gt;
+        public static int CurrentMemberId()
+        {
+            int currentMemberId = 0;
+
+            // For backwards compatibility between umbraco members and .net membership
+            if (HttpContext.Current.User.Identity.IsAuthenticated)
+            {
+                var provider = MembershipProviderExtensions.GetMembersMembershipProvider();
+                var member = provider.GetCurrentUser();
+                if (member == null)
+                {
+                    throw new InvalidOperationException(&quot;No member object found with username &quot; + provider.GetCurrentUserName());
+                }
+                int.TryParse(member.ProviderUserKey.ToString(), out currentMemberId);
+            }
+
+            return currentMemberId;
+        }
+
+        /// &lt;summary&gt;
+        /// Get the current member
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;Returns the member, if visitor is not logged in: null&lt;/returns&gt;
+        public static Member GetCurrentMember()
+        {
+            try
+            {
+                if (HttpContext.Current.User.Identity.IsAuthenticated)
+                {
+                    var provider = MembershipProviderExtensions.GetMembersMembershipProvider();
+                    var member = provider.GetCurrentUser();
+                    if (member == null)
+                    {
+                        throw new InvalidOperationException(&quot;No member object found with username &quot; + provider.GetCurrentUserName());
+                    }
+
+                    int currentMemberId = 0;
+                    if (int.TryParse(member.ProviderUserKey.ToString(), out currentMemberId))
+                    {
+                        var m = new Member(currentMemberId);
+                        return m;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogHelper.Error&lt;Member&gt;(&quot;An error occurred in GetCurrentMember&quot;, ex);
+            }
+            return null;
+        }
+
+        #endregion
+
+        #region Events
+
+        /// &lt;summary&gt;
+        /// The save event handler
+        /// &lt;/summary&gt;
+        public delegate void SaveEventHandler(Member sender, SaveEventArgs e);
+
+        /// &lt;summary&gt;
+        /// The new event handler
+        /// &lt;/summary&gt;
+        public delegate void NewEventHandler(Member sender, NewEventArgs e);
+
+        /// &lt;summary&gt;
+        /// The delete event handler
+        /// &lt;/summary&gt;
+        public delegate void DeleteEventHandler(Member sender, DeleteEventArgs e);
+
+        /// &lt;summary&gt;
+        /// The add to cache event handler
+        /// &lt;/summary&gt;
+        public delegate void AddingToCacheEventHandler(Member sender, AddToCacheEventArgs e);
+
+        /// &lt;summary&gt;
+        /// The add group event handler
+        /// &lt;/summary&gt;
+        public delegate void AddingGroupEventHandler(Member sender, AddGroupEventArgs e);
+
+        /// &lt;summary&gt;
+        /// The remove group event handler
+        /// &lt;/summary&gt;
+        public delegate void RemovingGroupEventHandler(Member sender, RemoveGroupEventArgs e);
+
+
+        /// &lt;summary&gt;
+        /// Occurs when [before save].
+        /// &lt;/summary&gt;
+        new public static event SaveEventHandler BeforeSave;
+        /// &lt;summary&gt;
+        /// Raises the &lt;see cref=&quot;E:BeforeSave&quot;/&gt; event.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;e&quot;&gt;The &lt;see cref=&quot;System.EventArgs&quot;/&gt; instance containing the event data.&lt;/param&gt;
+        new protected virtual void FireBeforeSave(SaveEventArgs e)
+        {
+            if (BeforeSave != null)
+            {
+                BeforeSave(this, e);
+            }
+        }
+
+
+        new public static event SaveEventHandler AfterSave;
+        new protected virtual void FireAfterSave(SaveEventArgs e)
+        {
+            if (AfterSave != null)
+            {
+                AfterSave(this, e);
+            }
+        }
+
+
+        public static event NewEventHandler New;
+        protected virtual void OnNew(NewEventArgs e)
+        {
+            if (New != null)
+            {
+                New(this, e);
+            }
+        }
+
+
+        public static event AddingGroupEventHandler BeforeAddGroup;
+        protected virtual void FireBeforeAddGroup(AddGroupEventArgs e)
+        {
+            if (BeforeAddGroup != null)
+            {
+                BeforeAddGroup(this, e);
+            }
+        }
+        public static event AddingGroupEventHandler AfterAddGroup;
+        protected virtual void FireAfterAddGroup(AddGroupEventArgs e)
+        {
+            if (AfterAddGroup != null)
+            {
+                AfterAddGroup(this, e);
+            }
+        }
+
+
+        public static event RemovingGroupEventHandler BeforeRemoveGroup;
+        protected virtual void FireBeforeRemoveGroup(RemoveGroupEventArgs e)
+        {
+            if (BeforeRemoveGroup != null)
+            {
+                BeforeRemoveGroup(this, e);
+            }
+        }
+
+        public static event RemovingGroupEventHandler AfterRemoveGroup;
+        protected virtual void FireAfterRemoveGroup(RemoveGroupEventArgs e)
+        {
+            if (AfterRemoveGroup != null)
+            {
+                AfterRemoveGroup(this, e);
+            }
+        }
+
+
+        public static event AddingToCacheEventHandler BeforeAddToCache;
+        protected virtual void FireBeforeAddToCache(AddToCacheEventArgs e)
+        {
+            if (BeforeAddToCache != null)
+            {
+                BeforeAddToCache(this, e);
+            }
+        }
+
+
+        public static event AddingToCacheEventHandler AfterAddToCache;
+        protected virtual void FireAfterAddToCache(AddToCacheEventArgs e)
+        {
+            if (AfterAddToCache != null)
+            {
+                AfterAddToCache(this, e);
+            }
+        }
+
+        new public static event DeleteEventHandler BeforeDelete;
+        new protected virtual void FireBeforeDelete(DeleteEventArgs e)
+        {
+            if (BeforeDelete != null)
+            {
+                BeforeDelete(this, e);
+            }
+        }
+
+        new public static event DeleteEventHandler AfterDelete;
+        new protected virtual void FireAfterDelete(DeleteEventArgs e)
+        {
+            if (AfterDelete != null)
+            {
+                AfterDelete(this, e);
+            }
+        }
+        #endregion
+
+        #region Membership helper class used for encryption methods
+        /// &lt;summary&gt;
+        /// ONLY FOR INTERNAL USE.
+        /// This is needed due to a design flaw where the Umbraco membership provider is located 
+        /// in a separate project referencing this project, which means we can&#39;t call special methods
+        /// directly on the UmbracoMemberShipMember class.
+        /// This is a helper implementation only to be able to use the encryption functionality 
+        /// of the membership provides (which are protected).
+        /// 
+        /// ... which means this class should have been marked internal with a Friend reference to the other assembly right??
+        /// &lt;/summary&gt;
+        internal class MemberShipHelper : MembershipProvider
+        {
+            public override string ApplicationName
+            {
+                get
+                {
+                    throw new NotImplementedException();
+                }
+                set
+                {
+                    throw new NotImplementedException();
+                }
+            }
+
+            public override bool ChangePassword(string username, string oldPassword, string newPassword)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override bool ChangePasswordQuestionAndAnswer(string username, string password, string newPasswordQuestion, string newPasswordAnswer)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override MembershipUser CreateUser(string username, string password, string email, string passwordQuestion, string passwordAnswer, bool isApproved, object providerUserKey, out MembershipCreateStatus status)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override bool DeleteUser(string username, bool deleteAllRelatedData)
+            {
+                throw new NotImplementedException();
+            }
+
+            public string EncodePassword(string password, MembershipPasswordFormat pwFormat)
+            {
+                string encodedPassword = password;
+                switch (pwFormat)
+                {
+                    case MembershipPasswordFormat.Clear:
+                        break;
+                    case MembershipPasswordFormat.Encrypted:
+                        encodedPassword =
+                          Convert.ToBase64String(EncryptPassword(Encoding.Unicode.GetBytes(password)));
+                        break;
+                    case MembershipPasswordFormat.Hashed:
+                        HMACSHA1 hash = new HMACSHA1();
+                        hash.Key = Encoding.Unicode.GetBytes(password);
+                        encodedPassword =
+                          Convert.ToBase64String(hash.ComputeHash(Encoding.Unicode.GetBytes(password)));
+                        break;
+                }
+                return encodedPassword;
+            }
+
+            public override bool EnablePasswordReset
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public override bool EnablePasswordRetrieval
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public override MembershipUserCollection FindUsersByEmail(string emailToMatch, int pageIndex, int pageSize, out int totalRecords)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override MembershipUserCollection FindUsersByName(string usernameToMatch, int pageIndex, int pageSize, out int totalRecords)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override MembershipUserCollection GetAllUsers(int pageIndex, int pageSize, out int totalRecords)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override int GetNumberOfUsersOnline()
+            {
+                throw new NotImplementedException();
+            }
+
+            public override string GetPassword(string username, string answer)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override MembershipUser GetUser(string username, bool userIsOnline)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override MembershipUser GetUser(object providerUserKey, bool userIsOnline)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override string GetUserNameByEmail(string email)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override int MaxInvalidPasswordAttempts
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public override int MinRequiredNonAlphanumericCharacters
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public override int MinRequiredPasswordLength
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public override int PasswordAttemptWindow
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public override MembershipPasswordFormat PasswordFormat
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public override string PasswordStrengthRegularExpression
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public override bool RequiresQuestionAndAnswer
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public override bool RequiresUniqueEmail
+            {
+                get { throw new NotImplementedException(); }
+            }
+
+            public override string ResetPassword(string username, string answer)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override bool UnlockUser(string userName)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override void UpdateUser(MembershipUser user)
+            {
+                throw new NotImplementedException();
+            }
+
+            public override bool ValidateUser(string username, string password)
+            {
+                throw new NotImplementedException();
+            }
+        }
+        #endregion
+
+    }
+
+
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[41,9,41,122,0],[42,9,42,118,0],[43,9,43,90,0],[63,9,63,42,0],[63,9,63,42,0],[63,9,63,42,0],[63,9,63,42,0],[63,9,63,42,0],[71,15,71,27,0],[72,9,72,10,0],[73,13,73,31,0],[74,9,74,10,0],[80,33,80,41,0],[80,42,80,43,0],[80,44,80,45,0],[86,34,86,42,0],[86,43,86,44,0],[86,45,86,46,0],[94,47,94,64,0],[94,65,94,66,0],[94,67,94,68,0],[96,48,96,65,0],[96,66,96,67,0],[96,68,96,69,0],[109,13,109,14,0],[110,17,110,49,0],[111,13,111,14,0],[115,9,115,10,0],[117,13,118,30,0],[118,30,118,43,0],[118,43,119,28,0],[117,13,119,28,0],[120,9,120,10,0],[127,9,127,10,0],[132,13,132,39,0],[134,20,134,57,0],[135,20,137,110,0],[138,13,138,14,0],[140,17,140,34,0],[141,17,141,18,0],[142,21,142,46,0],[143,17,143,18,0],[144,13,144,14,0],[146,13,146,27,0],[147,13,147,14,0],[148,17,149,34,0],[149,34,149,47,0],[149,47,150,32,0],[148,17,150,32,0],[153,13,153,37,0],[154,9,154,10,0],[162,9,162,10,0],[165,13,167,51,0],[167,51,167,64,0],[167,64,168,49,0],[165,13,168,49,0],[169,9,169,10,0],[172,9,172,10,0],[174,13,174,43,0],[175,13,175,14,0],[176,17,177,106,0],[178,17,178,42,0],[178,42,178,55,0],[178,55,178,67,0],[178,17,178,67,0],[181,13,181,14,0],[182,17,183,106,0],[184,17,184,42,0],[184,42,184,55,0],[184,55,184,67,0],[184,17,184,67,0],[186,9,186,10,0],[196,9,196,10,0],[197,13,197,50,0],[198,9,198,10,0],[210,9,210,10,0],[211,13,211,53,0],[212,9,212,10,0],[223,9,223,10,0],[224,13,224,29,0],[224,30,224,69,0],[225,13,225,91,0],[227,13,227,88,0],[232,13,232,98,0],[233,17,233,123,0],[234,13,234,59,0],[235,17,235,134,0],[237,13,238,71,0],[241,13,241,46,0],[242,17,242,29,0],[244,13,244,44,0],[245,13,245,40,0],[247,13,247,29,0],[249,13,249,27,0],[251,13,251,27,0],[252,9,252,10,0],[262,9,262,10,0],[263,13,263,69,0],[265,13,265,100,0],[266,13,266,31,0],[266,32,266,44,0],[268,13,268,38,0],[269,9,269,10,0],[279,9,279,10,0],[280,13,280,45,0],[281,17,281,29,0],[283,13,283,93,0],[284,13,284,31,0],[284,32,284,44,0],[286,13,286,38,0],[287,9,287,10,0],[297,9,297,10,0],[298,13,298,45,0],[299,17,299,29,0],[302,13,303,87,0],[305,13,305,38,0],[305,38,305,51,0],[305,51,305,63,0],[305,13,305,63,0],[306,9,306,10,0],[318,9,318,10,0],[319,13,319,37,0],[320,13,320,14,0],[321,17,321,92,0],[324,17,324,64,0],[325,17,325,18,0],[326,21,326,62,0],[329,17,329,18,0],[330,21,330,147,0],[331,21,331,33,0],[335,13,335,14,0],[336,17,336,101,0],[337,17,337,29,0],[339,9,339,10,0],[343,9,343,10,0],[344,20,344,57,0],[345,13,345,14,0],[346,17,349,70,0],[351,17,351,31,0],[352,21,352,33,0],[355,17,355,60,0],[356,21,356,33,0],[358,17,358,42,0],[360,9,360,10,0],[364,9,364,10,0],[365,13,365,88,0],[366,13,366,59,0],[367,9,367,10,0],[370,9,370,10,0],[371,13,371,67,0],[372,9,372,10,0],[381,9,381,10,0],[382,13,382,69,0],[383,13,383,88,0],[384,9,384,10,0],[395,9,395,10,0],[396,13,396,90,0],[397,9,397,10,0],[406,13,406,14,0],[407,17,407,83,0],[408,13,408,14,0],[410,13,410,14,0],[411,17,411,40,0],[412,17,412,18,0],[413,21,413,44,0],[414,17,414,18,0],[416,17,416,18,0],[417,21,417,50,0],[418,17,418,18,0],[419,13,419,14,0],[425,13,425,14,0],[426,17,426,75,0],[427,13,427,14,0],[429,13,429,14,0],[430,17,430,40,0],[431,17,431,18,0],[432,21,432,40,0],[433,17,433,18,0],[435,17,435,18,0],[436,21,436,46,0],[437,17,437,18,0],[438,13,438,14,0],[444,13,444,14,0],[445,17,445,81,0],[446,13,446,14,0],[452,13,452,14,0],[453,17,453,73,0],[454,13,454,14,0],[456,13,456,14,0],[457,17,457,40,0],[458,17,458,18,0],[459,21,459,39,0],[460,17,460,18,0],[462,17,462,18,0],[463,21,463,45,0],[464,17,464,18,0],[465,13,465,14,0],[472,13,472,14,0],[473,17,473,40,0],[474,13,474,14,0],[476,13,476,14,0],[477,17,477,38,0],[478,17,478,41,0],[479,13,479,14,0],[489,13,489,14,0],[490,17,490,52,0],[491,13,491,14,0],[493,13,493,14,0],[497,17,497,53,0],[498,17,498,92,0],[499,17,499,101,0],[500,13,500,14,0],[509,13,509,14,0],[510,17,510,44,0],[511,13,511,14,0],[513,13,513,14,0],[514,17,514,49,0],[515,21,515,118,0],[516,17,516,41,0],[517,21,517,103,0],[518,17,518,45,0],[519,13,519,14,0],[528,13,528,14,0],[529,17,529,37,0],[530,21,530,38,0],[531,17,531,32,0],[532,13,532,14,0],[541,13,541,14,0],[542,17,542,106,0],[543,13,543,14,0],[545,13,545,14,0],[546,17,546,73,0],[547,13,547,14,0],[555,9,555,10,0],[556,13,556,26,0],[557,13,557,14,0],[558,17,558,34,0],[559,17,559,24,0],[562,13,562,89,0],[564,13,564,33,0],[565,17,565,98,0],[567,13,567,32,0],[568,9,568,10,0],[571,9,571,10,0],[572,13,572,34,0],[574,13,574,38,0],[577,13,577,76,0],[580,13,580,39,0],[581,17,581,46,0],[582,9,582,10,0],[589,9,589,10,0],[590,13,590,88,0],[593,13,593,67,0],[595,13,595,63,0],[596,13,596,93,0],[596,93,596,103,0],[596,103,596,105,0],[596,13,596,105,0],[597,13,597,14,0],[598,17,598,123,0],[601,13,601,41,0],[602,13,602,29,0],[603,13,603,14,0],[604,17,604,35,0],[605,13,605,14,0],[607,13,607,20,0],[607,22,607,34,0],[607,35,607,37,0],[607,38,607,55,0],[608,13,608,14,0],[609,17,609,82,0],[610,13,610,14,0],[612,13,612,35,0],[613,13,613,14,0],[614,17,614,97,0],[618,17,618,29,0],[620,17,620,33,0],[621,17,621,18,0],[622,21,622,38,0],[623,17,623,18,0],[624,13,624,14,0],[625,9,625,10,0],[631,9,631,10,0],[632,13,632,24,0],[633,9,633,10,0],[642,9,642,10,0],[643,13,643,42,0],[644,13,644,75,0],[645,13,645,14,0],[646,17,646,89,0],[647,13,647,14,0],[648,13,648,71,0],[649,13,649,14,0],[650,17,650,81,0],[651,13,651,14,0],[652,13,652,69,0],[653,13,653,14,0],[654,17,654,93,0],[655,13,655,14,0],[656,13,656,22,0],[657,9,657,10,0],[664,9,664,10,0],[665,13,665,43,0],[666,13,666,33,0],[668,13,668,27,0],[669,13,669,14,0],[670,17,670,40,0],[671,17,671,18,0],[672,21,672,90,0],[673,17,673,18,0],[675,17,675,18,0],[676,21,676,96,0],[677,21,677,86,0],[678,17,678,18,0],[681,17,681,31,0],[683,17,683,36,0],[684,13,684,14,0],[685,9,685,10,0],[693,9,693,10,0],[694,13,694,55,0],[695,9,695,10,0],[702,9,702,10,0],[703,13,703,48,0],[704,9,704,10,0],[712,9,712,10,0],[713,13,713,45,0],[714,13,714,33,0],[715,13,715,35,0],[717,13,717,27,0],[718,13,718,14,0],[719,24,719,61,0],[720,17,720,18,0],[721,21,722,111,0],[723,21,724,80,0],[725,21,725,33,0],[726,25,727,63,0],[728,17,728,18,0],[730,17,730,34,0],[732,17,732,38,0],[733,13,733,14,0],[734,9,734,10,0],[741,9,741,10,0],[742,13,742,48,0],[743,13,743,33,0],[744,13,744,38,0],[746,13,746,27,0],[747,13,747,14,0],[748,24,748,61,0],[749,21,751,107,0],[752,17,752,34,0],[753,17,753,41,0],[754,13,754,14,0],[755,9,755,10,0],[760,9,760,10,0],[761,13,761,75,0],[762,13,762,46,0],[763,13,763,88,0],[764,13,764,80,0],[765,13,765,25,0],[766,9,766,10,0],[773,9,773,10,0],[774,13,774,40,0],[776,20,776,57,0],[777,20,779,54,0],[780,13,780,14,0],[781,17,781,34,0],[782,21,783,68,0],[784,13,784,14,0],[785,13,785,28,0],[786,9,786,10,0],[789,9,789,10,0],[790,13,790,87,0],[791,9,791,10,0],[795,9,795,10,0],[797,13,797,48,0],[798,13,798,43,0],[799,9,799,10,0],[817,9,817,10,0],[819,13,819,27,0],[820,13,820,14,0],[821,17,821,51,0],[822,17,822,43,0],[824,17,824,31,0],[825,17,825,18,0],[831,21,831,74,0],[834,21,838,23,0],[838,23,838,24,0],[838,24,840,29,0],[840,29,842,101,0],[842,101,844,27,0],[844,27,844,36,0],[844,36,845,23,0],[845,23,845,24,0],[845,24,845,26,0],[834,21,845,26,0],[847,21,847,46,0],[848,17,848,18,0],[849,13,849,14,0],[851,9,851,10,0],[868,9,868,10,0],[869,13,869,27,0],[870,13,870,14,0],[871,17,871,51,0],[872,17,872,43,0],[874,17,874,31,0],[875,17,875,18,0],[880,21,880,81,0],[883,21,887,23,0],[887,23,887,24,0],[887,24,889,29,0],[889,29,891,101,0],[891,101,893,27,0],[893,27,893,36,0],[893,36,894,23,0],[894,23,894,24,0],[894,24,894,26,0],[883,21,894,26,0],[896,21,896,46,0],[897,17,897,18,0],[899,13,899,14,0],[900,9,900,10,0],[910,9,910,10,0],[911,13,911,41,0],[912,9,912,10,0],[922,9,922,10,0],[923,13,923,106,0],[924,9,924,10,0],[934,9,934,10,0],[936,13,936,27,0],[937,17,937,45,0],[939,13,939,14,0],[942,17,942,36,0],[943,13,943,14,0],[945,13,945,43,0],[946,9,946,10,0],[956,9,956,10,0],[961,13,961,43,0],[963,13,963,43,0],[965,9,965,10,0],[974,9,974,10,0],[975,13,975,37,0],[977,13,978,56,0],[979,13,979,20,0],[979,22,979,27,0],[979,28,979,30,0],[979,31,979,36,0],[980,13,980,14,0],[981,17,981,32,0],[982,13,982,14,0],[983,13,983,22,0],[984,9,984,10,0],[994,9,994,10,0],[995,13,995,49,0],[996,13,996,41,0],[997,17,997,44,0],[999,17,999,29,0],[1000,9,1000,10,0],[1010,9,1010,10,0],[1011,13,1011,106,0],[1012,9,1012,10,0],[1019,9,1019,10,0],[1020,13,1020,37,0],[1023,13,1023,67,0],[1024,13,1024,14,0],[1025,17,1025,92,0],[1026,17,1026,56,0],[1027,17,1027,36,0],[1028,17,1028,18,0],[1029,21,1029,130,0],[1031,17,1031,86,0],[1032,13,1032,14,0],[1034,13,1034,36,0],[1035,9,1035,10,0],[1042,9,1042,10,0],[1044,13,1044,14,0],[1045,17,1045,71,0],[1046,17,1046,18,0],[1047,21,1047,96,0],[1048,21,1048,60,0],[1049,21,1049,40,0],[1050,21,1050,22,0],[1051,25,1051,134,0],[1054,21,1054,45,0],[1055,21,1055,94,0],[1056,21,1056,22,0],[1057,25,1057,61,0],[1058,25,1058,34,0],[1060,17,1060,18,0],[1061,13,1061,14,0],[1062,13,1062,33,0],[1063,13,1063,14,0],[1064,17,1064,86,0],[1065,13,1065,14,0],[1066,13,1066,25,0],[1067,9,1067,10,0],[1113,9,1113,10,0],[1114,13,1114,36,0],[1115,13,1115,14,0],[1116,17,1116,37,0],[1117,13,1117,14,0],[1118,9,1118,10,0],[1123,9,1123,10,0],[1124,13,1124,35,0],[1125,13,1125,14,0],[1126,17,1126,36,0],[1127,13,1127,14,0],[1128,9,1128,10,0],[1133,9,1133,10,0],[1134,13,1134,29,0],[1135,13,1135,14,0],[1136,17,1136,30,0],[1137,13,1137,14,0],[1138,9,1138,10,0],[1143,9,1143,10,0],[1144,13,1144,40,0],[1145,13,1145,14,0],[1146,17,1146,41,0],[1147,13,1147,14,0],[1148,9,1148,10,0],[1151,9,1151,10,0],[1152,13,1152,39,0],[1153,13,1153,14,0],[1154,17,1154,40,0],[1155,13,1155,14,0],[1156,9,1156,10,0],[1161,9,1161,10,0],[1162,13,1162,43,0],[1163,13,1163,14,0],[1164,17,1164,44,0],[1165,13,1165,14,0],[1166,9,1166,10,0],[1170,9,1170,10,0],[1171,13,1171,42,0],[1172,13,1172,14,0],[1173,17,1173,43,0],[1174,13,1174,14,0],[1175,9,1175,10,0],[1180,9,1180,10,0],[1181,13,1181,42,0],[1182,13,1182,14,0],[1183,17,1183,43,0],[1184,13,1184,14,0],[1185,9,1185,10,0],[1190,9,1190,10,0],[1191,13,1191,41,0],[1192,13,1192,14,0],[1193,17,1193,42,0],[1194,13,1194,14,0],[1195,9,1195,10,0],[1199,9,1199,10,0],[1200,13,1200,38,0],[1201,13,1201,14,0],[1202,17,1202,39,0],[1203,13,1203,14,0],[1204,9,1204,10,0],[1208,9,1208,10,0],[1209,13,1209,37,0],[1210,13,1210,14,0],[1211,17,1211,38,0],[1212,13,1212,14,0],[1213,9,1213,10,0],[1232,17,1232,18,0],[1233,21,1233,57,0],[1236,17,1236,18,0],[1237,21,1237,57,0],[1242,13,1242,14,0],[1243,17,1243,53,0],[1247,13,1247,14,0],[1248,17,1248,53,0],[1252,13,1252,14,0],[1253,17,1253,53,0],[1257,13,1257,14,0],[1258,17,1258,53,0],[1262,13,1262,14,0],[1263,17,1263,51,0],[1264,17,1264,34,0],[1267,25,1267,31,0],[1269,25,1270,104,0],[1271,25,1271,31,0],[1273,25,1273,56,0],[1274,25,1274,72,0],[1275,25,1276,105,0],[1277,25,1277,31,0],[1279,17,1279,40,0],[1280,13,1280,14,0],[1284,21,1284,22,0],[1284,23,1284,59,0],[1289,21,1289,22,0],[1289,23,1289,59,0],[1293,13,1293,14,0],[1294,17,1294,53,0],[1298,13,1298,14,0],[1299,17,1299,53,0],[1303,13,1303,14,0],[1304,17,1304,53,0],[1308,13,1308,14,0],[1309,17,1309,53,0],[1313,13,1313,14,0],[1314,17,1314,53,0],[1318,13,1318,14,0],[1319,17,1319,53,0],[1323,13,1323,14,0],[1324,17,1324,53,0],[1328,13,1328,14,0],[1329,17,1329,53,0],[1334,21,1334,22,0],[1334,23,1334,59,0],[1339,21,1339,22,0],[1339,23,1339,59,0],[1344,21,1344,22,0],[1344,23,1344,59,0],[1349,21,1349,22,0],[1349,23,1349,59,0],[1354,21,1354,22,0],[1354,23,1354,59,0],[1359,21,1359,22,0],[1359,23,1359,59,0],[1364,21,1364,22,0],[1364,23,1364,59,0],[1369,21,1369,22,0],[1369,23,1369,59,0],[1373,13,1373,14,0],[1374,17,1374,53,0],[1378,13,1378,14,0],[1379,17,1379,53,0],[1383,13,1383,14,0],[1384,17,1384,53,0],[1388,13,1388,14,0],[1389,17,1389,53,0]]);
+    </script>
+  </body>
+</html>

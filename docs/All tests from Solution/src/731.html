@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\UmbracoContext.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Web;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Configuration.UmbracoSettings;
+using Umbraco.Web.PublishedCache;
+using Umbraco.Web.Routing;
+using Umbraco.Web.Security;
+using umbraco.BusinessLogic;
+using umbraco.presentation.preview;
+using GlobalSettings = umbraco.GlobalSettings;
+using IOHelper = Umbraco.Core.IO.IOHelper;
+using SystemDirectories = Umbraco.Core.IO.SystemDirectories;
+
+namespace Umbraco.Web
+{
+    /// &lt;summary&gt;
+    /// Class that encapsulates Umbraco information of a specific HTTP request
+    /// &lt;/summary&gt;
+    public class UmbracoContext : DisposableObject, IDisposeOnRequestEnd
+    {
+        internal const string HttpContextItemName = &quot;Umbraco.Web.UmbracoContext&quot;;
+        private static readonly object Locker = new object();
+
+        private bool _replacing;
+        private bool? _previewing;
+        private readonly Lazy&lt;ContextualPublishedContentCache&gt; _contentCache;
+        private readonly Lazy&lt;ContextualPublishedMediaCache&gt; _mediaCache;
+
+        /// &lt;summary&gt;
+        /// Used if not running in a web application (no real HttpContext)
+        /// &lt;/summary&gt;
+        [ThreadStatic]
+        private static UmbracoContext _umbracoContext;
+
+        #region EnsureContext methods
+
+        #region Obsolete
+        [Obsolete(&quot;Use the method that specifies IUmbracoSettings instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public static UmbracoContext EnsureContext(
+            HttpContextBase httpContext,
+            ApplicationContext applicationContext,
+            WebSecurity webSecurity)
+        {
+            return EnsureContext(httpContext, applicationContext, webSecurity, false);
+        }
+        [Obsolete(&quot;Use the method that specifies IUmbracoSettings instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public static UmbracoContext EnsureContext(
+            HttpContextBase httpContext,
+            ApplicationContext applicationContext)
+        {
+            return EnsureContext(httpContext, applicationContext, new WebSecurity(httpContext, applicationContext), false);
+        }
+        [Obsolete(&quot;Use the method that specifies IUmbracoSettings instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public static UmbracoContext EnsureContext(
+            HttpContextBase httpContext,
+            ApplicationContext applicationContext,
+            bool replaceContext)
+        {
+            return EnsureContext(httpContext, applicationContext, new WebSecurity(httpContext, applicationContext), replaceContext);
+        }
+        [Obsolete(&quot;Use the method that specifies IUmbracoSettings instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public static UmbracoContext EnsureContext(
+            HttpContextBase httpContext,
+            ApplicationContext applicationContext,
+            WebSecurity webSecurity,
+            bool replaceContext)
+        {
+            return EnsureContext(httpContext, applicationContext, new WebSecurity(httpContext, applicationContext), replaceContext, null);
+        }
+        [Obsolete(&quot;Use the method that specifies IUmbracoSettings instead&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public static UmbracoContext EnsureContext(
+            HttpContextBase httpContext,
+            ApplicationContext applicationContext,
+            WebSecurity webSecurity,
+            bool replaceContext,
+            bool? preview)
+        {
+            return EnsureContext(httpContext, applicationContext, webSecurity, UmbracoConfig.For.UmbracoSettings(), UrlProviderResolver.Current.Providers, replaceContext, preview);
+        } 
+        #endregion
+
+        /// &lt;summary&gt;
+        /// This is a helper method which is called to ensure that the singleton context is created
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;applicationContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;webSecurity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;umbracoSettings&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;urlProviders&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;replaceContext&quot;&gt;
+        /// if set to true will replace the current singleton with a new one, this is generally only ever used because
+        /// during application startup the base url domain will not be available so after app startup we&#39;ll replace the current
+        /// context with a new one in which we can access the httpcontext.Request object.
+        /// &lt;/param&gt;
+        /// &lt;param name=&quot;preview&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The Singleton context object
+        /// &lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// This is created in order to standardize the creation of the singleton. Normally it is created during a request
+        /// in the UmbracoModule, however this module does not execute during application startup so we need to ensure it
+        /// during the startup process as well.
+        /// See: http://issues.umbraco.org/issue/U4-1890, http://issues.umbraco.org/issue/U4-1717
+        /// &lt;/remarks&gt;
+        public static UmbracoContext EnsureContext(
+            HttpContextBase httpContext,
+            ApplicationContext applicationContext,
+            WebSecurity webSecurity,
+            IUmbracoSettingsSection umbracoSettings,
+            IEnumerable&lt;IUrlProvider&gt; urlProviders,
+            bool replaceContext,
+            bool? preview = null)
+        {
+            if (httpContext == null) throw new ArgumentNullException(&quot;httpContext&quot;);
+            if (applicationContext == null) throw new ArgumentNullException(&quot;applicationContext&quot;);
+            if (webSecurity == null) throw new ArgumentNullException(&quot;webSecurity&quot;);
+            if (umbracoSettings == null) throw new ArgumentNullException(&quot;umbracoSettings&quot;);
+            if (urlProviders == null) throw new ArgumentNullException(&quot;urlProviders&quot;);
+
+            //if there&#39;s already a singleton, and we&#39;re not replacing then there&#39;s no need to ensure anything
+            if (UmbracoContext.Current != null)
+            {
+                if (replaceContext == false)
+                    return UmbracoContext.Current;
+                UmbracoContext.Current._replacing = true;
+            }
+
+            var umbracoContext = CreateContext(httpContext, applicationContext, webSecurity, umbracoSettings, urlProviders, preview);
+
+            //assign the singleton
+            UmbracoContext.Current = umbracoContext;
+            return UmbracoContext.Current;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a standalone UmbracoContext instance
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;applicationContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;webSecurity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;umbracoSettings&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;urlProviders&quot;&gt;&lt;/param&gt;        
+        /// &lt;param name=&quot;preview&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// A new instance of UmbracoContext
+        /// &lt;/returns&gt;        
+        public static UmbracoContext CreateContext(
+            HttpContextBase httpContext,
+            ApplicationContext applicationContext,
+            WebSecurity webSecurity,
+            IUmbracoSettingsSection umbracoSettings,
+            IEnumerable&lt;IUrlProvider&gt; urlProviders,        
+            bool? preview)
+        {
+            if (httpContext == null) throw new ArgumentNullException(&quot;httpContext&quot;);
+            if (applicationContext == null) throw new ArgumentNullException(&quot;applicationContext&quot;);
+            if (webSecurity == null) throw new ArgumentNullException(&quot;webSecurity&quot;);
+            if (umbracoSettings == null) throw new ArgumentNullException(&quot;umbracoSettings&quot;);
+            if (urlProviders == null) throw new ArgumentNullException(&quot;urlProviders&quot;);          
+
+            var umbracoContext = new UmbracoContext(
+                httpContext,
+                applicationContext,
+                new Lazy&lt;IPublishedCaches&gt;(() =&gt; PublishedCachesResolver.Current.Caches, false),
+                webSecurity,
+                preview);
+
+            // create the RoutingContext, and assign
+            var routingContext = new RoutingContext(
+                umbracoContext,
+
+                //TODO: Until the new cache is done we can&#39;t really expose these to override/mock
+                new Lazy&lt;IEnumerable&lt;IContentFinder&gt;&gt;(() =&gt; ContentFinderResolver.Current.Finders),
+                new Lazy&lt;IContentFinder&gt;(() =&gt; ContentLastChanceFinderResolver.Current.Finder),
+
+                // create the nice urls provider
+                // there&#39;s one per request because there are some behavior parameters that can be changed
+                new Lazy&lt;UrlProvider&gt;(
+                    () =&gt; new UrlProvider(
+                        umbracoContext,
+                        umbracoSettings.WebRouting,
+                        urlProviders),
+                    false));
+
+            //assign the routing context back
+            umbracoContext.RoutingContext = routingContext;
+
+            return umbracoContext;
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new Umbraco context.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;applicationContext&quot;&gt; &lt;/param&gt;
+        /// &lt;param name=&quot;publishedCaches&quot;&gt;The published caches.&lt;/param&gt;
+        /// &lt;param name=&quot;webSecurity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;preview&quot;&gt;An optional value overriding detection of preview mode.&lt;/param&gt;
+        internal UmbracoContext(
+            HttpContextBase httpContext,
+            ApplicationContext applicationContext,
+            IPublishedCaches publishedCaches,
+            WebSecurity webSecurity,
+            bool? preview = null)
+            : this(httpContext, applicationContext, new Lazy&lt;IPublishedCaches&gt;(() =&gt; publishedCaches), webSecurity, preview)
+        {
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a new Umbraco context.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;httpContext&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;applicationContext&quot;&gt; &lt;/param&gt;
+        /// &lt;param name=&quot;publishedCaches&quot;&gt;The published caches.&lt;/param&gt;
+        /// &lt;param name=&quot;webSecurity&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;preview&quot;&gt;An optional value overriding detection of preview mode.&lt;/param&gt;
+        internal UmbracoContext(
+			HttpContextBase httpContext, 
+			ApplicationContext applicationContext,
+            Lazy&lt;IPublishedCaches&gt; publishedCaches,
+            WebSecurity webSecurity,
+            bool? preview = null)
+        {
+            //This ensures the dispose method is called when the request terminates, though
+            // we also ensure this happens in the Umbraco module because the UmbracoContext is added to the
+            // http context items.
+            httpContext.DisposeOnPipelineCompleted(this);
+
+            if (httpContext == null) throw new ArgumentNullException(&quot;httpContext&quot;);
+            if (applicationContext == null) throw new ArgumentNullException(&quot;applicationContext&quot;);
+
+            ObjectCreated = DateTime.Now;
+            UmbracoRequestId = Guid.NewGuid();
+
+            HttpContext = httpContext;
+            Application = applicationContext;
+            Security = webSecurity;
+
+            _contentCache = new Lazy&lt;ContextualPublishedContentCache&gt;(() =&gt; publishedCaches.Value.CreateContextualContentCache(this));
+            _mediaCache = new Lazy&lt;ContextualPublishedMediaCache&gt;(() =&gt; publishedCaches.Value.CreateContextualMediaCache(this));
+            _previewing = preview;
+            
+            // set the urls...
+            //original request url
+            //NOTE: The request will not be available during app startup so we can only set this to an absolute URL of localhost, this
+            // is a work around to being able to access the UmbracoContext during application startup and this will also ensure that people
+            // &#39;could&#39; still generate URLs during startup BUT any domain driven URL generation will not work because it is NOT possible to get
+            // the current domain during application startup.
+            // see: http://issues.umbraco.org/issue/U4-1890
+
+            var requestUrl = new Uri(&quot;http://localhost&quot;);
+            var request = GetRequestFromContext();
+            if (request != null)
+            {
+                requestUrl = request.Url;
+            }
+            this.OriginalRequestUrl = requestUrl;
+            //cleaned request url
+            this.CleanedUmbracoUrl = UriUtility.UriToUmbraco(this.OriginalRequestUrl);
+
+        } 
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Gets the current Umbraco Context.
+        /// &lt;/summary&gt;
+		public static UmbracoContext Current
+        {
+            get
+            {
+                //if we have a real context then return the request based object
+                if (System.Web.HttpContext.Current != null)
+                {
+                    return (UmbracoContext)System.Web.HttpContext.Current.Items[HttpContextItemName];
+                }
+
+                //return the object if not running in a real HttpContext
+                return _umbracoContext;
+            }
+
+            internal set
+            {
+                lock (Locker)
+                {
+                    //if running in a real HttpContext, this can only be set once
+                    if (System.Web.HttpContext.Current != null &amp;&amp; Current != null &amp;&amp; !Current._replacing)
+                    {
+                        throw new ApplicationException(&quot;The current UmbracoContext can only be set once during a request.&quot;);
+                    }
+
+                    //if there is an HttpContext, return the item
+                    if (System.Web.HttpContext.Current != null)
+                    {
+                        System.Web.HttpContext.Current.Items[HttpContextItemName] = value;
+                    }
+                    else
+                    {
+                        _umbracoContext = value;
+                    }
+                }
+            }
+        }
+
+		/// &lt;summary&gt;
+		/// This is used internally for performance calculations, the ObjectCreated DateTime is set as soon as this
+		/// object is instantiated which in the web site is created during the BeginRequest phase.
+		/// We can then determine complete rendering time from that.
+		/// &lt;/summary&gt;
+		internal DateTime ObjectCreated { get; private set; }
+
+		/// &lt;summary&gt;
+		/// This is used internally for debugging and also used to define anything required to distinguish this request from another.
+		/// &lt;/summary&gt;
+		internal Guid UmbracoRequestId { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Gets the current ApplicationContext
+        /// &lt;/summary&gt;
+        [Obsolete(&quot;Do not access the ApplicationContext via the UmbracoContext, either inject the ApplicationContext into the services you need or access it via it&#39;s own Singleton accessor ApplicationContext.Current&quot;)]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public ApplicationContext Application { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Gets the WebSecurity class
+        /// &lt;/summary&gt;
+        public WebSecurity Security { get; private set; }
+
+	    /// &lt;summary&gt;
+	    /// Gets the uri that is handled by ASP.NET after server-side rewriting took place.
+	    /// &lt;/summary&gt;
+		internal Uri OriginalRequestUrl { get; private set; }
+
+		/// &lt;summary&gt;
+		/// Gets the cleaned up url that is handled by Umbraco.
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;That is, lowercase, no trailing slash after path, no .aspx...&lt;/remarks&gt;
+		internal Uri CleanedUmbracoUrl { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the published content cache.
+        /// &lt;/summary&gt;
+        public ContextualPublishedContentCache ContentCache
+        {
+            get { return _contentCache.Value; }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets or sets the published media cache.
+        /// &lt;/summary&gt;
+        public ContextualPublishedMediaCache MediaCache
+        {
+            get { return _mediaCache.Value; }
+        }
+
+        /// &lt;summary&gt;
+        /// Boolean value indicating whether the current request is a front-end umbraco request
+        /// &lt;/summary&gt;
+        public bool IsFrontEndUmbracoRequest
+		{
+			get { return PublishedContentRequest != null; }
+		}
+
+		/// &lt;summary&gt;
+		/// A shortcut to the UmbracoContext&#39;s RoutingContext&#39;s NiceUrlProvider
+		/// &lt;/summary&gt;
+		/// &lt;remarks&gt;
+		/// If the RoutingContext is null, this will throw an exception.
+		/// &lt;/remarks&gt;
+    	public UrlProvider UrlProvider
+    	{
+    		get
+    		{
+    			if (RoutingContext == null)
+					throw new InvalidOperationException(&quot;Cannot access the UrlProvider when the UmbracoContext&#39;s RoutingContext is null&quot;);
+    			return RoutingContext.UrlProvider;
+    		}
+    	}
+
+		/// &lt;summary&gt;
+		/// Gets/sets the RoutingContext object
+		/// &lt;/summary&gt;
+		public RoutingContext RoutingContext { get; internal set; }	
+
+		/// &lt;summary&gt;
+		/// Gets/sets the PublishedContentRequest object
+		/// &lt;/summary&gt;
+		public PublishedContentRequest PublishedContentRequest { get; set; }	
+
+        /// &lt;summary&gt;
+        /// Exposes the HttpContext for the current request
+        /// &lt;/summary&gt;
+        public HttpContextBase HttpContext { get; private set; }
+
+        /// &lt;summary&gt;
+        /// Gets a value indicating whether the request has debugging enabled
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;&lt;c&gt;true&lt;/c&gt; if this instance is debug; otherwise, &lt;c&gt;false&lt;/c&gt;.&lt;/value&gt;
+        public bool IsDebug
+        {
+            get
+            {
+                var request = GetRequestFromContext();
+                //NOTE: the request can be null during app startup!
+                return GlobalSettings.DebugMode &amp;&amp; request != null
+                    &amp;&amp; (!string.IsNullOrEmpty(request[&quot;umbdebugshowtrace&quot;]) || !string.IsNullOrEmpty(request[&quot;umbdebug&quot;]));
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the current page ID, or &lt;c&gt;null&lt;/c&gt; if no page ID is available (e.g. a custom page).
+        /// &lt;/summary&gt;
+        public int? PageId
+        {
+            // TODO - this is dirty old legacy tricks, we should clean it up at some point
+            // also, what is a &quot;custom page&quot; and when should this be either null, or different
+            // from PublishedContentRequest.PublishedContent.Id ??
+            // SD: Have found out it can be different when rendering macro contents in the back office, but really youshould just be able
+            // to pass a page id to the macro renderer instead but due to all the legacy bits that&#39;s real difficult.
+            get
+            {
+                try
+                {
+                    //TODO: this should be done with a wrapper: http://issues.umbraco.org/issue/U4-61
+                    return int.Parse(HttpContext.Items[&quot;pageID&quot;].ToString());
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Gets the current logged in Umbraco user (editor).
+        /// &lt;/summary&gt;
+        /// &lt;value&gt;The Umbraco user object or null&lt;/value&gt;
+        [Obsolete(&quot;This should no longer be used since it returns the legacy user object, use The Security.CurrentUser instead to return the proper user object&quot;)]
+        public User UmbracoUser
+        {
+            get
+            {
+                var user = Security.CurrentUser;
+                return user == null ? null : new User(user);
+            }
+
+        }
+
+        /// &lt;summary&gt;
+        /// Determines whether the current user is in a preview mode and browsing the site (ie. not in the admin UI)
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;Can be internally set by the RTE macro rendering to render macros in the appropriate mode.&lt;/remarks&gt;
+        public bool InPreviewMode
+        {
+            get { return _previewing ?? (_previewing = DetectInPreviewModeFromRequest()).Value; }
+			set { _previewing = value; }
+        }
+
+        private bool DetectInPreviewModeFromRequest()
+        {
+            var request = GetRequestFromContext();
+            if (request == null || request.Url == null)
+                return false;
+            
+            return
+                HttpContext.Request.HasPreviewCookie()
+                &amp;&amp; request.Url.IsBackOfficeRequest(HttpRuntime.AppDomainAppVirtualPath) == false
+                &amp;&amp; Security.CurrentUser != null; // has user
+        }
+        
+        private HttpRequestBase GetRequestFromContext()
+        {
+            try
+            {
+                return HttpContext.Request;
+            }
+            catch (System.Web.HttpException)
+            {
+                return null;
+            }
+        }
+
+
+        protected override void DisposeResources()
+        {
+            Security.DisposeIfDisposable();
+
+            //If not running in a web ctx, ensure the thread based instance is nulled
+            _umbracoContext = null;
+        }
+    }
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[25,9,25,62,1],[47,9,47,10,0],[48,13,48,87,0],[49,9,49,10,0],[55,9,55,10,0],[56,13,56,124,0],[57,9,57,10,0],[64,9,64,10,0],[65,13,65,133,0],[66,9,66,10,0],[74,9,74,10,0],[75,13,75,139,0],[76,9,76,10,0],[85,9,85,10,0],[86,13,86,181,0],[87,9,87,10,0],[121,9,121,10,1],[122,13,122,37,1],[122,38,122,85,0],[123,13,123,44,1],[123,45,123,99,0],[124,13,124,37,1],[124,38,124,85,0],[125,13,125,41,1],[125,42,125,93,0],[126,13,126,38,1],[126,39,126,87,0],[129,13,129,48,1],[130,13,130,14,1],[131,17,131,45,1],[132,21,132,51,0],[133,17,133,58,1],[134,13,134,14,1],[136,13,136,134,1],[139,13,139,53,1],[140,13,140,43,1],[141,9,141,10,1],[162,9,162,10,1],[163,13,163,37,1],[163,38,163,85,0],[164,13,164,44,1],[164,45,164,99,0],[165,13,165,37,1],[165,38,165,85,0],[166,13,166,41,1],[166,42,166,93,0],[167,13,167,38,1],[167,39,167,87,0],[169,13,172,50,1],[172,50,172,88,0],[172,88,174,26,1],[169,13,174,26,1],[177,13,181,61,1],[181,61,181,98,0],[181,98,182,48,1],[182,48,182,94,0],[182,94,187,27,1],[187,27,190,38,0],[190,38,191,29,1],[177,13,191,29,1],[194,13,194,60,1],[196,13,196,35,1],[197,9,197,10,1],[213,15,213,86,1],[213,86,213,101,1],[213,101,213,125,1],[213,15,213,125,1],[214,9,214,10,1],[215,9,215,10,1],[225,9,230,34,1],[231,9,231,10,1],[235,13,235,58,1],[237,13,237,37,1],[237,38,237,85,0],[238,13,238,44,1],[238,45,238,99,0],[240,13,240,42,1],[241,13,241,47,1],[243,13,243,39,1],[244,13,244,46,1],[245,13,245,36,1],[247,13,247,77,1],[247,77,247,133,1],[247,133,247,135,1],[247,13,247,135,1],[248,13,248,73,1],[248,73,248,127,1],[248,127,248,129,1],[248,13,248,129,1],[249,13,249,35,1],[259,13,259,58,1],[260,13,260,51,1],[261,13,261,33,1],[262,13,262,14,1],[263,17,263,42,1],[264,13,264,14,1],[265,13,265,50,1],[267,13,267,87,1],[269,9,269,10,1],[278,13,278,14,1],[280,17,280,60,1],[281,17,281,18,0],[282,21,282,102,0],[286,17,286,40,1],[287,13,287,14,1],[290,13,290,14,1],[291,17,291,30,1],[292,17,292,18,1],[294,21,294,106,1],[295,21,295,22,0],[296,25,296,125,0],[300,21,300,64,1],[301,21,301,22,0],[302,25,302,91,0],[303,21,303,22,0],[305,21,305,22,1],[306,25,306,49,1],[307,21,307,22,1],[308,17,308,18,1],[309,13,309,14,1],[317,37,317,41,0],[317,42,317,54,1],[322,36,322,40,0],[322,41,322,53,1],[329,49,329,53,1],[329,54,329,66,1],[334,39,334,43,0],[334,44,334,56,1],[339,37,339,41,1],[339,42,339,54,1],[345,36,345,40,1],[345,41,345,53,1],[352,17,352,18,1],[352,19,352,46,1],[352,47,352,48,1],[360,17,360,18,1],[360,19,360,44,1],[360,45,360,46,1],[368,8,368,9,1],[368,10,368,49,1],[368,50,368,51,1],[380,7,380,8,1],[381,8,381,35,1],[382,6,382,124,0],[383,8,383,42,1],[384,7,384,8,1],[390,42,390,46,1],[390,47,390,60,1],[395,60,395,64,1],[395,65,395,69,1],[400,46,400,50,1],[400,51,400,63,1],[409,13,409,14,0],[410,17,410,55,0],[412,17,413,124,0],[414,13,414,14,0],[428,13,428,14,0],[430,17,430,18,0],[432,21,432,78,0],[434,17,434,22,0],[435,17,435,18,0],[436,21,436,33,0],[438,13,438,14,0],[449,13,449,14,0],[450,17,450,49,0],[451,17,451,61,0],[452,13,452,14,0],[462,17,462,18,1],[462,19,462,96,1],[462,97,462,98,1],[463,8,463,9,0],[463,10,463,30,0],[463,31,463,32,0],[467,9,467,10,1],[468,13,468,51,1],[469,13,469,56,1],[470,17,470,30,0],[472,13,475,49,1],[476,9,476,10,1],[479,9,479,10,1],[481,13,481,14,1],[482,17,482,44,1],[484,13,484,45,0],[485,13,485,14,0],[486,17,486,29,0],[488,9,488,10,1],[492,9,492,10,0],[493,13,493,44,0],[496,13,496,36,0],[497,9,497,10,0]]);
+    </script>
+  </body>
+</html>

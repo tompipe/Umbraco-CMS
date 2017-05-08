@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Tests\PublishedContent\PublishedMediaTests.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text.RegularExpressions;
+using System.Web;
+using System.Xml.Linq;
+using System.Xml.XPath;
+using Examine;
+using Examine.LuceneEngine;
+using Examine.LuceneEngine.Providers;
+using Lucene.Net.Analysis.Standard;
+using Lucene.Net.Store;
+using Moq;
+using NUnit.Framework;
+using Umbraco.Core;
+using Umbraco.Core.Configuration;
+using Umbraco.Core.Models;
+using Umbraco.Core.PropertyEditors;
+using Umbraco.Tests.TestHelpers;
+using Umbraco.Tests.TestHelpers.Entities;
+using Umbraco.Tests.UmbracoExamine;
+using Umbraco.Web;
+using Umbraco.Web.PublishedCache;
+using Umbraco.Web.PublishedCache.XmlPublishedCache;
+using UmbracoExamine;
+using UmbracoExamine.DataServices;
+using umbraco.BusinessLogic;
+using System.Linq;
+using Lucene.Net.Index;
+
+namespace Umbraco.Tests.PublishedContent
+{
+    /// &lt;summary&gt;
+    /// Tests the typed extension methods on IPublishedContent using the DefaultPublishedMediaStore
+    /// &lt;/summary&gt;
+    [DatabaseTestBehavior(DatabaseBehavior.NewDbFileAndSchemaPerTest)]
+    [TestFixture, RequiresSTA]
+    public class PublishedMediaTests : PublishedContentTestBase
+    {
+
+        public override void Initialize()
+        {
+            base.Initialize();
+            UmbracoExamineSearcher.DisableInitializationCheck = true;
+            BaseUmbracoIndexer.DisableInitializationCheck = true;            
+        }
+
+        public override void TearDown()
+        {
+            base.TearDown();
+            UmbracoExamineSearcher.DisableInitializationCheck = null;
+            BaseUmbracoIndexer.DisableInitializationCheck = null;
+        }
+
+        /// &lt;summary&gt;
+        /// Shared with PublishMediaStoreTests
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;umbracoContext&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        internal static IPublishedContent GetNode(int id, UmbracoContext umbracoContext)
+        {
+            var ctx = umbracoContext;
+            var cache = new ContextualPublishedMediaCache(new PublishedMediaCache(ctx.Application), ctx);
+            var doc = cache.GetById(id);
+            Assert.IsNotNull(doc);
+            return doc;
+        }
+
+        private IPublishedContent GetNode(int id)
+        {
+            return GetNode(id, GetUmbracoContext(&quot;/test&quot;, 1234));
+        }
+
+        [Test]
+        public void Get_Property_Value_Uses_Converter()
+        {            
+            var mType = MockedContentTypes.CreateImageMediaType(&quot;image2&quot;);
+            //lets add an RTE to this
+            mType.PropertyGroups.First().PropertyTypes.Add(
+                new PropertyType(&quot;test&quot;, DataTypeDatabaseType.Nvarchar, &quot;content&quot;)
+                    {
+                        Name = &quot;Rich Text&quot;,
+                        DataTypeDefinitionId = -87 //tiny mce
+                    });
+            ServiceContext.ContentTypeService.Save(mType);
+            var media = MockedMedia.CreateMediaImage(mType, -1);
+            media.Properties[&quot;content&quot;].Value = &quot;&lt;div&gt;This is some content&lt;/div&gt;&quot;;
+            ServiceContext.MediaService.Save(media);
+
+            var publishedMedia = GetNode(media.Id);
+
+            var propVal = publishedMedia.GetPropertyValue(&quot;content&quot;);
+            Assert.IsInstanceOf&lt;IHtmlString&gt;(propVal);
+            Assert.AreEqual(&quot;&lt;div&gt;This is some content&lt;/div&gt;&quot;, propVal.ToString());
+
+            var propVal2 = publishedMedia.GetPropertyValue&lt;IHtmlString&gt;(&quot;content&quot;);
+            Assert.IsInstanceOf&lt;IHtmlString&gt;(propVal2);
+            Assert.AreEqual(&quot;&lt;div&gt;This is some content&lt;/div&gt;&quot;, propVal2.ToString());
+
+            var propVal3 = publishedMedia.GetPropertyValue(&quot;Content&quot;);
+            Assert.IsInstanceOf&lt;IHtmlString&gt;(propVal3);
+            Assert.AreEqual(&quot;&lt;div&gt;This is some content&lt;/div&gt;&quot;, propVal3.ToString());
+        }
+
+        [Test]
+        public void Ensure_Children_Sorted_With_Examine()
+        {
+            using (var luceneDir = new RandomIdRAMDirectory())
+            using (var writer = new IndexWriter(luceneDir, new StandardAnalyzer(Lucene.Net.Util.Version.LUCENE_29), IndexWriter.MaxFieldLength.LIMITED))
+            using (var indexer = IndexInitializer.GetUmbracoIndexer(writer))
+            using (var searcher = IndexInitializer.GetUmbracoSearcher(writer))
+            {
+                //var indexer = IndexInitializer.GetUmbracoIndexer(luceneDir);
+                indexer.RebuildIndex();
+                //var searcher = IndexInitializer.GetUmbracoSearcher(luceneDir);
+                var ctx = GetUmbracoContext(&quot;/test&quot;, 1234);
+                var cache = new ContextualPublishedMediaCache(new PublishedMediaCache(ctx.Application, searcher, indexer), ctx);
+
+                //we are using the media.xml media to test the examine results implementation, see the media.xml file in the ExamineHelpers namespace
+                var publishedMedia = cache.GetById(1111);
+                var rootChildren = publishedMedia.Children().ToArray();
+                var currSort = 0;
+                for (var i = 0; i &lt; rootChildren.Count(); i++)
+                {
+                    Assert.GreaterOrEqual(rootChildren[i].SortOrder, currSort);
+                    currSort = rootChildren[i].SortOrder;
+                }
+            }
+
+            
+
+
+
+        }
+
+
+        [Test]
+        public void Do_Not_Find_In_Recycle_Bin()
+        {
+            using (var luceneDir = new RandomIdRAMDirectory())
+            using (var writer = new IndexWriter(luceneDir, new StandardAnalyzer(Lucene.Net.Util.Version.LUCENE_29), IndexWriter.MaxFieldLength.LIMITED))
+            using (var indexer = IndexInitializer.GetUmbracoIndexer(writer))
+            using (var searcher = IndexInitializer.GetUmbracoSearcher(writer))
+            {
+                //var indexer = IndexInitializer.GetUmbracoIndexer(luceneDir);
+                indexer.RebuildIndex();
+                //var searcher = IndexInitializer.GetUmbracoSearcher(luceneDir);
+                var ctx = GetUmbracoContext(&quot;/test&quot;, 1234);
+                var cache = new ContextualPublishedMediaCache(new PublishedMediaCache(ctx.Application, searcher, indexer), ctx);
+
+                //ensure it is found
+                var publishedMedia = cache.GetById(3113);
+                Assert.IsNotNull(publishedMedia);
+
+                //move item to recycle bin
+                var newXml = XElement.Parse(@&quot;&lt;node id=&#39;3113&#39; version=&#39;5b3e46ab-3e37-4cfa-ab70-014234b5bd33&#39; parentID=&#39;-21&#39; level=&#39;1&#39; writerID=&#39;0&#39; nodeType=&#39;1032&#39; template=&#39;0&#39; sortOrder=&#39;2&#39; createDate=&#39;2010-05-19T17:32:46&#39; updateDate=&#39;2010-05-19T17:32:46&#39; nodeName=&#39;Another Umbraco Image&#39; urlName=&#39;acnestressscrub&#39; writerName=&#39;Administrator&#39; nodeTypeAlias=&#39;Image&#39; path=&#39;-1,-21,3113&#39;&gt;
+					&lt;data alias=&#39;umbracoFile&#39;&gt;&lt;![CDATA[/media/1234/blah.pdf]]&gt;&lt;/data&gt;
+					&lt;data alias=&#39;umbracoWidth&#39;&gt;115&lt;/data&gt;
+					&lt;data alias=&#39;umbracoHeight&#39;&gt;268&lt;/data&gt;
+					&lt;data alias=&#39;umbracoBytes&#39;&gt;10726&lt;/data&gt;
+					&lt;data alias=&#39;umbracoExtension&#39;&gt;jpg&lt;/data&gt;
+				&lt;/node&gt;&quot;);
+                indexer.ReIndexNode(newXml, &quot;media&quot;);
+
+                //ensure it still exists in the index (raw examine search)
+                var criteria = searcher.CreateSearchCriteria();
+                var filter = criteria.Id(3113);
+                var found = searcher.Search(filter.Compile());
+                Assert.IsNotNull(found);
+                Assert.AreEqual(1, found.TotalItemCount);
+
+                //ensure it does not show up in the published media store
+                var recycledMedia = cache.GetById(3113);
+                Assert.IsNull(recycledMedia);
+
+            }
+
+        }
+
+        [Test]
+        public void Children_With_Examine()
+        {
+            using (var luceneDir = new RandomIdRAMDirectory())
+            using (var writer = new IndexWriter(luceneDir, new StandardAnalyzer(Lucene.Net.Util.Version.LUCENE_29), IndexWriter.MaxFieldLength.LIMITED))
+            using (var indexer = IndexInitializer.GetUmbracoIndexer(writer))
+            using (var searcher = IndexInitializer.GetUmbracoSearcher(writer))
+            {
+                //var indexer = IndexInitializer.GetUmbracoIndexer(luceneDir);
+                indexer.RebuildIndex();
+                //var searcher = IndexInitializer.GetUmbracoSearcher(luceneDir);
+                var ctx = GetUmbracoContext(&quot;/test&quot;, 1234);
+                var cache = new ContextualPublishedMediaCache(new PublishedMediaCache(ctx.Application, searcher, indexer), ctx);
+
+                //we are using the media.xml media to test the examine results implementation, see the media.xml file in the ExamineHelpers namespace
+                var publishedMedia = cache.GetById(1111);
+                var rootChildren = publishedMedia.Children();
+                Assert.IsTrue(rootChildren.Select(x =&gt; x.Id).ContainsAll(new[] { 2222, 1113, 1114, 1115, 1116 }));
+
+                var publishedChild1 = cache.GetById(2222);
+                var subChildren = publishedChild1.Children();
+                Assert.IsTrue(subChildren.Select(x =&gt; x.Id).ContainsAll(new[] { 2112 }));
+            }
+        }
+
+        [Test]
+        public void Descendants_With_Examine()
+        {
+            using (var luceneDir = new RandomIdRAMDirectory())
+            using (var writer = new IndexWriter(luceneDir, new StandardAnalyzer(Lucene.Net.Util.Version.LUCENE_29), IndexWriter.MaxFieldLength.LIMITED))
+            using (var indexer = IndexInitializer.GetUmbracoIndexer(writer))
+            using (var searcher = IndexInitializer.GetUmbracoSearcher(writer))
+            {
+                //var indexer = IndexInitializer.GetUmbracoIndexer(luceneDir);
+                indexer.RebuildIndex();
+                //var searcher = IndexInitializer.GetUmbracoSearcher(luceneDir);
+                var ctx = GetUmbracoContext(&quot;/test&quot;, 1234);
+                var cache = new ContextualPublishedMediaCache(new PublishedMediaCache(ctx.Application, searcher, indexer), ctx);
+
+                //we are using the media.xml media to test the examine results implementation, see the media.xml file in the ExamineHelpers namespace
+                var publishedMedia = cache.GetById(1111);
+                var rootDescendants = publishedMedia.Descendants();
+                Assert.IsTrue(rootDescendants.Select(x =&gt; x.Id).ContainsAll(new[] { 2112, 2222, 1113, 1114, 1115, 1116 }));
+
+                var publishedChild1 = cache.GetById(2222);
+                var subDescendants = publishedChild1.Descendants();
+                Assert.IsTrue(subDescendants.Select(x =&gt; x.Id).ContainsAll(new[] { 2112, 3113 }));
+            }
+        }
+
+        [Test]
+        public void DescendantsOrSelf_With_Examine()
+        {
+            using (var luceneDir = new RandomIdRAMDirectory())
+            using (var writer = new IndexWriter(luceneDir, new StandardAnalyzer(Lucene.Net.Util.Version.LUCENE_29), IndexWriter.MaxFieldLength.LIMITED))
+            using (var indexer = IndexInitializer.GetUmbracoIndexer(writer))
+            using (var searcher = IndexInitializer.GetUmbracoSearcher(writer))
+            {
+                //var indexer = IndexInitializer.GetUmbracoIndexer(luceneDir);
+                indexer.RebuildIndex();
+                //var searcher = IndexInitializer.GetUmbracoSearcher(luceneDir);
+                var ctx = GetUmbracoContext(&quot;/test&quot;, 1234);
+                var cache = new ContextualPublishedMediaCache(new PublishedMediaCache(ctx.Application, searcher, indexer), ctx);
+
+                //we are using the media.xml media to test the examine results implementation, see the media.xml file in the ExamineHelpers namespace
+                var publishedMedia = cache.GetById(1111);
+                var rootDescendants = publishedMedia.DescendantsOrSelf();
+                Assert.IsTrue(rootDescendants.Select(x =&gt; x.Id).ContainsAll(new[] { 1111, 2112, 2222, 1113, 1114, 1115, 1116 }));
+
+                var publishedChild1 = cache.GetById(2222);
+                var subDescendants = publishedChild1.DescendantsOrSelf();
+                Assert.IsTrue(subDescendants.Select(x =&gt; x.Id).ContainsAll(new[] { 2222, 2112, 3113 }));
+            }
+        }
+
+        [Test]
+        public void Ancestors_With_Examine()
+        {
+            using (var luceneDir = new RandomIdRAMDirectory())
+            using (var writer = new IndexWriter(luceneDir, new StandardAnalyzer(Lucene.Net.Util.Version.LUCENE_29), IndexWriter.MaxFieldLength.LIMITED))
+            using (var indexer = IndexInitializer.GetUmbracoIndexer(writer))
+            using (var searcher = IndexInitializer.GetUmbracoSearcher(writer))
+            {
+                //var indexer = IndexInitializer.GetUmbracoIndexer(luceneDir);
+                indexer.RebuildIndex();
+                var ctx = GetUmbracoContext(&quot;/test&quot;, 1234);
+                //var searcher = IndexInitializer.GetUmbracoSearcher(luceneDir);
+                var cache = new ContextualPublishedMediaCache(new PublishedMediaCache(ctx.Application, searcher, indexer), ctx);
+
+                //we are using the media.xml media to test the examine results implementation, see the media.xml file in the ExamineHelpers namespace
+                var publishedMedia = cache.GetById(3113);
+                var ancestors = publishedMedia.Ancestors();
+                Assert.IsTrue(ancestors.Select(x =&gt; x.Id).ContainsAll(new[] { 2112, 2222, 1111 }));
+            }
+
+        }
+
+        [Test]
+        public void AncestorsOrSelf_With_Examine()
+        {
+            using (var luceneDir = new RandomIdRAMDirectory())
+            using (var writer = new IndexWriter(luceneDir, new StandardAnalyzer(Lucene.Net.Util.Version.LUCENE_29), IndexWriter.MaxFieldLength.LIMITED))
+            using (var indexer = IndexInitializer.GetUmbracoIndexer(writer))
+            using (var searcher = IndexInitializer.GetUmbracoSearcher(writer))
+            {
+                //var indexer = IndexInitializer.GetUmbracoIndexer(luceneDir);
+                indexer.RebuildIndex();
+                var ctx = GetUmbracoContext(&quot;/test&quot;, 1234);
+                //var searcher = IndexInitializer.GetUmbracoSearcher(luceneDir);
+                var cache = new ContextualPublishedMediaCache(new PublishedMediaCache(ctx.Application, searcher, indexer), ctx);
+
+                //we are using the media.xml media to test the examine results implementation, see the media.xml file in the ExamineHelpers namespace
+                var publishedMedia = cache.GetById(3113);
+                var ancestors = publishedMedia.AncestorsOrSelf();
+                Assert.IsTrue(ancestors.Select(x =&gt; x.Id).ContainsAll(new[] { 3113, 2112, 2222, 1111 }));
+            }
+        }
+
+        [Test]
+        public void Children_Without_Examine()
+        {
+            var user = new User(0);
+            var mType = global::umbraco.cms.businesslogic.media.MediaType.MakeNew(user, &quot;TestMediaType&quot;);
+            var mRoot = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;MediaRoot&quot;, mType, user, -1);
+
+            var mChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child1&quot;, mType, user, mRoot.Id);
+            var mChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child2&quot;, mType, user, mRoot.Id);
+            var mChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child3&quot;, mType, user, mRoot.Id);
+
+            var mSubChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild1&quot;, mType, user, mChild1.Id);
+            var mSubChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild2&quot;, mType, user, mChild1.Id);
+            var mSubChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild3&quot;, mType, user, mChild1.Id);
+
+            var publishedMedia = GetNode(mRoot.Id);
+            var rootChildren = publishedMedia.Children();
+            Assert.IsTrue(rootChildren.Select(x =&gt; x.Id).ContainsAll(new[] { mChild1.Id, mChild2.Id, mChild3.Id }));
+
+            var publishedChild1 = GetNode(mChild1.Id);
+            var subChildren = publishedChild1.Children();
+            Assert.IsTrue(subChildren.Select(x =&gt; x.Id).ContainsAll(new[] { mSubChild1.Id, mSubChild2.Id, mSubChild3.Id }));
+        }
+
+        [Test]
+        public void Descendants_Without_Examine()
+        {
+            var user = new User(0);
+            var mType = global::umbraco.cms.businesslogic.media.MediaType.MakeNew(user, &quot;TestMediaType&quot;);
+            var mRoot = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;MediaRoot&quot;, mType, user, -1);
+
+            var mChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child1&quot;, mType, user, mRoot.Id);
+            var mChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child2&quot;, mType, user, mRoot.Id);
+            var mChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child3&quot;, mType, user, mRoot.Id);
+
+            var mSubChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild1&quot;, mType, user, mChild1.Id);
+            var mSubChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild2&quot;, mType, user, mChild1.Id);
+            var mSubChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild3&quot;, mType, user, mChild1.Id);
+
+            var publishedMedia = GetNode(mRoot.Id);
+            var rootDescendants = publishedMedia.Descendants();
+            Assert.IsTrue(rootDescendants.Select(x =&gt; x.Id).ContainsAll(new[] { mChild1.Id, mChild2.Id, mChild3.Id, mSubChild1.Id, mSubChild2.Id, mSubChild3.Id }));
+
+            var publishedChild1 = GetNode(mChild1.Id);
+            var subDescendants = publishedChild1.Descendants();
+            Assert.IsTrue(subDescendants.Select(x =&gt; x.Id).ContainsAll(new[] { mSubChild1.Id, mSubChild2.Id, mSubChild3.Id }));
+        }
+
+        [Test]
+        public void DescendantsOrSelf_Without_Examine()
+        {
+            var user = new User(0);
+            var mType = global::umbraco.cms.businesslogic.media.MediaType.MakeNew(user, &quot;TestMediaType&quot;);
+            var mRoot = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;MediaRoot&quot;, mType, user, -1);
+
+            var mChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child1&quot;, mType, user, mRoot.Id);
+            var mChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child2&quot;, mType, user, mRoot.Id);
+            var mChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child3&quot;, mType, user, mRoot.Id);
+
+            var mSubChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild1&quot;, mType, user, mChild1.Id);
+            var mSubChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild2&quot;, mType, user, mChild1.Id);
+            var mSubChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild3&quot;, mType, user, mChild1.Id);
+
+            var publishedMedia = GetNode(mRoot.Id);
+            var rootDescendantsOrSelf = publishedMedia.DescendantsOrSelf();
+            Assert.IsTrue(rootDescendantsOrSelf.Select(x =&gt; x.Id).ContainsAll(
+                new[] { mRoot.Id, mChild1.Id, mChild2.Id, mChild3.Id, mSubChild1.Id, mSubChild2.Id, mSubChild3.Id }));
+
+            var publishedChild1 = GetNode(mChild1.Id);
+            var subDescendantsOrSelf = publishedChild1.DescendantsOrSelf();
+            Assert.IsTrue(subDescendantsOrSelf.Select(x =&gt; x.Id).ContainsAll(
+                new[] { mChild1.Id, mSubChild1.Id, mSubChild2.Id, mSubChild3.Id }));
+        }
+
+        [Test]
+        public void Parent_Without_Examine()
+        {
+            var user = new User(0);
+            var mType = global::umbraco.cms.businesslogic.media.MediaType.MakeNew(user, &quot;TestMediaType&quot;);
+            var mRoot = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;MediaRoot&quot;, mType, user, -1);
+
+            var mChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child1&quot;, mType, user, mRoot.Id);
+            var mChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child2&quot;, mType, user, mRoot.Id);
+            var mChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child3&quot;, mType, user, mRoot.Id);
+
+            var mSubChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild1&quot;, mType, user, mChild1.Id);
+            var mSubChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild2&quot;, mType, user, mChild1.Id);
+            var mSubChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild3&quot;, mType, user, mChild1.Id);
+
+            var publishedRoot = GetNode(mRoot.Id);
+            Assert.AreEqual(null, publishedRoot.Parent);
+
+            var publishedChild1 = GetNode(mChild1.Id);
+            Assert.AreEqual(mRoot.Id, publishedChild1.Parent.Id);
+
+            var publishedSubChild1 = GetNode(mSubChild1.Id);
+            Assert.AreEqual(mChild1.Id, publishedSubChild1.Parent.Id);
+        }
+
+        [Test]
+        public void Ancestors_Without_Examine()
+        {
+            var user = new User(0);
+            var mType = global::umbraco.cms.businesslogic.media.MediaType.MakeNew(user, &quot;TestMediaType&quot;);
+            var mRoot = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;MediaRoot&quot;, mType, user, -1);
+
+            var mChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child1&quot;, mType, user, mRoot.Id);
+            var mChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child2&quot;, mType, user, mRoot.Id);
+            var mChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child3&quot;, mType, user, mRoot.Id);
+
+            var mSubChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild1&quot;, mType, user, mChild1.Id);
+            var mSubChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild2&quot;, mType, user, mChild1.Id);
+            var mSubChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild3&quot;, mType, user, mChild1.Id);
+
+            var publishedSubChild1 = GetNode(mSubChild1.Id);
+            Assert.IsTrue(publishedSubChild1.Ancestors().Select(x =&gt; x.Id).ContainsAll(new[] { mChild1.Id, mRoot.Id }));
+        }
+
+        [Test]
+        public void AncestorsOrSelf_Without_Examine()
+        {
+            var user = new User(0);
+            var mType = global::umbraco.cms.businesslogic.media.MediaType.MakeNew(user, &quot;TestMediaType&quot;);
+            var mRoot = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;MediaRoot&quot;, mType, user, -1);
+
+            var mChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child1&quot;, mType, user, mRoot.Id);
+            var mChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child2&quot;, mType, user, mRoot.Id);
+            var mChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;Child3&quot;, mType, user, mRoot.Id);
+
+            var mSubChild1 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild1&quot;, mType, user, mChild1.Id);
+            var mSubChild2 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild2&quot;, mType, user, mChild1.Id);
+            var mSubChild3 = global::umbraco.cms.businesslogic.media.Media.MakeNew(&quot;SubChild3&quot;, mType, user, mChild1.Id);
+
+            var publishedSubChild1 = GetNode(mSubChild1.Id);
+            Assert.IsTrue(publishedSubChild1.AncestorsOrSelf().Select(x =&gt; x.Id).ContainsAll(
+                new[] { mSubChild1.Id, mChild1.Id, mRoot.Id }));
+        }
+
+        [Test]
+        public void Convert_From_Legacy_Xml()
+        {
+            var config = SettingsForTests.GenerateMockSettings();
+
+            var contentMock = Mock.Get(config.Content);
+            contentMock.Setup(x =&gt; x.UseLegacyXmlSchema).Returns(true);
+
+            SettingsForTests.ConfigureSettings(config);
+
+            var nodeId = 2112;
+
+            var xml = XElement.Parse(@&quot;&lt;node id=&quot;&quot;2112&quot;&quot; version=&quot;&quot;5b3e46ab-3e37-4cfa-ab70-014234b5bd39&quot;&quot; parentID=&quot;&quot;2222&quot;&quot; level=&quot;&quot;3&quot;&quot; writerID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1032&quot;&quot; template=&quot;&quot;0&quot;&quot; sortOrder=&quot;&quot;1&quot;&quot; createDate=&quot;&quot;2010-05-19T17:32:46&quot;&quot; updateDate=&quot;&quot;2010-05-19T17:32:46&quot;&quot; nodeName=&quot;&quot;Sam&#39;s Umbraco Image&quot;&quot; urlName=&quot;&quot;acnestressscrub&quot;&quot; writerName=&quot;&quot;Administrator&quot;&quot; nodeTypeAlias=&quot;&quot;Image&quot;&quot; path=&quot;&quot;-1,1111,2222,2112&quot;&quot;&gt;
+				&lt;data alias=&quot;&quot;umbracoFile&quot;&quot;&gt;&lt;![CDATA[/media/1234/blah.pdf]]&gt;&lt;/data&gt;
+				&lt;data alias=&quot;&quot;umbracoWidth&quot;&quot;&gt;115&lt;/data&gt;
+				&lt;data alias=&quot;&quot;umbracoHeight&quot;&quot;&gt;268&lt;/data&gt;
+				&lt;data alias=&quot;&quot;umbracoBytes&quot;&quot;&gt;10726&lt;/data&gt;
+				&lt;data alias=&quot;&quot;umbracoExtension&quot;&quot;&gt;jpg&lt;/data&gt;
+				&lt;node id=&quot;&quot;3113&quot;&quot; version=&quot;&quot;5b3e46ab-3e37-4cfa-ab70-014234b5bd33&quot;&quot; parentID=&quot;&quot;2112&quot;&quot; level=&quot;&quot;4&quot;&quot; writerID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1032&quot;&quot; template=&quot;&quot;0&quot;&quot; sortOrder=&quot;&quot;2&quot;&quot; createDate=&quot;&quot;2010-05-19T17:32:46&quot;&quot; updateDate=&quot;&quot;2010-05-19T17:32:46&quot;&quot; nodeName=&quot;&quot;Another Umbraco Image&quot;&quot; urlName=&quot;&quot;acnestressscrub&quot;&quot; writerName=&quot;&quot;Administrator&quot;&quot; nodeTypeAlias=&quot;&quot;Image&quot;&quot; path=&quot;&quot;-1,1111,2222,2112,3113&quot;&quot;&gt;
+					&lt;data alias=&quot;&quot;umbracoFile&quot;&quot;&gt;&lt;![CDATA[/media/1234/blah.pdf]]&gt;&lt;/data&gt;
+					&lt;data alias=&quot;&quot;umbracoWidth&quot;&quot;&gt;115&lt;/data&gt;
+					&lt;data alias=&quot;&quot;umbracoHeight&quot;&quot;&gt;268&lt;/data&gt;
+					&lt;data alias=&quot;&quot;umbracoBytes&quot;&quot;&gt;10726&lt;/data&gt;
+					&lt;data alias=&quot;&quot;umbracoExtension&quot;&quot;&gt;jpg&lt;/data&gt;
+				&lt;/node&gt;
+			&lt;/node&gt;&quot;);
+            var node = xml.DescendantsAndSelf(&quot;node&quot;).Single(x =&gt; (int) x.Attribute(&quot;id&quot;) == nodeId);
+
+            var publishedMedia = new PublishedMediaCache(ApplicationContext);
+
+            var nav = node.CreateNavigator();
+
+            var converted = publishedMedia.CreateFromCacheValues(
+                publishedMedia.ConvertFromXPathNodeIterator(nav.Select(&quot;/node&quot;), nodeId));
+
+            Assert.AreEqual(nodeId, converted.Id);
+            Assert.AreEqual(3, converted.Level);
+            Assert.AreEqual(1, converted.SortOrder);
+            Assert.AreEqual(&quot;Sam&#39;s Umbraco Image&quot;, converted.Name);
+            Assert.AreEqual(&quot;-1,1111,2222,2112&quot;, converted.Path);
+        }
+
+        [Test]
+        public void Convert_From_Standard_Xml()
+        {
+            var config = SettingsForTests.GenerateMockSettings();
+
+            var contentMock = Mock.Get(config.Content);
+            contentMock.Setup(x =&gt; x.UseLegacyXmlSchema).Returns(true);
+
+            SettingsForTests.ConfigureSettings(config);
+
+            var nodeId = 2112;
+
+            var xml = XElement.Parse(@&quot;&lt;Image id=&quot;&quot;2112&quot;&quot; version=&quot;&quot;5b3e46ab-3e37-4cfa-ab70-014234b5bd39&quot;&quot; parentID=&quot;&quot;2222&quot;&quot; level=&quot;&quot;3&quot;&quot; writerID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1032&quot;&quot; template=&quot;&quot;0&quot;&quot; sortOrder=&quot;&quot;1&quot;&quot; createDate=&quot;&quot;2010-05-19T17:32:46&quot;&quot; updateDate=&quot;&quot;2010-05-19T17:32:46&quot;&quot; nodeName=&quot;&quot;Sam&#39;s Umbraco Image&quot;&quot; urlName=&quot;&quot;acnestressscrub&quot;&quot; writerName=&quot;&quot;Administrator&quot;&quot; nodeTypeAlias=&quot;&quot;Image&quot;&quot; path=&quot;&quot;-1,1111,2222,2112&quot;&quot; isDoc=&quot;&quot;&quot;&quot;&gt;
+				&lt;umbracoFile&gt;&lt;![CDATA[/media/1234/blah.pdf]]&gt;&lt;/umbracoFile&gt;
+				&lt;umbracoWidth&gt;115&lt;/umbracoWidth&gt;
+				&lt;umbracoHeight&gt;268&lt;/umbracoHeight&gt;
+				&lt;umbracoBytes&gt;10726&lt;/umbracoBytes&gt;
+				&lt;umbracoExtension&gt;jpg&lt;/umbracoExtension&gt;
+				&lt;Image id=&quot;&quot;3113&quot;&quot; version=&quot;&quot;5b3e46ab-3e37-4cfa-ab70-014234b5bd33&quot;&quot; parentID=&quot;&quot;2112&quot;&quot; level=&quot;&quot;4&quot;&quot; writerID=&quot;&quot;0&quot;&quot; nodeType=&quot;&quot;1032&quot;&quot; template=&quot;&quot;0&quot;&quot; sortOrder=&quot;&quot;2&quot;&quot; createDate=&quot;&quot;2010-05-19T17:32:46&quot;&quot; updateDate=&quot;&quot;2010-05-19T17:32:46&quot;&quot; nodeName=&quot;&quot;Another Umbraco Image&quot;&quot; urlName=&quot;&quot;acnestressscrub&quot;&quot; writerName=&quot;&quot;Administrator&quot;&quot; nodeTypeAlias=&quot;&quot;Image&quot;&quot; path=&quot;&quot;-1,1111,2222,2112,3113&quot;&quot; isDoc=&quot;&quot;&quot;&quot;&gt;
+					&lt;umbracoFile&gt;&lt;![CDATA[/media/1234/blah.pdf]]&gt;&lt;/umbracoFile&gt;
+					&lt;umbracoWidth&gt;115&lt;/umbracoWidth&gt;
+					&lt;umbracoHeight&gt;268&lt;/umbracoHeight&gt;
+					&lt;umbracoBytes&gt;10726&lt;/umbracoBytes&gt;
+					&lt;umbracoExtension&gt;jpg&lt;/umbracoExtension&gt;
+				&lt;/Image&gt;
+			&lt;/Image&gt;&quot;);
+            var node = xml.DescendantsAndSelf(&quot;Image&quot;).Single(x =&gt; (int)x.Attribute(&quot;id&quot;) == nodeId);
+
+            var publishedMedia = new PublishedMediaCache(ApplicationContext);
+
+            var nav = node.CreateNavigator();
+
+            var converted = publishedMedia.CreateFromCacheValues(
+                publishedMedia.ConvertFromXPathNodeIterator(nav.Select(&quot;/Image&quot;), nodeId));
+
+            Assert.AreEqual(nodeId, converted.Id);
+            Assert.AreEqual(3, converted.Level);
+            Assert.AreEqual(1, converted.SortOrder);
+            Assert.AreEqual(&quot;Sam&#39;s Umbraco Image&quot;, converted.Name);
+            Assert.AreEqual(&quot;-1,1111,2222,2112&quot;, converted.Path);
+        }
+
+        [Test]
+        public void Detects_Error_In_Xml()
+        {
+            var errorXml = new XElement(&quot;error&quot;, string.Format(&quot;No media is maching &#39;{0}&#39;&quot;, 1234));
+            var nav = errorXml.CreateNavigator();
+
+            var publishedMedia = new PublishedMediaCache(ApplicationContext);
+            var converted = publishedMedia.ConvertFromXPathNodeIterator(nav.Select(&quot;/&quot;), 1234);
+
+            Assert.IsNull(converted);
+        }
+    }
+
+
+}
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[43,9,43,10,1],[44,13,44,31,1],[45,13,45,70,1],[46,13,46,66,1],[47,9,47,10,1],[50,9,50,10,1],[51,13,51,29,1],[52,13,52,70,1],[53,13,53,66,1],[54,9,54,10,1],[63,9,63,10,1],[64,13,64,38,1],[65,13,65,106,1],[66,13,66,41,1],[67,13,67,35,1],[68,13,68,24,1],[69,9,69,10,1],[72,9,72,10,1],[73,13,73,66,1],[74,9,74,10,1],[78,9,78,10,1],[79,13,79,75,1],[81,13,86,24,1],[87,13,87,59,1],[88,13,88,65,1],[89,13,89,83,1],[90,13,90,53,1],[92,13,92,52,1],[94,13,94,70,1],[95,13,95,55,1],[96,13,96,84,1],[98,13,98,84,1],[99,13,99,56,1],[100,13,100,85,1],[102,13,102,71,1],[103,13,103,56,1],[104,13,104,85,1],[105,9,105,10,1],[109,9,109,10,1],[110,20,110,62,1],[111,20,111,152,1],[112,20,112,76,1],[113,20,113,78,1],[114,13,114,14,1],[116,17,116,40,1],[118,17,118,60,1],[119,17,119,129,1],[122,17,122,58,1],[123,17,123,72,1],[124,17,124,34,1],[125,22,125,31,1],[125,33,125,57,1],[125,59,125,62,1],[126,17,126,18,1],[127,21,127,80,1],[128,21,128,58,1],[129,17,129,18,1],[130,13,130,14,1],[136,9,136,10,1],[141,9,141,10,1],[142,20,142,62,1],[143,20,143,152,1],[144,20,144,76,1],[145,20,145,78,1],[146,13,146,14,1],[148,17,148,40,1],[150,17,150,60,1],[151,17,151,129,1],[154,17,154,58,1],[155,17,155,50,1],[158,17,164,15,1],[165,17,165,54,1],[168,17,168,64,1],[169,17,169,48,1],[170,17,170,63,1],[171,17,171,41,1],[172,17,172,58,1],[175,17,175,57,1],[176,17,176,46,1],[178,13,178,14,1],[180,9,180,10,1],[184,9,184,10,1],[185,20,185,62,1],[186,20,186,152,1],[187,20,187,76,1],[188,20,188,78,1],[189,13,189,14,1],[191,17,191,40,1],[193,17,193,60,1],[194,17,194,129,1],[197,17,197,58,1],[198,17,198,62,1],[199,17,199,56,1],[199,56,199,60,1],[199,60,199,115,1],[199,17,199,115,1],[201,17,201,59,1],[202,17,202,62,1],[203,17,203,55,1],[203,55,203,59,1],[203,59,203,90,1],[203,17,203,90,1],[204,13,204,14,1],[205,9,205,10,1],[209,9,209,10,1],[210,20,210,62,1],[211,20,211,152,1],[212,20,212,76,1],[213,20,213,78,1],[214,13,214,14,1],[216,17,216,40,1],[218,17,218,60,1],[219,17,219,129,1],[222,17,222,58,1],[223,17,223,68,1],[224,17,224,59,1],[224,59,224,63,1],[224,63,224,124,1],[224,17,224,124,1],[226,17,226,59,1],[227,17,227,68,1],[228,17,228,58,1],[228,58,228,62,1],[228,62,228,99,1],[228,17,228,99,1],[229,13,229,14,1],[230,9,230,10,1],[234,9,234,10,1],[235,20,235,62,1],[236,20,236,152,1],[237,20,237,76,1],[238,20,238,78,1],[239,13,239,14,1],[241,17,241,40,1],[243,17,243,60,1],[244,17,244,129,1],[247,17,247,58,1],[248,17,248,74,1],[249,17,249,59,1],[249,59,249,63,1],[249,63,249,130,1],[249,17,249,130,1],[251,17,251,59,1],[252,17,252,74,1],[253,17,253,58,1],[253,58,253,62,1],[253,62,253,105,1],[253,17,253,105,1],[254,13,254,14,1],[255,9,255,10,1],[259,9,259,10,1],[260,20,260,62,1],[261,20,261,152,1],[262,20,262,76,1],[263,20,263,78,1],[264,13,264,14,1],[266,17,266,40,1],[267,17,267,60,1],[269,17,269,129,1],[272,17,272,58,1],[273,17,273,60,1],[274,17,274,53,1],[274,53,274,57,1],[274,57,274,100,1],[274,17,274,100,1],[275,13,275,14,1],[277,9,277,10,1],[281,9,281,10,1],[282,20,282,62,1],[283,20,283,152,1],[284,20,284,76,1],[285,20,285,78,1],[286,13,286,14,1],[288,17,288,40,1],[289,17,289,60,1],[291,17,291,129,1],[294,17,294,58,1],[295,17,295,66,1],[296,17,296,53,1],[296,53,296,57,1],[296,57,296,106,1],[296,17,296,106,1],[297,13,297,14,1],[298,9,298,10,1],[302,9,302,10,1],[303,13,303,36,1],[304,13,304,106,1],[305,13,305,109,1],[307,13,307,114,1],[308,13,308,114,1],[309,13,309,114,1],[311,13,311,122,1],[312,13,312,122,1],[313,13,313,122,1],[315,13,315,52,1],[316,13,316,58,1],[317,13,317,52,1],[317,52,317,56,1],[317,56,317,117,1],[317,13,317,117,1],[319,13,319,55,1],[320,13,320,58,1],[321,13,321,51,1],[321,51,321,55,1],[321,55,321,125,1],[321,13,321,125,1],[322,9,322,10,1],[326,9,326,10,1],[327,13,327,36,1],[328,13,328,106,1],[329,13,329,109,1],[331,13,331,114,1],[332,13,332,114,1],[333,13,333,114,1],[335,13,335,122,1],[336,13,336,122,1],[337,13,337,122,1],[339,13,339,52,1],[340,13,340,64,1],[341,13,341,55,1],[341,55,341,59,1],[341,59,341,165,1],[341,13,341,165,1],[343,13,343,55,1],[344,13,344,64,1],[345,13,345,54,1],[345,54,345,58,1],[345,58,345,128,1],[345,13,345,128,1],[346,9,346,10,1],[350,9,350,10,1],[351,13,351,36,1],[352,13,352,106,1],[353,13,353,109,1],[355,13,355,114,1],[356,13,356,114,1],[357,13,357,114,1],[359,13,359,122,1],[360,13,360,122,1],[361,13,361,122,1],[363,13,363,52,1],[364,13,364,76,1],[365,13,365,61,1],[365,61,365,65,1],[365,65,366,119,1],[365,13,366,119,1],[368,13,368,55,1],[369,13,369,76,1],[370,13,370,60,1],[370,60,370,64,1],[370,64,371,85,1],[370,13,371,85,1],[372,9,372,10,1],[376,9,376,10,1],[377,13,377,36,1],[378,13,378,106,1],[379,13,379,109,1],[381,13,381,114,1],[382,13,382,114,1],[383,13,383,114,1],[385,13,385,122,1],[386,13,386,122,1],[387,13,387,122,1],[389,13,389,51,1],[390,13,390,57,1],[392,13,392,55,1],[393,13,393,66,1],[395,13,395,61,1],[396,13,396,71,1],[397,9,397,10,1],[401,9,401,10,1],[402,13,402,36,1],[403,13,403,106,1],[404,13,404,109,1],[406,13,406,114,1],[407,13,407,114,1],[408,13,408,114,1],[410,13,410,122,1],[411,13,411,122,1],[412,13,412,122,1],[414,13,414,61,1],[415,13,415,70,1],[415,70,415,74,1],[415,74,415,121,1],[415,13,415,121,1],[416,9,416,10,1],[420,9,420,10,1],[421,13,421,36,1],[422,13,422,106,1],[423,13,423,109,1],[425,13,425,114,1],[426,13,426,114,1],[427,13,427,114,1],[429,13,429,122,1],[430,13,430,122,1],[431,13,431,122,1],[433,13,433,61,1],[434,13,434,76,1],[434,76,434,80,1],[434,80,435,65,1],[434,13,435,65,1],[436,9,436,10,1],[440,9,440,10,1],[441,13,441,66,1],[443,13,443,56,1],[444,13,444,72,1],[446,13,446,56,1],[448,13,448,31,1],[450,13,463,14,1],[464,13,464,67,1],[464,67,464,100,1],[464,100,464,102,1],[464,13,464,102,1],[466,13,466,78,1],[468,13,468,46,1],[470,13,471,91,1],[473,13,473,51,1],[474,13,474,49,1],[475,13,475,53,1],[476,13,476,68,1],[477,13,477,66,1],[478,9,478,10,1],[482,9,482,10,1],[483,13,483,66,1],[485,13,485,56,1],[486,13,486,72,1],[488,13,488,56,1],[490,13,490,31,1],[492,13,505,15,1],[506,13,506,68,1],[506,68,506,100,1],[506,100,506,102,1],[506,13,506,102,1],[508,13,508,78,1],[510,13,510,46,1],[512,13,513,92,1],[515,13,515,51,1],[516,13,516,49,1],[517,13,517,53,1],[518,13,518,68,1],[519,13,519,66,1],[520,9,520,10,1],[524,9,524,10,1],[525,13,525,100,1],[526,13,526,50,1],[528,13,528,78,1],[529,13,529,96,1],[531,13,531,38,1],[532,9,532,10,1]]);
+    </script>
+  </body>
+</html>

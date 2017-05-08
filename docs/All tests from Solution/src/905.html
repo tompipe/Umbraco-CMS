@@ -1,0 +1,890 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Web\Security\MembershipHelper.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Web;
+using System.Web.Security;
+using Umbraco.Core;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.PublishedContent;
+using Umbraco.Core.Security;
+using Umbraco.Web.Models;
+using Umbraco.Web.PublishedCache;
+using Umbraco.Core.Cache;
+using Umbraco.Web.Security.Providers;
+using MPE = global::Umbraco.Core.Security.MembershipProviderExtensions;
+
+namespace Umbraco.Web.Security
+{
+
+    /// &lt;summary&gt;
+    /// A helper class for handling Members
+    /// &lt;/summary&gt;
+    public class MembershipHelper
+    {
+        private readonly MembershipProvider _membershipProvider;
+        private readonly RoleProvider _roleProvider;
+        private readonly ApplicationContext _applicationContext;
+        private readonly HttpContextBase _httpContext;
+
+        #region Constructors
+        public MembershipHelper(ApplicationContext applicationContext, HttpContextBase httpContext)
+            : this(applicationContext, httpContext, MPE.GetMembersMembershipProvider(), Roles.Enabled ? Roles.Provider : new MembersRoleProvider(applicationContext.Services.MemberService))
+        {            
+        }
+
+        public MembershipHelper(ApplicationContext applicationContext, HttpContextBase httpContext, MembershipProvider membershipProvider, RoleProvider roleProvider)
+        {
+            if (applicationContext == null) throw new ArgumentNullException(&quot;applicationContext&quot;);
+            if (httpContext == null) throw new ArgumentNullException(&quot;httpContext&quot;);
+            if (membershipProvider == null) throw new ArgumentNullException(&quot;membershipProvider&quot;);
+            if (roleProvider == null) throw new ArgumentNullException(&quot;roleProvider&quot;);
+            _applicationContext = applicationContext;
+            _httpContext = httpContext;
+            _membershipProvider = membershipProvider;
+            _roleProvider = roleProvider;
+        }   
+
+        public MembershipHelper(UmbracoContext umbracoContext)
+            : this(umbracoContext, MPE.GetMembersMembershipProvider(), Roles.Enabled ? Roles.Provider: new MembersRoleProvider(umbracoContext.Application.Services.MemberService))
+        {            
+        }
+
+        public MembershipHelper(UmbracoContext umbracoContext, MembershipProvider membershipProvider, RoleProvider roleProvider)
+        {
+            if (umbracoContext == null) throw new ArgumentNullException(&quot;umbracoContext&quot;);
+            if (membershipProvider == null) throw new ArgumentNullException(&quot;membershipProvider&quot;);
+            if (roleProvider == null) throw new ArgumentNullException(&quot;roleProvider&quot;);
+            _httpContext = umbracoContext.HttpContext;
+            _applicationContext = umbracoContext.Application;
+            _membershipProvider = membershipProvider;
+            _roleProvider = roleProvider;
+        }
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Returns true if the current membership provider is the Umbraco built-in one.
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public bool IsUmbracoMembershipProviderActive()
+        {
+            var provider = _membershipProvider;
+            return provider.IsUmbracoMembershipProvider();
+        }
+
+        /// &lt;summary&gt;
+        /// Updates the currently logged in members profile
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// The updated MembershipUser object
+        /// &lt;/returns&gt;
+        public virtual Attempt&lt;MembershipUser&gt; UpdateMemberProfile(ProfileModel model)
+        {
+            if (IsLoggedIn() == false)
+            {
+                throw new NotSupportedException(&quot;No member is currently logged in&quot;);
+            }
+
+            //get the current membership user
+            var provider = _membershipProvider;
+            var membershipUser = provider.GetCurrentUser();
+            //NOTE: This should never happen since they are logged in
+            if (membershipUser == null) throw new InvalidOperationException(&quot;Could not find member with username &quot; + _httpContext.User.Identity.Name);
+
+            try
+            {
+                //check if the email needs to change
+                if (model.Email.InvariantEquals(membershipUser.Email) == false)
+                {
+                    //Use the membership provider to change the email since that is configured to do the checks to check for unique emails if that is configured.
+                    var requiresUpdating = UpdateMember(membershipUser, provider, model.Email);
+                    membershipUser = requiresUpdating.Result;
+                }
+            }
+            catch (Exception ex)
+            {
+                //This will occur if an email already exists!
+                return Attempt&lt;MembershipUser&gt;.Fail(ex);
+            }
+
+            var member = GetCurrentPersistedMember();
+
+            //NOTE: If changing the username is a requirement, than that needs to be done via the IMember directly since MembershipProvider&#39;s natively do 
+            // not support changing a username! 
+            if (model.Name != null &amp;&amp; member.Name != model.Name)
+            {
+                member.Name = model.Name;
+            }
+
+            if (model.MemberProperties != null)
+            {
+                foreach (var property in model.MemberProperties
+                    //ensure the property they are posting exists
+                    .Where(p =&gt; member.ContentType.PropertyTypeExists(p.Alias))
+                    .Where(property =&gt; member.Properties.Contains(property.Alias))
+                    //needs to be editable
+                    .Where(p =&gt; member.ContentType.MemberCanEditProperty(p.Alias)))
+                {
+                    member.Properties[property.Alias].Value = property.Value;
+                }
+            }
+
+            _applicationContext.Services.MemberService.Save(member);
+
+            //reset the FormsAuth cookie since the username might have changed
+            FormsAuthentication.SetAuthCookie(member.Username, true);
+
+            return Attempt&lt;MembershipUser&gt;.Succeed(membershipUser);
+        }
+
+        /// &lt;summary&gt;
+        /// Registers a new member
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;model&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;status&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;logMemberIn&quot;&gt;
+        /// true to log the member in upon successful registration
+        /// &lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual MembershipUser RegisterMember(RegisterModel model, out MembershipCreateStatus status, bool logMemberIn = true)
+        {
+            model.Username = (model.UsernameIsEmail || model.Username == null) ? model.Email : model.Username;
+
+            MembershipUser membershipUser;
+            var provider = _membershipProvider;
+            //update their real name 
+            if (provider.IsUmbracoMembershipProvider())
+            {
+                membershipUser = ((UmbracoMembershipProviderBase)provider).CreateUser(
+                    model.MemberTypeAlias,
+                    model.Username, model.Password, model.Email,
+                    //TODO: Support q/a http://issues.umbraco.org/issue/U4-3213
+                    null, null,
+                    true, null, out status);
+
+                if (status != MembershipCreateStatus.Success) return null;
+
+                var member = _applicationContext.Services.MemberService.GetByUsername(membershipUser.UserName);
+                member.Name = model.Name;
+
+                if (model.MemberProperties != null)
+                {
+                    foreach (var property in model.MemberProperties.Where(p =&gt; p.Value != null)
+                        .Where(property =&gt; member.Properties.Contains(property.Alias)))
+                    {
+                        member.Properties[property.Alias].Value = property.Value;
+                    }
+                }
+
+                _applicationContext.Services.MemberService.Save(member);
+            }
+            else
+            {
+                membershipUser = provider.CreateUser(model.Username, model.Password, model.Email,
+                    //TODO: Support q/a http://issues.umbraco.org/issue/U4-3213
+                    null, null,
+                    true, null, out status);
+
+                if (status != MembershipCreateStatus.Success) return null;
+            }
+
+            if (logMemberIn)
+            {
+                //Set member online
+                provider.GetUser(model.Username, true);
+    
+                //Log them in
+                FormsAuthentication.SetAuthCookie(membershipUser.UserName, model.CreatePersistentLoginCookie);
+            }
+
+            return membershipUser;
+        }
+
+        /// &lt;summary&gt;
+        /// A helper method to perform the validation and logging in of a member - this is simply wrapping standard membership provider and asp.net forms auth logic.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;password&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual bool Login(string username, string password)
+        {
+            var provider = _membershipProvider;
+            //Validate credentials
+            if (provider.ValidateUser(username, password) == false)
+            {
+                return false;
+            }
+            //Set member online
+            var member = provider.GetUser(username, true);
+            if (member == null)
+            {
+                //this should not happen
+                LogHelper.Warn&lt;MembershipHelper&gt;(&quot;The member validated but then no member was returned with the username &quot; + username);                
+                return false;
+            }
+            //Log them in
+            FormsAuthentication.SetAuthCookie(member.UserName, true);
+            return true;
+        }
+
+        /// &lt;summary&gt;
+        /// Logs out the current member
+        /// &lt;/summary&gt;
+        public virtual void Logout()
+        {
+            FormsAuthentication.SignOut();
+        }
+
+        #region Querying for front-end
+
+        public virtual IPublishedContent GetByProviderKey(object key)
+        {
+            return _applicationContext.ApplicationCache.RequestCache.GetCacheItem&lt;IPublishedContent&gt;(
+                GetCacheKey(&quot;GetByProviderKey&quot;, key), () =&gt;
+                {
+                    var provider = _membershipProvider;
+                    if (provider.IsUmbracoMembershipProvider() == false)
+                    {
+                        throw new NotSupportedException(&quot;Cannot access this method unless the Umbraco membership provider is active&quot;);
+                    }
+
+                    var result = _applicationContext.Services.MemberService.GetByProviderKey(key);
+                    return result == null ? null : new MemberPublishedContent(result).CreateModel();
+                });
+        }
+
+        public virtual IPublishedContent GetById(int memberId)
+        {
+            return _applicationContext.ApplicationCache.RequestCache.GetCacheItem&lt;IPublishedContent&gt;(
+                GetCacheKey(&quot;GetById&quot;, memberId), () =&gt;
+                {
+                    var provider = _membershipProvider;
+                    if (provider.IsUmbracoMembershipProvider() == false)
+                    {
+                        throw new NotSupportedException(&quot;Cannot access this method unless the Umbraco membership provider is active&quot;);
+                    }
+
+                    var result = _applicationContext.Services.MemberService.GetById(memberId);
+                    return result == null ? null : new MemberPublishedContent(result).CreateModel();
+                });
+        }
+
+        public virtual IPublishedContent GetByUsername(string username)
+        {
+            return _applicationContext.ApplicationCache.RequestCache.GetCacheItem&lt;IPublishedContent&gt;(
+                GetCacheKey(&quot;GetByUsername&quot;, username), () =&gt;
+                {
+                    var provider = _membershipProvider;
+                    if (provider.IsUmbracoMembershipProvider() == false)
+                    {
+                        throw new NotSupportedException(&quot;Cannot access this method unless the Umbraco membership provider is active&quot;);
+                    }
+
+                    var result = _applicationContext.Services.MemberService.GetByUsername(username);
+                    return result == null ? null : new MemberPublishedContent(result).CreateModel();
+                });
+        }
+
+        public virtual IPublishedContent GetByEmail(string email)
+        {
+            return _applicationContext.ApplicationCache.RequestCache.GetCacheItem&lt;IPublishedContent&gt;(
+                GetCacheKey(&quot;GetByEmail&quot;, email), () =&gt;
+                {
+                    var provider = _membershipProvider;
+                    if (provider.IsUmbracoMembershipProvider() == false)
+                    {
+                        throw new NotSupportedException(&quot;Cannot access this method unless the Umbraco membership provider is active&quot;);
+                    }
+
+                    var result = _applicationContext.Services.MemberService.GetByEmail(email);
+                    return result == null ? null : new MemberPublishedContent(result).CreateModel();
+                });
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the currently logged in member as IPublishedContent
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual IPublishedContent GetCurrentMember()
+        {
+            if (IsLoggedIn() == false)
+            {
+                return null;
+            }
+            var result = GetCurrentPersistedMember();
+            return result == null ? null : new MemberPublishedContent(result).CreateModel();
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the currently logged in member id, -1 if they are not logged in
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public int GetCurrentMemberId()
+        {
+            if (IsLoggedIn() == false)
+            {
+                return -1;
+            }
+            var result = GetCurrentMember();
+            return result == null ? -1 : result.Id;
+        }
+        
+        #endregion
+
+        #region Model Creation methods for member data editing on the front-end
+        /// &lt;summary&gt;
+        /// Creates a new profile model filled in with the current members details if they are logged in which allows for editing
+        /// profile properties
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual ProfileModel GetCurrentMemberProfileModel()
+        {
+            if (IsLoggedIn() == false)
+            {
+                return null;
+            }
+
+            var provider = _membershipProvider;
+
+            if (provider.IsUmbracoMembershipProvider())
+            {                
+                var membershipUser = provider.GetCurrentUserOnline();
+                var member = GetCurrentPersistedMember();
+                //this shouldn&#39;t happen but will if the member is deleted in the back office while the member is trying
+                // to use the front-end!
+                if (member == null)
+                {
+                    //log them out since they&#39;ve been removed
+                    FormsAuthentication.SignOut();
+
+                    return null;
+                }
+
+                var model = ProfileModel.CreateModel();
+                model.Name = member.Name;
+                model.MemberTypeAlias = member.ContentTypeAlias;
+
+                model.Email = membershipUser.Email;
+                model.UserName = membershipUser.UserName;
+                model.PasswordQuestion = membershipUser.PasswordQuestion;
+                model.Comment = membershipUser.Comment;
+                model.IsApproved = membershipUser.IsApproved;
+                model.IsLockedOut = membershipUser.IsLockedOut;
+                model.LastLockoutDate = membershipUser.LastLockoutDate;
+                model.CreationDate = membershipUser.CreationDate;
+                model.LastLoginDate = membershipUser.LastLoginDate;
+                model.LastActivityDate = membershipUser.LastActivityDate;
+                model.LastPasswordChangedDate = membershipUser.LastPasswordChangedDate;
+
+
+                var memberType = member.ContentType;
+
+                var builtIns = Constants.Conventions.Member.GetStandardPropertyTypeStubs().Select(x =&gt; x.Key).ToArray();
+
+                model.MemberProperties = GetMemberPropertiesViewModel(memberType, builtIns, member).ToList();
+
+                return model;
+            }
+
+            //we can try to look up an associated member by the provider user key
+            //TODO: Support this at some point!
+            throw new NotSupportedException(&quot;Currently a member profile cannot be edited unless using the built-in Umbraco membership providers&quot;);
+        }
+
+        /// &lt;summary&gt;
+        /// Creates a model to use for registering new members with custom member properties
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;memberTypeAlias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual RegisterModel CreateRegistrationModel(string memberTypeAlias = null)
+        {
+            var provider = _membershipProvider;
+            if (provider.IsUmbracoMembershipProvider())
+            {
+                memberTypeAlias = memberTypeAlias ?? Constants.Conventions.MemberTypes.DefaultAlias;
+                var memberType = _applicationContext.Services.MemberTypeService.Get(memberTypeAlias);
+                if (memberType == null)
+                    throw new InvalidOperationException(&quot;Could not find a member type with alias &quot; + memberTypeAlias);
+
+                var builtIns = Constants.Conventions.Member.GetStandardPropertyTypeStubs().Select(x =&gt; x.Key).ToArray();
+                var model = RegisterModel.CreateModel();
+                model.MemberTypeAlias = memberTypeAlias;
+                model.MemberProperties = GetMemberPropertiesViewModel(memberType, builtIns).ToList();
+                return model;
+            }
+            else
+            {
+                var model = RegisterModel.CreateModel();
+                model.MemberTypeAlias = string.Empty;
+                return model;
+            }
+        }
+
+        private IEnumerable&lt;UmbracoProperty&gt; GetMemberPropertiesViewModel(IMemberType memberType, IEnumerable&lt;string&gt; builtIns, IMember member = null)
+        {
+            var viewProperties = new List&lt;UmbracoProperty&gt;();
+
+            foreach (var prop in memberType.PropertyTypes
+                    .Where(x =&gt; builtIns.Contains(x.Alias) == false &amp;&amp; memberType.MemberCanEditProperty(x.Alias))
+                    .OrderBy(p =&gt; p.SortOrder))
+            {
+                var value = string.Empty;
+                if (member != null)
+                {
+                    var propValue = member.Properties[prop.Alias];
+                    if (propValue != null &amp;&amp; propValue.Value != null)
+                    {
+                        value = propValue.Value.ToString();
+                    }    
+                }
+
+                var viewProperty = new UmbracoProperty
+                {
+                    Alias = prop.Alias,
+                    Name = prop.Name,
+                    Value = value
+                };
+
+                //TODO: Perhaps one day we&#39;ll ship with our own EditorTempates but for now developers 
+                // can just render their own.
+
+                ////This is a rudimentary check to see what data template we should render
+                //// if developers want to change the template they can do so dynamically in their views or controllers 
+                //// for a given property.
+                ////These are the default built-in MVC template types: “Boolean”, “Decimal”, “EmailAddress”, “HiddenInput”, “Html”, “Object”, “String”, “Text”, and “Url”
+                //// by default we&#39;ll render a text box since we&#39;ve defined that metadata on the UmbracoProperty.Value property directly.
+                //if (prop.DataTypeId == new Guid(Constants.PropertyEditors.TrueFalse))
+                //{
+                //    viewProperty.EditorTemplate = &quot;UmbracoBoolean&quot;;
+                //}
+                //else
+                //{                    
+                //    switch (prop.DataTypeDatabaseType)
+                //    {
+                //        case DataTypeDatabaseType.Integer:
+                //            viewProperty.EditorTemplate = &quot;Decimal&quot;;
+                //            break;
+                //        case DataTypeDatabaseType.Ntext:
+                //            viewProperty.EditorTemplate = &quot;Text&quot;;
+                //            break;
+                //        case DataTypeDatabaseType.Date:
+                //        case DataTypeDatabaseType.Nvarchar:
+                //            break;
+                //    }
+                //}
+
+                viewProperties.Add(viewProperty);
+            }
+            return viewProperties;
+        }
+        #endregion
+
+        /// &lt;summary&gt;
+        /// Returns the login status model of the currently logged in member, if no member is logged in it returns null;
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual LoginStatusModel GetCurrentLoginStatus()
+        {
+            var model = LoginStatusModel.CreateModel();
+
+            if (IsLoggedIn() == false)
+            {
+                model.IsLoggedIn = false;
+                return model;
+            }
+
+            var provider = _membershipProvider;
+
+            if (provider.IsUmbracoMembershipProvider())
+            {
+                var member = GetCurrentPersistedMember();
+                //this shouldn&#39;t happen but will if the member is deleted in the back office while the member is trying
+                // to use the front-end!
+                if (member == null)
+                {
+                    //log them out since they&#39;ve been removed
+                    FormsAuthentication.SignOut();
+                    model.IsLoggedIn = false;
+                    return model;
+                }
+                model.Name = member.Name;
+                model.Username = member.Username;
+                model.Email = member.Email;
+            }
+            else
+            {
+                var member = provider.GetCurrentUserOnline();
+                //this shouldn&#39;t happen but will if the member is deleted in the back office while the member is trying
+                // to use the front-end!
+                if (member == null)
+                {
+                    //log them out since they&#39;ve been removed
+                    FormsAuthentication.SignOut();
+                    model.IsLoggedIn = false;
+                    return model;
+                }
+                model.Name = member.UserName;
+                model.Username = member.UserName;
+                model.Email = member.Email;
+            }
+
+            model.IsLoggedIn = true;
+            return model;
+        }
+
+        /// &lt;summary&gt;
+        /// Check if a member is logged in
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public bool IsLoggedIn()
+        {
+            return _httpContext.User != null &amp;&amp; _httpContext.User.Identity.IsAuthenticated;
+        }
+
+        /// &lt;summary&gt;
+        /// Returns the currently logged in username
+        /// &lt;/summary&gt;
+        public string CurrentUserName
+        {
+            get { return _httpContext.User.Identity.Name; }
+        }
+
+        /// &lt;summary&gt;
+        /// Returns true or false if the currently logged in member is authorized based on the parameters provided
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;allowAll&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;allowTypes&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;allowGroups&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;allowMembers&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual bool IsMemberAuthorized(
+            bool allowAll = false,
+            IEnumerable&lt;string&gt; allowTypes = null,
+            IEnumerable&lt;string&gt; allowGroups = null,
+            IEnumerable&lt;int&gt; allowMembers = null)
+        {
+            if (allowAll)
+                return true;
+
+            if (allowTypes == null)
+                allowTypes = Enumerable.Empty&lt;string&gt;();
+            if (allowGroups == null)
+                allowGroups = Enumerable.Empty&lt;string&gt;();
+            if (allowMembers == null)
+                allowMembers = Enumerable.Empty&lt;int&gt;();
+
+            // Allow by default
+            var allowAction = true;
+            
+            if (IsLoggedIn() == false)
+            {
+                // If not logged on, not allowed
+                allowAction = false;
+            }
+            else
+            {
+                var provider = _membershipProvider;
+
+                string username;
+                if (provider.IsUmbracoMembershipProvider())
+                {
+                    var member = GetCurrentPersistedMember();
+                    username = member.Username;
+                    // If types defined, check member is of one of those types
+                    var allowTypesList = allowTypes as IList&lt;string&gt; ?? allowTypes.ToList();
+                    if (allowTypesList.Any(allowType =&gt; allowType != string.Empty))
+                    {
+                        // Allow only if member&#39;s type is in list
+                        allowAction = allowTypesList.Select(x =&gt; x.ToLowerInvariant()).Contains(member.ContentType.Alias.ToLowerInvariant());
+                    }
+
+                    // If specific members defined, check member is of one of those
+                    if (allowAction &amp;&amp; allowMembers.Any())
+                    {
+                        // Allow only if member&#39;s Id is in the list
+                        allowAction = allowMembers.Contains(member.Id);
+                    }
+                }
+                else
+                {
+                    var member = provider.GetCurrentUser();
+                    username = member.UserName;
+                }
+                
+                // If groups defined, check member is of one of those groups
+                var allowGroupsList = allowGroups as IList&lt;string&gt; ?? allowGroups.ToList();
+                if (allowAction &amp;&amp; allowGroupsList.Any(allowGroup =&gt; allowGroup != string.Empty))
+                {
+                    // Allow only if member is assigned to a group in the list
+                    var groups = _roleProvider.GetRolesForUser(username);
+                    allowAction = allowGroupsList.Select(s =&gt; s.ToLowerInvariant()).Intersect(groups.Select(myGroup =&gt; myGroup.ToLowerInvariant())).Any();
+                }
+
+                
+            }
+
+            return allowAction;
+        }
+
+        /// &lt;summary&gt;
+        /// Changes password for a member/user given the membership provider name and the password change model
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;passwordModel&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;membershipProviderName&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public virtual Attempt&lt;PasswordChangedModel&gt; ChangePassword(string username, ChangingPasswordModel passwordModel, string membershipProviderName)
+        {
+            var provider = Membership.Providers[membershipProviderName];
+            if (provider == null)
+            {
+                throw new InvalidOperationException(&quot;Could not find provider with name &quot; + membershipProviderName);
+            }
+            return ChangePassword(username, passwordModel, provider);
+        }
+
+        /// &lt;summary&gt;
+        /// Changes password for a member/user given the membership provider and the password change model
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;username&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;passwordModel&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;membershipProvider&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;        
+        public virtual Attempt&lt;PasswordChangedModel&gt; ChangePassword(string username, ChangingPasswordModel passwordModel, MembershipProvider membershipProvider)
+        {
+            // YES! It is completely insane how many options you have to take into account based on the membership provider. yikes!        
+
+            if (passwordModel == null) throw new ArgumentNullException(&quot;passwordModel&quot;);
+            if (membershipProvider == null) throw new ArgumentNullException(&quot;membershipProvider&quot;);
+
+            //Are we resetting the password??
+            if (passwordModel.Reset.HasValue &amp;&amp; passwordModel.Reset.Value)
+            {
+                if (membershipProvider.EnablePasswordReset == false)
+                {
+                    return Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Password reset is not enabled&quot;, new[] { &quot;resetPassword&quot; }) });
+                }
+                if (membershipProvider.RequiresQuestionAndAnswer &amp;&amp; passwordModel.Answer.IsNullOrWhiteSpace())
+                {
+                    return Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Password reset requires a password answer&quot;, new[] { &quot;resetPassword&quot; }) });
+                }
+                //ok, we should be able to reset it
+                try
+                {
+                    var newPass = membershipProvider.ResetPassword(
+                        username,
+                        membershipProvider.RequiresQuestionAndAnswer ? passwordModel.Answer : null);
+
+                    //return the generated pword
+                    return Attempt.Succeed(new PasswordChangedModel { ResetPassword = newPass });
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.WarnWithException&lt;WebSecurity&gt;(&quot;Could not reset member password&quot;, ex);
+                    return Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Could not reset password, error: &quot; + ex.Message + &quot; (see log for full details)&quot;, new[] { &quot;resetPassword&quot; }) });
+                }
+            }
+
+            //we&#39;re not resetting it so we need to try to change it.
+
+            if (passwordModel.NewPassword.IsNullOrWhiteSpace())
+            {
+                return Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Cannot set an empty password&quot;, new[] { &quot;value&quot; }) });
+            }
+
+            //This is an edge case and is only necessary for backwards compatibility:
+            var umbracoBaseProvider = membershipProvider as MembershipProviderBase;
+            if (umbracoBaseProvider != null &amp;&amp; umbracoBaseProvider.AllowManuallyChangingPassword)
+            {
+                //this provider allows manually changing the password without the old password, so we can just do it
+                try
+                {
+                    var result = umbracoBaseProvider.ChangePassword(username, &quot;&quot;, passwordModel.NewPassword);
+                    return result == false
+                        ? Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Could not change password, invalid username or password&quot;, new[] { &quot;value&quot; }) })
+                        : Attempt.Succeed(new PasswordChangedModel());
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.WarnWithException&lt;WebSecurity&gt;(&quot;Could not change member password&quot;, ex);
+                    return Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Could not change password, error: &quot; + ex.Message + &quot; (see log for full details)&quot;, new[] { &quot;value&quot; }) });
+                }
+            }
+
+            //The provider does not support manually chaning the password but no old password supplied - need to return an error
+            if (passwordModel.OldPassword.IsNullOrWhiteSpace() &amp;&amp; membershipProvider.EnablePasswordRetrieval == false)
+            {
+                //if password retrieval is not enabled but there is no old password we cannot continue
+                return Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Password cannot be changed without the old password&quot;, new[] { &quot;value&quot; }) });
+            }
+
+            if (passwordModel.OldPassword.IsNullOrWhiteSpace() == false)
+            {
+                //if an old password is suplied try to change it
+
+                try
+                {
+                    var result = membershipProvider.ChangePassword(username, passwordModel.OldPassword, passwordModel.NewPassword);
+                    return result == false
+                        ? Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Could not change password, invalid username or password&quot;, new[] { &quot;value&quot; }) })
+                        : Attempt.Succeed(new PasswordChangedModel());
+                }
+                catch (Exception ex)
+                {
+                    LogHelper.WarnWithException&lt;WebSecurity&gt;(&quot;Could not change member password&quot;, ex);
+                    return Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Could not change password, error: &quot; + ex.Message + &quot; (see log for full details)&quot;, new[] { &quot;value&quot; }) });
+                }
+            }
+
+            if (membershipProvider.EnablePasswordRetrieval == false)
+            {
+                //we cannot continue if we cannot get the current password
+                return Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Password cannot be changed without the old password&quot;, new[] { &quot;value&quot; }) });
+            }
+            if (membershipProvider.RequiresQuestionAndAnswer &amp;&amp; passwordModel.Answer.IsNullOrWhiteSpace())
+            {
+                //if the question answer is required but there isn&#39;t one, we cannot continue
+                return Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Password cannot be changed without the password answer&quot;, new[] { &quot;value&quot; }) });
+            }
+
+            //lets try to get the old one so we can change it
+            try
+            {
+                var oldPassword = membershipProvider.GetPassword(
+                    username,
+                    membershipProvider.RequiresQuestionAndAnswer ? passwordModel.Answer : null);
+
+                try
+                {
+                    var result = membershipProvider.ChangePassword(username, oldPassword, passwordModel.NewPassword);
+                    return result == false
+                        ? Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Could not change password&quot;, new[] { &quot;value&quot; }) })
+                        : Attempt.Succeed(new PasswordChangedModel());
+                }
+                catch (Exception ex1)
+                {
+                    LogHelper.WarnWithException&lt;WebSecurity&gt;(&quot;Could not change member password&quot;, ex1);
+                    return Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Could not change password, error: &quot; + ex1.Message + &quot; (see log for full details)&quot;, new[] { &quot;value&quot; }) });
+                }
+
+            }
+            catch (Exception ex2)
+            {
+                LogHelper.WarnWithException&lt;WebSecurity&gt;(&quot;Could not retrieve member password&quot;, ex2);
+                return Attempt.Fail(new PasswordChangedModel { ChangeError = new ValidationResult(&quot;Could not change password, error: &quot; + ex2.Message + &quot; (see log for full details)&quot;, new[] { &quot;value&quot; }) });
+            }
+        }
+        
+        /// &lt;summary&gt;
+        /// Updates a membership user with all of it&#39;s writable properties
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;member&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;provider&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;email&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;isApproved&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;lastLoginDate&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;lastActivityDate&quot;&gt;&lt;/param&gt;
+        /// &lt;param name=&quot;comment&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;
+        /// Returns successful if the membershipuser required updating, otherwise returns failed if it didn&#39;t require updating.
+        /// &lt;/returns&gt;
+        internal Attempt&lt;MembershipUser&gt; UpdateMember(MembershipUser member, MembershipProvider provider,
+            string email = null,
+            bool? isApproved = null,
+            DateTime? lastLoginDate = null,
+            DateTime? lastActivityDate = null,
+            string comment = null)
+        {
+            var needsUpdating = new List&lt;bool&gt;();
+
+            //set the writable properties
+            if (email != null)
+            {
+                needsUpdating.Add(member.Email != email);
+                member.Email = email;
+            }
+            if (isApproved.HasValue)
+            {
+                needsUpdating.Add(member.IsApproved != isApproved.Value);
+                member.IsApproved = isApproved.Value;
+            }
+            if (lastLoginDate.HasValue)
+            {
+                needsUpdating.Add(member.LastLoginDate != lastLoginDate.Value);
+                member.LastLoginDate = lastLoginDate.Value;
+            }
+            if (lastActivityDate.HasValue)
+            {
+                needsUpdating.Add(member.LastActivityDate != lastActivityDate.Value);
+                member.LastActivityDate = lastActivityDate.Value;
+            }
+            if (comment != null)
+            {
+                needsUpdating.Add(member.Comment != comment);
+                member.Comment = comment;
+            }
+
+            //Don&#39;t persist anything if nothing has changed
+            if (needsUpdating.Any(x =&gt; x == true))
+            {
+                provider.UpdateUser(member);
+                return Attempt&lt;MembershipUser&gt;.Succeed(member);
+            }
+
+            return Attempt&lt;MembershipUser&gt;.Fail(member);
+        }
+        
+        /// &lt;summary&gt;
+        /// Returns the currently logged in IMember object - this should never be exposed to the front-end since it&#39;s returning a business logic entity!
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        private IMember GetCurrentPersistedMember()
+        {
+            return _applicationContext.ApplicationCache.RequestCache.GetCacheItem&lt;IMember&gt;(
+                GetCacheKey(&quot;GetCurrentPersistedMember&quot;), () =&gt;
+                {
+                    var provider = _membershipProvider;
+
+                    if (provider.IsUmbracoMembershipProvider() == false)
+                    {
+                        throw new NotSupportedException(&quot;An IMember model can only be retreived when using the built-in Umbraco membership providers&quot;);
+                    }
+                    var username = provider.GetCurrentUserName();
+                    var member = _applicationContext.Services.MemberService.GetByUsername(username);
+                    return member;
+                });
+        }
+
+        private string GetCacheKey(string key, params object[] additional)
+        {
+            var sb = new StringBuilder(string.Format(&quot;{0}-{1}&quot;, typeof (MembershipHelper).Name, key));
+            foreach (var s in additional)
+            {
+                sb.Append(&quot;-&quot;);
+                sb.Append(s);
+            }
+            return sb.ToString();
+        }
+
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[34,15,34,189,0],[35,9,35,10,0],[36,9,36,10,0],[38,9,38,166,0],[39,9,39,10,0],[40,13,40,44,0],[40,45,40,99,0],[41,13,41,37,0],[41,38,41,85,0],[42,13,42,44,0],[42,45,42,99,0],[43,13,43,38,0],[43,39,43,87,0],[44,13,44,54,0],[45,13,45,40,0],[46,13,46,54,0],[47,13,47,42,0],[48,9,48,10,0],[51,15,51,179,0],[52,9,52,10,0],[53,9,53,10,0],[55,9,55,129,1],[56,9,56,10,1],[57,13,57,40,1],[57,41,57,91,0],[58,13,58,44,1],[58,45,58,99,0],[59,13,59,38,1],[59,39,59,87,0],[60,13,60,55,1],[61,13,61,62,1],[62,13,62,54,1],[63,13,63,42,1],[64,9,64,10,1],[72,9,72,10,0],[73,13,73,48,0],[74,13,74,59,0],[75,9,75,10,0],[85,9,85,10,0],[86,13,86,39,0],[87,13,87,14,0],[88,17,88,85,0],[92,13,92,48,0],[93,13,93,60,0],[95,13,95,40,0],[95,41,95,151,0],[98,13,98,14,0],[100,17,100,80,0],[101,17,101,18,0],[103,21,103,96,0],[104,21,104,62,0],[105,17,105,18,0],[106,13,106,14,0],[107,13,107,33,0],[108,13,108,14,0],[110,17,110,57,0],[113,13,113,54,0],[117,13,117,65,0],[118,13,118,14,0],[119,17,119,42,0],[120,13,120,14,0],[122,13,122,48,0],[123,13,123,14,0],[124,17,124,24,0],[124,26,124,38,0],[124,39,124,41,0],[124,42,126,33,0],[126,33,126,79,0],[126,79,127,40,0],[127,40,127,82,0],[127,82,129,33,0],[129,33,129,82,0],[129,82,129,83,0],[124,42,129,83,0],[130,17,130,18,0],[131,21,131,78,0],[132,17,132,18,0],[133,13,133,14,0],[135,13,135,69,0],[138,13,138,70,0],[140,13,140,68,0],[141,9,141,10,0],[153,9,153,10,0],[154,13,154,111,0],[157,13,157,48,0],[159,13,159,56,0],[160,13,160,14,0],[161,17,166,45,0],[168,17,168,62,0],[168,63,168,75,0],[170,17,170,112,0],[171,17,171,42,0],[173,17,173,52,0],[174,17,174,18,0],[175,21,175,28,0],[175,30,175,42,0],[175,43,175,45,0],[175,46,175,80,0],[175,80,175,95,0],[175,95,176,44,0],[176,44,176,86,0],[176,86,176,87,0],[175,46,176,87,0],[177,21,177,22,0],[178,25,178,82,0],[179,21,179,22,0],[180,17,180,18,0],[182,17,182,73,0],[183,13,183,14,0],[185,13,185,14,0],[186,17,189,45,0],[191,17,191,62,0],[191,63,191,75,0],[192,13,192,14,0],[194,13,194,29,0],[195,13,195,14,0],[197,17,197,56,0],[200,17,200,111,0],[201,13,201,14,0],[203,13,203,35,0],[204,9,204,10,0],[213,9,213,10,0],[214,13,214,48,0],[216,13,216,68,0],[217,13,217,14,0],[218,17,218,30,0],[221,13,221,59,0],[222,13,222,32,0],[223,13,223,14,0],[225,17,225,136,0],[226,17,226,30,0],[229,13,229,70,0],[230,13,230,25,0],[231,9,231,10,0],[237,9,237,10,0],[238,13,238,43,0],[239,9,239,10,0],[244,9,244,10,0],[245,13,247,17,0],[247,17,247,18,0],[247,18,248,21,0],[248,21,248,56,0],[248,56,249,21,0],[249,21,249,73,0],[249,73,250,21,0],[250,21,250,22,0],[250,22,251,25,0],[251,25,251,135,0],[251,135,254,21,0],[254,21,254,99,0],[254,99,255,21,0],[255,21,255,101,0],[255,101,256,17,0],[256,17,256,18,0],[256,18,256,20,0],[245,13,256,20,0],[257,9,257,10,0],[260,9,260,10,0],[261,13,263,17,0],[263,17,263,18,0],[263,18,264,21,0],[264,21,264,56,0],[264,56,265,21,0],[265,21,265,73,0],[265,73,266,21,0],[266,21,266,22,0],[266,22,267,25,0],[267,25,267,135,0],[267,135,270,21,0],[270,21,270,95,0],[270,95,271,21,0],[271,21,271,101,0],[271,101,272,17,0],[272,17,272,18,0],[272,18,272,20,0],[261,13,272,20,0],[273,9,273,10,0],[276,9,276,10,0],[277,13,279,17,0],[279,17,279,18,0],[279,18,280,21,0],[280,21,280,56,0],[280,56,281,21,0],[281,21,281,73,0],[281,73,282,21,0],[282,21,282,22,0],[282,22,283,25,0],[283,25,283,135,0],[283,135,286,21,0],[286,21,286,101,0],[286,101,287,21,0],[287,21,287,101,0],[287,101,288,17,0],[288,17,288,18,0],[288,18,288,20,0],[277,13,288,20,0],[289,9,289,10,0],[292,9,292,10,0],[293,13,295,17,0],[295,17,295,18,0],[295,18,296,21,0],[296,21,296,56,0],[296,56,297,21,0],[297,21,297,73,0],[297,73,298,21,0],[298,21,298,22,0],[298,22,299,25,0],[299,25,299,135,0],[299,135,302,21,0],[302,21,302,95,0],[302,95,303,21,0],[303,21,303,101,0],[303,101,304,17,0],[304,17,304,18,0],[304,18,304,20,0],[293,13,304,20,0],[305,9,305,10,0],[312,9,312,10,0],[313,13,313,39,0],[314,13,314,14,0],[315,17,315,29,0],[317,13,317,54,0],[318,13,318,93,0],[319,9,319,10,0],[326,9,326,10,0],[327,13,327,39,0],[328,13,328,14,0],[329,17,329,27,0],[331,13,331,45,0],[332,13,332,52,0],[333,9,333,10,0],[344,9,344,10,0],[345,13,345,39,0],[346,13,346,14,0],[347,17,347,29,0],[350,13,350,48,0],[352,13,352,56,0],[353,13,353,14,0],[354,17,354,70,0],[355,17,355,58,0],[358,17,358,36,0],[359,17,359,18,0],[361,21,361,51,0],[363,21,363,33,0],[366,17,366,56,0],[367,17,367,42,0],[368,17,368,65,0],[370,17,370,52,0],[371,17,371,58,0],[372,17,372,74,0],[373,17,373,56,0],[374,17,374,62,0],[375,17,375,64,0],[376,17,376,72,0],[377,17,377,66,0],[378,17,378,68,0],[379,17,379,74,0],[380,17,380,88,0],[383,17,383,53,0],[385,17,385,104,0],[385,104,385,109,0],[385,109,385,121,0],[385,17,385,121,0],[387,17,387,110,0],[389,17,389,30,0],[394,13,394,147,0],[395,9,395,10,0],[403,9,403,10,0],[404,13,404,48,0],[405,13,405,56,0],[406,13,406,14,0],[407,17,407,101,0],[408,17,408,102,0],[409,17,409,40,0],[410,21,410,119,0],[412,17,412,104,0],[412,104,412,109,0],[412,109,412,121,0],[412,17,412,121,0],[413,17,413,57,0],[414,17,414,57,0],[415,17,415,102,0],[416,17,416,30,0],[419,13,419,14,0],[420,17,420,57,0],[421,17,421,54,0],[422,17,422,30,0],[424,9,424,10,0],[427,9,427,10,0],[428,13,428,62,0],[430,13,430,20,0],[430,22,430,30,0],[430,31,430,33,0],[430,34,431,33,0],[431,33,431,113,0],[431,113,432,35,0],[432,35,432,46,0],[432,46,432,47,0],[430,34,432,47,0],[433,13,433,14,0],[434,17,434,42,0],[435,17,435,36,0],[436,17,436,18,0],[437,21,437,67,0],[438,21,438,70,0],[439,21,439,22,0],[440,25,440,60,0],[441,21,441,22,0],[442,17,442,18,0],[444,17,449,19,0],[479,17,479,50,0],[480,13,480,14,0],[481,13,481,35,0],[482,9,482,10,0],[490,9,490,10,0],[491,13,491,56,0],[493,13,493,39,0],[494,13,494,14,0],[495,17,495,42,0],[496,17,496,30,0],[499,13,499,48,0],[501,13,501,56,0],[502,13,502,14,0],[503,17,503,58,0],[506,17,506,36,0],[507,17,507,18,0],[509,21,509,51,0],[510,21,510,46,0],[511,21,511,34,0],[513,17,513,42,0],[514,17,514,50,0],[515,17,515,44,0],[516,13,516,14,0],[518,13,518,14,0],[519,17,519,62,0],[522,17,522,36,0],[523,17,523,18,0],[525,21,525,51,0],[526,21,526,46,0],[527,21,527,34,0],[529,17,529,46,0],[530,17,530,50,0],[531,17,531,44,0],[532,13,532,14,0],[534,13,534,37,0],[535,13,535,26,0],[536,9,536,10,0],[543,9,543,10,0],[544,13,544,92,0],[545,9,545,10,0],[552,17,552,18,0],[552,19,552,58,0],[552,59,552,60,0],[568,9,568,10,0],[569,13,569,26,0],[570,17,570,29,0],[572,13,572,36,0],[573,17,573,57,0],[574,13,574,37,0],[575,17,575,58,0],[576,13,576,38,0],[577,17,577,56,0],[580,13,580,36,0],[582,13,582,39,0],[583,13,583,14,0],[585,17,585,37,0],[586,13,586,14,0],[588,13,588,14,0],[589,17,589,52,0],[592,17,592,60,0],[593,17,593,18,0],[594,21,594,62,0],[595,21,595,48,0],[597,21,597,93,0],[598,21,598,57,0],[598,57,598,82,0],[598,82,598,84,0],[598,21,598,84,0],[599,21,599,22,0],[601,25,601,66,0],[601,66,601,86,0],[601,86,601,142,0],[601,25,601,142,0],[602,21,602,22,0],[605,21,605,59,0],[606,21,606,22,0],[608,25,608,72,0],[609,21,609,22,0],[610,17,610,18,0],[612,17,612,18,0],[613,21,613,60,0],[614,21,614,48,0],[615,17,615,18,0],[618,17,618,92,0],[619,17,619,70,0],[619,70,619,96,0],[619,96,619,98,0],[619,17,619,98,0],[620,17,620,18,0],[622,21,622,74,0],[623,21,623,63,0],[623,63,623,83,0],[623,83,623,120,0],[623,120,623,146,0],[623,146,623,155,0],[623,21,623,155,0],[624,17,624,18,0],[627,13,627,14,0],[629,13,629,32,0],[630,9,630,10,0],[640,9,640,10,0],[641,13,641,73,0],[642,13,642,34,0],[643,13,643,14,0],[644,17,644,116,0],[646,13,646,70,0],[647,9,647,10,0],[657,9,657,10,0],[660,13,660,39,0],[660,40,660,89,0],[661,13,661,44,0],[661,45,661,99,0],[664,13,664,75,0],[665,13,665,14,0],[666,17,666,69,0],[667,17,667,18,0],[668,21,668,166,0],[670,17,670,111,0],[671,17,671,18,0],[672,21,672,178,0],[676,17,676,18,0],[677,21,679,101,0],[682,21,682,98,0],[684,17,684,37,0],[685,17,685,18,0],[686,21,686,101,0],[687,21,687,215,0],[693,13,693,64,0],[694,13,694,14,0],[695,17,695,153,0],[699,13,699,84,0],[700,13,700,98,0],[701,13,701,14,0],[704,17,704,18,0],[705,21,705,110,0],[706,21,708,71,0],[710,17,710,37,0],[711,17,711,18,0],[712,21,712,102,0],[713,21,713,208,0],[718,13,718,119,0],[719,13,719,14,0],[721,17,721,176,0],[724,13,724,73,0],[725,13,725,14,0],[729,17,729,18,0],[730,21,730,132,0],[731,21,733,71,0],[735,17,735,37,0],[736,17,736,18,0],[737,21,737,102,0],[738,21,738,208,0],[742,13,742,69,0],[743,13,743,14,0],[745,17,745,176,0],[747,13,747,107,0],[748,13,748,14,0],[750,17,750,179,0],[755,13,755,14,0],[756,17,758,97,0],[761,17,761,18,0],[762,21,762,118,0],[763,21,765,71,0],[767,17,767,38,0],[768,17,768,18,0],[769,21,769,103,0],[770,21,770,209,0],[774,13,774,34,0],[775,13,775,14,0],[776,17,776,101,0],[777,17,777,205,0],[779,9,779,10,0],[800,9,800,10,0],[801,13,801,50,0],[804,13,804,31,0],[805,13,805,14,0],[806,17,806,58,0],[807,17,807,38,0],[808,13,808,14,0],[809,13,809,37,0],[810,13,810,14,0],[811,17,811,74,0],[812,17,812,54,0],[813,13,813,14,0],[814,13,814,40,0],[815,13,815,14,0],[816,17,816,80,0],[817,17,817,60,0],[818,13,818,14,0],[819,13,819,43,0],[820,13,820,14,0],[821,17,821,86,0],[822,17,822,66,0],[823,13,823,14,0],[824,13,824,33,0],[825,13,825,14,0],[826,17,826,62,0],[827,17,827,42,0],[828,13,828,14,0],[831,13,831,40,0],[831,40,831,49,0],[831,49,831,51,0],[831,13,831,51,0],[832,13,832,14,0],[833,17,833,45,0],[834,17,834,64,0],[837,13,837,57,0],[838,9,838,10,0],[845,9,845,10,0],[846,13,848,17,0],[848,17,848,18,0],[848,18,849,21,0],[849,21,849,56,0],[849,56,851,21,0],[851,21,851,73,0],[851,73,852,21,0],[852,21,852,22,0],[852,22,853,25,0],[853,25,853,152,0],[853,152,855,21,0],[855,21,855,66,0],[855,66,856,21,0],[856,21,856,101,0],[856,101,857,21,0],[857,21,857,35,0],[857,35,858,17,0],[858,17,858,18,0],[858,18,858,20,0],[846,13,858,20,0],[859,9,859,10,0],[862,9,862,10,0],[863,13,863,103,0],[864,13,864,20,0],[864,22,864,27,0],[864,28,864,30,0],[864,31,864,41,0],[865,13,865,14,0],[866,17,866,32,0],[867,17,867,30,0],[868,13,868,14,0],[869,13,869,34,0],[870,9,870,10,0]]);
+    </script>
+  </body>
+</html>

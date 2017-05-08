@@ -1,0 +1,1285 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <title>C:\Users\Tom Pipe\Documents\Hexadigital\Code\Umbraco\Umbraco-CMS\src\Umbraco.Core\Persistence\Repositories\ContentTypeBaseRepository.cs</title>
+    <script type="text/javascript" src="../js/dotcover.sourceview.js"></script>
+    <link rel="stylesheet" type="text/css" href="../css/dotcover.report.css" />
+  </head>
+  <body>
+    <pre id="content" class="source-code">
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Umbraco.Core.Events;
+using Umbraco.Core.Exceptions;
+using Umbraco.Core.Logging;
+using Umbraco.Core.Models;
+using Umbraco.Core.Models.EntityBase;
+using Umbraco.Core.Models.Rdbms;
+
+using Umbraco.Core.Persistence.Factories;
+using Umbraco.Core.Persistence.Querying;
+using Umbraco.Core.Persistence.Relators;
+using Umbraco.Core.Persistence.SqlSyntax;
+using Umbraco.Core.Persistence.UnitOfWork;
+using Umbraco.Core.Services;
+
+namespace Umbraco.Core.Persistence.Repositories
+{
+    /// &lt;summary&gt;
+    /// Represent an abstract Repository for ContentType based repositories
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;Exposes shared functionality&lt;/remarks&gt;
+    /// &lt;typeparam name=&quot;TEntity&quot;&gt;&lt;/typeparam&gt;
+    internal abstract class ContentTypeBaseRepository&lt;TEntity&gt; : PetaPocoRepositoryBase&lt;int, TEntity&gt;, IReadRepository&lt;Guid, TEntity&gt;
+        where TEntity : class, IContentTypeComposition
+    {
+        protected ContentTypeBaseRepository(IDatabaseUnitOfWork work, CacheHelper cache, ILogger logger, ISqlSyntaxProvider sqlSyntax)
+            : base(work, cache, logger, sqlSyntax)
+        {
+        }
+
+        public IEnumerable&lt;MoveEventInfo&lt;TEntity&gt;&gt; Move(TEntity toMove, EntityContainer container)
+        {
+            var parentId = Constants.System.Root;
+            if (container != null)
+            {
+                // Check on paths
+                if ((string.Format(&quot;,{0},&quot;, container.Path)).IndexOf(string.Format(&quot;,{0},&quot;, toMove.Id), StringComparison.Ordinal) &gt; -1)
+                {
+                    throw new DataOperationException&lt;MoveOperationStatusType&gt;(MoveOperationStatusType.FailedNotAllowedByPath);
+                }
+                parentId = container.Id;
+            }
+
+            //used to track all the moved entities to be given to the event
+            var moveInfo = new List&lt;MoveEventInfo&lt;TEntity&gt;&gt;
+            {
+                new MoveEventInfo&lt;TEntity&gt;(toMove, toMove.Path, parentId)
+            };
+
+
+            // get the level delta (old pos to new pos)
+            var levelDelta = container == null
+                ? 1 - toMove.Level
+                : container.Level + 1 - toMove.Level;
+
+            // move to parent (or -1), update path, save
+            toMove.ParentId = parentId;
+            var toMovePath = toMove.Path + &quot;,&quot;; // save before changing
+            toMove.Path = (container == null ? Constants.System.Root.ToString() : container.Path) + &quot;,&quot; + toMove.Id;
+            toMove.Level = container == null ? 1 : container.Level + 1;
+            AddOrUpdate(toMove);
+
+            //update all descendants, update in order of level
+            var descendants = GetByQuery(new Query&lt;TEntity&gt;().Where(type =&gt; type.Path.StartsWith(toMovePath)));
+            var paths = new Dictionary&lt;int, string&gt;();
+            paths[toMove.Id] = toMove.Path;
+
+            foreach (var descendant in descendants.OrderBy(x =&gt; x.Level))
+            {
+                moveInfo.Add(new MoveEventInfo&lt;TEntity&gt;(descendant, descendant.Path, descendant.ParentId));
+
+                descendant.Path = paths[descendant.Id] = paths[descendant.ParentId] + &quot;,&quot; + descendant.Id;
+                descendant.Level += levelDelta;
+
+                AddOrUpdate(descendant);
+            }
+
+            return moveInfo;
+        }
+        /// &lt;summary&gt;
+        /// Returns the content type ids that match the query
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;query&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        protected IEnumerable&lt;int&gt; PerformGetByQuery(IQuery&lt;PropertyType&gt; query)
+        {
+            var sqlClause = new Sql();
+            sqlClause.Select(&quot;*&quot;)
+               .From&lt;PropertyTypeGroupDto&gt;(SqlSyntax)
+               .RightJoin&lt;PropertyTypeDto&gt;(SqlSyntax)
+               .On&lt;PropertyTypeGroupDto, PropertyTypeDto&gt;(SqlSyntax, left =&gt; left.Id, right =&gt; right.PropertyTypeGroupId)
+               .InnerJoin&lt;DataTypeDto&gt;(SqlSyntax)
+               .On&lt;PropertyTypeDto, DataTypeDto&gt;(SqlSyntax, left =&gt; left.DataTypeId, right =&gt; right.DataTypeId);
+
+            var translator = new SqlTranslator&lt;PropertyType&gt;(sqlClause, query);
+            var sql = translator.Translate()
+                                .OrderBy&lt;PropertyTypeDto&gt;(x =&gt; x.PropertyTypeGroupId, SqlSyntax);
+
+            var dtos = Database.Fetch&lt;PropertyTypeGroupDto, PropertyTypeDto, DataTypeDto, PropertyTypeGroupDto&gt;(new GroupPropertyTypeRelator().Map, sql);
+
+            foreach (var dto in dtos.DistinctBy(x =&gt; x.ContentTypeNodeId))
+            {
+                yield return dto.ContentTypeNodeId;
+            }
+        }
+
+        protected virtual PropertyType CreatePropertyType(string propertyEditorAlias, DataTypeDatabaseType dbType, string propertyTypeAlias)
+        {
+            return new PropertyType(propertyEditorAlias, dbType, propertyTypeAlias);
+        }
+
+        protected void PersistNewBaseContentType(IContentTypeComposition entity)
+        {
+            var factory = new ContentTypeFactory();
+            var dto = factory.BuildContentTypeDto(entity);
+
+            //Cannot add a duplicate content type type
+            var exists = Database.ExecuteScalar&lt;int&gt;(@&quot;SELECT COUNT(*) FROM cmsContentType
+INNER JOIN umbracoNode ON cmsContentType.nodeId = umbracoNode.id
+WHERE cmsContentType.&quot; + SqlSyntax.GetQuotedColumnName(&quot;alias&quot;) + @&quot;= @alias
+AND umbracoNode.nodeObjectType = @objectType&quot;,
+                new { alias = entity.Alias, objectType = NodeObjectTypeId });
+            if (exists &gt; 0)
+            {
+                throw new DuplicateNameException(&quot;An item with the alias &quot; + entity.Alias + &quot; already exists&quot;);
+            }
+
+            //Logic for setting Path, Level and SortOrder
+            var parent = Database.First&lt;NodeDto&gt;(&quot;WHERE id = @ParentId&quot;, new { ParentId = entity.ParentId });
+            int level = parent.Level + 1;
+            int sortOrder =
+                Database.ExecuteScalar&lt;int&gt;(&quot;SELECT COUNT(*) FROM umbracoNode WHERE parentID = @ParentId AND nodeObjectType = @NodeObjectType&quot;,
+                                                      new { ParentId = entity.ParentId, NodeObjectType = NodeObjectTypeId });
+
+            //Create the (base) node data - umbracoNode
+            var nodeDto = dto.NodeDto;
+            nodeDto.Path = parent.Path;
+            nodeDto.Level = short.Parse(level.ToString(CultureInfo.InvariantCulture));
+            nodeDto.SortOrder = sortOrder;
+            var o = Database.IsNew(nodeDto) ? Convert.ToInt32(Database.Insert(nodeDto)) : Database.Update(nodeDto);
+
+            //Update with new correct path
+            nodeDto.Path = string.Concat(parent.Path, &quot;,&quot;, nodeDto.NodeId);
+            Database.Update(nodeDto);
+
+            //Update entity with correct values
+            entity.Id = nodeDto.NodeId; //Set Id on entity to ensure an Id is set
+            entity.Path = nodeDto.Path;
+            entity.SortOrder = sortOrder;
+            entity.Level = level;
+
+            //Insert new ContentType entry
+            dto.NodeId = nodeDto.NodeId;
+            Database.Insert(dto);
+
+            //Insert ContentType composition in new table
+            foreach (var composition in entity.ContentTypeComposition)
+            {
+                if (composition.Id == entity.Id) continue;//Just to ensure that we aren&#39;t creating a reference to ourself.
+
+                if (composition.HasIdentity)
+                {
+                    Database.Insert(new ContentType2ContentTypeDto { ParentId = composition.Id, ChildId = entity.Id });
+                }
+                else
+                {
+                    //Fallback for ContentTypes with no identity
+                    var contentTypeDto = Database.FirstOrDefault&lt;ContentTypeDto&gt;(&quot;WHERE alias = @Alias&quot;, new { Alias = composition.Alias });
+                    if (contentTypeDto != null)
+                    {
+                        Database.Insert(new ContentType2ContentTypeDto { ParentId = contentTypeDto.NodeId, ChildId = entity.Id });
+                    }
+                }
+            }
+
+            //Insert collection of allowed content types
+            foreach (var allowedContentType in entity.AllowedContentTypes)
+            {
+                Database.Insert(new ContentTypeAllowedContentTypeDto
+                                    {
+                                        Id = entity.Id,
+                                        AllowedId = allowedContentType.Id.Value,
+                                        SortOrder = allowedContentType.SortOrder
+                                    });
+            }
+
+            var propertyFactory = new PropertyGroupFactory(nodeDto.NodeId);
+
+            //Insert Tabs
+            foreach (var propertyGroup in entity.PropertyGroups)
+            {
+                var tabDto = propertyFactory.BuildGroupDto(propertyGroup);
+                var primaryKey = Convert.ToInt32(Database.Insert(tabDto));
+                propertyGroup.Id = primaryKey;//Set Id on PropertyGroup
+
+                //Ensure that the PropertyGroup&#39;s Id is set on the PropertyTypes within a group
+                //unless the PropertyGroupId has already been changed.
+                foreach (var propertyType in propertyGroup.PropertyTypes)
+                {
+                    if (propertyType.IsPropertyDirty(&quot;PropertyGroupId&quot;) == false)
+                    {
+                        var tempGroup = propertyGroup;
+                        propertyType.PropertyGroupId = new Lazy&lt;int&gt;(() =&gt; tempGroup.Id);
+                    }
+                }
+            }
+
+            //Insert PropertyTypes
+            foreach (var propertyType in entity.PropertyTypes)
+            {
+                var tabId = propertyType.PropertyGroupId != null ? propertyType.PropertyGroupId.Value : default(int);
+                //If the Id of the DataType is not set, we resolve it from the db by its PropertyEditorAlias
+                if (propertyType.DataTypeDefinitionId == 0 || propertyType.DataTypeDefinitionId == default(int))
+                {
+                    AssignDataTypeFromPropertyEditor(propertyType);
+                }
+                var propertyTypeDto = propertyFactory.BuildPropertyTypeDto(tabId, propertyType);
+                int typePrimaryKey = Convert.ToInt32(Database.Insert(propertyTypeDto));
+                propertyType.Id = typePrimaryKey; //Set Id on new PropertyType
+
+                //Update the current PropertyType with correct PropertyEditorAlias and DatabaseType
+                var dataTypeDto = Database.FirstOrDefault&lt;DataTypeDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = propertyTypeDto.DataTypeId });
+                propertyType.PropertyEditorAlias = dataTypeDto.PropertyEditorAlias;
+                propertyType.DataTypeDatabaseType = dataTypeDto.DbType.EnumParse&lt;DataTypeDatabaseType&gt;(true);
+            }
+        }
+
+        protected void PersistUpdatedBaseContentType(IContentTypeComposition entity)
+        {
+            var factory = new ContentTypeFactory();
+            var dto = factory.BuildContentTypeDto(entity);
+
+            // ensure the alias is not used already
+            var exists = Database.ExecuteScalar&lt;int&gt;(@&quot;SELECT COUNT(*) FROM cmsContentType
+INNER JOIN umbracoNode ON cmsContentType.nodeId = umbracoNode.id
+WHERE cmsContentType.&quot; + SqlSyntax.GetQuotedColumnName(&quot;alias&quot;) + @&quot;= @alias
+AND umbracoNode.nodeObjectType = @objectType
+AND umbracoNode.id &lt;&gt; @id&quot;,
+                new { id = dto.NodeId, alias = dto.Alias, objectType = NodeObjectTypeId });
+            if (exists &gt; 0)
+                throw new DuplicateNameException(&quot;An item with the alias &quot; + dto.Alias + &quot; already exists&quot;);
+
+            // handle (update) the node
+            var nodeDto = dto.NodeDto;
+            Database.Update(nodeDto);
+
+            // look up ContentType entry to get PrimaryKey for updating the DTO
+            // fixme - why? we are UPDATING so we should ALREADY have a PK!
+            var dtoPk = Database.First&lt;ContentTypeDto&gt;(&quot;WHERE nodeId = @Id&quot;, new { Id = entity.Id });
+            dto.PrimaryKey = dtoPk.PrimaryKey;
+            Database.Update(dto);
+
+            // handle (delete then recreate) compositions
+            Database.Delete&lt;ContentType2ContentTypeDto&gt;(&quot;WHERE childContentTypeId = @Id&quot;, new { Id = entity.Id });
+            foreach (var composition in entity.ContentTypeComposition)
+                Database.Insert(new ContentType2ContentTypeDto { ParentId = composition.Id, ChildId = entity.Id });
+
+            // removing a ContentType from a composition (U4-1690)
+            // 1. Find content based on the current ContentType: entity.Id
+            // 2. Find all PropertyTypes on the ContentType that was removed - tracked id (key)
+            // 3. Remove properties based on property types from the removed content type where the content ids correspond to those found in step one
+            var compositionBase = entity as ContentTypeCompositionBase;
+            if (compositionBase != null &amp;&amp; compositionBase.RemovedContentTypeKeyTracker != null &amp;&amp;
+                compositionBase.RemovedContentTypeKeyTracker.Any())
+            {
+                // find Content based on the current ContentType
+                var sql = new Sql();
+                sql.Select(&quot;*&quot;)
+                   .From&lt;ContentDto&gt;(SqlSyntax)
+                   .InnerJoin&lt;NodeDto&gt;(SqlSyntax).On&lt;ContentDto, NodeDto&gt;(SqlSyntax, left =&gt; left.NodeId, right =&gt; right.NodeId)
+                   .Where&lt;NodeDto&gt;(x =&gt; x.NodeObjectType == new Guid(Constants.ObjectTypes.Document))
+                   .Where&lt;ContentDto&gt;(x =&gt; x.ContentTypeId == entity.Id);
+                var contentDtos = Database.Fetch&lt;ContentDto, NodeDto&gt;(sql);
+
+                // loop through all tracked keys, which corresponds to the ContentTypes that has been removed from the composition
+                foreach (var key in compositionBase.RemovedContentTypeKeyTracker)
+                {
+                    // find PropertyTypes for the removed ContentType
+                    var propertyTypes = Database.Fetch&lt;PropertyTypeDto&gt;(&quot;WHERE contentTypeId = @Id&quot;, new { Id = key });
+                    // loop through the Content that is based on the current ContentType in order to remove the Properties that are
+                    // based on the PropertyTypes that belong to the removed ContentType.
+                    foreach (var contentDto in contentDtos)
+                    {
+                        foreach (var propertyType in propertyTypes)
+                        {
+                            var nodeId = contentDto.NodeId;
+                            var propertyTypeId = propertyType.Id;
+                            var propertySql = new Sql().Select(&quot;cmsPropertyData.id&quot;)
+                                .From&lt;PropertyDataDto&gt;(SqlSyntax)
+                                .InnerJoin&lt;PropertyTypeDto&gt;(SqlSyntax).On&lt;PropertyDataDto, PropertyTypeDto&gt;(SqlSyntax, left =&gt; left.PropertyTypeId, right =&gt; right.Id)
+                                .Where&lt;PropertyDataDto&gt;(x =&gt; x.NodeId == nodeId)
+                                .Where&lt;PropertyTypeDto&gt;(x =&gt; x.Id == propertyTypeId);
+
+                            // finally delete the properties that match our criteria for removing a ContentType from the composition
+                            Database.Delete&lt;PropertyDataDto&gt;(new Sql(&quot;WHERE id IN (&quot; + propertySql.SQL + &quot;)&quot;, propertySql.Arguments));
+                        }
+                    }
+                }
+            }
+
+            // delete the allowed content type entries before re-inserting the collectino of allowed content types
+            Database.Delete&lt;ContentTypeAllowedContentTypeDto&gt;(&quot;WHERE Id = @Id&quot;, new { entity.Id });
+            foreach (var allowedContentType in entity.AllowedContentTypes)
+            {
+                Database.Insert(new ContentTypeAllowedContentTypeDto
+                {
+                    Id = entity.Id,
+                    AllowedId = allowedContentType.Id.Value,
+                    SortOrder = allowedContentType.SortOrder
+                });
+            }
+
+            // FIXME below, manage the property types
+
+            // delete ??? fixme wtf is this?!
+            // by excepting entries from db with entries from collections
+            if (entity.IsPropertyDirty(&quot;PropertyTypes&quot;) || entity.PropertyTypes.Any(x =&gt; x.IsDirty()))
+            {
+                var dbPropertyTypes = Database.Fetch&lt;PropertyTypeDto&gt;(&quot;WHERE contentTypeId = @Id&quot;, new { Id = entity.Id });
+                var dbPropertyTypeAlias = dbPropertyTypes.Select(x =&gt; x.Id);
+                var entityPropertyTypes = entity.PropertyTypes.Where(x =&gt; x.HasIdentity).Select(x =&gt; x.Id);
+                var items = dbPropertyTypeAlias.Except(entityPropertyTypes);
+                foreach (var item in items)
+                    DeletePropertyType(entity.Id, item);
+            }
+
+            // delete tabs
+            // by excepting entries from db with entries from collections
+            List&lt;int&gt; orphanPropertyTypeIds = null;
+            if (entity.IsPropertyDirty(&quot;PropertyGroups&quot;) || entity.PropertyGroups.Any(x =&gt; x.IsDirty()))
+            {
+                // todo
+                // we used to try to propagate tabs renaming downstream, relying on ParentId, but
+                // 1) ParentId makes no sense (if a tab can be inherited from multiple composition
+                //    types) so we would need to figure things out differently, visiting downstream
+                //    content types and looking for tabs with the same name...
+                // 2) It was not deployable as changing a content type changes other content types
+                //    that was not deterministic, because it would depend on the order of the changes.
+                // That last point could be fixed if (1) is fixed, but then it still is an issue with
+                // deploy because changing a content type changes other content types that are not
+                // dependencies but dependents, and then what?
+                //
+                // So... for the time being, all renaming propagation is disabled. We just don&#39;t do it.
+
+                // (all gone)
+
+                // delete tabs that do not exist anymore
+                // get the tabs that are currently existing (in the db), get the tabs that we want,
+                // now, and derive the tabs that we want to delete
+                var existingPropertyGroups = Database.Fetch&lt;PropertyTypeGroupDto&gt;(&quot;WHERE contentTypeNodeId = @id&quot;, new { id = entity.Id })
+                    .Select(x =&gt; x.Id)
+                    .ToList();
+                var newPropertyGroups = entity.PropertyGroups.Select(x =&gt; x.Id).ToList();
+                var groupsToDelete = existingPropertyGroups
+                    .Except(newPropertyGroups)
+                    .ToArray();
+
+                // delete the tabs
+                if (groupsToDelete.Length &gt; 0)
+                {
+                    // if the tab contains properties, take care of them
+                    // - move them to &#39;generic properties&#39; so they remain consistent
+                    // - keep track of them, later on we&#39;ll figure out what to do with them
+                    // see http://issues.umbraco.org/issue/U4-8663
+                    orphanPropertyTypeIds = Database.Fetch&lt;PropertyTypeDto&gt;(&quot;WHERE propertyTypeGroupId IN (@ids)&quot;, new { ids = groupsToDelete })
+                        .Select(x =&gt; x.Id).ToList();
+                    Database.Update&lt;PropertyTypeDto&gt;(&quot;SET propertyTypeGroupId=NULL WHERE propertyTypeGroupId IN (@ids)&quot;, new { ids = groupsToDelete });
+
+                    // now we can delete the tabs
+                    Database.Delete&lt;PropertyTypeGroupDto&gt;(&quot;WHERE id IN (@ids)&quot;, new { ids = groupsToDelete });
+                }
+            }
+
+            var propertyGroupFactory = new PropertyGroupFactory(entity.Id);
+
+            // insert or update groups, assign properties
+            foreach (var propertyGroup in entity.PropertyGroups)
+            {
+                // insert or update group
+                var groupDto = propertyGroupFactory.BuildGroupDto(propertyGroup);
+                var groupId = propertyGroup.HasIdentity
+                    ? Database.Update(groupDto)
+                    : Convert.ToInt32(Database.Insert(groupDto));
+                if (propertyGroup.HasIdentity == false)
+                    propertyGroup.Id = groupId;
+                else
+                    groupId = propertyGroup.Id;
+
+                // assign properties to the group
+                // (all of them, even those that have .IsPropertyDirty(&quot;PropertyGroupId&quot;) == true,
+                //  because it should have been set to this group anyways and better be safe)
+                foreach (var propertyType in propertyGroup.PropertyTypes)
+                    propertyType.PropertyGroupId = new Lazy&lt;int&gt;(() =&gt; groupId);
+            }
+
+            // insert or update properties
+            // all of them, no-group and in groups
+            foreach (var propertyType in entity.PropertyTypes)
+            {
+                var groupId = propertyType.PropertyGroupId != null ? propertyType.PropertyGroupId.Value : default(int);
+
+                // if the Id of the DataType is not set, we resolve it from the db by its PropertyEditorAlias
+                if (propertyType.DataTypeDefinitionId == 0 || propertyType.DataTypeDefinitionId == default(int))
+                    AssignDataTypeFromPropertyEditor(propertyType);
+
+                // validate the alias
+                ValidateAlias(propertyType);
+
+                // insert or update property
+                var propertyTypeDto = propertyGroupFactory.BuildPropertyTypeDto(groupId, propertyType);
+                var typeId = propertyType.HasIdentity
+                    ? Database.Update(propertyTypeDto)
+                    : Convert.ToInt32(Database.Insert(propertyTypeDto));
+                if (propertyType.HasIdentity == false)
+                    propertyType.Id = typeId;
+                else
+                    typeId = propertyType.Id;
+
+                // not an orphan anymore
+                if (orphanPropertyTypeIds != null)
+                    orphanPropertyTypeIds.Remove(typeId);
+            }
+
+            // deal with orphan properties: those that were in a deleted tab,
+            // and have not been re-mapped to another tab or to &#39;generic properties&#39;
+            if (orphanPropertyTypeIds != null)
+                foreach (var id in orphanPropertyTypeIds)
+                    DeletePropertyType(entity.Id, id);
+        }
+
+        private void DeletePropertyType(int contentTypeId, int propertyTypeId)
+        {
+            // first clear dependencies
+            Database.Delete&lt;TagRelationshipDto&gt;(&quot;WHERE propertyTypeId = @Id&quot;, new { Id = propertyTypeId });
+            Database.Delete&lt;PropertyDataDto&gt;(&quot;WHERE propertytypeid = @Id&quot;, new { Id = propertyTypeId });
+
+            // then delete the property type
+            Database.Delete&lt;PropertyTypeDto&gt;(&quot;WHERE contentTypeId = @Id AND id = @PropertyTypeId&quot;, new { Id = contentTypeId, PropertyTypeId = propertyTypeId });
+        }
+
+        protected IEnumerable&lt;ContentTypeSort&gt; GetAllowedContentTypeIds(int id)
+        {
+            var sql = new Sql();
+            sql.Select(&quot;*&quot;)
+               .From&lt;ContentTypeAllowedContentTypeDto&gt;()
+               .LeftJoin&lt;ContentTypeDto&gt;()
+               .On&lt;ContentTypeAllowedContentTypeDto, ContentTypeDto&gt;(left =&gt; left.AllowedId, right =&gt; right.NodeId)
+               .Where&lt;ContentTypeAllowedContentTypeDto&gt;(x =&gt; x.Id == id);
+
+            var allowedContentTypeDtos = Database.Fetch&lt;ContentTypeAllowedContentTypeDto, ContentTypeDto&gt;(sql);
+            return allowedContentTypeDtos.Select(x =&gt; new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; x.AllowedId), x.SortOrder, x.ContentTypeDto.Alias)).ToList();
+        }
+
+        protected PropertyGroupCollection GetPropertyGroupCollection(int id, DateTime createDate, DateTime updateDate)
+        {
+            var sql = new Sql();
+            sql.Select(&quot;*&quot;)
+               .From&lt;PropertyTypeGroupDto&gt;()
+               .LeftJoin&lt;PropertyTypeDto&gt;()
+               .On&lt;PropertyTypeGroupDto, PropertyTypeDto&gt;(left =&gt; left.Id, right =&gt; right.PropertyTypeGroupId)
+               .LeftJoin&lt;DataTypeDto&gt;()
+               .On&lt;PropertyTypeDto, DataTypeDto&gt;(left =&gt; left.DataTypeId, right =&gt; right.DataTypeId)
+               .Where&lt;PropertyTypeGroupDto&gt;(x =&gt; x.ContentTypeNodeId == id)
+               .OrderBy&lt;PropertyTypeGroupDto&gt;(x =&gt; x.Id);
+
+            var dtos = Database.Fetch&lt;PropertyTypeGroupDto, PropertyTypeDto, DataTypeDto, PropertyTypeGroupDto&gt;(new GroupPropertyTypeRelator().Map, sql);
+
+            var propertyGroupFactory = new PropertyGroupFactory(id, createDate, updateDate, CreatePropertyType);
+            var propertyGroups = propertyGroupFactory.BuildEntity(dtos);
+            return new PropertyGroupCollection(propertyGroups);
+        }
+
+        protected PropertyTypeCollection GetPropertyTypeCollection(int id, DateTime createDate, DateTime updateDate)
+        {
+            var sql = new Sql();
+            sql.Select(&quot;*&quot;)
+               .From&lt;PropertyTypeDto&gt;()
+               .InnerJoin&lt;DataTypeDto&gt;()
+               .On&lt;PropertyTypeDto, DataTypeDto&gt;(left =&gt; left.DataTypeId, right =&gt; right.DataTypeId)
+               .Where&lt;PropertyTypeDto&gt;(x =&gt; x.ContentTypeId == id);
+
+            var dtos = Database.Fetch&lt;PropertyTypeDto, DataTypeDto&gt;(sql);
+
+            //TODO Move this to a PropertyTypeFactory
+            var list = new List&lt;PropertyType&gt;();
+            foreach (var dto in dtos.Where(x =&gt; (x.PropertyTypeGroupId &gt; 0) == false))
+            {
+                var propType = CreatePropertyType(dto.DataTypeDto.PropertyEditorAlias, dto.DataTypeDto.DbType.EnumParse&lt;DataTypeDatabaseType&gt;(true), dto.Alias);
+                propType.DataTypeDefinitionId = dto.DataTypeId;
+                propType.Description = dto.Description;
+                propType.Id = dto.Id;
+                propType.Key = dto.UniqueId;
+                propType.Name = dto.Name;
+                propType.Mandatory = dto.Mandatory;
+                propType.SortOrder = dto.SortOrder;
+                propType.ValidationRegExp = dto.ValidationRegExp;
+                propType.CreateDate = createDate;
+                propType.UpdateDate = updateDate;
+                list.Add(propType);
+            }
+            //Reset dirty properties
+            Parallel.ForEach(list, currentFile =&gt; currentFile.ResetDirtyProperties(false));
+
+            return new PropertyTypeCollection(list);
+        }
+
+        protected void ValidateAlias(PropertyType pt)
+        {
+            Mandate.That&lt;InvalidOperationException&gt;(string.IsNullOrEmpty(pt.Alias) == false,
+                                    () =&gt;
+                                    {
+                                        var message =
+                                            string.Format(
+                                                &quot;{0} &#39;{1}&#39; cannot have an empty Alias. This is most likely due to invalid characters stripped from the Alias.&quot;,
+                                                &quot;Property Type&quot;,
+                                                pt.Name);
+                                        var exception = new InvalidOperationException(message);
+
+                                        Logger.Error&lt;ContentTypeBaseRepository&lt;TEntity&gt;&gt;(message, exception);
+                                        throw exception;
+                                    });
+        }
+
+        protected void ValidateAlias(TEntity entity)
+        {
+            Mandate.That&lt;InvalidOperationException&gt;(string.IsNullOrEmpty(entity.Alias) == false,
+                                    () =&gt;
+                                    {
+                                        var message =
+                                            string.Format(
+                                                &quot;{0} &#39;{1}&#39; cannot have an empty Alias. This is most likely due to invalid characters stripped from the Alias.&quot;,
+                                                typeof(TEntity).Name,
+                                                entity.Name);
+                                        var exception = new InvalidOperationException(message);
+
+                                        Logger.Error&lt;ContentTypeBaseRepository&lt;TEntity&gt;&gt;(message, exception);
+                                        throw exception;
+                                    });
+        }
+
+        /// &lt;summary&gt;
+        /// Try to set the data type id based on its ControlId
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;propertyType&quot;&gt;&lt;/param&gt;
+        private void AssignDataTypeFromPropertyEditor(PropertyType propertyType)
+        {
+            //we cannot try to assign a data type of it&#39;s empty
+            if (propertyType.PropertyEditorAlias.IsNullOrWhiteSpace() == false)
+            {
+                var sql = new Sql()
+                    .Select(&quot;*&quot;)
+                    .From&lt;DataTypeDto&gt;()
+                    .Where(&quot;propertyEditorAlias = @propertyEditorAlias&quot;, new { propertyEditorAlias = propertyType.PropertyEditorAlias })
+                    .OrderBy&lt;DataTypeDto&gt;(typeDto =&gt; typeDto.DataTypeId);
+                var datatype = Database.FirstOrDefault&lt;DataTypeDto&gt;(sql);
+                //we cannot assign a data type if one was not found
+                if (datatype != null)
+                {
+                    propertyType.DataTypeDefinitionId = datatype.DataTypeId;
+                }
+                else
+                {
+                    Logger.Warn&lt;ContentTypeBaseRepository&lt;TEntity&gt;&gt;(&quot;Could not assign a data type for the property type &quot; + propertyType.Alias + &quot; since no data type was found with a property editor &quot; + propertyType.PropertyEditorAlias);
+                }
+            }
+        }
+
+        internal static class ContentTypeQueryMapper
+        {
+
+            public class AssociatedTemplate
+            {
+                public AssociatedTemplate(int templateId, string @alias, string templateName)
+                {
+                    TemplateId = templateId;
+                    Alias = alias;
+                    TemplateName = templateName;
+                }
+
+                public int TemplateId { get; set; }
+                public string Alias { get; set; }
+                public string TemplateName { get; set; }
+
+                protected bool Equals(AssociatedTemplate other)
+                {
+                    return TemplateId == other.TemplateId;
+                }
+
+                public override bool Equals(object obj)
+                {
+                    if (ReferenceEquals(null, obj)) return false;
+                    if (ReferenceEquals(this, obj)) return true;
+                    if (obj.GetType() != this.GetType()) return false;
+                    return Equals((AssociatedTemplate)obj);
+                }
+
+                public override int GetHashCode()
+                {
+                    return TemplateId;
+                }
+            }
+
+            public static IEnumerable&lt;IMediaType&gt; GetMediaTypes&lt;TRepo&gt;(
+                Database db, ISqlSyntaxProvider sqlSyntax,
+                TRepo contentTypeRepository)
+                where TRepo : IReadRepository&lt;int, TEntity&gt;
+            {
+                IDictionary&lt;int, List&lt;int&gt;&gt; allParentMediaTypeIds;
+                var mediaTypes = MapMediaTypes(db, sqlSyntax, out allParentMediaTypeIds)
+                    .ToArray();
+
+                MapContentTypeChildren(mediaTypes, db, sqlSyntax, contentTypeRepository, allParentMediaTypeIds);
+
+                return mediaTypes;
+            }
+
+            public static IEnumerable&lt;IContentType&gt; GetContentTypes&lt;TRepo&gt;(
+                Database db, ISqlSyntaxProvider sqlSyntax,
+                TRepo contentTypeRepository,
+                ITemplateRepository templateRepository)
+                where TRepo : IReadRepository&lt;int, TEntity&gt;
+            {
+                IDictionary&lt;int, List&lt;AssociatedTemplate&gt;&gt; allAssociatedTemplates;
+                IDictionary&lt;int, List&lt;int&gt;&gt; allParentContentTypeIds;
+                var contentTypes = MapContentTypes(db, sqlSyntax, out allAssociatedTemplates, out allParentContentTypeIds)
+                    .ToArray();
+
+                if (contentTypes.Any())
+                {
+                    MapContentTypeTemplates(
+                            contentTypes, db, contentTypeRepository, templateRepository, allAssociatedTemplates);
+
+                    MapContentTypeChildren(
+                            contentTypes, db, sqlSyntax, contentTypeRepository, allParentContentTypeIds);
+                }
+
+                return contentTypes;
+            }
+
+            internal static void MapContentTypeChildren&lt;TRepo&gt;(IContentTypeComposition[] contentTypes,
+                Database db, ISqlSyntaxProvider sqlSyntax,
+                TRepo contentTypeRepository,
+                IDictionary&lt;int, List&lt;int&gt;&gt; allParentContentTypeIds)
+                where TRepo : IReadRepository&lt;int, TEntity&gt;
+            {
+                //NOTE: SQL call #2
+
+                var ids = contentTypes.Select(x =&gt; x.Id).ToArray();
+                IDictionary&lt;int, PropertyGroupCollection&gt; allPropGroups;
+                IDictionary&lt;int, PropertyTypeCollection&gt; allPropTypes;
+                MapGroupsAndProperties(ids, db, sqlSyntax, out allPropTypes, out allPropGroups);
+
+                foreach (var contentType in contentTypes)
+                {
+                    contentType.PropertyGroups = allPropGroups[contentType.Id];
+                    contentType.NoGroupPropertyTypes = allPropTypes[contentType.Id];
+                }
+
+                //NOTE: SQL call #3++
+
+                if (allParentContentTypeIds != null)
+                {
+                    var allParentIdsAsArray = allParentContentTypeIds.SelectMany(x =&gt; x.Value).Distinct().ToArray();
+                    if (allParentIdsAsArray.Any())
+                    {
+                        var allParentContentTypes = contentTypes.Where(x =&gt; allParentIdsAsArray.Contains(x.Id)).ToArray();
+
+                        foreach (var contentType in contentTypes)
+                        {
+                            var entityId = contentType.Id;
+
+                            var parentContentTypes = allParentContentTypes.Where(x =&gt;
+                            {
+                                var parentEntityId = x.Id;
+
+                                return allParentContentTypeIds[entityId].Contains(parentEntityId);
+                            });
+                            foreach (var parentContentType in parentContentTypes)
+                            {
+                                var result = contentType.AddContentType(parentContentType);
+                                //Do something if adding fails? (Should hopefully not be possible unless someone created a circular reference)
+                            }
+
+                            //on initial construction we don&#39;t want to have dirty properties tracked
+                            // http://issues.umbraco.org/issue/U4-1946
+                            ((Entity)contentType).ResetDirtyProperties(false);
+                        }
+                    }
+                }
+
+
+            }
+
+            internal static void MapContentTypeTemplates&lt;TRepo&gt;(IContentType[] contentTypes,
+                Database db,
+                TRepo contentTypeRepository,
+                ITemplateRepository templateRepository,
+                IDictionary&lt;int, List&lt;AssociatedTemplate&gt;&gt; associatedTemplates)
+                where TRepo : IReadRepository&lt;int, TEntity&gt;
+            {
+                if (associatedTemplates == null || associatedTemplates.Any() == false) return;
+
+                //NOTE: SQL call #3++
+                //SEE: http://issues.umbraco.org/issue/U4-5174 to fix this
+
+                var templateIds = associatedTemplates.SelectMany(x =&gt; x.Value).Select(x =&gt; x.TemplateId)
+                    .Distinct()
+                    .ToArray();
+
+                var templates = (templateIds.Any()
+                    ? templateRepository.GetAll(templateIds)
+                    : Enumerable.Empty&lt;ITemplate&gt;()).ToArray();
+
+                foreach (var contentType in contentTypes)
+                {
+                    var entityId = contentType.Id;
+
+                    var associatedTemplateIds = associatedTemplates[entityId].Select(x =&gt; x.TemplateId)
+                        .Distinct()
+                        .ToArray();
+
+                    contentType.AllowedTemplates = (associatedTemplateIds.Any()
+                        ? templates.Where(x =&gt; associatedTemplateIds.Contains(x.Id))
+                        : Enumerable.Empty&lt;ITemplate&gt;()).ToArray();
+                }
+
+
+            }
+
+            internal static IEnumerable&lt;IMediaType&gt; MapMediaTypes(Database db, ISqlSyntaxProvider sqlSyntax,
+                out IDictionary&lt;int, List&lt;int&gt;&gt; parentMediaTypeIds)
+            {
+                Mandate.ParameterNotNull(db, &quot;db&quot;);
+
+                var sql = @&quot;SELECT cmsContentType.pk as ctPk, cmsContentType.alias as ctAlias, cmsContentType.allowAtRoot as ctAllowAtRoot, cmsContentType.description as ctDesc,
+                                cmsContentType.icon as ctIcon, cmsContentType.isContainer as ctIsContainer, cmsContentType.nodeId as ctId, cmsContentType.thumbnail as ctThumb,
+                                AllowedTypes.AllowedId as ctaAllowedId, AllowedTypes.SortOrder as ctaSortOrder, AllowedTypes.alias as ctaAlias,
+                                ParentTypes.parentContentTypeId as chtParentId, ParentTypes.parentContentTypeKey as chtParentKey,
+                                umbracoNode.createDate as nCreateDate, umbracoNode.&quot; + sqlSyntax.GetQuotedColumnName(&quot;level&quot;) + @&quot; as nLevel, umbracoNode.nodeObjectType as nObjectType, umbracoNode.nodeUser as nUser,
+		                        umbracoNode.parentID as nParentId, umbracoNode.&quot; + sqlSyntax.GetQuotedColumnName(&quot;path&quot;) + @&quot; as nPath, umbracoNode.sortOrder as nSortOrder, umbracoNode.&quot; + sqlSyntax.GetQuotedColumnName(&quot;text&quot;) + @&quot; as nName, umbracoNode.trashed as nTrashed,
+                                umbracoNode.uniqueID as nUniqueId
+                        FROM cmsContentType
+                        INNER JOIN umbracoNode
+                        ON cmsContentType.nodeId = umbracoNode.id
+                        LEFT JOIN (
+                            SELECT cmsContentTypeAllowedContentType.Id, cmsContentTypeAllowedContentType.AllowedId, cmsContentType.alias, cmsContentTypeAllowedContentType.SortOrder
+                            FROM cmsContentTypeAllowedContentType
+                            INNER JOIN cmsContentType
+                            ON cmsContentTypeAllowedContentType.AllowedId = cmsContentType.nodeId
+                        ) AllowedTypes
+                        ON AllowedTypes.Id = cmsContentType.nodeId
+                        LEFT JOIN (
+                            SELECT cmsContentType2ContentType.parentContentTypeId, umbracoNode.uniqueID AS parentContentTypeKey, cmsContentType2ContentType.childContentTypeId
+                            FROM cmsContentType2ContentType
+                            INNER JOIN umbracoNode
+                            ON cmsContentType2ContentType.parentContentTypeId = umbracoNode.&quot; + sqlSyntax.GetQuotedColumnName(&quot;id&quot;) + @&quot;
+                        ) ParentTypes
+                        ON ParentTypes.childContentTypeId = cmsContentType.nodeId
+                        WHERE (umbracoNode.nodeObjectType = @nodeObjectType)
+                        ORDER BY ctId&quot;;
+
+                var result = db.Fetch&lt;dynamic&gt;(sql, new { nodeObjectType = new Guid(Constants.ObjectTypes.MediaType) });
+
+                if (result.Any() == false)
+                {
+                    parentMediaTypeIds = null;
+                    return Enumerable.Empty&lt;IMediaType&gt;();
+                }
+
+                parentMediaTypeIds = new Dictionary&lt;int, List&lt;int&gt;&gt;();
+                var mappedMediaTypes = new List&lt;IMediaType&gt;();
+
+                //loop through each result and fill in our required values, each row will contain different requried data than the rest.
+                // it is much quicker to iterate each result and populate instead of looking up the values over and over in the result like
+                // we used to do.
+                var queue = new Queue&lt;dynamic&gt;(result);
+                var currAllowedContentTypes = new List&lt;ContentTypeSort&gt;();
+
+                while (queue.Count &gt; 0)
+                {
+                    var ct = queue.Dequeue();
+
+                    //check for allowed content types
+                    int? allowedCtId = ct.ctaAllowedId;
+                    int? allowedCtSort = ct.ctaSortOrder;
+                    string allowedCtAlias = ct.ctaAlias;
+                    if (allowedCtId.HasValue &amp;&amp; allowedCtSort.HasValue &amp;&amp; allowedCtAlias != null)
+                    {
+                        var ctSort = new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; allowedCtId.Value), allowedCtSort.Value, allowedCtAlias);
+                        if (currAllowedContentTypes.Contains(ctSort) == false)
+                        {
+                            currAllowedContentTypes.Add(ctSort);
+                        }
+                    }
+
+                    //always ensure there&#39;s a list for this content type
+                    if (parentMediaTypeIds.ContainsKey(ct.ctId) == false)
+                        parentMediaTypeIds[ct.ctId] = new List&lt;int&gt;();
+
+                    //check for parent ids and assign to the outgoing collection
+                    int? parentId = ct.chtParentId;
+                    if (parentId.HasValue)
+                    {
+                        var associatedParentIds = parentMediaTypeIds[ct.ctId];
+                        if (associatedParentIds.Contains(parentId.Value) == false)
+                            associatedParentIds.Add(parentId.Value);
+                    }
+
+                    if (queue.Count == 0 || queue.Peek().ctId != ct.ctId)
+                    {
+                        //it&#39;s the last in the queue or the content type is changing (moving to the next one)
+                        var mediaType = CreateForMapping(ct, currAllowedContentTypes);
+                        mappedMediaTypes.Add(mediaType);
+
+                        //Here we need to reset the current variables, we&#39;re now collecting data for a different content type
+                        currAllowedContentTypes = new List&lt;ContentTypeSort&gt;();
+                    }
+                }
+
+                return mappedMediaTypes;
+            }
+
+            private static IMediaType CreateForMapping(dynamic currCt, List&lt;ContentTypeSort&gt; currAllowedContentTypes)
+            {
+                // * create the DTO object
+                // * create the content type object
+                // * map the allowed content types
+                // * add to the outgoing list
+
+                var contentTypeDto = new ContentTypeDto
+                {
+                    Alias = currCt.ctAlias,
+                    AllowAtRoot = currCt.ctAllowAtRoot,
+                    Description = currCt.ctDesc,
+                    Icon = currCt.ctIcon,
+                    IsContainer = currCt.ctIsContainer,
+                    NodeId = currCt.ctId,
+                    PrimaryKey = currCt.ctPk,
+                    Thumbnail = currCt.ctThumb,
+                    //map the underlying node dto
+                    NodeDto = new NodeDto
+                    {
+                        CreateDate = currCt.nCreateDate,
+                        Level = (short)currCt.nLevel,
+                        NodeId = currCt.ctId,
+                        NodeObjectType = currCt.nObjectType,
+                        ParentId = currCt.nParentId,
+                        Path = currCt.nPath,
+                        SortOrder = currCt.nSortOrder,
+                        Text = currCt.nName,
+                        Trashed = currCt.nTrashed,
+                        UniqueId = currCt.nUniqueId,
+                        UserId = currCt.nUser
+                    }
+                };
+
+                //now create the content type object
+
+                var factory = new ContentTypeFactory();
+                var mediaType = factory.BuildMediaTypeEntity(contentTypeDto);
+
+                //map the allowed content types
+                mediaType.AllowedContentTypes = currAllowedContentTypes;
+
+                return mediaType;
+            }
+
+            internal static IEnumerable&lt;IContentType&gt; MapContentTypes(Database db, ISqlSyntaxProvider sqlSyntax,
+                out IDictionary&lt;int, List&lt;AssociatedTemplate&gt;&gt; associatedTemplates,
+                out IDictionary&lt;int, List&lt;int&gt;&gt; parentContentTypeIds)
+            {
+                Mandate.ParameterNotNull(db, &quot;db&quot;);
+
+                var sql = @&quot;SELECT cmsDocumentType.IsDefault as dtIsDefault, cmsDocumentType.templateNodeId as dtTemplateId,
+                                cmsContentType.pk as ctPk, cmsContentType.alias as ctAlias, cmsContentType.allowAtRoot as ctAllowAtRoot, cmsContentType.description as ctDesc,
+                                cmsContentType.icon as ctIcon, cmsContentType.isContainer as ctIsContainer, cmsContentType.nodeId as ctId, cmsContentType.thumbnail as ctThumb,
+                                AllowedTypes.AllowedId as ctaAllowedId, AllowedTypes.SortOrder as ctaSortOrder, AllowedTypes.alias as ctaAlias,
+                                ParentTypes.parentContentTypeId as chtParentId,ParentTypes.parentContentTypeKey as chtParentKey,
+                                umbracoNode.createDate as nCreateDate, umbracoNode.&quot; + sqlSyntax.GetQuotedColumnName(&quot;level&quot;) + @&quot; as nLevel, umbracoNode.nodeObjectType as nObjectType, umbracoNode.nodeUser as nUser,
+		                        umbracoNode.parentID as nParentId, umbracoNode.&quot; + sqlSyntax.GetQuotedColumnName(&quot;path&quot;) + @&quot; as nPath, umbracoNode.sortOrder as nSortOrder, umbracoNode.&quot; + sqlSyntax.GetQuotedColumnName(&quot;text&quot;) + @&quot; as nName, umbracoNode.trashed as nTrashed,
+                                umbracoNode.uniqueID as nUniqueId,
+                                Template.alias as tAlias, Template.nodeId as tId,Template.text as tText
+                        FROM cmsContentType
+                        INNER JOIN umbracoNode
+                        ON cmsContentType.nodeId = umbracoNode.id
+                        LEFT JOIN cmsDocumentType
+                        ON cmsDocumentType.contentTypeNodeId = cmsContentType.nodeId
+                        LEFT JOIN (
+                            SELECT cmsContentTypeAllowedContentType.Id, cmsContentTypeAllowedContentType.AllowedId, cmsContentType.alias, cmsContentTypeAllowedContentType.SortOrder
+                            FROM cmsContentTypeAllowedContentType
+                            INNER JOIN cmsContentType
+                            ON cmsContentTypeAllowedContentType.AllowedId = cmsContentType.nodeId
+                        ) AllowedTypes
+                        ON AllowedTypes.Id = cmsContentType.nodeId
+                        LEFT JOIN (
+                            SELECT * FROM cmsTemplate
+                            INNER JOIN umbracoNode
+                            ON cmsTemplate.nodeId = umbracoNode.id
+                        ) as Template
+                        ON Template.nodeId = cmsDocumentType.templateNodeId
+                        LEFT JOIN (
+                            SELECT cmsContentType2ContentType.parentContentTypeId, umbracoNode.uniqueID AS parentContentTypeKey, cmsContentType2ContentType.childContentTypeId
+                            FROM cmsContentType2ContentType
+                            INNER JOIN umbracoNode
+                            ON cmsContentType2ContentType.parentContentTypeId = umbracoNode.&quot; + sqlSyntax.GetQuotedColumnName(&quot;id&quot;) + @&quot;
+                        ) ParentTypes
+                        ON ParentTypes.childContentTypeId = cmsContentType.nodeId
+                        WHERE (umbracoNode.nodeObjectType = @nodeObjectType)
+                        ORDER BY ctId&quot;;
+
+                var result = db.Fetch&lt;dynamic&gt;(sql, new { nodeObjectType = new Guid(Constants.ObjectTypes.DocumentType)});
+
+                if (result.Any() == false)
+                {
+                    parentContentTypeIds = null;
+                    associatedTemplates = null;
+                    return Enumerable.Empty&lt;IContentType&gt;();
+                }
+
+                parentContentTypeIds = new Dictionary&lt;int, List&lt;int&gt;&gt;();
+                associatedTemplates = new Dictionary&lt;int, List&lt;AssociatedTemplate&gt;&gt;();
+                var mappedContentTypes = new List&lt;IContentType&gt;();
+
+                var queue = new Queue&lt;dynamic&gt;(result);
+                var currDefaultTemplate = -1;
+                var currAllowedContentTypes = new List&lt;ContentTypeSort&gt;();
+                while (queue.Count &gt; 0)
+                {
+                    var ct = queue.Dequeue();
+
+                    //check for default templates
+                    bool? isDefaultTemplate = Convert.ToBoolean(ct.dtIsDefault);
+                    int? templateId = ct.dtTemplateId;
+                    if (currDefaultTemplate == -1 &amp;&amp; isDefaultTemplate.HasValue &amp;&amp; isDefaultTemplate.Value &amp;&amp; templateId.HasValue)
+                    {
+                        currDefaultTemplate = templateId.Value;
+                    }
+
+                    //always ensure there&#39;s a list for this content type
+                    if (associatedTemplates.ContainsKey(ct.ctId) == false)
+                        associatedTemplates[ct.ctId] = new List&lt;AssociatedTemplate&gt;();
+
+                    //check for associated templates and assign to the outgoing collection
+                    if (ct.tId != null)
+                    {
+                        var associatedTemplate = new AssociatedTemplate(ct.tId, ct.tAlias, ct.tText);
+                        var associatedList = associatedTemplates[ct.ctId];
+
+                        if (associatedList.Contains(associatedTemplate) == false)
+                            associatedList.Add(associatedTemplate);
+                    }
+
+                    //check for allowed content types
+                    int? allowedCtId = ct.ctaAllowedId;
+                    int? allowedCtSort = ct.ctaSortOrder;
+                    string allowedCtAlias = ct.ctaAlias;
+                    if (allowedCtId.HasValue &amp;&amp; allowedCtSort.HasValue &amp;&amp; allowedCtAlias != null)
+                    {
+                        var ctSort = new ContentTypeSort(new Lazy&lt;int&gt;(() =&gt; allowedCtId.Value), allowedCtSort.Value, allowedCtAlias);
+                        if (currAllowedContentTypes.Contains(ctSort) == false)
+                        {
+                            currAllowedContentTypes.Add(ctSort);
+                        }
+                    }
+
+                    //always ensure there&#39;s a list for this content type
+                    if (parentContentTypeIds.ContainsKey(ct.ctId) == false)
+                        parentContentTypeIds[ct.ctId] = new List&lt;int&gt;();
+
+                    //check for parent ids and assign to the outgoing collection
+                    int? parentId = ct.chtParentId;
+                    if (parentId.HasValue)
+                    {
+                        var associatedParentIds = parentContentTypeIds[ct.ctId];
+
+                        if (associatedParentIds.Contains(parentId.Value) == false)
+                            associatedParentIds.Add(parentId.Value);
+                    }
+
+                    if (queue.Count == 0 || queue.Peek().ctId != ct.ctId)
+                    {
+                        //it&#39;s the last in the queue or the content type is changing (moving to the next one)
+                        var contentType = CreateForMapping(ct, currAllowedContentTypes, currDefaultTemplate);
+                        mappedContentTypes.Add(contentType);
+
+                        //Here we need to reset the current variables, we&#39;re now collecting data for a different content type
+                        currDefaultTemplate = -1;
+                        currAllowedContentTypes = new List&lt;ContentTypeSort&gt;();
+                    }
+                }
+
+                return mappedContentTypes;
+            }
+
+            private static IContentType CreateForMapping(dynamic currCt, List&lt;ContentTypeSort&gt; currAllowedContentTypes, int currDefaultTemplate)
+            {
+                // * set the default template to the first one if a default isn&#39;t found
+                // * create the DTO object
+                // * create the content type object
+                // * map the allowed content types
+                // * add to the outgoing list
+
+                var dtDto = new ContentTypeTemplateDto
+                {
+                    //create the content type dto
+                    ContentTypeDto = new ContentTypeDto
+                    {
+                        Alias = currCt.ctAlias,
+                        AllowAtRoot = currCt.ctAllowAtRoot,
+                        Description = currCt.ctDesc,
+                        Icon = currCt.ctIcon,
+                        IsContainer = currCt.ctIsContainer,
+                        NodeId = currCt.ctId,
+                        PrimaryKey = currCt.ctPk,
+                        Thumbnail = currCt.ctThumb,
+                        //map the underlying node dto
+                        NodeDto = new NodeDto
+                        {
+                            CreateDate = currCt.nCreateDate,
+                            Level = (short)currCt.nLevel,
+                            NodeId = currCt.ctId,
+                            NodeObjectType = currCt.nObjectType,
+                            ParentId = currCt.nParentId,
+                            Path = currCt.nPath,
+                            SortOrder = currCt.nSortOrder,
+                            Text = currCt.nName,
+                            Trashed = currCt.nTrashed,
+                            UniqueId = currCt.nUniqueId,
+                            UserId = currCt.nUser
+                        }
+                    },
+                    ContentTypeNodeId = currCt.ctId,
+                    IsDefault = currDefaultTemplate != -1,
+                    TemplateNodeId = currDefaultTemplate != -1 ? currDefaultTemplate : 0,
+                };
+
+                //now create the content type object
+
+                var factory = new ContentTypeFactory();
+                var contentType = factory.BuildContentTypeEntity(dtDto.ContentTypeDto);
+
+                // NOTE
+                // that was done by the factory but makes little sense, moved here, so
+                // now we have to reset dirty props again (as the factory does it) and yet,
+                // we are not managing allowed templates... the whole thing is weird.
+                ((ContentType)contentType).DefaultTemplateId = dtDto.TemplateNodeId;
+                contentType.ResetDirtyProperties(false);
+
+                //map the allowed content types
+                contentType.AllowedContentTypes = currAllowedContentTypes;
+
+                return contentType;
+            }
+
+            internal static void MapGroupsAndProperties(int[] contentTypeIds, Database db, ISqlSyntaxProvider sqlSyntax,
+                out IDictionary&lt;int, PropertyTypeCollection&gt; allPropertyTypeCollection,
+                out IDictionary&lt;int, PropertyGroupCollection&gt; allPropertyGroupCollection)
+            {
+                allPropertyGroupCollection = new Dictionary&lt;int, PropertyGroupCollection&gt;();
+                allPropertyTypeCollection = new Dictionary&lt;int, PropertyTypeCollection&gt;();
+
+                // query below is not safe + pointless if array is empty
+                if (contentTypeIds.Length == 0) return;
+
+                // first part Gets all property groups including property type data even when no property type exists on the group
+                // second part Gets all property types including ones that are not on a group
+                // therefore the union of the two contains all of the property type and property group information we need
+                // NOTE: MySQL requires a SELECT * FROM the inner union in order to be able to sort . lame.
+
+                var sqlBuilder = new StringBuilder(@&quot;SELECT PG.contenttypeNodeId as contentTypeId,
+                            PT.ptUniqueId as ptUniqueID, PT.ptId, PT.ptAlias, PT.ptDesc,PT.ptMandatory,PT.ptName,PT.ptSortOrder,PT.ptRegExp,
+                            PT.dtId,PT.dtDbType,PT.dtPropEdAlias,
+                            PG.id as pgId, PG.uniqueID as pgKey, PG.sortorder as pgSortOrder, PG.&quot; + sqlSyntax.GetQuotedColumnName(&quot;text&quot;) + @&quot; as pgText
+                        FROM cmsPropertyTypeGroup as PG
+                        LEFT JOIN
+                        (
+                            SELECT PT.uniqueID as ptUniqueId, PT.id as ptId, PT.Alias as ptAlias, PT.&quot; + sqlSyntax.GetQuotedColumnName(&quot;Description&quot;) + @&quot; as ptDesc,
+                                    PT.mandatory as ptMandatory, PT.Name as ptName, PT.sortOrder as ptSortOrder, PT.validationRegExp as ptRegExp,
+                                    PT.propertyTypeGroupId as ptGroupId,
+                                    DT.dbType as dtDbType, DT.nodeId as dtId, DT.propertyEditorAlias as dtPropEdAlias
+                            FROM cmsPropertyType as PT
+                            INNER JOIN cmsDataType as DT
+                            ON PT.dataTypeId = DT.nodeId
+                        )  as  PT
+                        ON PT.ptGroupId = PG.id
+                        WHERE (PG.contenttypeNodeId in (@contentTypeIds))
+
+                        UNION
+
+                        SELECT  PT.contentTypeId as contentTypeId,
+                                PT.uniqueID as ptUniqueID, PT.id as ptId, PT.Alias as ptAlias, PT.&quot; + sqlSyntax.GetQuotedColumnName(&quot;Description&quot;) + @&quot; as ptDesc,
+                                PT.mandatory as ptMandatory, PT.Name as ptName, PT.sortOrder as ptSortOrder, PT.validationRegExp as ptRegExp,
+                                DT.nodeId as dtId, DT.dbType as dtDbType, DT.propertyEditorAlias as dtPropEdAlias,
+                                PG.id as pgId, PG.uniqueID as pgKey, PG.sortorder as pgSortOrder, PG.&quot; + sqlSyntax.GetQuotedColumnName(&quot;text&quot;) + @&quot; as pgText
+                        FROM cmsPropertyType as PT
+                        INNER JOIN cmsDataType as DT
+                        ON PT.dataTypeId = DT.nodeId
+                        LEFT JOIN cmsPropertyTypeGroup as PG
+                        ON PG.id = PT.propertyTypeGroupId
+                        WHERE (PT.contentTypeId in (@contentTypeIds))&quot;);
+
+                sqlBuilder.AppendLine(&quot; ORDER BY (pgId)&quot;);
+
+                //NOTE: we are going to assume there&#39;s not going to be more than 2100 content type ids since that is the max SQL param count!
+                // Since there are 2 groups of params, it will be half!
+                if (((contentTypeIds.Length / 2) - 1) &gt; 2000)
+                    throw new InvalidOperationException(&quot;Cannot perform this lookup, too many sql parameters&quot;);
+
+                var result = db.Fetch&lt;dynamic&gt;(sqlBuilder.ToString(), new { contentTypeIds = contentTypeIds });
+
+                foreach (var contentTypeId in contentTypeIds)
+                {
+                    //from this we need to make :
+                    // * PropertyGroupCollection - Contains all property groups along with all property types associated with a group
+                    // * PropertyTypeCollection - Contains all property types that do not belong to a group
+
+                    //create the property group collection first, this means all groups (even empty ones) and all groups with properties
+
+                    int currId = contentTypeId;
+
+                    var propertyGroupCollection = new PropertyGroupCollection(result
+                        //get all rows that have a group id
+                        .Where(x =&gt; x.pgId != null)
+                        //filter based on the current content type
+                        .Where(x =&gt; x.contentTypeId == currId)
+                        //turn that into a custom object containing only the group info
+                        .Select(x =&gt; new { GroupId = x.pgId, SortOrder = x.pgSortOrder, Text = x.pgText, Key = x.pgKey })
+                        //get distinct data by id
+                        .DistinctBy(x =&gt; (int)x.GroupId)
+                        //for each of these groups, create a group object with it&#39;s associated properties
+                        .Select(group =&gt; new PropertyGroup(new PropertyTypeCollection(
+                            result
+                                .Where(row =&gt; row.pgId == group.GroupId &amp;&amp; row.ptId != null)
+                                .Select(row =&gt; new PropertyType(row.dtPropEdAlias, Enum&lt;DataTypeDatabaseType&gt;.Parse(row.dtDbType), row.ptAlias)
+                                {
+                                    //fill in the rest of the property type properties
+                                    Description = row.ptDesc,
+                                    DataTypeDefinitionId = row.dtId,
+                                    Id = row.ptId,
+                                    Key = row.ptUniqueID,
+                                    Mandatory = Convert.ToBoolean(row.ptMandatory),
+                                    Name = row.ptName,
+                                    PropertyGroupId = new Lazy&lt;int&gt;(() =&gt; group.GroupId, false),
+                                    SortOrder = row.ptSortOrder,
+                                    ValidationRegExp = row.ptRegExp
+                                })))
+                        {
+                            //fill in the rest of the group properties
+                            Id = group.GroupId,
+                            Name = group.Text,
+                            SortOrder = group.SortOrder,
+                            Key = group.Key
+                        }).ToArray());
+
+                    allPropertyGroupCollection[currId] = propertyGroupCollection;
+
+                    //Create the property type collection now (that don&#39;t have groups)
+
+                    var propertyTypeCollection = new PropertyTypeCollection(result
+                        .Where(x =&gt; x.pgId == null)
+                        //filter based on the current content type
+                        .Where(x =&gt; x.contentTypeId == currId)
+                        .Select(row =&gt; new PropertyType(row.dtPropEdAlias, Enum&lt;DataTypeDatabaseType&gt;.Parse(row.dtDbType), row.ptAlias)
+                        {
+                            //fill in the rest of the property type properties
+                            Description = row.ptDesc,
+                            DataTypeDefinitionId = row.dtId,
+                            Id = row.ptId,
+                            Key = row.ptUniqueID,
+                            Mandatory = Convert.ToBoolean(row.ptMandatory),
+                            Name = row.ptName,
+                            PropertyGroupId = null,
+                            SortOrder = row.ptSortOrder,
+                            ValidationRegExp = row.ptRegExp
+                        }).ToArray());
+
+                    allPropertyTypeCollection[currId] = propertyTypeCollection;
+                }
+
+
+            }
+
+        }
+
+        protected abstract TEntity PerformGet(Guid id);
+        protected abstract TEntity PerformGet(string alias);
+        protected abstract IEnumerable&lt;TEntity&gt; PerformGetAll(params Guid[] ids);
+        protected abstract bool PerformExists(Guid id);
+
+        /// &lt;summary&gt;
+        /// Gets an Entity by alias
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;alias&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public TEntity Get(string alias)
+        {
+            return PerformGet(alias);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets an Entity by Id
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public TEntity Get(Guid id)
+        {
+            return PerformGet(id);
+        }
+
+        /// &lt;summary&gt;
+        /// Gets all entities of the spefified type
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;ids&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        /// &lt;remarks&gt;
+        /// Ensure explicit implementation, we don&#39;t want to have any accidental calls to this since it is essentially the same signature as the main GetAll when there are no parameters
+        /// &lt;/remarks&gt;
+        IEnumerable&lt;TEntity&gt; IReadRepository&lt;Guid, TEntity&gt;.GetAll(params Guid[] ids)
+        {
+            return PerformGetAll(ids);
+        }
+
+        /// &lt;summary&gt;
+        /// Boolean indicating whether an Entity with the specified Id exists
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;id&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public bool Exists(Guid id)
+        {
+            return PerformExists(id);
+        }
+
+        public string GetUniqueAlias(string alias)
+        {
+            // alias is unique accross ALL content types!
+            var aliasColumn = SqlSyntax.GetQuotedColumnName(&quot;alias&quot;);
+            var aliases = Database.Fetch&lt;string&gt;(@&quot;SELECT cmsContentType.&quot; + aliasColumn + @&quot; FROM cmsContentType
+INNER JOIN umbracoNode ON cmsContentType.nodeId = umbracoNode.id
+WHERE cmsContentType.&quot; + aliasColumn + @&quot; LIKE @pattern&quot;,
+                new { pattern = alias + &quot;%&quot;, objectType = NodeObjectTypeId });
+            var i = 1;
+            string test;
+            while (aliases.Contains(test = alias + i)) i++;
+            return test;
+        }
+
+        /// &lt;summary&gt;
+        /// Given the path of a content item, this will return true if the content item exists underneath a list view content item
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;contentPath&quot;&gt;&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        public bool HasContainerInPath(string contentPath)
+        {
+            var ids = contentPath.Split(&#39;,&#39;).Select(int.Parse);
+            var sql = new Sql(@&quot;SELECT COUNT(*) FROM cmsContentType
+INNER JOIN cmsContent ON cmsContentType.nodeId=cmsContent.contentType 
+WHERE cmsContent.nodeId IN (@ids) AND cmsContentType.isContainer=@isContainer&quot;, new { ids, isContainer = true });
+            return Database.ExecuteScalar&lt;int&gt;(sql) &gt; 0;
+        }
+    }
+}
+
+    </pre>
+    <script type="text/javascript">
+      highlightRanges([[34,15,34,51,1],[35,9,35,10,1],[36,9,36,10,1],[39,9,39,10,1],[40,13,40,50,1],[41,13,41,35,1],[42,13,42,14,1],[44,17,44,136,1],[45,17,45,18,0],[46,21,46,127,0],[48,17,48,41,1],[49,13,49,14,1],[52,13,55,15,1],[59,13,61,54,1],[64,13,64,40,1],[65,13,65,48,1],[66,13,66,117,1],[67,13,67,72,1],[68,13,68,33,1],[71,13,71,112,1],[72,13,72,55,1],[73,13,73,44,1],[75,13,75,20,1],[75,22,75,36,1],[75,37,75,39,1],[75,40,75,65,1],[75,65,75,72,1],[75,72,75,73,1],[75,40,75,73,1],[76,13,76,14,1],[77,17,77,108,1],[79,17,79,107,1],[80,17,80,48,1],[82,17,82,41,1],[83,13,83,14,1],[85,13,85,29,1],[86,9,86,10,1],[115,9,115,10,0],[116,13,116,85,0],[117,9,117,10,0],[120,9,120,10,1],[121,13,121,52,1],[122,13,122,59,1],[125,13,129,78,1],[130,13,130,28,1],[131,13,131,14,0],[132,17,132,112,0],[136,13,136,110,1],[137,13,137,42,1],[138,13,140,126,1],[143,13,143,39,1],[144,13,144,40,1],[145,13,145,87,1],[146,13,146,43,1],[147,13,147,116,1],[150,13,150,76,1],[151,13,151,38,1],[154,13,154,40,1],[155,13,155,40,1],[156,13,156,42,1],[157,13,157,34,1],[160,13,160,41,1],[161,13,161,34,1],[164,13,164,20,1],[164,22,164,37,1],[164,38,164,40,1],[164,41,164,70,1],[165,13,165,14,1],[166,17,166,49,1],[166,50,166,59,0],[168,17,168,45,1],[169,17,169,18,1],[170,21,170,120,1],[171,17,171,18,1],[173,17,173,18,0],[175,21,175,141,0],[176,21,176,48,0],[177,21,177,22,0],[178,25,178,131,0],[179,21,179,22,0],[180,17,180,18,0],[181,13,181,14,1],[184,13,184,20,1],[184,22,184,44,1],[184,45,184,47,1],[184,48,184,74,1],[185,13,185,14,1],[186,17,191,40,1],[192,13,192,14,1],[194,13,194,76,1],[197,13,197,20,1],[197,22,197,39,1],[197,40,197,42,1],[197,43,197,64,1],[198,13,198,14,1],[199,17,199,75,1],[200,17,200,75,1],[201,17,201,47,1],[205,17,205,24,1],[205,26,205,42,1],[205,43,205,45,1],[205,46,205,73,1],[206,17,206,18,1],[207,21,207,82,1],[208,21,208,22,1],[209,25,209,55,1],[210,25,210,76,1],[210,76,210,88,1],[210,88,210,90,1],[210,25,210,90,1],[211,21,211,22,1],[212,17,212,18,1],[213,13,213,14,1],[216,13,216,20,1],[216,22,216,38,1],[216,39,216,41,1],[216,42,216,62,1],[217,13,217,14,1],[218,17,218,118,1],[220,17,220,113,1],[221,17,221,18,1],[222,21,222,68,1],[223,17,223,18,1],[224,17,224,97,1],[225,17,225,88,1],[226,17,226,50,1],[229,17,229,135,1],[230,17,230,84,1],[231,17,231,110,1],[232,13,232,14,1],[233,9,233,10,1],[236,9,236,10,1],[237,13,237,52,1],[238,13,238,59,1],[241,13,246,92,1],[247,13,247,28,1],[248,17,248,109,0],[251,13,251,39,1],[252,13,252,38,1],[256,13,256,102,1],[257,13,257,47,1],[258,13,258,34,1],[261,13,261,115,1],[262,13,262,20,1],[262,22,262,37,1],[262,38,262,40,1],[262,41,262,70,1],[263,17,263,116,1],[269,13,269,72,1],[270,13,271,68,1],[272,13,272,14,1],[274,17,274,37,1],[275,17,279,74,1],[280,17,280,76,1],[283,17,283,24,1],[283,26,283,33,1],[283,34,283,36,1],[283,37,283,81,1],[284,17,284,18,1],[286,21,286,120,1],[289,21,289,28,1],[289,30,289,44,0],[289,45,289,47,1],[289,48,289,59,1],[290,21,290,22,0],[291,25,291,32,0],[291,34,291,50,0],[291,51,291,53,0],[291,54,291,67,0],[292,25,292,26,0],[293,29,293,60,0],[294,29,294,66,0],[295,29,299,86,0],[302,29,302,135,0],[303,25,303,26,0],[304,21,304,22,0],[305,17,305,18,1],[306,13,306,14,1],[309,13,309,100,1],[310,13,310,20,1],[310,22,310,44,1],[310,45,310,47,1],[310,48,310,74,1],[311,13,311,14,1],[312,17,317,20,1],[318,13,318,14,1],[324,13,324,90,1],[324,90,324,101,1],[324,101,324,103,1],[324,13,324,103,1],[325,13,325,14,1],[326,17,326,124,1],[327,17,327,71,1],[327,71,327,75,1],[327,75,327,77,1],[327,17,327,77,1],[328,17,328,75,1],[328,75,328,88,1],[328,88,328,102,1],[328,102,328,106,1],[328,106,328,108,1],[328,17,328,108,1],[329,17,329,77,1],[330,17,330,24,1],[330,26,330,34,1],[330,35,330,37,1],[330,38,330,43,1],[331,21,331,57,1],[332,13,332,14,1],[336,13,336,52,1],[337,13,337,92,1],[337,92,337,103,1],[337,103,337,105,1],[337,13,337,105,1],[338,13,338,14,1],[357,17,358,34,1],[358,34,358,38,1],[358,38,359,31,1],[357,17,359,31,1],[360,17,360,75,1],[360,75,360,79,1],[360,79,360,90,1],[360,17,360,90,1],[361,17,363,32,1],[366,17,366,47,1],[367,17,367,18,1],[372,21,373,38,1],[373,38,373,42,1],[373,42,373,53,1],[372,21,373,53,1],[374,21,374,152,1],[377,21,377,111,1],[378,17,378,18,1],[379,13,379,14,1],[381,13,381,76,1],[384,13,384,20,1],[384,22,384,39,1],[384,40,384,42,1],[384,43,384,64,1],[385,13,385,14,1],[387,17,387,82,1],[388,17,390,66,1],[391,17,391,56,1],[392,21,392,48,1],[394,21,394,48,1],[399,17,399,24,1],[399,26,399,42,1],[399,43,399,45,1],[399,46,399,73,1],[400,21,400,72,1],[400,72,400,79,1],[400,79,400,81,1],[400,21,400,81,1],[401,13,401,14,1],[405,13,405,20,1],[405,22,405,38,1],[405,39,405,41,1],[405,42,405,62,1],[406,13,406,14,1],[407,17,407,120,1],[410,17,410,113,1],[411,21,411,68,1],[414,17,414,45,1],[417,17,417,104,1],[418,17,420,73,1],[421,17,421,55,1],[422,21,422,46,1],[424,21,424,46,1],[427,17,427,51,1],[428,21,428,58,1],[429,13,429,14,1],[433,13,433,47,1],[434,17,434,24,1],[434,26,434,32,0],[434,33,434,35,1],[434,36,434,57,1],[435,21,435,55,0],[436,9,436,10,1],[439,9,439,10,1],[441,13,441,108,1],[442,13,442,105,1],[445,13,445,161,1],[446,9,446,10,1],[449,9,449,10,0],[450,13,450,33,0],[451,13,455,74,0],[457,13,457,112,0],[458,13,458,55,0],[458,55,458,95,0],[458,95,458,106,0],[458,106,458,145,0],[458,55,458,145,0],[458,145,458,156,0],[458,13,458,156,0],[459,9,459,10,0],[462,9,462,10,0],[463,13,463,33,0],[464,13,471,58,0],[473,13,473,154,0],[475,13,475,113,0],[476,13,476,73,0],[477,13,477,64,0],[478,9,478,10,0],[481,9,481,10,0],[482,13,482,33,0],[483,13,487,68,0],[489,13,489,74,0],[492,13,492,49,0],[493,13,493,20,0],[493,22,493,29,0],[493,30,493,32,0],[493,33,493,49,0],[493,49,493,85,0],[493,85,493,86,0],[493,33,493,86,0],[494,13,494,14,0],[495,17,495,161,0],[496,17,496,64,0],[497,17,497,56,0],[498,17,498,38,0],[499,17,499,45,0],[500,17,500,42,0],[501,17,501,52,0],[502,17,502,52,0],[503,17,503,66,0],[504,17,504,50,0],[505,17,505,50,0],[506,17,506,36,0],[507,13,507,14,0],[509,13,509,51,0],[509,51,509,90,0],[509,90,509,92,0],[509,13,509,92,0],[511,13,511,53,0],[512,9,512,10,0],[515,9,515,10,1],[516,13,518,37,1],[518,37,518,38,0],[518,38,519,41,1],[519,41,523,58,0],[523,58,524,41,1],[524,41,524,96,0],[524,96,526,41,1],[526,41,526,110,0],[526,110,527,41,1],[527,41,527,57,0],[527,57,528,40,1],[516,13,528,40,1],[529,9,529,10,1],[532,9,532,10,1],[533,13,535,37,1],[535,37,535,38,1],[535,38,536,41,1],[536,41,540,62,1],[540,62,541,41,1],[541,41,541,96,1],[541,96,543,41,1],[543,41,543,110,1],[543,110,544,41,1],[544,41,544,57,1],[544,57,545,40,1],[533,13,545,40,1],[546,9,546,10,1],[553,9,553,10,1],[555,13,555,80,1],[556,13,556,14,1],[557,17,561,74,1],[562,17,562,74,1],[564,17,564,38,1],[565,17,565,18,1],[566,21,566,77,1],[567,17,567,18,1],[569,17,569,18,0],[570,21,570,238,0],[571,17,571,18,0],[572,13,572,14,1],[573,9,573,10,1],[580,17,580,94,1],[581,17,581,18,1],[582,21,582,45,1],[583,21,583,35,1],[584,21,584,49,1],[585,17,585,18,1],[587,41,587,45,1],[587,46,587,50,1],[588,39,588,43,0],[588,44,588,48,1],[589,46,589,50,0],[589,51,589,55,1],[592,17,592,18,1],[593,21,593,59,1],[594,17,594,18,1],[597,17,597,18,1],[598,21,598,52,1],[598,53,598,66,0],[599,21,599,52,1],[599,53,599,65,0],[600,21,600,57,1],[600,58,600,71,0],[601,21,601,60,1],[602,17,602,18,1],[605,17,605,18,0],[606,21,606,39,0],[607,17,607,18,0],[614,13,614,14,1],[616,17,617,32,1],[619,17,619,113,1],[621,17,621,35,1],[622,13,622,14,1],[629,13,629,14,1],[632,17,633,32,1],[635,17,635,40,1],[636,17,636,18,1],[637,21,638,114,1],[640,21,641,106,1],[642,17,642,18,1],[644,17,644,37,1],[645,13,645,14,1],[652,13,652,14,1],[655,17,655,52,1],[655,52,655,56,1],[655,56,655,68,1],[655,17,655,68,1],[658,17,658,97,1],[660,17,660,24,1],[660,26,660,41,1],[660,42,660,44,1],[660,45,660,57,1],[661,17,661,18,1],[662,21,662,80,1],[663,21,663,85,1],[664,17,664,18,1],[668,17,668,53,1],[669,17,669,18,1],[670,21,670,87,1],[670,87,670,94,1],[670,94,670,117,1],[670,21,670,117,1],[671,21,671,51,1],[672,21,672,22,1],[673,25,673,77,1],[673,77,673,111,1],[673,111,673,123,1],[673,25,673,123,1],[675,25,675,32,1],[675,34,675,49,1],[675,50,675,52,1],[675,53,675,65,1],[676,25,676,26,1],[677,29,677,59,1],[679,29,680,29,1],[680,29,680,30,1],[680,30,681,33,1],[681,33,681,59,1],[681,59,683,33,1],[683,33,683,99,1],[683,99,684,29,1],[684,29,684,30,1],[684,30,684,32,1],[679,29,684,32,1],[685,29,685,36,1],[685,38,685,59,1],[685,60,685,62,1],[685,63,685,81,1],[686,29,686,30,1],[687,33,687,92,1],[689,29,689,30,1],[693,29,693,79,1],[694,25,694,26,1],[695,21,695,22,1],[696,17,696,18,1],[699,13,699,14,1],[707,13,707,14,1],[708,17,708,87,1],[708,88,708,95,0],[713,17,713,71,1],[713,71,713,78,1],[713,78,713,92,1],[713,92,713,104,1],[713,104,715,32,1],[713,17,715,32,1],[717,17,719,64,1],[721,17,721,24,1],[721,26,721,41,1],[721,42,721,44,1],[721,45,721,57,1],[722,17,722,18,1],[723,21,723,51,1],[725,21,725,91,1],[725,91,725,103,1],[725,103,727,36,1],[725,21,727,36,1],[729,21,730,48,1],[730,48,730,84,1],[730,84,731,68,1],[729,21,731,68,1],[732,17,732,18,1],[735,13,735,14,1],[739,13,739,14,1],[740,17,740,52,1],[742,17,767,40,1],[769,17,769,121,1],[771,17,771,43,1],[772,17,772,18,0],[773,21,773,47,0],[774,21,774,59,0],[777,17,777,71,1],[778,17,778,63,1],[783,17,783,56,1],[784,17,784,75,1],[786,17,786,40,1],[787,17,787,18,1],[788,21,788,46,1],[791,21,791,56,1],[792,21,792,58,1],[793,21,793,57,1],[794,21,794,98,1],[795,21,795,22,1],[796,25,796,78,1],[796,78,796,95,1],[796,95,796,135,1],[796,25,796,135,1],[797,25,797,79,1],[798,25,798,26,1],[799,29,799,65,1],[800,25,800,26,1],[801,21,801,22,1],[804,21,804,74,1],[805,25,805,71,1],[808,21,808,52,1],[809,21,809,43,1],[810,21,810,22,1],[811,25,811,79,1],[812,25,812,83,1],[813,29,813,69,1],[814,21,814,22,1],[816,21,816,74,1],[817,21,817,22,1],[819,25,819,87,1],[820,25,820,57,1],[823,25,823,79,1],[824,21,824,22,1],[825,17,825,18,1],[827,17,827,41,1],[828,13,828,14,1],[831,13,831,14,1],[837,17,862,19,1],[866,17,866,56,1],[867,17,867,78,1],[870,17,870,73,1],[872,17,872,34,1],[873,13,873,14,1],[878,13,878,14,1],[879,17,879,52,1],[881,17,916,40,1],[918,17,918,123,1],[920,17,920,43,1],[921,17,921,18,1],[922,21,922,49,1],[923,21,923,48,1],[924,21,924,61,1],[927,17,927,73,1],[928,17,928,87,1],[929,17,929,67,1],[931,17,931,56,1],[932,17,932,46,1],[933,17,933,75,1],[934,17,934,40,1],[935,17,935,18,1],[936,21,936,46,1],[939,21,939,81,1],[940,21,940,55,1],[941,21,941,131,1],[942,21,942,22,1],[943,25,943,64,1],[944,21,944,22,1],[947,21,947,75,1],[948,25,948,87,1],[951,21,951,40,1],[952,21,952,22,1],[953,25,953,102,1],[954,25,954,75,1],[956,25,956,82,1],[957,29,957,68,1],[958,21,958,22,1],[961,21,961,56,1],[962,21,962,58,1],[963,21,963,57,1],[964,21,964,98,1],[965,21,965,22,1],[966,25,966,78,1],[966,78,966,95,1],[966,95,966,135,1],[966,25,966,135,1],[967,25,967,79,1],[968,25,968,26,1],[969,29,969,65,1],[970,25,970,26,1],[971,21,971,22,1],[974,21,974,76,1],[975,25,975,73,1],[978,21,978,52,1],[979,21,979,43,1],[980,21,980,22,1],[981,25,981,81,1],[983,25,983,83,1],[984,29,984,69,1],[985,21,985,22,1],[987,21,987,74,1],[988,21,988,22,1],[990,25,990,110,1],[991,25,991,61,1],[994,25,994,50,1],[995,25,995,79,1],[996,21,996,22,1],[997,17,997,18,1],[999,17,999,43,1],[1000,13,1000,14,1],[1003,13,1003,14,1],[1010,17,1042,19,1],[1046,17,1046,56,1],[1047,17,1047,88,1],[1053,17,1053,85,1],[1054,17,1054,57,1],[1057,17,1057,75,1],[1059,17,1059,36,1],[1060,13,1060,14,1],[1065,13,1065,14,1],[1066,17,1066,93,1],[1067,17,1067,91,1],[1070,17,1070,48,1],[1070,49,1070,56,0],[1077,17,1107,73,1],[1109,17,1109,59,1],[1113,17,1113,62,1],[1114,21,1114,112,0],[1116,17,1116,112,1],[1118,17,1118,24,1],[1118,26,1118,43,1],[1118,44,1118,46,1],[1118,47,1118,61,1],[1119,17,1119,18,1],[1126,21,1126,48,1],[1128,21,1130,37,1],[1130,37,1130,51,1],[1130,51,1132,37,1],[1132,37,1132,62,1],[1132,62,1134,38,1],[1134,38,1134,121,1],[1134,121,1136,42,1],[1136,42,1136,56,1],[1136,56,1138,42,1],[1138,42,1140,47,1],[1140,47,1140,92,1],[1140,92,1141,48,1],[1141,48,1150,75,1],[1150,75,1150,88,0],[1150,88,1153,34,1],[1141,48,1153,34,1],[1153,34,1160,26,1],[1138,42,1160,26,1],[1160,26,1160,39,1],[1128,21,1160,39,1],[1162,21,1162,82,1],[1166,21,1167,37,1],[1167,37,1167,51,1],[1167,51,1169,37,1],[1169,37,1169,62,1],[1169,62,1170,40,1],[1170,40,1182,26,1],[1182,26,1182,39,1],[1166,21,1182,39,1],[1184,21,1184,80,1],[1185,17,1185,18,1],[1188,13,1188,14,1],[1203,9,1203,10,1],[1204,13,1204,38,1],[1205,9,1205,10,1],[1213,9,1213,10,1],[1214,13,1214,35,1],[1215,9,1215,10,1],[1226,9,1226,10,1],[1227,13,1227,39,1],[1228,9,1228,10,1],[1236,9,1236,10,0],[1237,13,1237,38,0],[1238,9,1238,10,0],[1241,9,1241,10,0],[1243,13,1243,70,0],[1244,13,1247,79,0],[1248,13,1248,23,0],[1250,13,1250,55,0],[1250,56,1250,60,0],[1251,13,1251,25,0],[1252,9,1252,10,0],[1260,9,1260,10,0],[1261,13,1261,64,0],[1262,13,1264,114,0],[1265,13,1265,57,0],[1266,9,1266,10,0]]);
+    </script>
+  </body>
+</html>
