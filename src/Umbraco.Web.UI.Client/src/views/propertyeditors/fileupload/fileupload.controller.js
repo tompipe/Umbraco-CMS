@@ -130,6 +130,9 @@ function fileUploadController($scope, $element, $compile, imageHelper, fileManag
             // in the description of this controller, it states that this value isn't actually used for persistence,
             // but we need to set it so that the editor and the server can detect that it's been changed, and it is used for validation.
             $scope.model.value = { selectedFiles: newVal.trimEnd(",") };
+
+            //need to explicity setDirty here as file upload field can't track dirty & we can't use the fileCount (hidden field/model)
+            $scope.propertyForm.$setDirty();
         });
     });
 
@@ -138,15 +141,15 @@ function fileUploadController($scope, $element, $compile, imageHelper, fileManag
         //cannot just check for !newVal because it might be an empty string which we
         //want to look for.
         if (newVal !== null && newVal !== undefined && newVal !== oldVal) {
-            //now we need to check if we need to re-initialize our structure which is kind of tricky
-            // since we only want to do that if the server has changed the value, not if this controller
-            // has changed the value. There's only 2 scenarios where we change the value internall so
-            // we know what those values can be, if they are not either of them, then we'll re-initialize.
-
-            if (newVal.clearFiles !== true && newVal !== $scope.originalValue && !newVal.selectedFiles) {
+            // here we need to check if the value change needs to trigger an update in the UI.
+            // if the value is only changed in the controller and not in the server values, we do not
+            // want to trigger an update yet.
+            // we can however no longer rely on checking values in the controller vs. values from the server
+            // to determine whether to update or not, since you could potentially be uploading a file with
+            // the exact same name - in that case we need to reinitialize to show the newly uploaded file.
+            if (newVal.clearFiles !== true && !newVal.selectedFiles) {
                 initialize($scope.rebuildInput.index + 1);
             }
-
         }
     });
 };
