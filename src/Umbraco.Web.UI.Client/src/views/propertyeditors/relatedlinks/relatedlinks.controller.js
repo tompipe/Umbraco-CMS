@@ -25,6 +25,7 @@
                $scope.contentPickerOverlay.view = "contentpicker";
                $scope.contentPickerOverlay.multiPicker = false;
                $scope.contentPickerOverlay.show = true;
+               $scope.contentPickerOverlay.ignoreUserStartNodes = $scope.model.config.ignoreUserStartNodes === "1" ? true:  false;
                $scope.contentPickerOverlay.idType = $scope.model.config.idType ? $scope.model.config.idType : "int";
 
                $scope.contentPickerOverlay.submit = function(model) {
@@ -50,6 +51,7 @@
                $scope.contentPickerOverlay.view = "contentpicker";
                $scope.contentPickerOverlay.multiPicker = false;
                $scope.contentPickerOverlay.show = true;
+               $scope.contentPickerOverlay.ignoreUserStartNodes = $scope.model.config.ignoreUserStartNodes === "1" ? true : false;
                $scope.contentPickerOverlay.idType = $scope.model.config.idType ? $scope.model.config.idType : "int";
 
                $scope.contentPickerOverlay.submit = function(model) {
@@ -167,7 +169,7 @@
                 placeholder: 'sortable-placeholder',
                 forcePlaceholderSize: true,
                 helper: function (e, ui) {
-                    // When sorting table rows, the cells collapse. This helper fixes that: http://www.foliotek.com/devblog/make-table-rows-sortable-using-jquery-ui-sortable/
+                    // When sorting table rows, the cells collapse. This helper fixes that: https://www.foliotek.com/devblog/make-table-rows-sortable-using-jquery-ui-sortable/
                     ui.children().each(function () {
                         $(this).width($(this).width());
                     });
@@ -189,7 +191,7 @@
                 start: function (e, ui) {
                     //ui.placeholder.html("<td colspan='5'></td>");
 
-                    // Build a placeholder cell that spans all the cells in the row: http://stackoverflow.com/questions/25845310/jquery-ui-sortable-and-table-cell-size
+                    // Build a placeholder cell that spans all the cells in the row: https://stackoverflow.com/questions/25845310/jquery-ui-sortable-and-table-cell-size
                     var cellCount = 0;
                     $('td, th', ui.helper).each(function () {
                         // For each td or th try and get it's colspan attribute, and add that or 1 to the total

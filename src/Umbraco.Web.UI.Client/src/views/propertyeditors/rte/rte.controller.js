@@ -1,6 +1,6 @@
 angular.module("umbraco")
     .controller("Umbraco.PropertyEditors.RTEController",
-    function ($rootScope, $scope, $q, $locale, dialogService, $log, imageHelper, assetsService, $timeout, tinyMceService, angularHelper, stylesheetResource, macroService) {
+    function ($rootScope, $scope, $q, $locale, dialogService, $log, imageHelper, assetsService, $timeout, tinyMceService, angularHelper, stylesheetResource, macroService, editorState) {
 
         $scope.isLoading = true;
 
@@ -11,20 +11,15 @@ angular.module("umbraco")
         var n = d.getTime();
         $scope.textAreaHtmlId = $scope.model.alias + "_" + n + "_rte";
 
-        var alreadyDirty = false;
         function syncContent(editor){
             editor.save();
             angularHelper.safeApply($scope, function () {
                 $scope.model.value = editor.getContent();
             });
 
-            if (!alreadyDirty) {
-                //make the form dirty manually so that the track changes works, setting our model doesn't trigger
-                // the angular bits because tinymce replaces the textarea.
-                var currForm = angularHelper.getCurrentForm($scope);
-                currForm.$setDirty();
-                alreadyDirty = true;
-            }
+            //make the form dirty manually so that the track changes works, setting our model doesn't trigger
+            // the angular bits because tinymce replaces the textarea.
+            angularHelper.getCurrentForm($scope).$setDirty();
         }
 
         tinyMceService.configuration().then(function (tinyMceConfig) {
@@ -185,6 +180,12 @@ angular.module("umbraco")
                                     //cannot parse, we'll just leave it
                                 }
                             }
+                            if (val === "true") {
+                                tinyMceConfig.customConfig[i] = true;
+                            }
+                            if (val === "false") {
+                                tinyMceConfig.customConfig[i] = false;
+                            }
                         }
                     }
 
@@ -260,18 +261,20 @@ angular.module("umbraco")
 
 
                     editor.on('ObjectResized', function (e) {
-                        var qs = "?width=" + e.width + "&height=" + e.height;
+                        var qs = "?width=" + e.width + "&height=" + e.height + "&mode=max";
                         var srcAttr = $(e.target).attr("src");
                         var path = srcAttr.split("?")[0];
                         $(e.target).attr("data-mce-src", path + qs);
 
                         syncContent(editor);
                     });
-
+					
                     tinyMceService.createLinkPicker(editor, $scope, function(currentTarget, anchorElement) {
                         $scope.linkPickerOverlay = {
                             view: "linkpicker",
                             currentTarget: currentTarget,
+							              anchors: editorState.current ? tinyMceService.getAnchorNames(JSON.stringify(editorState.current.properties)) : [],
+                            ignoreUserStartNodes: $scope.model.config.ignoreUserStartNodes === "1",
                             show: true,
                             submit: function(model) {
                                 tinyMceService.insertLinkInEditor(editor, model.target, anchorElement);
@@ -283,14 +286,24 @@ angular.module("umbraco")
 
                     //Create the insert media plugin
                     tinyMceService.createMediaPicker(editor, $scope, function(currentTarget, userData){
+                        var ignoreUserStartNodes = false;
+                        var startNodeId = userData.startMediaIds.length !== 1 ? -1 : userData.startMediaIds[0];
+                        var startNodeIsVirtual = userData.startMediaIds.length !== 1;
+
+                        if ($scope.model.config.ignoreUserStartNodes === "1") {
+                            ignoreUserStartNodes = true;
+                            startNodeId = -1;
+                            startNodeIsVirtual = true;
+                        }
 
                         $scope.mediaPickerOverlay = {
                             currentTarget: currentTarget,
                             onlyImages: true,
                             showDetails: true,
                             disableFolderSelect: true,
-                            startNodeId: userData.startMediaIds.length !== 1 ? -1 : userData.startMediaIds[0],
-                            startNodeIsVirtual: userData.startMediaIds.length !== 1,
+                            startNodeId: startNodeId,
+                            startNodeIsVirtual: startNodeIsVirtual,
+                            ignoreUserStartNodes: ignoreUserStartNodes,
                             view: "mediapicker",
                             show: true,
                             submit: function(model) {
@@ -370,7 +383,9 @@ angular.module("umbraco")
                 var unsubscribe = $scope.$on("formSubmitting", function () {
                     //TODO: Here we should parse out the macro rendered content so we can save on a lot of bytes in data xfer
                     // we do parse it out on the server side but would be nice to do that on the client side before as well.
-                    $scope.model.value = tinyMceEditor ? tinyMceEditor.getContent() : null;
+                    if (tinyMceEditor !== undefined && tinyMceEditor != null && !$scope.isLoading) {
+                        $scope.model.value = tinyMceEditor.getContent();
+                    }
                 });
 
                 //when the element is disposed we need to unsubscribe!
@@ -379,8 +394,8 @@ angular.module("umbraco")
                 $scope.$on('$destroy', function () {
                     unsubscribe();
 					if (tinyMceEditor !== undefined && tinyMceEditor != null) {
-						tinyMceEditor.destroy()
-					}
+                        tinyMceEditor.destroy();
+                    }
                 });
             });
         });

@@ -292,14 +292,29 @@ function entityResource($q, $http, umbRequestHelper) {
          * @returns {Promise} resourcePromise object containing the entity.
          *
          */
-        getAncestors: function (id, type) {            
+        getAncestors: function (id, type, options) {    
+            var defaults = {
+                ignoreUserStartNodes: false
+            };
+            if (options === undefined) {
+                options = {};
+            }
+            //overwrite the defaults if there are any specified
+            angular.extend(defaults, options);
+            //now copy back to the options we will use
+            options = defaults;
+
             return umbRequestHelper.resourcePromise(
                $http.get(
                    umbRequestHelper.getApiUrl(
                        "entityApiBaseUrl",
                        "GetAncestors",
-                       [{id: id}, {type: type}])),
-               'Failed to retrieve ancestor data for id ' + id);
+                       [
+                           { id: id },
+                           { type: type },
+                           { ignoreUserStartNodes: options.ignoreUserStartNodes }
+                       ])),
+                       'Failed to retrieve ancestor data for id ' + id);
         },
         
         /**
@@ -406,7 +421,7 @@ function entityResource($q, $http, umbRequestHelper) {
           *
           * ##usage
           * <pre>
-          * entityResource.getPagedDescendants(1234, "Content", {pageSize: 10, pageNumber: 2})
+          * entityResource.getPagedDescendants(1234, "Document", {pageSize: 10, pageNumber: 2})
           *    .then(function(contentArray) {
           *        var children = contentArray; 
           *        alert('they are here!');
@@ -416,8 +431,8 @@ function entityResource($q, $http, umbRequestHelper) {
           * @param {Int} parentid id of content item to return descendants of
           * @param {string} type Object type name
           * @param {Object} options optional options object
-          * @param {Int} options.pageSize if paging data, number of nodes per page, default = 1
-          * @param {Int} options.pageNumber if paging data, current page index, default = 100
+          * @param {Int} options.pageSize if paging data, number of nodes per page, default = 100
+          * @param {Int} options.pageNumber if paging data, current page index, default = 1
           * @param {String} options.filter if provided, query will only return those with names matching the filter
           * @param {String} options.orderDirection can be `Ascending` or `Descending` - Default: `Ascending`
           * @param {String} options.orderBy property to order items by, default: `SortOrder`
@@ -427,11 +442,12 @@ function entityResource($q, $http, umbRequestHelper) {
         getPagedDescendants: function (parentId, type, options) {
 
             var defaults = {
-                pageSize: 1,
-                pageNumber: 100,
+                pageSize: 100,
+                pageNumber: 1,
                 filter: '',
                 orderDirection: "Ascending",
-                orderBy: "SortOrder"
+                orderBy: "SortOrder",
+                ignoreUserStartNodes: false
             };
             if (options === undefined) {
                 options = {};
@@ -460,7 +476,8 @@ function entityResource($q, $http, umbRequestHelper) {
                             pageSize: options.pageSize,
                             orderBy: options.orderBy,
                             orderDirection: options.orderDirection,
-                            filter: encodeURIComponent(options.filter)
+                            filter: encodeURIComponent(options.filter),
+                            ignoreUserStartNodes: options.ignoreUserStartNodes
                         }
                     )),
                 'Failed to retrieve child data for id ' + parentId);
@@ -488,12 +505,19 @@ function entityResource($q, $http, umbRequestHelper) {
          * @returns {Promise} resourcePromise object containing the entity array.
          *
          */
-        search: function (query, type, searchFrom, canceler) {
+        search: function (query, type, options, canceler) {
 
-            var args = [{ query: query }, { type: type }];
-            if (searchFrom) {
-                args.push({ searchFrom: searchFrom });
+            var defaults = {
+                searchFrom: null,
+                ignoreUserStartNodes: false
+            };
+            if (options === undefined) {
+                options = {};
             }
+            //overwrite the defaults if there are any specified
+            angular.extend(defaults, options);
+            //now copy back to the options we will use
+            options = defaults;
 
             var httpConfig = {};
             if (canceler) {
@@ -505,7 +529,12 @@ function entityResource($q, $http, umbRequestHelper) {
                     umbRequestHelper.getApiUrl(
                         "entityApiBaseUrl",
                         "Search",
-                        args),
+                        {
+                            query: query,
+                            type: type,
+                            searchFrom: options.searchFrom,
+                            ignoreUserStartNodes: options.ignoreUserStartNodes
+                        }),
                     httpConfig),
                 'Failed to retrieve entity data for query ' + query);
         },
